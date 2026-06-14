@@ -30,6 +30,13 @@ from typing import TYPE_CHECKING, Any
 # the lazy attributes below (the runtime __getattr__ resolves them to Any
 # from the static analyzer's perspective). PEP 562.
 if TYPE_CHECKING:
+    from strands_robots.device_connect import (
+        ReachyMiniDriver,
+        RobotDeviceDriver,
+        SimulationDeviceDriver,
+        init_device_connect,
+        init_device_connect_sync,
+    )
     from strands_robots.policies.groot import Gr00tPolicy
     from strands_robots.registry import list_robots
     from strands_robots.robot import Robot
@@ -82,7 +89,14 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "lerobot_teleoperate": ("strands_robots.tools.lerobot_teleoperate", "lerobot_teleoperate"),
     "pose_tool": ("strands_robots.tools.pose_tool", "pose_tool"),
     "serial_tool": ("strands_robots.tools.serial_tool", "serial_tool"),
+    # Robot mesh coordination tool (Device Connect dispatch + mesh fallback)
     "robot_mesh": ("strands_robots.tools.robot_mesh", "robot_mesh"),
+    # Device Connect integration — wraps robots as Device Connect devices
+    "init_device_connect": ("strands_robots.device_connect", "init_device_connect"),
+    "init_device_connect_sync": ("strands_robots.device_connect", "init_device_connect_sync"),
+    "RobotDeviceDriver": ("strands_robots.device_connect", "RobotDeviceDriver"),
+    "SimulationDeviceDriver": ("strands_robots.device_connect", "SimulationDeviceDriver"),
+    "ReachyMiniDriver": ("strands_robots.device_connect", "ReachyMiniDriver"),
 }
 
 __all__ = [
@@ -109,6 +123,11 @@ __all__ = [
     "serial_tool",
     "pose_tool",
     "robot_mesh",
+    "init_device_connect",
+    "init_device_connect_sync",
+    "RobotDeviceDriver",
+    "SimulationDeviceDriver",
+    "ReachyMiniDriver",
 ]
 
 

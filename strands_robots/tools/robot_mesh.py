@@ -66,6 +66,7 @@ _RATE_LIMITS: dict[str, tuple[int, float]] = {
     "send": (30, 60.0),
     "broadcast": (10, 60.0),
     "stop": (20, 60.0),
+    "rpc": (30, 60.0),
     "emergency_stop": (3, 60.0),
 }
 _RATE_HISTORY: dict[str, collections.deque[float]] = {}
@@ -84,16 +85,18 @@ _RATE_LOCK = threading.Lock()
 # every read-only observation. Operators who treat telemetry as sensitive
 # opt them in via ``STRANDS_MESH_HITL_ACTIONS``.
 _GATEABLE_ACTIONS: frozenset[str] = frozenset(
-    {"emergency_stop", "broadcast", "tell", "send", "stop", "subscribe", "watch"}
+    {"emergency_stop", "broadcast", "tell", "send", "stop", "rpc", "subscribe", "watch"}
 )
 
 # Default interrupt set: every action with a direct physical-actuation
 # effect. ``emergency_stop`` and ``broadcast`` are fleet-wide;
-# ``tell`` / ``send`` / ``stop`` actuate a single targeted peer. Gating
-# all five by default means a prompt-injected agent cannot drive ANY
-# physical command without an out-of-band operator approval. Consumers
-# who want a narrower or wider gate override via the env var below.
-_DEFAULT_INTERRUPT_ACTIONS: frozenset[str] = frozenset({"emergency_stop", "broadcast", "tell", "send", "stop"})
+# ``tell`` / ``send`` / ``stop`` actuate a single targeted peer, and
+# ``rpc`` invokes a device-native function on a targeted peer (Device
+# Connect dispatch). Gating all six by default means a prompt-injected
+# agent cannot drive ANY physical command without an out-of-band operator
+# approval. Consumers who want a narrower or wider gate override via the
+# env var below.
+_DEFAULT_INTERRUPT_ACTIONS: frozenset[str] = frozenset({"emergency_stop", "broadcast", "tell", "send", "stop", "rpc"})
 
 
 # Sentinel raised by the resolver when the env var holds an unknown token.
@@ -469,6 +472,289 @@ def _resolve_mesh(target: str) -> Any | None:
     return next(iter(locals_.values()))
 
 
+# ── Device Connect dispatch helpers ────────────────────────────────────────
+# Device Connect is the primary discovery + RPC layer; the Zenoh mesh above is
+# the fallback. These helpers are invoked by robot_mesh() AFTER its safety
+# gates, so DC dispatch inherits the rate limit, HITL approval, validation, and
+# audit. When DC is unavailable or has discovered no devices the helpers return
+# None and robot_mesh() falls through to the built-in mesh path.
+
+_dc_state = {"connected": False}
+
+
+def _agent_identity() -> str:
+    """Return this agent's caller identity for Device Connect RPCs.
+
+    Sourced from ``STRANDS_ROBOT_MESH_AGENT_ID`` (falling back to the generic
+    ``DEVICE_CONNECT_CLIENT_ID``). Empty string when unset — in which case the
+    agent is an anonymous caller and a device with ``DEVICE_CONNECT_RPC_ALLOW``
+    set will (correctly) reject it.
+
+    SECURITY: this identity is *self-asserted*. It lets an operator who has
+    locked a device's RPC allowlist authorize this agent by id, but it is only
+    a trustworthy control when the transport authenticates the sender (mTLS).
+    On an insecure/trusted-LAN D2D link it is advisory — any peer can claim any
+    id, so do not rely on it as the sole authorization boundary there.
+    """
+    return os.environ.get("STRANDS_ROBOT_MESH_AGENT_ID") or os.environ.get("DEVICE_CONNECT_CLIENT_ID") or ""
+
+
+def _with_identity(params: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the agent's caller identity into the DC command envelope.
+
+    The device side reads ``params["_dc_meta"]["source_device"]`` and exposes it
+    via ``get_rpc_source_device()`` for the driver's caller-authorization check.
+    Without this the device sees an anonymous caller (``None``). No-op when no
+    identity is configured, preserving the anonymous-caller behaviour.
+    """
+    identity = _agent_identity()
+    if not identity:
+        return params
+    meta = dict(params.get("_dc_meta", {}))
+    meta.setdefault("source_device", identity)
+    return {**params, "_dc_meta": meta}
+
+
+class _DCResult(dict):
+    """Strands tool-response dict whose ``str()`` renders the text block cleanly."""
+
+    def __str__(self) -> str:
+        content = self.get("content", [])
+        if content and isinstance(content[0], dict):
+            return content[0].get("text", super().__str__())
+        return super().__str__()
+
+
+def _dc_ensure_connected() -> None:
+    """Establish the Device Connect agent-side connection (idempotent)."""
+    if _dc_state["connected"]:
+        return
+    os.environ.setdefault("MESSAGING_BACKEND", "zenoh")
+    # Security hardening: do NOT force insecure transport here. Previously this
+    # set DEVICE_CONNECT_ALLOW_INSECURE=true process-wide, silently downgrading
+    # every connection in the process. Insecure mode is now strictly opt-in by
+    # the operator. If they have opted in, surface a warning so it is visible.
+    if os.environ.get("DEVICE_CONNECT_ALLOW_INSECURE", "").lower() in ("true", "1", "yes"):
+        logger.warning(
+            "DEVICE_CONNECT_ALLOW_INSECURE is enabled — agent-side Device "
+            "Connect traffic is unencrypted and unauthenticated. Use only on "
+            "a trusted, isolated network."
+        )
+    from device_connect_agent_tools.connection import connect, get_connection
+
+    try:
+        get_connection()
+    except Exception:
+        connect()
+    _dc_state["connected"] = True
+
+
+def _try_device_connect(
+    action: str,
+    target: str,
+    instruction: str,
+    command: str,
+    policy_provider: str,
+    policy_port: int,
+    duration: float,
+    timeout: float,
+    function: str = "",
+    validated_command: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Dispatch *action* through Device Connect, or return None to fall back.
+
+    Returns None — signalling robot_mesh() to use the built-in mesh — when
+    Device Connect is unavailable, has discovered no devices, or the action is
+    one DC does not handle (subscribe / watch / inbox / unsubscribe).
+    """
+    if action in ("subscribe", "watch", "inbox", "unsubscribe"):
+        return None  # mesh-only actions — let the built-in mesh handle them
+    if os.environ.get("STRANDS_ROBOT_MESH_DC", "on").strip().lower() in ("off", "0", "false", "no"):
+        return None  # Device Connect dispatch disabled (e.g. hermetic unit tests)
+    try:
+        _dc_ensure_connected()
+        from device_connect_agent_tools.connection import get_connection
+
+        conn = get_connection()
+        devices = conn.list_devices()
+    except Exception as exc:  # noqa: BLE001 — DC is optional; fall back to mesh
+        logger.debug("Device Connect unavailable, using mesh fallback: %s", exc)
+        return None
+    # A well-formed connection returns a list of device dicts. Anything else
+    # (e.g. a malformed/stubbed connection) means DC is not usable here, so fall
+    # back to the built-in mesh rather than misdispatch.
+    if not isinstance(devices, (list, tuple)) or not devices:
+        return None
+    return _device_connect_dispatch(
+        action,
+        target,
+        instruction,
+        command,
+        policy_provider,
+        policy_port,
+        duration,
+        timeout,
+        function,
+        validated_command,
+    )
+
+
+def _device_connect_dispatch(
+    action: str,
+    target: str,
+    instruction: str,
+    command: str,
+    policy_provider: str,
+    policy_port: int,
+    duration: float,
+    timeout: float,
+    function: str = "",
+    validated_command: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Render a robot_mesh action through Device Connect (dev-compatible API).
+
+    Fetches the agent-side connection via ``get_connection()`` (patchable in
+    unit tests) and returns a Strands tool-response dict (``_DCResult``).
+    """
+    try:
+        from device_connect_agent_tools.connection import get_connection
+
+        conn = get_connection()
+        if action in ("peers", "status"):
+            devices = conn.list_devices()
+            text = (
+                f"Discovered {len(devices)} device(s):\n"
+                if action == "peers"
+                else f"Network: {len(devices)} device(s)\n"
+            )
+            for d in devices:
+                dtype = d.get("device_type", "?")
+                icon = {"strands_robot": "robot", "strands_sim": "sim", "reachy_mini": "reachy"}.get(dtype, dtype)
+                status = d.get("status", {})
+                avail = status.get("availability", "?") if isinstance(status, dict) else "?"
+                text += f"  [{icon}] {d['device_id']} — {avail}\n"
+                if action == "peers":
+                    funcs = d.get("functions", [])
+                    if funcs:
+                        names = [f["name"] if isinstance(f, dict) else f for f in funcs]
+                        text += f"    Functions: {', '.join(names)}\n"
+            return _DCResult(_ok(text))
+
+        if action == "tell":
+            if not target or not instruction:
+                return _DCResult(_err("tell requires both target and instruction"))
+            kwargs: dict[str, Any] = {"policy_provider": policy_provider, "duration": duration}
+            if policy_port:
+                kwargs["policy_port"] = policy_port
+            # Inherit the mesh path's per-action command validation.
+            try:
+                _security.validate_command({"action": "execute", "instruction": instruction, **kwargs})
+            except _security.ValidationError as exc:
+                _audit_tool_action(action, target, False, f"validation: {exc}")
+                return _DCResult(_err(f"tell rejected: {exc}"))
+            result = conn.invoke(
+                target, "execute", _with_identity({"instruction": instruction, **kwargs}), timeout=timeout
+            )
+            r = result.get("result", result)
+            _audit_tool_action(action, target, True, f"instruction={instruction[:200]}")
+            return _DCResult(_ok(f"-> {target}: {instruction}\n  {json.dumps(r, default=str)}"))
+
+        if action == "send":
+            if not target:
+                return _DCResult(_err("send requires target"))
+            if not command:
+                return _DCResult(_err("send requires command (JSON string)"))
+            try:
+                cmd = json.loads(command)
+            except json.JSONDecodeError as exc:
+                return _DCResult(_err(f"command is not valid JSON: {exc}"))
+            if not isinstance(cmd, dict):
+                return _DCResult(_err("command must decode to a JSON object (dict)"))
+            try:
+                cmd = _security.validate_command(cmd)
+            except _security.ValidationError as exc:
+                _audit_tool_action(action, target, False, f"validation: {exc}")
+                return _DCResult(_err(f"send rejected: {exc}"))
+            func = cmd.pop("action", cmd.pop("function", "getStatus"))
+            result = conn.invoke(target, func, _with_identity(cmd), timeout=timeout)
+            r = result.get("result", result)
+            _audit_tool_action(action, target, True, f"action={func}")
+            return _DCResult(_ok(f"{target}:\n{json.dumps(r, indent=2, default=str)[:2000]}"))
+
+        if action == "rpc":
+            # Device-native RPC (e.g. Reachy nod/look/playMove). Validated via
+            # security.validate_device_rpc (charset + bounded params) WITHOUT
+            # the policy-action allowlist, then invoked directly on the device.
+            if not target:
+                return _DCResult(_err("rpc requires target"))
+            if not function:
+                return _DCResult(_err("rpc requires function (the device-native function name)"))
+            rpc_params: dict[str, Any] = {}
+            if command:
+                try:
+                    parsed = json.loads(command)
+                except json.JSONDecodeError as exc:
+                    return _DCResult(_err(f"rpc params (command) is not valid JSON: {exc}"))
+                if not isinstance(parsed, dict):
+                    return _DCResult(_err("rpc params (command) must decode to a JSON object (dict)"))
+                rpc_params = parsed
+            try:
+                func_name, rpc_params = _security.validate_device_rpc(function, rpc_params)
+            except _security.ValidationError as exc:
+                _audit_tool_action(action, target, False, f"validation: {exc}")
+                return _DCResult(_err(f"rpc rejected: {exc}"))
+            result = conn.invoke(target, func_name, _with_identity(rpc_params), timeout=timeout)
+            r = result.get("result", result) if isinstance(result, dict) else result
+            _audit_tool_action(action, target, True, f"function={func_name}")
+            return _DCResult(
+                _ok(f"{target}.{func_name}({rpc_params}) ->\n{json.dumps(r, indent=2, default=str)[:2000]}")
+            )
+
+        if action == "stop":
+            if not target:
+                return _DCResult(_err("stop requires target"))
+            result = conn.invoke(target, "stop", _with_identity({}), timeout=min(timeout, 5.0))
+            r = result.get("result", result)
+            _audit_tool_action(action, target, True, "")
+            return _DCResult(_ok(f"Stop {target}: {json.dumps(r, default=str)}"))
+
+        if action == "emergency_stop":
+            devices = conn.list_devices()
+            stopped = 0
+            for d in devices:
+                try:
+                    conn.invoke(d["device_id"], "stop", _with_identity({}), timeout=3.0)
+                    stopped += 1
+                except Exception:  # noqa: BLE001 — best-effort fan-out
+                    pass
+            _audit_tool_action(action, "*", True, f"stopped={stopped}/{len(devices)}")
+            return _DCResult(_ok(f"E-STOP: {stopped}/{len(devices)} devices stopped"))
+
+        if action == "broadcast":
+            # Security hardening: dispatch the *validated* command that the
+            # operator approved at the HITL gate — never re-parse the raw
+            # caller-supplied string here (that would allow a payload whose
+            # validated form differs from what actually executes).
+            if validated_command is None:
+                return _DCResult(_err("broadcast reached Device Connect dispatch without a validated command"))
+            cmd = dict(validated_command)
+            func = cmd.pop("action", cmd.pop("function", "getStatus"))
+            params = _with_identity(cmd)
+            results = conn.broadcast(func, params, timeout=timeout)
+            _audit_tool_action(action, "*", True, f"action={func} responses={len(results)}")
+            text = f"[broadcast] {len(results)} responses\n"
+            for r in results[:10]:
+                sstr = "ok" if "result" in r else f"error: {r.get('error', '?')}"
+                text += f"  {r.get('device_id', '?')}: {sstr}\n"
+            return _DCResult(_ok(text.rstrip()))
+
+        # subscribe / watch / inbox / unsubscribe → handled by the mesh path
+        return None
+    except Exception as exc:  # noqa: BLE001 — never raise out of the dispatcher
+        logger.debug("Device Connect dispatch error for %s: %s", action, exc)
+        return _DCResult(_err(f"[{action}] Device Connect error: {exc}"))
+
+
 @tool(context=True)
 def robot_mesh(
     action: str,
@@ -482,13 +768,19 @@ def robot_mesh(
     timeout: float = 30.0,
     name: str = "",
     limit: int = 50,
+    function: str = "",
 ) -> dict[str, Any]:
     """Coordinate every robot, sim, and agent on the local Zenoh mesh.
 
     Args:
         action: One of ``peers`` / ``status`` / ``tell`` / ``send`` /
-            ``broadcast`` / ``stop`` / ``emergency_stop`` / ``subscribe`` /
-            ``unsubscribe`` / ``watch`` / ``inbox``.
+            ``rpc`` / ``broadcast`` / ``stop`` / ``emergency_stop`` /
+            ``subscribe`` / ``unsubscribe`` / ``watch`` / ``inbox``.
+            ``rpc`` calls a device's NATIVE Device Connect function (e.g.
+            the Reachy's ``nod`` / ``look`` / ``playMove``) directly,
+            bypassing the policy-action allowlist that ``tell`` / ``send``
+            enforce. Pass the function name in ``function`` and any kwargs
+            as a JSON object in ``command``.
         target: Peer id (for ``tell`` / ``send`` / ``stop`` / ``watch``) or
             Zenoh topic pattern (for ``subscribe``).
         instruction: Natural-language instruction for ``tell``.
@@ -499,6 +791,7 @@ def robot_mesh(
         timeout: Response timeout for RPC actions (seconds).
         name: Optional subscription name for ``subscribe`` / ``inbox``.
         limit: Max messages returned by ``inbox`` (default: 50).
+        function: Device-native function name for ``rpc`` (e.g. ``nod``).
 
     Returns:
         A Strands tool response dict with status and a single text block.
@@ -650,6 +943,9 @@ def robot_mesh(
                 reason={
                     "action": action,
                     "target": _approval_target,
+                    # Surface the device-native function name for rpc so the
+                    # operator approves the specific function being invoked.
+                    "function": function if action == "rpc" else "",
                     "command": _approval_command,
                     "instruction": instruction,
                     "warning": _scope_warning,
@@ -700,6 +996,26 @@ def robot_mesh(
         # unconditionally (matches the pre-split behaviour for
         # non-fleet-wide actions like ``tell``, ``send``, ``stop``).
         _rate_limit_record(action)
+
+    # ── Device Connect dispatch (primary networking layer) ─────────────────
+    # Every safety gate above (rate limit, HITL approval, broadcast
+    # pre-validation, audit) has already run, so Device Connect inherits them.
+    # _try_device_connect returns None when DC is unavailable or has discovered
+    # no devices, in which case we fall through to the built-in mesh below.
+    _dc_result = _try_device_connect(
+        action,
+        target,
+        instruction,
+        command,
+        policy_provider,
+        policy_port,
+        duration,
+        timeout,
+        function,
+        validated_broadcast_cmd,
+    )
+    if _dc_result is not None:
+        return _dc_result
 
     try:
         from strands_robots.mesh import get_local_robots
@@ -948,8 +1264,16 @@ def robot_mesh(
         _audit_tool_action(action, sub_name, True, "")
         return _ok(f"[unsub] unsubscribed from '{sub_name}'")
 
+    if action == "rpc":
+        return _err(
+            "rpc (device-native function call) requires Device Connect, which is "
+            "unavailable or has discovered no devices in this context. The built-in "
+            "Zenoh mesh has no equivalent. Ensure the agent connected via "
+            "device_connect_agent_tools.connect() and the target is online."
+        )
+
     return _err(
-        f"unknown action: {action!r}. Valid: peers, status, tell, send, "
+        f"unknown action: {action!r}. Valid: peers, status, tell, send, rpc, "
         "broadcast, stop, emergency_stop, subscribe, unsubscribe, watch, inbox."
     )
 
