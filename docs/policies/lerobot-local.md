@@ -271,6 +271,7 @@ little execution window to overlap.
 
 ## See also
 
+- [MolmoAct2 (SO-100/101)](molmoact2.md) - action contract, units, and motion diagnostics
 - [Policy providers](../policies/overview.md)
 - [Training](../training/overview.md)
 - [GR00T](groot.md)
