@@ -37,6 +37,8 @@ if TYPE_CHECKING:
         init_device_connect,
         init_device_connect_sync,
     )
+    from strands_robots.hardware_ros_bridge import HardwareRosBridge
+    from strands_robots.hardware_rtps_bridge import RtpsHardwareBridge
     from strands_robots.policies.groot import Gr00tPolicy
     from strands_robots.registry import (
         get_robot,
@@ -78,6 +80,8 @@ from strands_robots.policies import MockPolicy, Policy, create_policy  # noqa: F
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # Hardware robot
     "Robot": ("strands_robots.robot", "Robot"),
+    "HardwareRosBridge": ("strands_robots.hardware_ros_bridge", "HardwareRosBridge"),
+    "RtpsHardwareBridge": ("strands_robots.hardware_rtps_bridge", "RtpsHardwareBridge"),
     "Teleoperator": ("strands_robots.teleoperator", "Teleoperator"),
     "list_robots": ("strands_robots.registry", "list_robots"),
     "get_robot": ("strands_robots.registry", "get_robot"),
@@ -120,6 +124,8 @@ __all__ = [
     "create_policy",
     # Lazy-loaded
     "Robot",
+    "HardwareRosBridge",
+    "RtpsHardwareBridge",
     "Teleoperator",
     "Gr00tPolicy",
     "Simulation",
