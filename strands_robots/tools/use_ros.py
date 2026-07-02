@@ -258,7 +258,9 @@ def _echo(topic: str, msg_type: str, timeout: float, count: int) -> list[dict[st
     node = _backend._ensure_node()
     msg_cls = _get_message(msg_type)
     received: list[dict[str, Any]] = []
-    sub = node.create_subscription(msg_cls, topic, lambda m: received.append(_msg_to_dict(m)), 10)
+    sub = node.create_subscription(
+        msg_cls, topic, lambda m: received.append(_msg_to_dict(m)), _qos_for_topic(node, topic)
+    )
     try:
         _backend.spin_for(lambda: len(received) >= count, timeout)
     finally:

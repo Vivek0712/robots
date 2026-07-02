@@ -283,6 +283,7 @@ class _FakeNode:
         self.pub_counts = {"/turtle1/cmd_vel": 1}
         self.sub_counts = {"/turtle1/cmd_vel": 2}
         self.sub_cb: Any = None
+        self.sub_qos: Any = None
         self.publishers: list[Any] = []
         self.clients: list[Any] = []
         self.destroyed: list[tuple[str, Any]] = []
@@ -302,8 +303,9 @@ class _FakeNode:
     def count_subscribers(self, name: str) -> int:
         return self.sub_counts.get(name, 0)
 
-    def create_subscription(self, cls: Any, topic: str, cb: Any, qos: int) -> Any:
+    def create_subscription(self, cls: Any, topic: str, cb: Any, qos: Any) -> Any:
         self.sub_cb = cb
+        self.sub_qos = qos
         return object()
 
     def destroy_subscription(self, sub: Any) -> None:
@@ -487,13 +489,16 @@ def test_info_reports_topic_service_and_miss(fake_node: _FakeNode) -> None:
 
 
 def test_echo_collects_and_caps_samples(
-    monkeypatch: pytest.MonkeyPatch, fake_node: _FakeNode, fake_rosidl: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch, fake_node: _FakeNode, fake_rosidl: dict[str, Any], fake_rclpy_qos: None
 ) -> None:
     pending = [{"x": 0}, {"x": 1}, {"x": 2}]
 
     def _deliver(predicate: Any, timeout: float) -> None:
         while pending and not predicate():
-            fake_node.sub_cb(pending.pop(0))
+            if fake_node.sub_cb is not None:
+                fake_node.sub_cb(pending.pop(0))
+            else:
+                break
 
     monkeypatch.setattr(ros_mod._backend, "spin_for", _deliver)
 
@@ -644,3 +649,14 @@ def test_qos_discovery_failure_degrades_to_default(fake_rclpy_qos: None) -> None
     node = _types.SimpleNamespace(get_publishers_info_by_topic=boom)
     qos = ros_mod._qos_for_topic(node, "/broken")
     assert (qos.reliability, qos.durability) == ("RELIABLE", "VOLATILE")
+
+
+def test_echo_subscribes_with_derived_qos(
+    monkeypatch: pytest.MonkeyPatch, fake_node: _FakeNode, fake_rosidl: dict[str, Any]
+) -> None:
+    # _echo must pass _qos_for_topic's answer to create_subscription - the
+    # red/green anchor for the /scan fix (pre-fix main passes the literal 10).
+    sentinel = object()
+    monkeypatch.setattr(ros_mod, "_qos_for_topic", lambda node, topic: sentinel)
+    ros_mod._echo("/scan", "sensor_msgs/msg/LaserScan", timeout=0.1, count=1)
+    assert fake_node.sub_qos is sentinel
