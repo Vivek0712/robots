@@ -5,6 +5,15 @@ All notable behavioural changes to `strands-robots` are logged here. Follows
 
 ## [Unreleased]
 
+### Added: ROS 2 action support in `use_ros` + goal-level `navigate_to` on `RosBridgedRobot`
+
+`use_ros` gains `list_actions` and `action_send_goal` (in-process `rclpy.action`,
+dynamic `get_action` type resolution, one end-to-end timeout budget). Timed-out
+goals are cancelled before the error returns, never orphaned on the robot;
+feedback is capped at 5 samples (first 4 + latest) to protect agent context.
+`RosBridgedRobot` gains `nav_action` wiring and `navigate_to(x, y, yaw)`,
+exposed as a `navigate_<node_name>` agent tool only when configured.
+
 ### Fixed: `examples/train_ppo_reach.py` aborted in its own `validate()` preflight
 
 The example shipped `rollout_steps=250` with `num_mini_batches=4`, but PPO spec
@@ -168,6 +177,24 @@ dimensions.
 -> the named camera's configured resolution; explicit dims -> override; the
 free/model-only cameras -> engine default. RGB and depth for the same camera
 are now pixel-aligned.
+
+### Added: `set_obs_noise` on the MuJoCo backend (sensor-noise parity with Newton)
+
+`set_obs_noise` is a declared `SimEngine` method for additive sensor
+measurement noise (a sim-to-real robustness lever), and the Newton backend
+implemented it, but the default MuJoCo backend inherited the base
+`NotImplementedError`. Robustness code that ran on Newton crashed on MuJoCo -
+the reference backend - and the two engines diverged on a shared contract.
+
+The MuJoCo backend now implements `set_obs_noise(joint_pos_std, joint_vel_std,
+camera_jitter_px, seed)` with the same semantics as Newton: joint-position and
+per-joint-velocity Gaussian noise applied on `get_observation` (positions, the
+`<joint>.vel` entries, and camera frames) and `get_robot_state`, plus integer
+pixel jitter on rendered frames. Values must be finite and non-negative
+(`status=error` otherwise). The noise stream is seedable/reproducible, and the
+default (never-configured) path is an exact no-op, so unconfigured observations
+and renders are byte-for-byte unchanged. `describe()` now advertises the method.
+
 
 ## [0.4.1] - 2026-07-01
 

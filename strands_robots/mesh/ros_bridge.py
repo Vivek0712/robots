@@ -30,6 +30,7 @@ Typical usage::
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -39,6 +40,7 @@ from strands.types.tools import AgentTool
 from strands_robots.tools.use_ros import use_ros
 
 _TWIST_TYPE = "geometry_msgs/msg/Twist"
+_NAV_ACTION_TYPE = "nav2_msgs/action/NavigateToPose"
 
 # ROS 2 graph names: leading slash plus alnum / _ / ~ segments. Reject anything
 # else early so a malformed topic fails at construction with a clear message
@@ -78,6 +80,12 @@ class RosBridgedRobot:
         scan_type: Interface type of ``scan_topic``. Optional - resolved from
             the live graph when omitted.
         publish_rate: Default rate (Hz) for multi-message :meth:`drive` calls.
+        nav_action: Optional Nav2-style action server name (e.g.
+            ``/navigate_to_pose``). When set, :meth:`navigate_to` sends
+            goal-level navigation instead of raw velocity, and a
+            ``navigate_<node_name>`` agent tool is exposed.
+        nav_action_type: Action interface for ``nav_action``. Defaults to
+            ``nav2_msgs/action/NavigateToPose``.
     """
 
     def __init__(
@@ -91,6 +99,8 @@ class RosBridgedRobot:
         odom_type: str | None = None,
         scan_type: str | None = None,
         publish_rate: float = 10.0,
+        nav_action: str | None = None,
+        nav_action_type: str = _NAV_ACTION_TYPE,
     ) -> None:
         self.node_name = _check_topic("node_name", node_name)
         self.cmd_vel_topic = _check_topic("cmd_vel_topic", cmd_vel_topic)
@@ -100,6 +110,8 @@ class RosBridgedRobot:
         self.odom_type = odom_type
         self.scan_type = scan_type
         self.publish_rate = publish_rate
+        self.nav_action = _check_topic("nav_action", nav_action) if nav_action else None
+        self.nav_action_type = nav_action_type
 
     @classmethod
     def from_ros(
@@ -188,6 +200,56 @@ class RosBridgedRobot:
             timeout=timeout,
         )
 
+    def navigate_to(
+        self,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        frame_id: str = "map",
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Send a goal-level navigation request to the robot's ``nav_action``.
+
+        Unlike :meth:`drive`, which streams raw velocity, this delegates
+        obstacle avoidance, path planning, and recovery to the robot's own
+        navigation stack (Nav2 by default) and blocks until the goal reaches a
+        terminal state or ``timeout`` expires - at which point ``use_ros``
+        cancels the goal so the robot does not keep navigating unattended.
+
+        Args:
+            x: Goal position x in ``frame_id`` (meters).
+            y: Goal position y in ``frame_id`` (meters).
+            yaw: Goal heading in radians, encoded as a planar quaternion.
+            frame_id: Frame the goal pose is expressed in (default ``map``).
+            timeout: End-to-end budget in seconds for the navigation goal.
+
+        Returns:
+            The ``use_ros`` action result dict (goal status, result, feedback
+            samples), or an error result when no ``nav_action`` was configured.
+        """
+        if not self.nav_action:
+            return {
+                "status": "error",
+                "content": [{"text": "navigate_to: no nav_action configured for this robot"}],
+            }
+        half = 0.5 * float(yaw)
+        fields = {
+            "pose": {
+                "header": {"frame_id": frame_id},
+                "pose": {
+                    "position": {"x": float(x), "y": float(y)},
+                    "orientation": {"z": math.sin(half), "w": math.cos(half)},
+                },
+            }
+        }
+        return use_ros(
+            action="action_send_goal",
+            action_name=self.nav_action,
+            type=self.nav_action_type,
+            fields=fields,
+            timeout=timeout,
+        )
+
     @property
     def tools(self) -> list[AgentTool]:
         """Return this robot's capabilities as named strands agent tools.
@@ -210,9 +272,21 @@ class RosBridgedRobot:
         def get_scan() -> dict[str, Any]:
             return self.get_scan()
 
+        @tool(
+            name=f"navigate_{suffix}",
+            description=(
+                f"Navigate the {self.node_name} robot to a map-frame (x, y, yaw) goal using its "
+                "navigation stack (planning and obstacle avoidance handled on-robot)."
+            ),
+        )
+        def navigate(x: float, y: float, yaw: float = 0.0, timeout: float = 120.0) -> dict[str, Any]:
+            return self.navigate_to(x=x, y=y, yaw=yaw, timeout=timeout)
+
         agent_tools: list[AgentTool] = [drive, get_pose]
         if self.scan_topic:
             agent_tools.append(get_scan)
+        if self.nav_action:
+            agent_tools.append(navigate)
         return agent_tools
 
     def __repr__(self) -> str:
