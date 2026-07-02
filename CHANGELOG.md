@@ -5,6 +5,16 @@ All notable behavioural changes to `strands-robots` are logged here. Follows
 
 ## [Unreleased]
 
+### Fixed: `use_ros` echo returned nothing on BEST_EFFORT sensor topics
+
+`echo` subscribed with the default RELIABLE profile, which never matches the
+BEST_EFFORT publishers used by hardware sensor topics (`/scan`, camera streams,
+IMU - the rmw sensor-data profile), so the agent saw an empty result and no
+error. The subscription QoS now mirrors `ros2 topic echo`: BEST_EFFORT unless
+every live publisher offers RELIABLE, and TRANSIENT_LOCAL when every publisher
+offers it (latched topics such as `/tf_static` deliver their history). With no
+live publishers, or if QoS discovery fails, behavior is unchanged.
+
 ### Fixed: `examples/train_ppo_reach.py` aborted in its own `validate()` preflight
 
 The example shipped `rollout_steps=250` with `num_mini_batches=4`, but PPO spec

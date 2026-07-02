@@ -30,7 +30,10 @@ Actions:
     list_nodes     - list nodes.
     list_services  - list services with their types.
     info           - describe a topic (type + pub/sub counts) or service (type).
-    echo           - subscribe to a topic and return N samples as JSON.
+    echo           - subscribe to a topic and return N samples as JSON. The
+                     subscription QoS matches what live publishers offer, so
+                     BEST_EFFORT sensor topics (/scan, cameras) and latched
+                     TRANSIENT_LOCAL topics (/tf_static) work automatically.
     publish        - publish N messages built from a JSON field dict.
     service_call   - call a service with a JSON request dict, return the response.
 

@@ -76,7 +76,7 @@ pip install 'strands-robots[ros2]'   # optional cyclonedds RMW binding only
 | `list_nodes` | - | Node names |
 | `list_services` | - | Services with their types |
 | `info` | `topic` or `service` | Topic (type + pub/sub counts) or service (type) details |
-| `echo` | `topic` (type auto-resolved) | N samples as JSON |
+| `echo` | `topic` (type auto-resolved) | N samples as JSON; subscription QoS auto-matches live publishers (BEST_EFFORT sensors and latched topics work without configuration) |
 | `publish` | `topic`, `type` | Publishes N messages built from `fields` |
 | `service_call` | `service`, `type` | Service response as JSON |
 
