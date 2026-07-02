@@ -312,6 +312,69 @@ def _service_call(service: str, srv_type: str, fields: dict[str, Any], timeout: 
         node.destroy_client(client)
 
 
+# --------------------------------------------------------------------------
+# Parameters (rcl_interfaces services on the target node - no CLI, no extra
+# client abstraction; parameters in ROS 2 are plain services).
+# --------------------------------------------------------------------------
+
+# rcl_interfaces/msg/ParameterType codes -> (type name, ParameterValue field).
+_PARAM_TYPE_FIELDS = {
+    1: ("bool", "bool_value"),
+    2: ("integer", "integer_value"),
+    3: ("double", "double_value"),
+    4: ("string", "string_value"),
+    5: ("byte_array", "byte_array_value"),
+    6: ("bool_array", "bool_array_value"),
+    7: ("integer_array", "integer_array_value"),
+    8: ("double_array", "double_array_value"),
+    9: ("string_array", "string_array_value"),
+}
+
+
+def _param_value_to_py(pv: dict[str, Any]) -> tuple[str, Any]:
+    """Decode a ParameterValue dict (from _msg_to_dict) to (type name, value)."""
+    ptype = int(pv.get("type") or 0)
+    if ptype == 0:
+        return ("not_set", None)
+    entry = _PARAM_TYPE_FIELDS.get(ptype)
+    if entry is None:
+        raise ValueError(f"unknown ParameterValue type code: {ptype}")
+    name, field = entry
+    value = pv.get(field)
+    if name == "byte_array" and value is not None:
+        value = list(value)  # bytes/array('B') from conversion -> plain JSON list
+    return (name, value)
+
+
+def _py_to_param_value(value: Any) -> dict[str, Any]:
+    """Map a JSON scalar/homogeneous array to a ParameterValue field dict.
+
+    bool is tested before int deliberately: bool subclasses int, and a True
+    that lands in integer_value would silently set the wrong parameter type.
+    """
+    if isinstance(value, bool):
+        return {"type": 1, "bool_value": value}
+    if isinstance(value, int):
+        return {"type": 2, "integer_value": value}
+    if isinstance(value, float):
+        return {"type": 3, "double_value": value}
+    if isinstance(value, str):
+        return {"type": 4, "string_value": value}
+    if isinstance(value, list):
+        if not value:
+            raise ValueError("cannot infer a parameter type for an empty list")
+        if all(isinstance(v, bool) for v in value):
+            return {"type": 6, "bool_array_value": value}
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+            return {"type": 7, "integer_array_value": value}
+        if all(isinstance(v, float) for v in value):
+            return {"type": 8, "double_array_value": value}
+        if all(isinstance(v, str) for v in value):
+            return {"type": 9, "string_array_value": value}
+        raise ValueError("mixed-type list cannot map to a ROS parameter array")
+    raise ValueError(f"unsupported parameter value type: {type(value).__name__}")
+
+
 @tool
 def use_ros(
     action: str,

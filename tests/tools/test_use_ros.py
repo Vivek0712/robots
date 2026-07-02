@@ -660,3 +660,56 @@ def test_echo_subscribes_with_derived_qos(
     monkeypatch.setattr(ros_mod, "_qos_for_topic", lambda node, topic: sentinel)
     ros_mod._echo("/scan", "sensor_msgs/msg/LaserScan", timeout=0.1, count=1)
     assert fake_node.sub_qos is sentinel
+
+
+# Parameters ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("pv", "expected"),
+    [
+        ({"type": 1, "bool_value": True}, ("bool", True)),
+        ({"type": 2, "integer_value": 7}, ("integer", 7)),
+        ({"type": 3, "double_value": 0.25}, ("double", 0.25)),
+        ({"type": 4, "string_value": "map"}, ("string", "map")),
+        ({"type": 5, "byte_array_value": [1, 2]}, ("byte_array", [1, 2])),
+        ({"type": 6, "bool_array_value": [True, False]}, ("bool_array", [True, False])),
+        ({"type": 7, "integer_array_value": [1, 2]}, ("integer_array", [1, 2])),
+        ({"type": 8, "double_array_value": [0.5]}, ("double_array", [0.5])),
+        ({"type": 9, "string_array_value": ["a", "b"]}, ("string_array", ["a", "b"])),
+        ({"type": 0}, ("not_set", None)),
+    ],
+)
+def test_param_value_to_py_decodes_every_arm(pv: dict[str, Any], expected: tuple[str, Any]) -> None:
+    assert ros_mod._param_value_to_py(pv) == expected
+
+
+def test_param_value_to_py_rejects_unknown_code() -> None:
+    with pytest.raises(ValueError, match="unknown ParameterValue type"):
+        ros_mod._param_value_to_py({"type": 42})
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, {"type": 1, "bool_value": True}),  # bool BEFORE int: bool subclasses int
+        (7, {"type": 2, "integer_value": 7}),
+        (0.25, {"type": 3, "double_value": 0.25}),
+        ("map", {"type": 4, "string_value": "map"}),
+        ([True, False], {"type": 6, "bool_array_value": [True, False]}),
+        ([1, 2], {"type": 7, "integer_array_value": [1, 2]}),
+        ([0.5, 1.5], {"type": 8, "double_array_value": [0.5, 1.5]}),
+        (["a", "b"], {"type": 9, "string_array_value": ["a", "b"]}),
+    ],
+)
+def test_py_to_param_value_infers_arm(value: Any, expected: dict[str, Any]) -> None:
+    assert ros_mod._py_to_param_value(value) == expected
+
+
+@pytest.mark.parametrize("bad", [[], [1, "a"], [True, 1], {"k": "v"}, None])
+def test_py_to_param_value_rejects_ambiguous(bad: Any) -> None:
+    # Empty lists have no inferable arm; mixed lists map to no ROS array type;
+    # bools mixed into int lists must not silently coerce; dicts/None are not
+    # parameter values.
+    with pytest.raises(ValueError):
+        ros_mod._py_to_param_value(bad)
