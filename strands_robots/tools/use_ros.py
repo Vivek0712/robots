@@ -67,6 +67,8 @@ logger = logging.getLogger(__name__)
 # unexpected characters into the rclpy graph API or type-resolution layer.
 _NAME_RE = re.compile(r"^[A-Za-z0-9_/~{}]+$")
 _TYPE_RE = re.compile(r"^[A-Za-z0-9_]+/[A-Za-z0-9_]+/[A-Za-z0-9_]+$")
+# Parameter names: alnum plus _ and . (nested parameters like "controller.rate").
+_PARAM_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 
 _INSTALL_HINT = (
     "rclpy is not importable - source a ROS 2 distro before launching the agent "
@@ -375,6 +377,34 @@ def _py_to_param_value(value: Any) -> dict[str, Any]:
     raise ValueError(f"unsupported parameter value type: {type(value).__name__}")
 
 
+def _param_list(node_name: str, timeout: float) -> list[str]:
+    resp = _service_call(f"{node_name}/list_parameters", "rcl_interfaces/srv/ListParameters", {}, timeout)
+    return sorted(resp.get("result", {}).get("names", []))
+
+
+def _param_get(node_name: str, param_name: str, timeout: float) -> dict[str, Any]:
+    resp = _service_call(
+        f"{node_name}/get_parameters",
+        "rcl_interfaces/srv/GetParameters",
+        {"names": [param_name]},
+        timeout,
+    )
+    values = resp.get("values", [])
+    if not values:
+        raise ValueError(f"node {node_name} returned no value for parameter {param_name!r}")
+    type_name, value = _param_value_to_py(values[0])
+    return {"name": param_name, "type": type_name, "value": value}
+
+
+def _param_set(node_name: str, param_name: str, value: Any, timeout: float) -> dict[str, Any]:
+    fields = {"parameters": [{"name": param_name, "value": _py_to_param_value(value)}]}
+    resp = _service_call(f"{node_name}/set_parameters", "rcl_interfaces/srv/SetParameters", fields, timeout)
+    results = resp.get("results", [])
+    if not results:
+        raise ValueError(f"node {node_name} returned no result for set_parameters")
+    return results[0]
+
+
 @tool
 def use_ros(
     action: str,
@@ -385,12 +415,16 @@ def use_ros(
     timeout: float = 5.0,
     count: int = 1,
     rate: float = 10.0,
+    node_name: str | None = None,
+    param_name: str | None = None,
+    param_value: Any = None,
 ) -> dict[str, Any]:
     """Universal ROS 2 tool - in-process rclpy, dynamic types, no shelling out.
 
     Args:
         action: One of ``status``, ``list_topics``, ``list_nodes``,
-            ``list_services``, ``info``, ``echo``, ``publish``, ``service_call``.
+            ``list_services``, ``info``, ``echo``, ``publish``, ``service_call``,
+            ``param_list``, ``param_get``, ``param_set``.
         topic: Topic name (``echo``, ``publish``, ``info``).
         service: Service name (``service_call``, ``info``).
         type: Fully-qualified interface type, e.g. ``geometry_msgs/msg/Twist``
@@ -401,6 +435,13 @@ def use_ros(
         timeout: Seconds to wait for samples / a service.
         count: Number of messages to echo or publish.
         rate: Publish rate in Hz.
+        node_name: Fully-qualified node name (``param_list`` / ``param_get`` /
+            ``param_set``), e.g. ``/amcl``.
+        param_name: Parameter name on that node, dots allowed for nested
+            parameters (``param_get``, ``param_set``).
+        param_value: New value (``param_set``). JSON scalar or homogeneous
+            array; the ROS parameter type is inferred from the Python type
+            (bool checked before int).
 
     Returns:
         A Strands tool result dict ``{"status": ..., "content": [{"text": ...}]}``.
@@ -414,6 +455,10 @@ def use_ros(
         return _err(f"invalid service name: {service!r}")
     if type is not None and not _TYPE_RE.match(type):
         return _err(f"invalid interface type: {type!r} (expected pkg/msg/Name or pkg/srv/Name)")
+    if node_name is not None and not _NAME_RE.match(node_name):
+        return _err(f"invalid node name: {node_name!r}")
+    if param_name is not None and not _PARAM_RE.match(param_name):
+        return _err(f"invalid parameter name: {param_name!r}")
 
     if action == "status":
         if _backend.available():
@@ -465,6 +510,31 @@ def use_ros(
 
                 resp = _service_call(service, type, fields, timeout)
                 return _ok(f"response:\n{json.dumps(resp, indent=2, default=str)}")
+
+            if action == "param_list":
+                if not node_name:
+                    return _err("param_list requires node_name")
+                names = _param_list(node_name, timeout)
+                return _ok(f"parameters on {node_name} ({len(names)}):\n" + "\n".join(names))
+
+            if action == "param_get":
+                if not node_name or not param_name:
+                    return _err("param_get requires node_name and param_name")
+                import json
+
+                payload = _param_get(node_name, param_name, timeout)
+                return _ok(f"parameter on {node_name}:\n{json.dumps(payload, indent=2, default=str)}")
+
+            if action == "param_set":
+                if not node_name or not param_name:
+                    return _err("param_set requires node_name and param_name")
+                if param_value is None:
+                    return _err("param_set requires param_value")
+                outcome = _param_set(node_name, param_name, param_value, timeout)
+                if not outcome.get("successful"):
+                    reason = outcome.get("reason") or "no reason given"
+                    return _err(f"set of {param_name} on {node_name} rejected: {reason}")
+                return _ok(f"set {param_name} on {node_name}")
 
             return _err(f"unknown action: {action}")
     except TimeoutError as exc:

@@ -713,3 +713,132 @@ def test_py_to_param_value_rejects_ambiguous(bad: Any) -> None:
     # parameter values.
     with pytest.raises(ValueError):
         ros_mod._py_to_param_value(bad)
+
+
+def test_param_list_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_list(node_name: str, timeout: float) -> list[str]:
+        captured.update(node=node_name, timeout=timeout)
+        return ["use_sim_time", "robot_radius"]
+
+    monkeypatch.setattr(ros_mod, "_param_list", fake_list)
+    result = use_ros(action="param_list", node_name="/amcl", timeout=3.0)
+    assert result["status"] == "success"
+    assert "use_sim_time" in _texts(result) and "robot_radius" in _texts(result)
+    assert captured == {"node": "/amcl", "timeout": 3.0}
+    _ascii_only(result)
+
+
+def test_param_list_requires_node_name() -> None:
+    result = use_ros(action="param_list")
+    assert result["status"] == "error"
+    assert "requires node_name" in _texts(result)
+
+
+def test_param_get_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ros_mod,
+        "_param_get",
+        lambda node_name, param_name, timeout: {"name": param_name, "type": "double", "value": 0.22},
+    )
+    result = use_ros(action="param_get", node_name="/amcl", param_name="robot_radius")
+    assert result["status"] == "success"
+    assert "0.22" in _texts(result) and "robot_radius" in _texts(result)
+    _ascii_only(result)
+
+
+def test_param_get_requires_node_and_param() -> None:
+    result = use_ros(action="param_get", node_name="/amcl")
+    assert result["status"] == "error"
+    assert "requires node_name and param_name" in _texts(result)
+
+
+def test_param_set_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_set(node_name: str, param_name: str, value: Any, timeout: float) -> dict[str, Any]:
+        captured.update(node=node_name, name=param_name, value=value)
+        return {"successful": True, "reason": ""}
+
+    monkeypatch.setattr(ros_mod, "_param_set", fake_set)
+    result = use_ros(action="param_set", node_name="/amcl", param_name="use_sim_time", param_value=True)
+    assert result["status"] == "success"
+    # The value reaches the helper as a real bool, not a string.
+    assert captured["value"] is True
+    _ascii_only(result)
+
+
+def test_param_set_rejection_is_structured_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Mirrors action_send_goal's rejection contract: server-side rejection is a
+    # structured error carrying the server's reason, never an exception.
+    monkeypatch.setattr(
+        ros_mod,
+        "_param_set",
+        lambda *a, **k: {"successful": False, "reason": "parameter is read-only"},
+    )
+    result = use_ros(action="param_set", node_name="/amcl", param_name="frame_id", param_value="map")
+    assert result["status"] == "error"
+    assert "rejected" in _texts(result) and "read-only" in _texts(result)
+    _ascii_only(result)
+
+
+def test_param_set_requires_value() -> None:
+    result = use_ros(action="param_set", node_name="/amcl", param_name="use_sim_time")
+    assert result["status"] == "error"
+    assert "requires param_value" in _texts(result)
+
+
+def test_invalid_node_name_rejected() -> None:
+    result = use_ros(action="param_list", node_name="/amcl; rm -rf")
+    assert result["status"] == "error"
+    assert "invalid node name" in _texts(result)
+    _ascii_only(result)
+
+
+def test_invalid_param_name_rejected() -> None:
+    # Parameter names allow dots (nested params) but nothing shell-shaped.
+    result = use_ros(action="param_get", node_name="/amcl", param_name="rate$(x)")
+    assert result["status"] == "error"
+    assert "invalid parameter name" in _texts(result)
+    _ascii_only(result)
+
+
+def test_param_helpers_call_rcl_interfaces_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The helpers are thin adapters over _service_call against the standard
+    # parameter services - pin service names, types, and payload shapes.
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_service_call(service: str, srv_type: str, fields: dict[str, Any], timeout: float) -> dict[str, Any]:
+        calls.append((service, srv_type, fields))
+        if service.endswith("/list_parameters"):
+            return {"result": {"names": ["b_param", "a_param"], "prefixes": []}}
+        if service.endswith("/get_parameters"):
+            return {"values": [{"type": 2, "integer_value": 30}]}
+        return {"results": [{"successful": True, "reason": ""}]}
+
+    monkeypatch.setattr(ros_mod, "_service_call", fake_service_call)
+
+    assert ros_mod._param_list("/amcl", 5.0) == ["a_param", "b_param"]  # sorted
+    assert ros_mod._param_get("/amcl", "max_beams", 5.0) == {
+        "name": "max_beams",
+        "type": "integer",
+        "value": 30,
+    }
+    assert ros_mod._param_set("/amcl", "max_beams", 60, 5.0) == {"successful": True, "reason": ""}
+
+    assert calls == [
+        ("/amcl/list_parameters", "rcl_interfaces/srv/ListParameters", {}),
+        ("/amcl/get_parameters", "rcl_interfaces/srv/GetParameters", {"names": ["max_beams"]}),
+        (
+            "/amcl/set_parameters",
+            "rcl_interfaces/srv/SetParameters",
+            {"parameters": [{"name": "max_beams", "value": {"type": 2, "integer_value": 60}}]},
+        ),
+    ]
+
+
+def test_param_get_empty_values_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ros_mod, "_service_call", lambda *a, **k: {"values": []})
+    with pytest.raises(ValueError, match="no value"):
+        ros_mod._param_get("/amcl", "ghost", 5.0)
