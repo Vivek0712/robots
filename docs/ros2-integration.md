@@ -79,6 +79,9 @@ pip install 'strands-robots[ros2]'   # optional cyclonedds RMW binding only
 | `echo` | `topic` (type auto-resolved) | N samples as JSON; subscription QoS auto-matches live publishers (BEST_EFFORT sensors and latched topics work without configuration) |
 | `publish` | `topic`, `type` | Publishes N messages built from `fields` |
 | `service_call` | `service`, `type` | Service response as JSON |
+| `param_list` | `node_name` | Sorted parameter names on the node |
+| `param_get` | `node_name`, `param_name` | `{name, type, value}` as JSON |
+| `param_set` | `node_name`, `param_name`, `param_value` | Confirmation; server rejection is a structured error with the node's reason |
 
 Graph introspection (`list_*`, `info`, `echo` type auto-resolution) uses the
 rclpy node API directly (`get_topic_names_and_types`, `get_node_names_and_namespaces`,

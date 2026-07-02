@@ -5,6 +5,16 @@ All notable behavioural changes to `strands-robots` are logged here. Follows
 
 ## [Unreleased]
 
+### Added: parameter support in `use_ros` (`param_list` / `param_get` / `param_set`)
+
+Parameters in ROS 2 are plain services, so the three new actions reuse the
+existing in-process service machinery against the standard `rcl_interfaces`
+endpoints (`<node>/list_parameters` / `get_parameters` / `set_parameters`) -
+no new dependencies or clients. Values map between JSON and `ParameterValue`
+with the type inferred from the Python type (bool checked before int); a
+server-side rejection surfaces as a structured error carrying the node's
+reason, never an exception.
+
 ### Fixed: `use_ros` echo returned nothing on BEST_EFFORT sensor topics
 
 `echo` subscribed with the default RELIABLE profile, which never matches the

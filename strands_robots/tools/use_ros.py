@@ -36,6 +36,10 @@ Actions:
                      TRANSIENT_LOCAL topics (/tf_static) work automatically.
     publish        - publish N messages built from a JSON field dict.
     service_call   - call a service with a JSON request dict, return the response.
+    param_list     - list a node's parameters (rcl_interfaces list_parameters).
+    param_get      - read one parameter as {name, type, value}.
+    param_set      - set one parameter; server rejection returns a structured
+                     error carrying the node's reason.
 
 Examples:
     use_ros(action="status")
@@ -47,6 +51,10 @@ Examples:
     use_ros(action="service_call", service="/spawn",
             type="turtlesim/srv/Spawn",
             fields={"x": 3.0, "y": 3.0, "name": "t2"})
+    use_ros(action="param_list", node_name="/amcl")
+    use_ros(action="param_get", node_name="/amcl", param_name="max_beams")
+    use_ros(action="param_set", node_name="/amcl", param_name="max_beams",
+            param_value=60)
 """
 
 from __future__ import annotations

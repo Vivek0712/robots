@@ -770,8 +770,8 @@ def test_param_set_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_param_set_rejection_is_structured_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Mirrors action_send_goal's rejection contract: server-side rejection is a
-    # structured error carrying the server's reason, never an exception.
+    # Server-side rejection is a structured error carrying the server's
+    # reason, never an exception.
     monkeypatch.setattr(
         ros_mod,
         "_param_set",
