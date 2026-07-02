@@ -222,6 +222,36 @@ def _info(target: str) -> str | None:
 # --------------------------------------------------------------------------
 
 
+def _qos_for_topic(node, topic: str):
+    """Subscription QoS matched to what live publishers offer (ros2cli policy).
+
+    A RELIABLE subscription never matches a BEST_EFFORT publisher, so hardware
+    sensor topics (/scan, cameras, IMU - published with the rmw sensor-data
+    profile) silently deliver nothing to a default subscription. Mirror
+    ``ros2 topic echo``: reliability is RELIABLE only when every live publisher
+    offers RELIABLE; durability is TRANSIENT_LOCAL only when every publisher
+    offers it (so latched topics like /tf_static deliver their history). Zero
+    publishers or a failed discovery query -> the pre-existing default profile
+    (RELIABLE / VOLATILE, depth 10) - adaptation must never make echo less
+    usable than it was before.
+    """
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+    qos = QoSProfile(depth=10)
+    try:
+        _backend.spin_for(lambda: False, 0.2)  # discovery settle
+        offered = [info.qos_profile for info in node.get_publishers_info_by_topic(topic)]
+    except (AttributeError, RuntimeError, ValueError):
+        return qos
+    if not offered:
+        return qos
+    if any(p.reliability != ReliabilityPolicy.RELIABLE for p in offered):
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+    if all(p.durability == DurabilityPolicy.TRANSIENT_LOCAL for p in offered):
+        qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+    return qos
+
+
 def _echo(topic: str, msg_type: str, timeout: float, count: int) -> list[dict[str, Any]]:
     from rosidl_runtime_py.set_message import set_message_fields  # noqa: F401 (validates import path)
 

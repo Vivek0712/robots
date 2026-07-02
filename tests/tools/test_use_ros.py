@@ -555,3 +555,92 @@ def test_service_call_raises_when_response_never_arrives(fake_node: _FakeNode, f
     with pytest.raises(TimeoutError, match="timed out"):
         ros_mod._service_call("/spawn", "turtlesim/srv/Spawn", {}, timeout=0.1)
     assert ("client", client) in fake_node.destroyed
+
+
+# QoS-adaptive echo -----------------------------------------------------------
+
+
+@pytest.fixture
+def fake_rclpy_qos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject a fake rclpy.qos so _qos_for_topic's lazy import resolves.
+
+    Enum members are sentinel strings, so assertions read naturally and no
+    rclpy is required.
+    """
+
+    class _QoSProfile:
+        def __init__(self, depth: int) -> None:
+            self.depth = depth
+            self.reliability = "RELIABLE"
+            self.durability = "VOLATILE"
+
+    class _Rel:
+        RELIABLE = "RELIABLE"
+        BEST_EFFORT = "BEST_EFFORT"
+
+    class _Dur:
+        TRANSIENT_LOCAL = "TRANSIENT_LOCAL"
+        VOLATILE = "VOLATILE"
+
+    qos_mod = _types.ModuleType("rclpy.qos")
+    qos_mod.QoSProfile = _QoSProfile  # type: ignore[attr-defined]
+    qos_mod.ReliabilityPolicy = _Rel  # type: ignore[attr-defined]
+    qos_mod.DurabilityPolicy = _Dur  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "rclpy", _types.ModuleType("rclpy"))
+    monkeypatch.setitem(sys.modules, "rclpy.qos", qos_mod)
+    monkeypatch.setattr(ros_mod._backend, "spin_for", lambda predicate, timeout: None)
+
+
+def _pub_info(reliability: str, durability: str = "VOLATILE") -> Any:
+    return _types.SimpleNamespace(qos_profile=_types.SimpleNamespace(reliability=reliability, durability=durability))
+
+
+def _node_with_pubs(infos: list[Any]) -> Any:
+    return _types.SimpleNamespace(get_publishers_info_by_topic=lambda topic: infos)
+
+
+def test_qos_all_reliable_publishers_stay_reliable(fake_rclpy_qos: None) -> None:
+    node = _node_with_pubs([_pub_info("RELIABLE"), _pub_info("RELIABLE")])
+    qos = ros_mod._qos_for_topic(node, "/odom")
+    assert qos.reliability == "RELIABLE"
+    assert qos.durability == "VOLATILE"
+    assert qos.depth == 10
+
+
+def test_qos_any_best_effort_publisher_downgrades_reliability(fake_rclpy_qos: None) -> None:
+    # The hardware-sensor case (/scan): a BEST_EFFORT publisher can never match
+    # a RELIABLE subscription, so echo must subscribe BEST_EFFORT.
+    node = _node_with_pubs([_pub_info("RELIABLE"), _pub_info("BEST_EFFORT")])
+    qos = ros_mod._qos_for_topic(node, "/scan")
+    assert qos.reliability == "BEST_EFFORT"
+
+
+def test_qos_all_transient_local_publishers_latch(fake_rclpy_qos: None) -> None:
+    # The latched-topic case (/tf_static, /map): subscribe TRANSIENT_LOCAL so
+    # history published before we subscribed is still delivered.
+    node = _node_with_pubs([_pub_info("RELIABLE", "TRANSIENT_LOCAL"), _pub_info("RELIABLE", "TRANSIENT_LOCAL")])
+    qos = ros_mod._qos_for_topic(node, "/tf_static")
+    assert qos.durability == "TRANSIENT_LOCAL"
+
+
+def test_qos_mixed_durability_stays_volatile(fake_rclpy_qos: None) -> None:
+    node = _node_with_pubs([_pub_info("RELIABLE", "TRANSIENT_LOCAL"), _pub_info("RELIABLE", "VOLATILE")])
+    qos = ros_mod._qos_for_topic(node, "/mixed")
+    assert qos.durability == "VOLATILE"
+
+
+def test_qos_no_publishers_returns_default(fake_rclpy_qos: None) -> None:
+    node = _node_with_pubs([])
+    qos = ros_mod._qos_for_topic(node, "/quiet")
+    assert (qos.reliability, qos.durability, qos.depth) == ("RELIABLE", "VOLATILE", 10)
+
+
+def test_qos_discovery_failure_degrades_to_default(fake_rclpy_qos: None) -> None:
+    # QoS adaptation must never make echo less usable than it is today: a
+    # failing discovery call falls back to the pre-existing default profile.
+    def boom(topic: str) -> Any:
+        raise RuntimeError("graph query failed")
+
+    node = _types.SimpleNamespace(get_publishers_info_by_topic=boom)
+    qos = ros_mod._qos_for_topic(node, "/broken")
+    assert (qos.reliability, qos.durability) == ("RELIABLE", "VOLATILE")
