@@ -79,6 +79,8 @@ pip install 'strands-robots[ros2]'   # optional cyclonedds RMW binding only
 | `echo` | `topic` (type auto-resolved) | N samples as JSON |
 | `publish` | `topic`, `type` | Publishes N messages built from `fields` |
 | `service_call` | `service`, `type` | Service response as JSON |
+| `list_actions` | - | Action servers with their types |
+| `action_send_goal` | `action_name`, `type` | Terminal `{goal_status, result, feedback}` as JSON; goal is cancelled if `timeout` expires |
 
 Graph introspection (`list_*`, `info`, `echo` type auto-resolution) uses the
 rclpy node API directly (`get_topic_names_and_types`, `get_node_names_and_namespaces`,

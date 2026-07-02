@@ -5,6 +5,15 @@ All notable behavioural changes to `strands-robots` are logged here. Follows
 
 ## [Unreleased]
 
+### Added: ROS 2 action support in `use_ros` + goal-level `navigate_to` on `RosBridgedRobot`
+
+`use_ros` gains `list_actions` and `action_send_goal` (in-process `rclpy.action`,
+dynamic `get_action` type resolution, one end-to-end timeout budget). Timed-out
+goals are cancelled before the error returns, never orphaned on the robot;
+feedback is capped at 5 samples (first 4 + latest) to protect agent context.
+`RosBridgedRobot` gains `nav_action` wiring and `navigate_to(x, y, yaw)`,
+exposed as a `navigate_<node_name>` agent tool only when configured.
+
 ### Fixed: `examples/train_ppo_reach.py` aborted in its own `validate()` preflight
 
 The example shipped `rollout_steps=250` with `num_mini_batches=4`, but PPO spec
