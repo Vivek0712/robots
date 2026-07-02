@@ -555,3 +555,91 @@ def test_service_call_raises_when_response_never_arrives(fake_node: _FakeNode, f
     with pytest.raises(TimeoutError, match="timed out"):
         ros_mod._service_call("/spawn", "turtlesim/srv/Spawn", {}, timeout=0.1)
     assert ("client", client) in fake_node.destroyed
+
+
+# Actions ---------------------------------------------------------------------
+
+
+def test_invalid_action_name_rejected() -> None:
+    result = use_ros(action="action_send_goal", action_name="/nav; rm -rf", type="nav2_msgs/action/NavigateToPose")
+    assert result["status"] == "error"
+    assert "invalid action name" in _texts(result)
+    _ascii_only(result)
+
+
+def test_action_send_goal_requires_name_and_type() -> None:
+    result = use_ros(action="action_send_goal", action_name="/navigate_to_pose")
+    assert result["status"] == "error"
+    assert "requires action_name and type" in _texts(result)
+
+
+def test_action_type_shape_rejected() -> None:
+    result = use_ros(action="action_send_goal", action_name="/navigate_to_pose", type="not_a_type")
+    assert result["status"] == "error"
+    assert "invalid interface type" in _texts(result)
+
+
+def test_list_actions_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ros_mod, "_list_actions", lambda: "/navigate_to_pose [nav2_msgs/action/NavigateToPose]")
+    result = use_ros(action="list_actions")
+    assert result["status"] == "success"
+    assert "/navigate_to_pose" in _texts(result)
+    _ascii_only(result)
+
+
+def test_action_send_goal_dispatch_returns_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake(action_name: str, action_type: str, fields: dict[str, Any], timeout: float) -> dict[str, Any]:
+        captured.update(name=action_name, type=action_type, fields=fields, timeout=timeout)
+        return {"goal_status": "SUCCEEDED", "result": {}, "feedback": []}
+
+    monkeypatch.setattr(ros_mod, "_action_send_goal", _fake)
+    goal_fields = {"pose": {"header": {"frame_id": "map"}}}
+    result = use_ros(
+        action="action_send_goal",
+        action_name="/navigate_to_pose",
+        type="nav2_msgs/action/NavigateToPose",
+        fields=goal_fields,
+        timeout=120.0,
+    )
+    assert result["status"] == "success"
+    assert "SUCCEEDED" in _texts(result)
+    # The payload reached the helper as a real dict, untouched.
+    assert captured == {
+        "name": "/navigate_to_pose",
+        "type": "nav2_msgs/action/NavigateToPose",
+        "fields": goal_fields,
+        "timeout": 120.0,
+    }
+    _ascii_only(result)
+
+
+def test_action_send_goal_timeout_surfaces_as_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("goal to /navigate_to_pose did not finish within 0.1s (cancel requested)")
+
+    monkeypatch.setattr(ros_mod, "_action_send_goal", _fake)
+    result = use_ros(
+        action="action_send_goal",
+        action_name="/navigate_to_pose",
+        type="nav2_msgs/action/NavigateToPose",
+        timeout=0.1,
+    )
+    assert result["status"] == "error"
+    assert "cancel requested" in _texts(result)
+    _ascii_only(result)
+
+
+def test_action_send_goal_rejection_surfaces_as_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError("goal rejected by action server /navigate_to_pose")
+
+    monkeypatch.setattr(ros_mod, "_action_send_goal", _fake)
+    result = use_ros(
+        action="action_send_goal",
+        action_name="/navigate_to_pose",
+        type="nav2_msgs/action/NavigateToPose",
+    )
+    assert result["status"] == "error"
+    assert "goal rejected" in _texts(result)

@@ -33,6 +33,12 @@ Actions:
     echo           - subscribe to a topic and return N samples as JSON.
     publish        - publish N messages built from a JSON field dict.
     service_call   - call a service with a JSON request dict, return the response.
+    list_actions   - list action servers with their types.
+    action_send_goal - send a goal to an action server, stream feedback, and
+                     return the terminal result (goal-level autonomy: Nav2
+                     NavigateToPose, FollowJointTrajectory, gripper commands).
+                     On timeout the goal is cancelled before returning, so a
+                     robot is never left executing an orphaned goal.
 
 Examples:
     use_ros(action="status")
@@ -44,6 +50,11 @@ Examples:
     use_ros(action="service_call", service="/spawn",
             type="turtlesim/srv/Spawn",
             fields={"x": 3.0, "y": 3.0, "name": "t2"})
+    use_ros(action="action_send_goal", action_name="/navigate_to_pose",
+            type="nav2_msgs/action/NavigateToPose",
+            fields={"pose": {"header": {"frame_id": "map"},
+                             "pose": {"position": {"x": 1.0, "y": 2.0}}}},
+            timeout=120.0)
 """
 
 from __future__ import annotations
@@ -148,6 +159,12 @@ def _get_service(type_str: str):
     from rosidl_runtime_py.utilities import get_service
 
     return get_service(type_str)
+
+
+def _get_action(type_str: str):
+    from rosidl_runtime_py.utilities import get_action
+
+    return get_action(type_str)
 
 
 def _msg_to_dict(msg) -> dict[str, Any]:
@@ -277,11 +294,114 @@ def _service_call(service: str, srv_type: str, fields: dict[str, Any], timeout: 
         node.destroy_client(client)
 
 
+# --------------------------------------------------------------------------
+# Actions (rclpy.action - goal / feedback / result, timeout-cancelled).
+# --------------------------------------------------------------------------
+
+# Terminal GoalStatus codes -> names (action_msgs/msg/GoalStatus constants).
+_GOAL_STATUS_NAMES = {
+    0: "UNKNOWN",
+    1: "ACCEPTED",
+    2: "EXECUTING",
+    3: "CANCELING",
+    4: "SUCCEEDED",
+    5: "CANCELED",
+    6: "ABORTED",
+}
+
+# Cap on feedback samples retained per goal. Long-running goals (Nav2 emits
+# feedback at control-loop rate) would otherwise grow an unbounded list and
+# flood the agent's context with thousands of near-identical dicts.
+_FEEDBACK_LIMIT = 5
+
+
+def _list_actions() -> str:
+    from rclpy.action import get_action_names_and_types
+
+    node = _backend._ensure_node()
+    _backend.spin_for(lambda: False, 0.2)
+    lines = [f"{name} [{', '.join(types)}]" for name, types in sorted(get_action_names_and_types(node))]
+    return "\n".join(lines)
+
+
+def _action_send_goal(
+    action_name: str,
+    action_type: str,
+    fields: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    """Send a goal, spin until the terminal result or ``timeout``, then return.
+
+    A single overall deadline governs server discovery, goal acceptance, and
+    result delivery. If the deadline expires after the goal was accepted, a
+    cancel request is sent *before* raising, so a timed-out ``use_ros`` call
+    never leaves a physical robot executing an orphaned goal - the same
+    fail-safe posture as ``HardwareRosBridge``'s reject-whole command clamping.
+    """
+    from rclpy.action import ActionClient
+    from rosidl_runtime_py.set_message import set_message_fields
+
+    node = _backend._ensure_node()
+    action_cls = _get_action(action_type)
+    client = ActionClient(node, action_cls, action_name)
+    deadline = time.monotonic() + timeout
+
+    feedback: list[dict[str, Any]] = []
+
+    def _on_feedback(fb: Any) -> None:
+        # Keep first (limit - 1) plus always the most recent sample, so the
+        # agent sees both how the goal started and where it currently is.
+        entry = _msg_to_dict(fb.feedback)
+        if len(feedback) < _FEEDBACK_LIMIT:
+            feedback.append(entry)
+        else:
+            feedback[-1] = entry
+
+    def _remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    goal_handle = None
+    try:
+        if not client.wait_for_server(timeout_sec=_remaining()):
+            raise TimeoutError(f"action server {action_name} not available within {timeout}s")
+
+        goal = action_cls.Goal()
+        set_message_fields(goal, fields)
+
+        send_future = client.send_goal_async(goal, feedback_callback=_on_feedback)
+        _backend.spin_for(lambda: send_future.done(), _remaining())
+        if not send_future.done():
+            raise TimeoutError(f"goal to {action_name} not acknowledged within {timeout}s")
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise ValueError(f"goal rejected by action server {action_name}")
+
+        result_future = goal_handle.get_result_async()
+        _backend.spin_for(lambda: result_future.done(), _remaining())
+        if not result_future.done() or result_future.result() is None:
+            # Deadline hit mid-execution: cancel before surfacing the timeout
+            # so the robot stops pursuing the goal.
+            cancel_future = goal_handle.cancel_goal_async()
+            _backend.spin_for(lambda: cancel_future.done(), 2.0)
+            raise TimeoutError(f"goal to {action_name} did not finish within {timeout}s (cancel requested)")
+
+        wrapped = result_future.result()
+        status = int(wrapped.status)
+        return {
+            "goal_status": _GOAL_STATUS_NAMES.get(status, str(status)),
+            "result": _msg_to_dict(wrapped.result),
+            "feedback": feedback,
+        }
+    finally:
+        client.destroy()
+
+
 @tool
 def use_ros(
     action: str,
     topic: str | None = None,
     service: str | None = None,
+    action_name: str | None = None,
     type: str | None = None,
     fields: dict[str, Any] | None = None,
     timeout: float = 5.0,
@@ -292,15 +412,23 @@ def use_ros(
 
     Args:
         action: One of ``status``, ``list_topics``, ``list_nodes``,
-            ``list_services``, ``info``, ``echo``, ``publish``, ``service_call``.
+            ``list_services``, ``list_actions``, ``info``, ``echo``,
+            ``publish``, ``service_call``, ``action_send_goal``.
         topic: Topic name (``echo``, ``publish``, ``info``).
         service: Service name (``service_call``, ``info``).
-        type: Fully-qualified interface type, e.g. ``geometry_msgs/msg/Twist``
-            or ``turtlesim/srv/Spawn``. Auto-resolved for ``echo`` when omitted.
+        action_name: Action server name (``action_send_goal``), e.g.
+            ``/navigate_to_pose``.
+        type: Fully-qualified interface type, e.g. ``geometry_msgs/msg/Twist``,
+            ``turtlesim/srv/Spawn``, or ``nav2_msgs/action/NavigateToPose``.
+            Auto-resolved for ``echo`` when omitted.
         fields: JSON field dict applied with ``set_message_fields`` (``publish``,
-            ``service_call``). Booleans and nulls are preserved - the dict is
-            passed straight to rclpy, never serialised through source.
-        timeout: Seconds to wait for samples / a service.
+            ``service_call``, ``action_send_goal``). Booleans and nulls are
+            preserved - the dict is passed straight to rclpy, never serialised
+            through source.
+        timeout: Seconds to wait for samples / a service / an action result.
+            For ``action_send_goal`` this is the end-to-end budget (discovery +
+            acceptance + execution); size it to the goal (e.g. 120 for a Nav2
+            navigation), and note the goal is cancelled when it expires.
         count: Number of messages to echo or publish.
         rate: Publish rate in Hz.
 
@@ -314,6 +442,8 @@ def use_ros(
         return _err(f"invalid topic name: {topic!r}")
     if service is not None and not _NAME_RE.match(service):
         return _err(f"invalid service name: {service!r}")
+    if action_name is not None and not _NAME_RE.match(action_name):
+        return _err(f"invalid action name: {action_name!r}")
     if type is not None and not _TYPE_RE.match(type):
         return _err(f"invalid interface type: {type!r} (expected pkg/msg/Name or pkg/srv/Name)")
 
@@ -335,6 +465,17 @@ def use_ros(
 
             if action == "list_services":
                 return _ok(_list_services())
+
+            if action == "list_actions":
+                return _ok(_list_actions())
+
+            if action == "action_send_goal":
+                if not action_name or not type:
+                    return _err("action_send_goal requires action_name and type")
+                import json
+
+                outcome = _action_send_goal(action_name, type, fields, timeout)
+                return _ok(f"goal to {action_name} finished:\n{json.dumps(outcome, indent=2, default=str)}")
 
             if action == "info":
                 target = topic or service

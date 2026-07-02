@@ -123,3 +123,59 @@ def test_drive_tool_forwards_to_instance(rec: _Recorder) -> None:
     drive_tool(linear=1.0)
     assert rec.calls[0]["action"] == "publish"
     assert rec.calls[0]["fields"]["linear"]["x"] == 1.0
+
+
+# navigate_to -----------------------------------------------------------------
+
+
+def _nav_turtle() -> RosBridgedRobot:
+    return RosBridgedRobot.from_ros(
+        node_name="tb4",
+        cmd_vel_topic="/cmd_vel",
+        odom_topic="/odom",
+        scan_topic="/scan",
+        nav_action="/navigate_to_pose",
+    )
+
+
+def test_navigate_to_forwards_action_goal(rec: _Recorder) -> None:
+    import math
+
+    _nav_turtle().navigate_to(x=1.0, y=2.0, yaw=math.pi / 2, timeout=60.0)
+    call = rec.calls[0]
+    assert call["action"] == "action_send_goal"
+    assert call["action_name"] == "/navigate_to_pose"
+    assert call["type"] == "nav2_msgs/action/NavigateToPose"
+    assert call["timeout"] == 60.0
+    pose = call["fields"]["pose"]
+    assert pose["header"]["frame_id"] == "map"
+    assert pose["pose"]["position"] == {"x": 1.0, "y": 2.0}
+    # yaw=pi/2 -> planar quaternion (z=sin(pi/4), w=cos(pi/4)).
+    assert pose["pose"]["orientation"]["z"] == pytest.approx(math.sin(math.pi / 4))
+    assert pose["pose"]["orientation"]["w"] == pytest.approx(math.cos(math.pi / 4))
+
+
+def test_navigate_to_without_nav_action_is_error(rec: _Recorder) -> None:
+    result = _turtle().navigate_to(x=1.0, y=1.0)
+    assert result["status"] == "error"
+    assert "no nav_action configured" in result["content"][0]["text"]
+    assert rec.calls == []  # nothing forwarded
+
+
+def test_invalid_nav_action_rejected_at_construction() -> None:
+    with pytest.raises(ValueError, match="invalid nav_action"):
+        RosBridgedRobot("tb", "/cmd_vel", "/odom", nav_action="/nav goal")
+
+
+def test_navigate_tool_exposed_only_when_configured() -> None:
+    with_nav = {t.tool_name for t in _nav_turtle().tools}
+    without_nav = {t.tool_name for t in _turtle().tools}
+    assert "navigate_tb4" in with_nav
+    assert not any(name.startswith("navigate_") for name in without_nav)
+
+
+def test_navigate_tool_forwards_to_navigate_to(rec: _Recorder) -> None:
+    robot = _nav_turtle()
+    nav_tool: Any = next(t for t in robot.tools if t.tool_name == "navigate_tb4")
+    nav_tool(x=0.5, y=-0.5)
+    assert rec.calls and rec.calls[0]["action"] == "action_send_goal"
