@@ -37,6 +37,7 @@ have and what you want to do:
 | **`use_ros`** tool | client / observer + commander | in-process `rclpy` | yes | List/echo/publish topics, call services on any ROS 2 graph - full type coverage |
 | **`use_rtps`** tool | participant / **act as a robot** | pure `cyclonedds` (pip) | **no** | Join a graph as a DDS peer and publish topics a real stack consumes; works on macOS/CI/Jetson, all distros |
 | **`RosBridgedRobot`** | a ROS 2 robot as a strands `Robot` | `use_ros` | yes | `drive()`/`get_pose()` a `cmd_vel`/odom base with the same `Agent(tools=[robot])` UX as sim/hardware |
+| **`AckermannRosRobot`** | an Ackermann ROS 2 car as a strands `Robot` | `use_ros` | yes | `drive()`/`get_scan()` a steering-geometry car (AWS DeepRacer servo stack) with bicycle-model conversion and an automatic enable handshake |
 | **`SimEngine(ros2_bridge=True)`** | the **simulation as a ROS node** | `rclpy` | yes | Publish a running MuJoCo sim's `joint_states` + camera `image_raw` so rviz/nav2/agents can subscribe |
 | **`Robot(ros2_bridge=True)`** | a **real robot as a ROS node** (full duplex) | `rclpy` | yes | Publish a physical arm's live `joint_states` + camera `image_raw` so rviz/nav2/agents subscribe to the hardware, **and** subscribe to `joint_command` to drive the arm - symmetric to the sim bridge, plus an inbound command path the sim does not need |
 
@@ -138,6 +139,32 @@ command-injection or `eval` surface to defend - the validation simply keeps
 malformed names from reaching the ROS 2 client library. Backend and timeout
 failures are returned as structured `{"status": "error"}` results rather than
 raised exceptions.
+
+## Ackermann robots (AWS DeepRacer)
+
+Differential-drive bases take `geometry_msgs/msg/Twist`; Ackermann cars do
+not. The AWS DeepRacer's stock stack subscribes to normalized servo pairs
+(`deepracer_interfaces_pkg/msg/ServoCtrlMsg`, `angle`/`throttle` in [-1, 1])
+and acts on them only after a two-step manual-mode service handshake
+(`/ctrl_pkg/vehicle_state` with `state=1`, then `/ctrl_pkg/enable_state` with
+`is_active=true`). `AckermannRosRobot` absorbs both differences:
+
+    from strands_robots.mesh import AckermannRosRobot
+
+    car = AckermannRosRobot.from_deepracer(node_name="deepracer")
+    car.drive(linear=0.5, angular=1.0, duration=2.0)
+    car.get_scan()
+
+`drive()` keeps the same `(linear, angular)` contract as `RosBridgedRobot` -
+a bicycle model (`atan(wheelbase * angular / linear)`, clamped to the steering
+limit) converts to servo values internally. The handshake declared in
+`init_services` runs once, automatically, before the first command; a failed
+handshake aborts the drive. Sustained commands are always followed by a zero
+servo message - even when the publish fails - so a tool call cannot leave the
+car with a live throttle. Commands are clamped to `max_speed`; holds longer
+than `max_duration` are rejected loudly rather than silently truncated. The
+stock platform publishes no odometry, so there is deliberately no
+`get_pose`. See `examples/ros2/deepracer_agent.py`.
 
 ## Sim bridge: publish a simulation on a ROS 2 domain
 
