@@ -37,6 +37,10 @@ Typical usage::
 from __future__ import annotations
 
 import math
+from typing import Any
+
+from strands_robots.mesh.ros_bridge import _check_topic
+from strands_robots.tools.use_ros import use_ros
 
 _SERVO_TYPE = "deepracer_interfaces_pkg/msg/ServoCtrlMsg"
 
@@ -75,3 +79,176 @@ def _twist_to_servo(
     delta = max(-max_steering_rad, min(max_steering_rad, delta))
     throttle = max(-1.0, min(1.0, v / max_speed))
     return (delta / max_steering_rad, throttle)
+
+
+class AckermannRosRobot:
+    """An Ackermann-steering ROS 2 car exposed as a strands-controllable robot.
+
+    The bridge owns no ROS 2 state; every method forwards to :func:`use_ros`.
+    Constructing it never needs a ROS 2 environment - errors surface as
+    structured results when a method actually runs.
+
+    Args:
+        node_name: Identifier used to name this robot's agent tools
+            (``drive_<node_name>`` etc.); it does not need to match a ROS 2
+            node name.
+        servo_topic: Topic the vehicle's servo stack subscribes to (DeepRacer:
+            ``/webserver_pkg/manual_drive``).
+        scan_topic: Optional laser-scan topic. Read by :meth:`get_scan`.
+        servo_type: Interface type of ``servo_topic``. Defaults to the
+            DeepRacer ``ServoCtrlMsg`` (normalized ``angle``/``throttle``).
+        scan_type: Interface type of ``scan_topic``. Optional - resolved from
+            the live graph when omitted.
+        wheelbase_m: Front-to-rear axle distance for the bicycle model.
+        max_speed: Linear speed (m/s) mapped to full throttle; commands are
+            clamped to this magnitude.
+        max_steering_rad: Steering angle mapped to full servo deflection.
+        max_duration: Longest single :meth:`drive` hold accepted; longer
+            requests are rejected loudly rather than silently truncated.
+        publish_rate: Command publish rate (Hz) for held :meth:`drive` calls.
+        init_services: Ordered service calls (``{"service", "type", "fields"}``
+            dicts) that put the vehicle into a commandable state. Run once,
+            automatically, before the first :meth:`drive`. The DeepRacer
+            manual-mode handshake in :meth:`from_deepracer` is the reference
+            use.
+
+    There is deliberately no ``get_pose``: the stock platform publishes no
+    odometry.
+    """
+
+    def __init__(
+        self,
+        node_name: str,
+        servo_topic: str,
+        scan_topic: str | None = None,
+        *,
+        servo_type: str = _SERVO_TYPE,
+        scan_type: str | None = None,
+        wheelbase_m: float = 0.164,
+        max_speed: float = 1.5,
+        max_steering_rad: float = 0.5236,
+        max_duration: float = 10.0,
+        publish_rate: float = 20.0,
+        init_services: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.node_name = _check_topic("node_name", node_name)
+        self.servo_topic = _check_topic("servo_topic", servo_topic)
+        self.scan_topic = _check_topic("scan_topic", scan_topic) if scan_topic else None
+        self.servo_type = servo_type
+        self.scan_type = scan_type
+        for label, value in (
+            ("wheelbase_m", wheelbase_m),
+            ("max_speed", max_speed),
+            ("max_steering_rad", max_steering_rad),
+            ("max_duration", max_duration),
+            ("publish_rate", publish_rate),
+        ):
+            if value <= 0:
+                raise ValueError(f"{label} must be positive, got {value!r}")
+        self.wheelbase_m = float(wheelbase_m)
+        self.max_speed = float(max_speed)
+        self.max_steering_rad = float(max_steering_rad)
+        self.max_duration = float(max_duration)
+        self.publish_rate = float(publish_rate)
+        self.init_services = list(init_services or [])
+        for item in self.init_services:
+            _check_topic("init_services service", item.get("service", ""))
+            if not item.get("type"):
+                raise ValueError(
+                    f"init_services entry for {item.get('service')!r} is missing its 'type' "
+                    "(expected an interface type like pkg/srv/Name)"
+                )
+        self._enabled = False
+
+    @classmethod
+    def from_deepracer(cls, node_name: str, **overrides: Any) -> AckermannRosRobot:
+        """Construct a bridge wired for the stock AWS DeepRacer software stack.
+
+        Servo commands go to the webserver package's manual-drive topic, the
+        RPLIDAR scan topic is preconfigured, and ``init_services`` carries the
+        two-step manual-mode handshake (``vehicle_state`` state=1, then
+        ``enable_state`` is_active=True) the car requires before it acts on
+        servo messages. Any keyword can be overridden for a modified car.
+        """
+        wiring: dict[str, Any] = {
+            "servo_topic": "/webserver_pkg/manual_drive",
+            "scan_topic": "/rplidar_ros/scan",
+            "init_services": [
+                {
+                    "service": "/ctrl_pkg/vehicle_state",
+                    "type": "deepracer_interfaces_pkg/srv/ActiveStateSrv",
+                    "fields": {"state": 1},
+                },
+                {
+                    "service": "/ctrl_pkg/enable_state",
+                    "type": "deepracer_interfaces_pkg/srv/EnableStateSrv",
+                    "fields": {"is_active": True},
+                },
+            ],
+        }
+        wiring.update(overrides)
+        servo_topic = wiring.pop("servo_topic")
+        scan_topic = wiring.pop("scan_topic")
+        return cls(node_name, servo_topic, scan_topic, **wiring)
+
+    @staticmethod
+    def _error(text: str) -> dict[str, Any]:
+        return {"status": "error", "content": [{"text": text}]}
+
+    def enable(self) -> dict[str, Any]:
+        """Run the ``init_services`` handshake once; idempotent on success.
+
+        Stops at the first failing call and returns its structured error
+        without latching, so a later attempt retries from the start.
+        """
+        if self._enabled:
+            return {
+                "status": "success",
+                "content": [{"text": f"{self.node_name}: already enabled"}],
+            }
+        for item in self.init_services:
+            result = use_ros(
+                action="service_call",
+                service=item["service"],
+                type=item["type"],
+                fields=item.get("fields", {}),
+            )
+            if result.get("status") != "success":
+                return result
+        self._enabled = True
+        return {
+            "status": "success",
+            "content": [{"text": f"{self.node_name}: enabled ({len(self.init_services)} init call(s))"}],
+        }
+
+    def _publish_servo(self, angle: float, throttle: float, count: int) -> dict[str, Any]:
+        return use_ros(
+            action="publish",
+            topic=self.servo_topic,
+            type=self.servo_type,
+            fields={"angle": float(angle), "throttle": float(throttle)},
+            count=count,
+            rate=self.publish_rate,
+        )
+
+    def stop(self) -> dict[str, Any]:
+        """Publish a single zero servo command. Never gated on :meth:`enable`."""
+        return self._publish_servo(0.0, 0.0, count=1)
+
+    def get_scan(self, timeout: float = 5.0) -> dict[str, Any]:
+        """Read one sample from the laser-scan topic (error when unconfigured)."""
+        if not self.scan_topic:
+            return self._error("get_scan: no scan_topic configured for this robot")
+        return use_ros(
+            action="echo",
+            topic=self.scan_topic,
+            type=self.scan_type,
+            count=1,
+            timeout=timeout,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"AckermannRosRobot(node_name={self.node_name!r}, "
+            f"servo_topic={self.servo_topic!r}, scan_topic={self.scan_topic!r})"
+        )
