@@ -146,8 +146,8 @@ class AckermannRosRobot:
             ("max_duration", max_duration),
             ("publish_rate", publish_rate),
         ):
-            if value <= 0:
-                raise ValueError(f"{label} must be positive, got {value!r}")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{label} must be a positive finite number, got {value!r}")
         self.wheelbase_m = float(wheelbase_m)
         self.max_speed = float(max_speed)
         self.max_steering_rad = float(max_steering_rad)
@@ -236,21 +236,32 @@ class AckermannRosRobot:
         Same contract as ``RosBridgedRobot.drive``: ``linear`` (m/s) and
         ``angular`` (rad/s), an optional ``duration`` hold (publishes
         ``round(duration * publish_rate)`` messages, takes precedence over
-        ``count``). The vehicle's ``init_services`` handshake runs
-        automatically before the first command; a failed handshake aborts the
-        drive. After any sustained non-zero command a single zero servo
-        message is published - even if the main publish failed - so a tool
-        call can never leave the car with a live throttle latched.
+        ``count``). Validation runs before any side effect, in order: inputs
+        must be finite, ``duration`` (when given) must be a positive finite
+        number within ``max_duration``, and only then does the vehicle's
+        ``init_services`` handshake run (automatically, before the first
+        command; a failed handshake aborts the drive). Every timed or
+        multi-message non-zero command is followed by a single zero servo
+        message - even if the main publish failed - so it can never leave the
+        car with a live throttle latched. A bare single-shot command (no
+        ``duration``, ``count=1``) latches like a raw servo command until
+        :meth:`stop`.
         """
+        for label, value in (("linear", linear), ("angular", angular)):
+            if not math.isfinite(value):
+                return self._error(f"drive: {label} must be a finite number, got {value!r}")
+        if duration is not None:
+            if not math.isfinite(duration) or duration <= 0:
+                return self._error(f"drive: duration must be a positive finite number of seconds, got {duration!r}")
+            if duration > self.max_duration:
+                return self._error(
+                    f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
+                    "- issue shorter commands instead of one long hold"
+                )
         if not self._enabled and self.init_services:
             enabled = self.enable()
             if enabled.get("status") != "success":
                 return enabled
-        if duration is not None and duration > self.max_duration:
-            return self._error(
-                f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
-                "- issue shorter commands instead of one long hold"
-            )
         v = max(-self.max_speed, min(self.max_speed, float(linear)))
         angle, throttle = _twist_to_servo(
             v,
@@ -263,7 +274,7 @@ class AckermannRosRobot:
         try:
             return self._publish_servo(angle, throttle, count=n)
         finally:
-            if n > 1 and (angle or throttle):
+            if (duration is not None or n > 1) and (angle or throttle):
                 self._publish_servo(0.0, 0.0, count=1)
 
     def _publish_servo(self, angle: float, throttle: float, count: int) -> dict[str, Any]:
@@ -309,7 +320,9 @@ class AckermannRosRobot:
             description=(
                 f"Drive the {self.node_name} Ackermann robot (linear m/s, angular rad/s, "
                 f"optional duration s). Steering geometry: cannot turn in place; "
-                f"minimum turning radius ~{min_radius:.2f} m."
+                f"minimum turning radius ~{min_radius:.2f} m. A command with duration "
+                f"stops automatically afterwards; without duration the last command "
+                f"latches until stop."
             ),
         )
         def drive(linear: float = 0.0, angular: float = 0.0, duration: float | None = None) -> dict[str, Any]:

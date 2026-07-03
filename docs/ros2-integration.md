@@ -159,9 +159,11 @@ and acts on them only after a two-step manual-mode service handshake
 a bicycle model (`atan(wheelbase * angular / linear)`, clamped to the steering
 limit) converts to servo values internally. The handshake declared in
 `init_services` runs once, automatically, before the first command; a failed
-handshake aborts the drive. Sustained commands are always followed by a zero
-servo message - even when the publish fails - so a tool call cannot leave the
-car with a live throttle. Commands are clamped to `max_speed`; holds longer
+handshake aborts the drive. Timed and multi-message commands are always
+followed by a zero servo message - even when the publish fails - so a timed
+drive cannot leave the car with a live throttle. A bare single-shot `drive()`
+(no `duration`) latches like any raw servo command until `stop()`. Commands
+are clamped to `max_speed`; holds longer
 than `max_duration` are rejected loudly rather than silently truncated. The
 stock platform publishes no odometry, so there is deliberately no
 `get_pose`. See `examples/ros2/deepracer_agent.py`.

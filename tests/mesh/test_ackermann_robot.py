@@ -309,6 +309,51 @@ def test_drive_sustained_zero_command_has_no_trailing_zero(rec: _Recorder) -> No
     assert len(rec.calls) == 1
 
 
+def test_drive_rejects_nonfinite_inputs(rec: _Recorder) -> None:
+    # NaN passes a min/max clamp silently - it must be rejected loudly, not
+    # published as full throttle / full steering.
+    cases: list[dict[str, Any]] = [
+        {"linear": float("nan")},
+        {"angular": float("inf")},
+        {"linear": 0.5, "duration": float("nan")},
+    ]
+    for kwargs in cases:
+        result = _car().drive(**kwargs)
+        assert result["status"] == "error"
+    assert rec.calls == []
+
+
+def test_constructor_rejects_nonfinite_numerics() -> None:
+    with pytest.raises(ValueError, match="wheelbase_m"):
+        _car(wheelbase_m=float("nan"))
+
+
+def test_drive_rejects_nonpositive_duration(rec: _Recorder) -> None:
+    for bad in (0.0, -2.0):
+        result = _car().drive(linear=0.5, duration=bad)
+        assert result["status"] == "error"
+        assert "duration" in result["content"][0]["text"]
+    assert rec.calls == []
+
+
+def test_drive_short_duration_still_gets_trailing_zero(rec: _Recorder) -> None:
+    # duration=0.01 rounds to a single message - but it is still a TIMED
+    # command, so the trailing zero must go out (the latch hole).
+    _car().drive(linear=1.0, duration=0.01)
+    assert len(rec.calls) == 2
+    assert rec.calls[0]["count"] == 1
+    assert rec.calls[1]["fields"] == {"angle": 0.0, "throttle": 0.0}
+
+
+def test_drive_overlong_duration_rejected_before_enable(rec: _Recorder) -> None:
+    # Validation precedes side effects: an invalid request must not switch the
+    # car into manual mode.
+    car = _car(init_services=_HANDSHAKE, max_duration=2.0)
+    result = car.drive(linear=0.5, duration=99.0)
+    assert result["status"] == "error"
+    assert rec.calls == []
+
+
 # tools -------------------------------------------------------------------------
 
 
