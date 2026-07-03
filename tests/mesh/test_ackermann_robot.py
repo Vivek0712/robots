@@ -232,3 +232,78 @@ def test_get_scan_forwards_echo(rec: _Recorder) -> None:
     assert call["topic"] == "/scan"
     assert call["timeout"] == 3.0
     assert call["count"] == 1
+
+
+# drive -------------------------------------------------------------------------
+
+
+def test_drive_converts_and_publishes(rec: _Recorder) -> None:
+    car = _car()
+    result = car.drive(linear=1.5, angular=0.0)
+    assert result["status"] == "success"
+    call = rec.calls[0]
+    assert call["action"] == "publish"
+    assert call["topic"] == "/servo"
+    assert call["type"] == "deepracer_interfaces_pkg/msg/ServoCtrlMsg"
+    assert call["fields"] == {"angle": 0.0, "throttle": 1.0}
+    assert call["count"] == 1
+    assert call["rate"] == 20.0
+    assert len(rec.calls) == 1  # single-shot command: no trailing zero needed
+
+
+def test_drive_runs_enable_first_and_only_once(rec: _Recorder) -> None:
+    car = _car(init_services=_HANDSHAKE)
+    car.drive(linear=0.5)
+    car.drive(linear=0.5)
+    actions = [c["action"] for c in rec.calls]
+    assert actions == ["service_call", "service_call", "publish", "publish"]
+
+
+def test_drive_aborts_when_enable_fails(rec: _Recorder) -> None:
+    car = _car(init_services=_HANDSHAKE)
+    failure = {"status": "error", "content": [{"text": "use_ros: service not available"}]}
+    rec.responses = [failure]
+    result = car.drive(linear=0.5)
+    assert result is failure
+    assert [c["action"] for c in rec.calls] == ["service_call"]  # nothing published
+
+
+def test_drive_rejects_overlong_duration(rec: _Recorder) -> None:
+    car = _car(max_duration=2.0)
+    result = car.drive(linear=0.5, duration=3.0)
+    assert result["status"] == "error"
+    assert "max_duration" in result["content"][0]["text"]
+    assert rec.calls == []  # rejected loudly, nothing published
+
+
+def test_drive_clamps_linear_to_max_speed(rec: _Recorder) -> None:
+    car = _car()
+    car.drive(linear=99.0)
+    assert rec.calls[0]["fields"]["throttle"] == 1.0
+
+
+def test_drive_duration_publishes_n_then_trailing_zero(rec: _Recorder) -> None:
+    car = _car()
+    car.drive(linear=1.0, duration=1.0)  # 20 Hz -> 20 messages
+    assert len(rec.calls) == 2
+    main, trailing = rec.calls
+    assert main["count"] == 20
+    assert main["fields"]["throttle"] == pytest.approx(1.0 / 1.5)
+    assert trailing["fields"] == {"angle": 0.0, "throttle": 0.0}
+    assert trailing["count"] == 1
+
+
+def test_drive_trailing_zero_sent_even_when_publish_errors(rec: _Recorder) -> None:
+    car = _car()
+    failure = {"status": "error", "content": [{"text": "use_ros: publish failed"}]}
+    rec.responses = [failure]
+    result = car.drive(linear=1.0, duration=1.0)
+    assert result is failure  # the main publish outcome is what the caller sees
+    assert len(rec.calls) == 2  # ...but the trailing zero still went out
+    assert rec.calls[1]["fields"] == {"angle": 0.0, "throttle": 0.0}
+
+
+def test_drive_sustained_zero_command_has_no_trailing_zero(rec: _Recorder) -> None:
+    car = _car()
+    car.drive(linear=0.0, duration=1.0)  # already zero: trailing zero is redundant
+    assert len(rec.calls) == 1

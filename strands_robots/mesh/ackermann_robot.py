@@ -221,6 +221,48 @@ class AckermannRosRobot:
             "content": [{"text": f"{self.node_name}: enabled ({len(self.init_services)} init call(s))"}],
         }
 
+    def drive(
+        self,
+        linear: float = 0.0,
+        angular: float = 0.0,
+        duration: float | None = None,
+        count: int = 1,
+    ) -> dict[str, Any]:
+        """Publish a velocity command, converted through the bicycle model.
+
+        Same contract as ``RosBridgedRobot.drive``: ``linear`` (m/s) and
+        ``angular`` (rad/s), an optional ``duration`` hold (publishes
+        ``round(duration * publish_rate)`` messages, takes precedence over
+        ``count``). The vehicle's ``init_services`` handshake runs
+        automatically before the first command; a failed handshake aborts the
+        drive. After any sustained non-zero command a single zero servo
+        message is published - even if the main publish failed - so a tool
+        call can never leave the car with a live throttle latched.
+        """
+        if not self._enabled and self.init_services:
+            enabled = self.enable()
+            if enabled.get("status") != "success":
+                return enabled
+        if duration is not None and duration > self.max_duration:
+            return self._error(
+                f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
+                "- issue shorter commands instead of one long hold"
+            )
+        v = max(-self.max_speed, min(self.max_speed, float(linear)))
+        angle, throttle = _twist_to_servo(
+            v,
+            angular,
+            wheelbase_m=self.wheelbase_m,
+            max_speed=self.max_speed,
+            max_steering_rad=self.max_steering_rad,
+        )
+        n = max(1, round(duration * self.publish_rate)) if duration is not None else count
+        try:
+            return self._publish_servo(angle, throttle, count=n)
+        finally:
+            if n > 1 and (angle or throttle):
+                self._publish_servo(0.0, 0.0, count=1)
+
     def _publish_servo(self, angle: float, throttle: float, count: int) -> dict[str, Any]:
         return use_ros(
             action="publish",
