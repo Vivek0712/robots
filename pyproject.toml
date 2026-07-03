@@ -312,6 +312,9 @@ vera-sim = [
 ollama = [
     "strands-agents[ollama]>=1.0.0,<2.0.0",
 ]
+rosbridge = [
+    "roslibpy>=1.7.0,<2.0.0",
+]
 all = [
     "strands-robots[groot-service]",
     "strands-robots[moveit2]",
@@ -324,6 +327,7 @@ all = [
     "strands-robots[motionbricks]",
     "strands-robots[molmoact2]",
     "strands-robots[ollama]",
+    "strands-robots[rosbridge]",
 ]
 dev = [
     "pytest>=6.0,<10.0.0",
