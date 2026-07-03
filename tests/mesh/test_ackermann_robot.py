@@ -307,3 +307,39 @@ def test_drive_sustained_zero_command_has_no_trailing_zero(rec: _Recorder) -> No
     car = _car()
     car.drive(linear=0.0, duration=1.0)  # already zero: trailing zero is redundant
     assert len(rec.calls) == 1
+
+
+# tools -------------------------------------------------------------------------
+
+
+def test_tools_naming_and_conditional_scan() -> None:
+    with_scan = {t.tool_name for t in _car(scan_topic="/scan").tools}
+    without_scan = {t.tool_name for t in _car().tools}
+    assert with_scan == {"drive_car", "stop_car", "get_scan_car"}
+    assert without_scan == {"drive_car", "stop_car"}
+
+
+def test_drive_tool_description_states_turning_radius() -> None:
+    drive_tool = next(t for t in _car().tools if t.tool_name == "drive_car")
+    # wheelbase 0.164 / tan(0.5236) ~= 0.28 m - the agent must know it cannot
+    # turn in place.
+    spec_desc = drive_tool.tool_spec["description"]
+    assert "cannot turn in place" in spec_desc
+    assert "0.28" in spec_desc
+
+
+def test_tools_forward_to_instance(rec: _Recorder) -> None:
+    car = _car(scan_topic="/scan")
+    tools: dict[str, Any] = {t.tool_name: t for t in car.tools}
+    tools["drive_car"](linear=1.5)
+    assert rec.calls[-1]["fields"]["throttle"] == 1.0
+    tools["stop_car"]()
+    assert rec.calls[-1]["fields"] == {"angle": 0.0, "throttle": 0.0}
+    tools["get_scan_car"]()
+    assert rec.calls[-1]["action"] == "echo"
+
+
+def test_exported_from_mesh_package() -> None:
+    from strands_robots.mesh import AckermannRosRobot as exported
+
+    assert exported is ack_mod.AckermannRosRobot

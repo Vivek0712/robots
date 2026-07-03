@@ -39,6 +39,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from strands import tool
+from strands.types.tools import AgentTool
+
 from strands_robots.mesh.ros_bridge import _check_topic
 from strands_robots.tools.use_ros import use_ros
 
@@ -288,6 +291,42 @@ class AckermannRosRobot:
             count=1,
             timeout=timeout,
         )
+
+    @property
+    def tools(self) -> list[AgentTool]:
+        """This robot's capabilities as named strands agent tools.
+
+        Tools are bound to this instance and suffixed with ``node_name`` so
+        multiple robots coexist in one ``Agent(tools=[...])`` call. The drive
+        tool's description states the Ackermann kinematic limit (minimum
+        turning radius) so the agent can plan paths the platform can follow.
+        """
+        suffix = self.node_name.strip("/").replace("/", "_")
+        min_radius = self.wheelbase_m / math.tan(self.max_steering_rad)
+
+        @tool(
+            name=f"drive_{suffix}",
+            description=(
+                f"Drive the {self.node_name} Ackermann robot (linear m/s, angular rad/s, "
+                f"optional duration s). Steering geometry: cannot turn in place; "
+                f"minimum turning radius ~{min_radius:.2f} m."
+            ),
+        )
+        def drive(linear: float = 0.0, angular: float = 0.0, duration: float | None = None) -> dict[str, Any]:
+            return self.drive(linear=linear, angular=angular, duration=duration)
+
+        @tool(name=f"stop_{suffix}", description=f"Immediately stop the {self.node_name} robot.")
+        def stop() -> dict[str, Any]:
+            return self.stop()
+
+        @tool(name=f"get_scan_{suffix}", description=f"Read one laser scan from the {self.node_name} robot.")
+        def get_scan() -> dict[str, Any]:
+            return self.get_scan()
+
+        agent_tools: list[AgentTool] = [drive, stop]
+        if self.scan_topic:
+            agent_tools.append(get_scan)
+        return agent_tools
 
     def __repr__(self) -> str:
         return (
