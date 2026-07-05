@@ -188,19 +188,72 @@ def test_connection_cached_per_host_port(fake_roslibpy: _types.ModuleType) -> No
     assert hosts == [("localhost", 9090), ("localhost", 9091)]  # second call reused the first
 
 
-def test_dead_connection_redialed(fake_roslibpy: _types.ModuleType) -> None:
+def test_stale_connection_kept_and_reused_after_recovery(fake_roslibpy: _types.ModuleType) -> None:
     use_rosbridge(action="status")
     first = fake_roslibpy.Ros.instances[0]  # type: ignore[attr-defined]
-    first.is_connected = False  # simulate a dropped WebSocket
+    first.is_connected = False  # dropped WebSocket, bridge still down
+    result = use_rosbridge(action="status", timeout=0.2)
+    assert result["status"] == "success"
+    assert "did not reconnect" in _texts(result)
+    # The entry is never terminated NOR discarded - its factory keeps
+    # retrying, and a fresh Ros after churn is unreliable in-process.
+    assert not first.terminated
+    # Bridge comes back: the SAME object reconnects and is reused.
+    first.is_connected = True
+    result = use_rosbridge(action="status")
+    assert "connected to" in _texts(result)
+    assert len(fake_roslibpy.Ros.instances) == 1  # type: ignore[attr-defined]
+
+
+def test_stale_connection_reused_when_factory_reconnects(fake_roslibpy: _types.ModuleType) -> None:
     use_rosbridge(action="status")
-    assert first.terminated  # stale connection torn down
-    assert len(fake_roslibpy.Ros.instances) == 2  # type: ignore[attr-defined]
+    first = fake_roslibpy.Ros.instances[0]  # type: ignore[attr-defined]
+
+    class _Flapping:
+        # is_connected reads False twice (initial check + first wait poll),
+        # then True - simulating the auto-reconnecting factory recovering.
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def __get__(self, obj: Any, objtype: Any = None) -> bool:
+            self.reads += 1
+            return self.reads > 2
+
+    type(first).is_connected = _Flapping()  # type: ignore[assignment]
+    try:
+        result = use_rosbridge(action="status", timeout=1.0)
+        assert "connected to" in _texts(result)
+        assert len(fake_roslibpy.Ros.instances) == 1  # type: ignore[attr-defined]  # same object reused
+    finally:
+        del type(first).is_connected  # restore instance-attribute behavior
+
+
+def test_failed_dial_cached_and_recovers(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.fail_next_connect = True  # type: ignore[attr-defined]
+    result = use_rosbridge(action="status", timeout=0.2)
+    assert "not connected" in _texts(result)
+    fake_roslibpy.Ros.fail_next_connect = False  # type: ignore[attr-defined]
+    # The never-connected Ros stays cached; when its factory succeeds the
+    # same object is reused - no second dial is ever attempted.
+    orphan = fake_roslibpy.Ros.instances[0]  # type: ignore[attr-defined]
+    orphan.is_connected = True
+    result = use_rosbridge(action="status")
+    assert "connected to" in _texts(result)
+    assert len(fake_roslibpy.Ros.instances) == 1  # type: ignore[attr-defined]
 
 
 def test_unknown_action_errors(fake_roslibpy: _types.ModuleType) -> None:
     result = use_rosbridge(action="warp_drive")
     assert result["status"] == "error"
     assert "unknown action" in _texts(result)
+
+
+def test_unknown_action_rejected_before_any_connection(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.fail_next_connect = True  # type: ignore[attr-defined]
+    result = use_rosbridge(action="warp_drive")
+    assert result["status"] == "error"
+    assert "unknown action" in _texts(result)
+    assert fake_roslibpy.Ros.instances == []  # type: ignore[attr-defined]  # never dialed
 
 
 # rosapi-backed introspection ---------------------------------------------------
@@ -264,6 +317,13 @@ def test_echo_requires_topic(fake_roslibpy: _types.ModuleType) -> None:
     assert use_rosbridge(action="echo")["status"] == "error"
 
 
+def test_echo_empty_result_discloses_timeout(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.scripted_responses["/rosapi/topic_type"] = {"type": "nav_msgs/Odometry"}  # type: ignore[attr-defined]
+    result = use_rosbridge(action="echo", topic="/silent", timeout=0.1)
+    assert result["status"] == "success"
+    assert "no messages within" in _texts(result)
+
+
 def test_publish_traffic_and_unadvertise(fake_roslibpy: _types.ModuleType) -> None:
     result = use_rosbridge(
         action="publish",
@@ -290,3 +350,9 @@ def test_service_call_requires_service_and_type(fake_roslibpy: _types.ModuleType
     result = use_rosbridge(action="service_call", service="/gazebo/reset_world")
     assert result["status"] == "error"
     assert "requires service and type" in _texts(result)
+
+
+def test_publish_rejects_nonpositive_count(fake_roslibpy: _types.ModuleType) -> None:
+    result = use_rosbridge(action="publish", topic="/cmd_vel", type="geometry_msgs/Twist", count=0)
+    assert result["status"] == "error"
+    assert "count" in _texts(result)

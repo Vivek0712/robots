@@ -63,6 +63,8 @@ _INSTALL_HINT = (
     "pip (WebSocket); no ROS environment is needed on this machine."
 )
 
+_ACTIONS = frozenset({"status", "list_topics", "list_services", "echo", "publish", "service_call"})
+
 
 class _RosbridgeBackend:
     """Process-wide cache of live roslibpy connections, keyed by (host, port).
@@ -88,33 +90,49 @@ class _RosbridgeBackend:
         return self._available
 
     def connect(self, host: str, port: int, timeout: float) -> Any:
-        """Return a live connection to host:port, dialing (or re-dialing) if needed."""
+        """Return a live connection to host:port, dialing or awaiting reconnect.
+
+        One roslibpy.Ros is created per (host, port) for the process lifetime
+        and NEVER discarded: its ReconnectingClientFactory re-dials a dropped
+        WebSocket by itself (observed live), while a freshly constructed Ros
+        in a process that has seen reconnect churn can fail to connect at all
+        (roslibpy/Twisted limitation, observed live). Keeping the one object
+        is therefore both the reliable and the cheap choice - a bridge that is
+        down costs one retrying factory with exponential backoff, not a storm.
+        Calling ros.terminate() is never an option: it stops the process-wide,
+        non-restartable Twisted reactor and would break every connection in
+        this process.
+        """
         import roslibpy
 
         ros = self._connections.get((host, port))
-        if ros is not None and getattr(ros, "is_connected", False):
-            return ros
-        if ros is not None:
-            # Stale WebSocket: tear down best-effort and re-dial fresh below.
+        if ros is None:
+            ros = roslibpy.Ros(host=host, port=port)
+            self._connections[(host, port)] = ros
             try:
-                ros.terminate()
-            except Exception:  # noqa: BLE001 - third-party teardown must never block a re-dial
-                logger.debug("terminate of stale rosbridge connection failed", exc_info=True)
-            self._connections.pop((host, port), None)
-        ros = roslibpy.Ros(host=host, port=port)
-        try:
-            ros.run(timeout=timeout)
-        except Exception as exc:  # noqa: BLE001 - roslibpy raises library-specific errors; all mean "no connection"
-            raise TimeoutError(
-                f"could not connect to rosbridge at ws://{host}:{port} within {timeout}s "
-                f"- is rosbridge_server running? ({exc})"
-            ) from exc
-        if not getattr(ros, "is_connected", False):
-            raise TimeoutError(
-                f"could not connect to rosbridge at ws://{host}:{port} within {timeout}s - is rosbridge_server running?"
-            )
-        self._connections[(host, port)] = ros
-        return ros
+                ros.run(timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - roslibpy raises library-specific errors; all mean "not connected yet"
+                raise TimeoutError(
+                    f"could not connect to rosbridge at ws://{host}:{port} within {timeout}s "
+                    f"- is rosbridge_server running? ({exc})"
+                ) from exc
+            if not getattr(ros, "is_connected", False):
+                raise TimeoutError(
+                    f"could not connect to rosbridge at ws://{host}:{port} within {timeout}s "
+                    "- is rosbridge_server running?"
+                )
+            return ros
+        if getattr(ros, "is_connected", False):
+            return ros
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if getattr(ros, "is_connected", False):
+                return ros
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"rosbridge at ws://{host}:{port} did not reconnect within {timeout}s "
+            "- is rosbridge_server running? (the connection keeps retrying in the background)"
+        )
 
     @property
     def lock(self) -> threading.RLock:
@@ -231,6 +249,9 @@ def use_rosbridge(
     if type is not None and not _TYPE_RE.match(type):
         return _err(f"invalid interface type: {type!r} (expected ROS1 pkg/Name like geometry_msgs/Twist)")
 
+    if action not in _ACTIONS:
+        return _err(f"unknown action: {action}")
+
     if action == "status":
         if not _backend.available():
             return _ok("backend: none - " + _INSTALL_HINT)
@@ -257,13 +278,19 @@ def use_rosbridge(
             if action == "echo":
                 if not topic:
                     return _err("echo requires topic")
+                if count < 1:
+                    return _err("echo requires count >= 1")
                 msg_type = type or _resolve_topic_type(ros, topic, timeout)
                 if not msg_type:
                     return _err(f"cannot resolve type for {topic}; pass type=pkg/Name")
                 import json
 
                 samples = _echo(ros, topic, msg_type, timeout, count)
-                return _ok(f"echo {topic} ({msg_type}):\n{json.dumps(samples, indent=2, default=str)}")
+                body = json.dumps(samples, indent=2, default=str)
+                note = (
+                    "" if samples else f"\n(no messages within {timeout}s - topic may be silent or the type mismatched)"
+                )
+                return _ok(f"echo {topic} ({msg_type}):\n{body}{note}")
 
             if action == "service_call":
                 if not service or not type:
@@ -276,10 +303,15 @@ def use_rosbridge(
             if action == "publish":
                 if not topic or not type:
                     return _err("publish requires topic and type")
+                if count < 1:
+                    return _err("publish requires count >= 1")
                 _publish(ros, topic, type, fields, count, rate)
                 return _ok(f"published {count} message(s) to {topic}")
 
-            return _err(f"unknown action: {action}")
+            # Unreachable: action is validated against _ACTIONS above. Kept as
+            # a defensive fallback because mypy cannot prove the if/elif
+            # chain above is exhaustive from a runtime frozenset check.
+            return _err(f"unknown action: {action}")  # pragma: no cover
     except TimeoutError as exc:
         return _err(str(exc))
     except (ImportError, KeyError, AttributeError, ValueError, TypeError, OSError) as exc:
