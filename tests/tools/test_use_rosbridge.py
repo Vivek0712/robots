@@ -201,3 +201,34 @@ def test_unknown_action_errors(fake_roslibpy: _types.ModuleType) -> None:
     result = use_rosbridge(action="warp_drive")
     assert result["status"] == "error"
     assert "unknown action" in _texts(result)
+
+
+# rosapi-backed introspection ---------------------------------------------------
+
+
+def test_list_topics_formats_sorted_pairs(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.scripted_responses["/rosapi/topics"] = {  # type: ignore[attr-defined]
+        "topics": ["/zeta", "/curiosity_mars_rover/odom"],
+        "types": ["std_msgs/String", "nav_msgs/Odometry"],
+    }
+    result = use_rosbridge(action="list_topics")
+    assert result["status"] == "success"
+    lines = _texts(result).splitlines()
+    assert lines[0] == "/curiosity_mars_rover/odom [nav_msgs/Odometry]"  # sorted
+    assert "/zeta [std_msgs/String]" in lines[1]
+
+
+def test_list_services_sorted(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.scripted_responses["/rosapi/services"] = {  # type: ignore[attr-defined]
+        "services": ["/b_srv", "/a_srv"],
+    }
+    result = use_rosbridge(action="list_services")
+    assert _texts(result).splitlines() == ["/a_srv", "/b_srv"]
+
+
+def test_rosapi_absence_is_actionable(fake_roslibpy: _types.ModuleType) -> None:
+    # No scripted response -> the fake raises like a timed-out service; the
+    # tool must convert that into a structured, named error.
+    result = use_rosbridge(action="list_topics")
+    assert result["status"] == "error"
+    assert "/rosapi/topics" in _texts(result)

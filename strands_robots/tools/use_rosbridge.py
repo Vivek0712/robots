@@ -132,6 +132,36 @@ def _err(text: str) -> dict[str, Any]:
     return {"status": "error", "content": [{"text": f"use_rosbridge: {text}"}]}
 
 
+def _rosapi_call(ros: Any, service: str, srv_type: str, values: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """Call a service over rosbridge and return the response as a plain dict."""
+    import roslibpy
+
+    svc = roslibpy.Service(ros, service, srv_type)
+    request = roslibpy.ServiceRequest(dict(values))
+    try:
+        return dict(svc.call(request, timeout=timeout))
+    except Exception as exc:  # noqa: BLE001 - roslibpy raises library-specific errors; convert at the boundary
+        raise TimeoutError(
+            f"service {service} call failed via rosbridge: {exc} (is rosbridge_server running with rosapi?)"
+        ) from exc
+
+
+def _list_topics(ros: Any, timeout: float) -> str:
+    resp = _rosapi_call(ros, "/rosapi/topics", "rosapi/Topics", {}, timeout)
+    pairs = sorted(zip(resp.get("topics", []), resp.get("types", [])))
+    return "\n".join(f"{name} [{type_}]" for name, type_ in pairs)
+
+
+def _list_services(ros: Any, timeout: float) -> str:
+    resp = _rosapi_call(ros, "/rosapi/services", "rosapi/Services", {}, timeout)
+    return "\n".join(sorted(resp.get("services", [])))
+
+
+def _resolve_topic_type(ros: Any, topic: str, timeout: float) -> str | None:
+    resp = _rosapi_call(ros, "/rosapi/topic_type", "rosapi/TopicType", {"topic": topic}, timeout)
+    return resp.get("type") or None
+
+
 @tool
 def use_rosbridge(
     action: str,
@@ -193,6 +223,12 @@ def use_rosbridge(
     try:
         with _backend.lock:
             ros = _backend.connect(host, port, timeout)
+
+            if action == "list_topics":
+                return _ok(_list_topics(ros, timeout))
+
+            if action == "list_services":
+                return _ok(_list_services(ros, timeout))
 
             if action == "publish":
                 if not topic or not type:
