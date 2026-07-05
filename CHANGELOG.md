@@ -613,6 +613,40 @@ convention (the `_body_position` fallback was never mirrored to the quaternion
 path), so `(upright X)` on a procedurally-generated LIBERO object no longer
 silently evaluates to `False`.
 
+### Fixed: OLD-FORMAT in-model normalization was silently dropped -> canonical checkpoints ran un-normalized
+
+Loading a pre-processor-era lerobot checkpoint through the `lerobot_local`
+provider ran it with normalization dropped. Those checkpoints (the canonical
+zoo -- `lerobot/act_aloha_sim_transfer_cube_human`, `diffusion_pusht`, and the
+tdmpc/vqbet entries a user grabs first) store their Normalize modules *inside*
+the policy, so `model.safetensors` carries `normalize_inputs.*` /
+`unnormalize_outputs.*` buffers and `config.json` carries a
+`normalization_mapping`, with no `policy_preprocessor.json` /
+`policy_postprocessor.json`. Current lerobot no longer registers those modules,
+so `PreTrainedPolicy.from_pretrained` drops the buffers as "unexpected keys"
+(only a `WARNING:root` line) and, with no processor JSON to replace them, the
+policy ran with normalization dropped: observations reached the model raw and
+predicted actions reached the robot un-unnormalized. For a MEAN_STD checkpoint
+that is not an "arm barely moves" under-motion -- raw z-scored actions applied
+as robot units make the arm *flail* (measured on `act_aloha_sim_transfer_cube_human`:
+right-gripper path 3.36 m spanning z [0.03, 0.90] m, vs 0.62 m spanning
+z [0.16, 0.32] m once normalized). `ProcessorBridge` now reconstructs the
+pre/post pipelines from those same in-model buffers using lerobot's own
+`extract_normalization_stats` + `make_pre_post_processors` factory (the exact
+machinery of `migrate_policy_normalization`), so an old-format checkpoint runs
+normalized with zero user action. The reconstruction is best-effort and only
+fires when a checkpoint ships no processor configs, no `norm_stats.json`, but
+does carry in-model buffers -- modern checkpoints are untouched. The
+reconstruction also degrades to passthrough when the lerobot recovery
+helpers cannot be imported for any reason (not only `ImportError`): an
+unrelated broken sibling policy module -- e.g. a dataclass that fails at
+definition time while importing the `lerobot.policies` package -- must not
+crash an ACT/diffusion checkpoint load. The `make_pre_post_processors`
+factory is imported from its canonical module `lerobot.policies.factory`
+(where lerobot's own `migrate_policy_normalization` sources it) rather than
+the `lerobot.policies` top-level re-export, which is not stable across
+lerobot releases.
+
 ## [0.4.1] - 2026-07-01
 
 ### Security: Removed the unregistered `mimicgen` dependency (dependency-confusion RCE, CVE-pending)
