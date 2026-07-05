@@ -232,3 +232,61 @@ def test_rosapi_absence_is_actionable(fake_roslibpy: _types.ModuleType) -> None:
     result = use_rosbridge(action="list_topics")
     assert result["status"] == "error"
     assert "/rosapi/topics" in _texts(result)
+
+
+# echo / service_call ------------------------------------------------------------
+
+
+def test_echo_autoresolves_type_and_caps_count(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.scripted_responses["/rosapi/topic_type"] = {"type": "nav_msgs/Odometry"}  # type: ignore[attr-defined]
+    fake_roslibpy.Ros.scripted_messages["/curiosity_mars_rover/odom"] = [  # type: ignore[attr-defined]
+        {"pose": {"pose": {"position": {"x": 1.0}}}},
+        {"pose": {"pose": {"position": {"x": 2.0}}}},
+        {"pose": {"pose": {"position": {"x": 3.0}}}},
+    ]
+    result = use_rosbridge(action="echo", topic="/curiosity_mars_rover/odom", count=2)
+    assert result["status"] == "success"
+    assert "nav_msgs/Odometry" in _texts(result)
+    assert '"x": 1.0' in _texts(result) and '"x": 2.0' in _texts(result)
+    assert '"x": 3.0' not in _texts(result)  # capped at count
+    ros = fake_roslibpy.Ros.instances[0]  # type: ignore[attr-defined]
+    assert ros.topics[-1].unsubscribed  # subscription torn down in finally
+
+
+def test_echo_unresolvable_type_errors(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.scripted_responses["/rosapi/topic_type"] = {"type": ""}  # type: ignore[attr-defined]
+    result = use_rosbridge(action="echo", topic="/ghost")
+    assert result["status"] == "error"
+    assert "cannot resolve type" in _texts(result)
+
+
+def test_echo_requires_topic(fake_roslibpy: _types.ModuleType) -> None:
+    assert use_rosbridge(action="echo")["status"] == "error"
+
+
+def test_publish_traffic_and_unadvertise(fake_roslibpy: _types.ModuleType) -> None:
+    result = use_rosbridge(
+        action="publish",
+        topic="/cmd_vel",
+        type="geometry_msgs/Twist",
+        fields={"linear": {"x": 1.5}, "angular": {"z": 0.0}},
+        count=3,
+    )
+    assert result["status"] == "success"
+    ros = fake_roslibpy.Ros.instances[0]  # type: ignore[attr-defined]
+    pub = ros.topics[-1]
+    assert pub.advertised and pub.unadvertised
+    assert pub.published == [{"linear": {"x": 1.5}, "angular": {"z": 0.0}}] * 3
+
+
+def test_service_call_returns_response(fake_roslibpy: _types.ModuleType) -> None:
+    fake_roslibpy.Ros.scripted_responses["/gazebo/reset_world"] = {"ok": True}  # type: ignore[attr-defined]
+    result = use_rosbridge(action="service_call", service="/gazebo/reset_world", type="std_srvs/Empty")
+    assert result["status"] == "success"
+    assert '"ok": true' in _texts(result)
+
+
+def test_service_call_requires_service_and_type(fake_roslibpy: _types.ModuleType) -> None:
+    result = use_rosbridge(action="service_call", service="/gazebo/reset_world")
+    assert result["status"] == "error"
+    assert "requires service and type" in _texts(result)

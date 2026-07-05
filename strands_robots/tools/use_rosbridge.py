@@ -162,6 +162,30 @@ def _resolve_topic_type(ros: Any, topic: str, timeout: float) -> str | None:
     return resp.get("type") or None
 
 
+def _echo(ros: Any, topic: str, msg_type: str, timeout: float, count: int) -> list[dict[str, Any]]:
+    import roslibpy
+
+    received: list[dict[str, Any]] = []
+    done = threading.Event()
+
+    def _on_message(message: dict[str, Any]) -> None:
+        received.append(dict(message))
+        if len(received) >= count:
+            done.set()
+
+    sub = roslibpy.Topic(ros, topic, msg_type)
+    sub.subscribe(_on_message)
+    try:
+        done.wait(timeout)
+    finally:
+        sub.unsubscribe()
+    return received[:count]
+
+
+def _service_call(ros: Any, service: str, srv_type: str, fields: dict[str, Any], timeout: float) -> dict[str, Any]:
+    return _rosapi_call(ros, service, srv_type, fields, timeout)
+
+
 @tool
 def use_rosbridge(
     action: str,
@@ -229,6 +253,25 @@ def use_rosbridge(
 
             if action == "list_services":
                 return _ok(_list_services(ros, timeout))
+
+            if action == "echo":
+                if not topic:
+                    return _err("echo requires topic")
+                msg_type = type or _resolve_topic_type(ros, topic, timeout)
+                if not msg_type:
+                    return _err(f"cannot resolve type for {topic}; pass type=pkg/Name")
+                import json
+
+                samples = _echo(ros, topic, msg_type, timeout, count)
+                return _ok(f"echo {topic} ({msg_type}):\n{json.dumps(samples, indent=2, default=str)}")
+
+            if action == "service_call":
+                if not service or not type:
+                    return _err("service_call requires service and type")
+                import json
+
+                resp = _service_call(ros, service, type, fields, timeout)
+                return _ok(f"response:\n{json.dumps(resp, indent=2, default=str)}")
 
             if action == "publish":
                 if not topic or not type:
