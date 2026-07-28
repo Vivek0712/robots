@@ -21,8 +21,9 @@ objects:
 * :class:`NormStatsPostprocessorStep` unnormalizes ``action``.
 
 The numeric transform is a bit-for-bit port of the reference normalizer in
-``lerobot.policies.molmoact2.hf_model.modeling_molmoact2._FeatureNormalizer``
-(see ``configuration_molmoact2.py::apply_norm_tag_metadata``). For ``q01_q99``::
+``lerobot.policies.molmoact2.molmoact2_hf_model.modeling_molmoact2._FeatureNormalizer``
+(see the ``_RobotStats.normalize_state`` / ``.unnormalize_action`` norm-tag
+dispatch in the same module). For ``q01_q99``::
 
     x_norm   = clip(2 * (x - q01) / max(q99 - q01, eps) - 1, -1, 1)
     x_unnorm = (clip(x_norm, -1, 1) + 1) * (q99 - q01) / 2 + q01
@@ -91,7 +92,9 @@ class FeatureNormalizer:
     normalization modes. ``normalize`` maps raw robot units into the model's
     normalized space; ``unnormalize`` inverts it. Both preserve the input
     container type (numpy in -> numpy out, tensor in -> tensor out on the same
-    device/dtype).
+    device/dtype). An unrecognized ``mode`` raises :class:`ValueError` in both
+    directions rather than silently passing values through un-normalized (the
+    passthrough failure this module exists to prevent).
     """
 
     def __init__(
@@ -175,7 +178,12 @@ class FeatureNormalizer:
         raise ValueError(f"Unsupported robot normalization mode {mode!r}.")
 
     def normalize(self, x: Any) -> Any:
-        """Map raw values into the model's normalized space."""
+        """Map raw values into the model's normalized space.
+
+        Raises:
+            ValueError: If ``mode`` is not a recognized normalization mode
+                (refusing to send un-normalized state to the policy).
+        """
         arr = _to_array(x)
         if arr is None:
             return None
@@ -191,7 +199,11 @@ class FeatureNormalizer:
             assert self.q_low is not None and self.q_high is not None
             normed = 2.0 * (arr - self.q_low) / np.maximum(self.q_high - self.q_low, _EPS) - 1.0
         else:
-            normed = arr
+            raise ValueError(
+                f"FeatureNormalizer.normalize: unsupported mode {self.mode!r}. Refusing to "
+                "pass state through un-normalized -- silent passthrough sends un-normalized "
+                "state to the policy (the single biggest cause of off-policy arm motion)."
+            )
         if self.mode in {"min_max", "q01_q99", "q10_q90"}:
             normed = np.clip(normed, -1.0, 1.0)
         if self.mask is not None:
@@ -201,7 +213,12 @@ class FeatureNormalizer:
         return self._restore_like(normed, x)
 
     def unnormalize(self, x: Any) -> Any:
-        """Invert :meth:`normalize`, mapping normalized values back to robot units."""
+        """Invert :meth:`normalize`, mapping normalized values back to robot units.
+
+        Raises:
+            ValueError: If ``mode`` is not a recognized normalization mode
+                (refusing to send un-unnormalized actions to the motors).
+        """
         arr = _to_array(x)
         if arr is None:
             return None
@@ -219,7 +236,11 @@ class FeatureNormalizer:
             assert self.q_low is not None and self.q_high is not None
             out = (arr + 1.0) * (self.q_high - self.q_low) / 2.0 + self.q_low
         else:
-            out = arr
+            raise ValueError(
+                f"FeatureNormalizer.unnormalize: unsupported mode {self.mode!r}. Refusing to "
+                "pass actions through un-unnormalized -- silent passthrough sends "
+                "un-unnormalized actions to the motors."
+            )
         if self.mask is not None:
             out = np.where(self.mask, out, arr)
         return self._restore_like(out, x)
@@ -243,6 +264,7 @@ def load_norm_stats(
     pretrained_name_or_path: str,
     *,
     filename: str = "norm_stats.json",
+    revision: str | None = None,
 ) -> dict[str, Any] | None:
     """Load a ``norm_stats.json`` payload from a local dir or the HF Hub.
 
@@ -253,6 +275,8 @@ def load_norm_stats(
     Args:
         pretrained_name_or_path: HF repo id or local checkpoint directory.
         filename: Default norm-stats filename to look for.
+        revision: Optional Hub branch/tag/SHA to pin the download to, so the
+            norm-stats file matches revision-pinned policy weights.
 
     Returns:
         Parsed JSON payload dict, or ``None`` when unavailable.
@@ -285,14 +309,14 @@ def load_norm_stats(
         from huggingface_hub import hf_hub_download
 
         try:
-            cfg_path = hf_hub_download(pretrained_name_or_path, "config.json")
+            cfg_path = hf_hub_download(pretrained_name_or_path, "config.json", revision=revision)
             cfg = _read_json(Path(cfg_path))
             if cfg and cfg.get("norm_stats_filename"):
                 resolved_filename = str(cfg["norm_stats_filename"])
         except Exception as exc:  # noqa: BLE001 - config.json is optional
             logger.debug("norm_stats: no config.json on hub: %s", exc)
 
-        downloaded = hf_hub_download(pretrained_name_or_path, resolved_filename)
+        downloaded = hf_hub_download(pretrained_name_or_path, resolved_filename, revision=revision)
         return _read_json(Path(downloaded))
     except Exception as exc:  # noqa: BLE001 - network/repo errors are non-fatal
         logger.debug("norm_stats: could not fetch %s from hub: %s", resolved_filename, exc)
@@ -379,11 +403,13 @@ def _make_step_classes() -> tuple[type, type] | None:
             self._state_key = state_key
 
         def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+            """Normalize ``observation.state`` in place via the feature normalizer (passthrough when the key is absent)."""
             if self._state_key in observation and observation[self._state_key] is not None:
                 observation[self._state_key] = self._normalizer.normalize(observation[self._state_key])
             return observation
 
         def transform_features(self, features: Any) -> Any:
+            """Return ``features`` unchanged: normalization does not alter the feature schema."""
             return features
 
     class NormStatsPostprocessorStep(ActionProcessorStep):  # type: ignore[misc,valid-type]
@@ -393,11 +419,13 @@ def _make_step_classes() -> tuple[type, type] | None:
             self._normalizer = normalizer
 
         def action(self, action: Any) -> Any:
+            """Unnormalize the policy ``action`` back into robot units (passthrough when ``None``)."""
             if action is None:
                 return action
             return self._normalizer.unnormalize(action)
 
         def transform_features(self, features: Any) -> Any:
+            """Return ``features`` unchanged: unnormalization does not alter the feature schema."""
             return features
 
     return NormStatsPreprocessorStep, NormStatsPostprocessorStep

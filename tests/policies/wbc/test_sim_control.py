@@ -17,12 +17,12 @@ weights and lives in the gated integration suite.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
 
-from strands_robots.policies.wbc import WBCConfig, WBCPolicy
+from strands_robots.policies.wbc import WBC_G1_ALL_JOINTS, WBCConfig, WBCPolicy
 from strands_robots.policies.wbc.policy import (
     _G1_SONIC_DEFAULT_ANGLES,
     _G1_SONIC_KDS,
@@ -185,3 +185,140 @@ class TestWBCTorqueController:
         # At least one driven actuator received a finite torque command.
         ctrls = np.array([float(data.ctrl[ai]) for ai in ctrl.leg_waist_actuator_ids])
         assert np.all(np.isfinite(ctrls))
+
+    def test_apply_non_numeric_action_value_holds_previous_target(self) -> None:
+        # One malformed action value (e.g. a NaN string leaking from a policy)
+        # must degrade to holding that joint's previous target, not abort the
+        # whole control step - the remaining joints still track their commands.
+        from strands_robots.policies.wbc import (
+            WBC_G1_LEG_WAIST_JOINTS,
+            install_wbc_torque_control,
+        )
+
+        model, data = _build_min_g1()
+        ns = _namespace_for(model)
+        sim = _FakeSim(_FakeWorld(model, data, ns))
+        policy = _g1_policy()
+        ctrl = install_wbc_torque_control(cast(SimEngine, sim), policy, "unitree_g1")
+
+        stance = {name: float(policy.default_angles[i]) for i, name in enumerate(WBC_G1_LEG_WAIST_JOINTS)}
+        ctrl.apply(stance, model, data, "unitree_g1")
+        held = float(ctrl._target_q[0])
+
+        # Poison joint 0 with a non-numeric value; give joint 1 a fresh command.
+        corrupt: dict[str, Any] = dict(stance)
+        corrupt[WBC_G1_LEG_WAIST_JOINTS[0]] = "not-a-number"
+        corrupt[WBC_G1_LEG_WAIST_JOINTS[1]] = 0.123
+        ctrl.apply(corrupt, model, data, "unitree_g1")
+
+        # Bad key held its prior target; the good key still updated.
+        assert float(ctrl._target_q[0]) == held
+        assert abs(float(ctrl._target_q[1]) - 0.123) < 1e-12
+        # And the step still produced finite torques (no abort / NaN spill).
+        ctrls = np.array([float(data.ctrl[ai]) for ai in ctrl.leg_waist_actuator_ids])
+        assert np.all(np.isfinite(ctrls))
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast resolution contracts
+# ---------------------------------------------------------------------------
+#
+# ``from_sim`` and ``install_wbc_torque_control`` flip a robot's actuators to
+# torque mode by name. When the sim can't provide what they need, they must
+# raise an actionable RuntimeError rather than silently install a controller
+# wired to the wrong (or no) actuators - a mis-wired torque shim would drive a
+# real G1 with garbage commands. ``wbc_uses_position_servo`` is the opposite
+# contract: it is a conservative predicate that returns False (leave the scene
+# untouched) when it cannot resolve the driven joints.
+
+
+def _model_from_xml(xml: str):  # type: ignore[no-untyped-def]
+    return mujoco.MjModel.from_xml_string(xml)
+
+
+# A single hinge that is NOT a WBC joint: from_sim can't resolve any driven
+# joint against it.
+_XML_NO_WBC_JOINTS = """
+<mujoco>
+  <worldbody>
+    <body name="b">
+      <joint name="unrelated_joint" type="hinge" axis="0 0 1"/>
+      <geom type="box" size="0.1 0.1 0.1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+# The first WBC driven joint exists but has no actuator driving it.
+_XML_JOINT_WITHOUT_ACTUATOR = f"""
+<mujoco>
+  <worldbody>
+    <body name="b">
+      <joint name="{WBC_G1_ALL_JOINTS[0]}" type="hinge" axis="0 0 1"/>
+      <geom type="box" size="0.1 0.1 0.1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+
+class TestWBCTorqueControllerFailFast:
+    def test_from_sim_without_world_raises(self) -> None:
+        from strands_robots.policies.wbc import WBCTorqueController
+
+        sim = _FakeSim(None)  # no compiled world/model on the sim
+        with pytest.raises(RuntimeError, match="no compiled world/model"):
+            WBCTorqueController.from_sim(cast(SimEngine, sim), _g1_policy(), "unitree_g1")
+
+    def test_from_sim_unresolvable_joint_raises(self) -> None:
+        from strands_robots.policies.wbc import WBCTorqueController
+
+        model = _model_from_xml(_XML_NO_WBC_JOINTS)
+        sim = _FakeSim(_FakeWorld(model, mujoco.MjData(model), ""))
+        with pytest.raises(RuntimeError, match="not found in the model"):
+            WBCTorqueController.from_sim(cast(SimEngine, sim), _g1_policy(), "unitree_g1")
+
+    def test_from_sim_joint_without_actuator_raises(self) -> None:
+        from strands_robots.policies.wbc import WBCTorqueController
+
+        model = _model_from_xml(_XML_JOINT_WITHOUT_ACTUATOR)
+        sim = _FakeSim(_FakeWorld(model, mujoco.MjData(model), ""))
+        with pytest.raises(RuntimeError, match="no driving actuator"):
+            WBCTorqueController.from_sim(cast(SimEngine, sim), _g1_policy(), "unitree_g1")
+
+    def test_hold_target_falls_back_to_zeros_on_shape_mismatch(self) -> None:
+        # The hold target must have length num_actions so the PD law never sees
+        # a ragged array, even if the policy's resolved default_angles disagree.
+        from strands_robots.policies.wbc import WBCTorqueController
+
+        class _MismatchCfg:
+            num_actions = 5
+
+        class _MismatchPolicy:
+            config = _MismatchCfg()
+            default_angles = np.array([0.1, 0.2, 0.3], dtype=np.float64)  # len 3 != 5
+
+        ctrl = WBCTorqueController(
+            cast(Any, _MismatchPolicy()),
+            leg_waist_actuator_ids=[],
+            arm_actuator_ids=[],
+            leg_waist_qpos_addrs=[],
+            leg_waist_dof_addrs=[],
+            arm_qpos_addrs=[],
+            arm_dof_addrs=[],
+            saved_actuator_gains={},
+            model=None,
+        )
+        assert ctrl._target_q.shape == (5,)
+        assert np.array_equal(ctrl._target_q, np.zeros(5))
+
+
+class TestWbcUsesPositionServo:
+    def test_unresolvable_scene_reports_false(self) -> None:
+        # Conservative predicate: a scene with none of the WBC joints cannot be
+        # a position-servo G1, so leave it untouched (no torque conversion).
+        from strands_robots.policies.wbc import wbc_uses_position_servo
+
+        model = _model_from_xml(_XML_NO_WBC_JOINTS)
+        sim = _FakeSim(_FakeWorld(model, mujoco.MjData(model), ""))
+        assert wbc_uses_position_servo(cast(SimEngine, sim), _g1_policy(), "unitree_g1") is False

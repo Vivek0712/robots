@@ -169,6 +169,56 @@ class TestBuildCommand:
         # consumed keys must not leak
         assert not any(c.startswith("--groot_root=") for c in cmd)
 
+    def test_no_augmentation_emits_no_augmentation_flags(self, spec):
+        """With no augmentation, none of the augmentation flags appear."""
+        cmd = Gr00tTrainer().build_command(spec)
+        assert not any(c.startswith("--random_rotation_angle=") for c in cmd)
+        assert not any(c.startswith("--color_jitter_params=") for c in cmd)
+        assert not any(c.startswith("--extra_augmentation_config=") for c in cmd)
+
+    def test_augmentation_native_and_extra_map_to_distinct_flags(self, spec):
+        """build_command mirrors build_finetune_config: random_rotation_angle
+        and color_jitter_params are native flags; any other key is bundled into
+        --extra_augmentation_config JSON that excludes those native keys.
+        """
+        spec.augmentation = {
+            "random_rotation_angle": 30,
+            "color_jitter_params": [0.3, 0.3, 0.3, 0.1],
+            "mixup_alpha": 0.4,
+        }
+        cmd = Gr00tTrainer().build_command(spec)
+        assert "--random_rotation_angle=30" in cmd
+        # color_jitter_params is a native field: its own flag, NOT folded into
+        # --extra_augmentation_config.
+        assert "--color_jitter_params=[0.3, 0.3, 0.3, 0.1]" in cmd
+        extra_flags = [c for c in cmd if c.startswith("--extra_augmentation_config=")]
+        assert len(extra_flags) == 1
+        extra = json.loads(extra_flags[0].split("=", 1)[1])
+        assert extra == {"mixup_alpha": 0.4}
+        # native keys must NOT leak into the extra config bundle.
+        assert "random_rotation_angle" not in extra
+        assert "color_jitter_params" not in extra
+
+    def test_extra_only_augmentation_is_not_dropped(self, spec):
+        """An augmentation dict with only non-native keys still emits
+        --extra_augmentation_config (regression: it used to be silently dropped
+        unless color_jitter_params was also present).
+        """
+        spec.augmentation = {"mixup_alpha": 0.4}
+        cmd = Gr00tTrainer().build_command(spec)
+        extra_flags = [c for c in cmd if c.startswith("--extra_augmentation_config=")]
+        assert len(extra_flags) == 1
+        assert json.loads(extra_flags[0].split("=", 1)[1]) == {"mixup_alpha": 0.4}
+
+    def test_color_jitter_only_emits_native_flag_no_extra(self, spec):
+        """color_jitter_params alone emits its native flag and no extra bundle
+        (regression: --extra_augmentation_config used to dump the whole dict).
+        """
+        spec.augmentation = {"color_jitter_params": [0.2, 0.2, 0.2, 0.05]}
+        cmd = Gr00tTrainer().build_command(spec)
+        assert "--color_jitter_params=[0.2, 0.2, 0.2, 0.05]" in cmd
+        assert not any(c.startswith("--extra_augmentation_config=") for c in cmd)
+
 
 # ---------------------------------------------------------------------------
 # Fake Isaac-GR00T package tree so the config-lowering + in-process launch
@@ -457,3 +507,104 @@ class TestResolveTune:
         assert merged["llm"] is False
         assert merged["visual"] is False
         assert merged["diffusion"] is True
+
+
+class TestTrainMultiGpu:
+    """train(num_gpus > 1) dispatches to torch elastic, not the in-process run.
+
+    The single-GPU path builds the config and calls ``experiment.run()``
+    directly; the multi-GPU path must instead hand ``_groot_worker`` to
+    ``elastic_launch_callable`` so torch's elastic agent spawns one worker per
+    GPU. A regression that ran ``experiment.run()`` in-process for num_gpus > 1
+    would DataParallel-wrap on a single process (the StopIteration crash the
+    single-GPU CUDA_VISIBLE_DEVICES pin exists to avoid) instead of sharding.
+    """
+
+    def test_multi_gpu_hands_worker_to_elastic_launch(self, spec, monkeypatch):
+        from strands_robots.training import groot as groot_mod
+
+        _install_fake_gr00t(monkeypatch)
+        spec.num_gpus = 2
+        os.makedirs(spec.output_dir, exist_ok=True)
+        (Path(spec.output_dir) / "checkpoint-42").mkdir()
+
+        launches: list = []
+
+        def _fake_elastic(fn, *, nproc_per_node, nnodes, run_id, fn_args):
+            launches.append((fn, nproc_per_node, nnodes, run_id, fn_args))
+
+        monkeypatch.setattr(groot_mod, "elastic_launch_callable", _fake_elastic)
+
+        # The in-process run must NOT be invoked on the multi-GPU path.
+        def _boom(*a, **k):
+            raise AssertionError("call_callable must not run for num_gpus > 1")
+
+        monkeypatch.setattr(groot_mod, "call_callable", _boom)
+
+        result = groot_mod.Gr00tTrainer().train(spec)
+
+        assert result.status == "success"
+        assert result.checkpoint_dir == str(Path(spec.output_dir) / "checkpoint-42")
+        assert len(launches) == 1
+        fn, nproc_per_node, nnodes, run_id, fn_args = launches[0]
+        assert fn is groot_mod._groot_worker
+        assert nproc_per_node == 2  # one worker per GPU
+        assert nnodes == 1
+        assert run_id == result.job_id
+        groot_root, forwarded_spec, log_path = fn_args
+        assert groot_root == spec.extra["groot_root"]
+        assert forwarded_spec is spec
+        assert log_path.endswith(".log")
+
+
+class TestGrootWorker:
+    """``_groot_worker``: the per-GPU elastic-launch worker body.
+
+    Pins the "only local rank 0 tees to the shared log" contract. Each worker
+    builds the FinetuneConfig + run Config from Python objects (no argv) and
+    calls ``experiment.run()`` via ``call_callable``. If a non-zero rank also
+    received the log path, every worker would open the same file and interleave
+    writes, corrupting the RUNNING-vs-learning verdict the log exists to support.
+    """
+
+    def test_rank0_tees_to_shared_log(self, spec, tmp_path, monkeypatch):
+        from strands_robots.training import groot as groot_mod
+
+        _install_fake_gr00t(monkeypatch)
+        monkeypatch.delenv("LOCAL_RANK", raising=False)  # unset defaults to rank 0
+
+        calls: list = []
+        monkeypatch.setattr(
+            groot_mod,
+            "call_callable",
+            lambda fn, cfg, log_path=None: calls.append((fn, cfg, log_path)),
+        )
+
+        log = str(tmp_path / "train.log")
+        groot_mod._groot_worker(spec.extra["groot_root"], spec, log)
+
+        assert len(calls) == 1
+        fn, _cfg, log_path = calls[0]
+        assert log_path == log
+        # experiment.run() was resolved from the (fake) GR00T package and forwarded.
+        import gr00t.experiment.experiment as exp  # noqa: PLC0415
+
+        assert fn is exp.run
+
+    def test_nonzero_rank_suppresses_log(self, spec, tmp_path, monkeypatch):
+        from strands_robots.training import groot as groot_mod
+
+        _install_fake_gr00t(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "1")
+
+        calls: list = []
+        monkeypatch.setattr(
+            groot_mod,
+            "call_callable",
+            lambda fn, cfg, log_path=None: calls.append((fn, cfg, log_path)),
+        )
+
+        groot_mod._groot_worker(spec.extra["groot_root"], spec, str(tmp_path / "train.log"))
+
+        assert len(calls) == 1
+        assert calls[0][2] is None  # non-rank-0 worker must not touch the shared log

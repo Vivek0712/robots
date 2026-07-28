@@ -12,7 +12,7 @@ end to end with all I/O mocked (no hardware, daemon, or network):
 - REST move/lifecycle RPCs (listMoves / wakeUp / sleep / stopMotion /
   getDaemonStatus) and the paths they hit.
 - Expression sequences (nod / shake / happy) with sleep stubbed out.
-- Caller authorization gating on a state-mutating RPC.
+- Caller-authorization fail-closed gating across the full mutating RPC surface.
 - ``onEmergencyStop`` acting only on an allowlisted source.
 
 These use the REAL device_connect_edge package so the @rpc caller-identity
@@ -296,13 +296,48 @@ def test_expression_returns_to_neutral(rmd, method, expression):
 # -- caller authorization ---------------------------------------------------
 
 
-def test_movement_rpc_denied_for_unlisted_caller(rmd, monkeypatch):
+# Every state-mutating RPC (real-time head/antenna/body commands, motor
+# torque toggles, recorded-move playback, expression sequences, and the
+# REST move/lifecycle calls) must consult the caller allowlist. Read-only
+# RPCs (getJoints / getImu / listMoves / getDaemonStatus) are intentionally
+# ungated and excluded here.
+_MUTATING_RPCS = [
+    ("look", {"pitch": 5}),
+    ("antennas", {"left": 10, "right": -10}),
+    ("body", {"yaw": 15}),
+    ("enableMotors", {"motor_ids": "1,2"}),
+    ("disableMotors", {"motor_ids": ""}),
+    ("playMove", {"move_name": "wave"}),
+    ("nod", {}),
+    ("shake", {}),
+    ("happy", {}),
+    ("wakeUp", {}),
+    ("sleep", {}),
+    ("stopMotion", {}),
+]
+
+
+@pytest.mark.parametrize(("method", "kwargs"), _MUTATING_RPCS, ids=[m for m, _ in _MUTATING_RPCS])
+def test_mutating_rpc_denied_for_unlisted_caller(rmd, monkeypatch, method, kwargs):
+    """Every mutating RPC fail-closes on an unauthorized caller.
+
+    With an allowlist configured and an anonymous caller (no source_device),
+    each state-mutating RPC must return the standard authorization error and
+    issue neither a real-time hardware command nor a daemon REST call. This
+    pins the contract for the whole mutating surface so a new RPC that forgets
+    the gate cannot slip through with only ``look`` covered.
+    """
     monkeypatch.setenv("DEVICE_CONNECT_RPC_ALLOW", "trusted-*")
     drv = _bare(rmd, _hw=AsyncMock())
-    res = _run(drv.look(pitch=5))
+    with patch.object(rmd, "api", MagicMock()) as fake_api, patch.object(rmd.asyncio, "sleep", AsyncMock()):
+        res = _run(getattr(drv, method)(**kwargs))
     assert res["status"] == "error"
     assert "not authorized" in res["reason"]
+    # The rejection names the specific RPC that was denied.
+    assert method in res["reason"]
+    # Fail-closed: no physical command and no daemon REST call may fire.
     drv._hw.send_cmd.assert_not_awaited()
+    fake_api.assert_not_called()
 
 
 # -- emergency stop ---------------------------------------------------------
@@ -324,3 +359,92 @@ def test_emergency_stop_ignores_unauthorized_source(rmd, monkeypatch):
         _run(drv.onEmergencyStop("rogue-device", "emergencyStop", {}))
     drv._hw.send_cmd.assert_not_awaited()
     fake_api.assert_not_called()
+
+
+# -- emergency stop under an RPC allowlist (regression) ---------------------
+
+
+def test_emergency_stop_disables_motors_even_with_rpc_allowlist_set(rmd, monkeypatch):
+    """E-stop must disable motors when DEVICE_CONNECT_RPC_ALLOW is configured.
+
+    The e-stop handler runs in an event-handler context where
+    ``get_rpc_source_device()`` is ``None``. When it dispatched through the
+    ``@rpc()``-gated ``stopMotion`` / ``disableMotors``, that rpc-scope gate
+    fail-closed on the ``None`` caller under an RPC allowlist and the discarded
+    ``authz_error`` dicts left the motors LIVE. The handler is already
+    authorized on ``scope="estop"``, so it must reach the un-gated impls.
+    """
+    # estop caller is allowlisted for estop, and an RPC allowlist IS set so the
+    # rpc-scope gate would fail-close on the None caller in event context.
+    monkeypatch.setenv("DEVICE_CONNECT_ESTOP_ALLOW", "safety-*")
+    monkeypatch.setenv("DEVICE_CONNECT_RPC_ALLOW", "trusted-*")
+    drv = _bare(rmd, _hw=AsyncMock())
+    with patch.object(rmd, "api", return_value={"ok": True}) as fake_api:
+        _run(drv.onEmergencyStop("safety-007", "emergencyStop", {}))
+    # Torque is cut (definitive motor kill) despite the RPC allowlist.
+    assert any(c.args[0].get("torque") is False for c in drv._hw.send_cmd.await_args_list)
+    # And the REST stop endpoint is hit.
+    assert any(call.args[2] == "/api/move/stop" for call in fake_api.call_args_list)
+
+
+def test_emergency_stop_surfaces_daemon_transport_failure(rmd, monkeypatch, caplog):
+    """A stop issued against a down daemon must be logged as a failure.
+
+    ``reachy_transport.api`` returns ``{"error": ...}`` on any HTTP/connection
+    failure without raising, so the REST stop would otherwise report success
+    against a dead daemon. The handler must surface it loudly (and still cut
+    torque, which rides the separate real-time link).
+    """
+    monkeypatch.setenv("DEVICE_CONNECT_ESTOP_ALLOW", "safety-*")
+    drv = _bare(rmd, _hw=AsyncMock())
+    with patch.object(rmd, "api", return_value={"error": "connection refused"}):
+        with caplog.at_level("CRITICAL"):
+            _run(drv.onEmergencyStop("safety-007", "emergencyStop", {}))
+    # Torque-off still fired (runs first, on the real-time link).
+    assert any(c.args[0].get("torque") is False for c in drv._hw.send_cmd.await_args_list)
+    # The REST stop failure surfaced instead of a false success ack.
+    assert any("did NOT fully complete" in r.message for r in caplog.records)
+
+
+def test_emergency_stop_attempts_rest_stop_when_torque_link_drops(rmd, monkeypatch, caplog):
+    """A dropped real-time link during torque-off must NOT skip the REST stop.
+
+    The hardware links raise transport-specific exceptions that are neither
+    ``RuntimeError`` nor ``OSError`` -- the Lite variant's ``WebSocketLink``
+    raises ``websockets.exceptions.ConnectionClosed`` (MRO
+    ``WebSocketException -> Exception``) and the Zenoh variant raises its own
+    publish errors. If the torque-off (which runs first, on the real-time link)
+    raises such an exception, the handler must still attempt the REST stop
+    (a separate HTTP channel that may still be alive) and log the failure --
+    honoring its own "attempt BOTH stop actions even if one fails" contract.
+    A narrow ``except (RuntimeError, OSError)`` let the exception escape,
+    aborting the handler before the REST stop.
+    """
+
+    class _ConnectionClosed(Exception):
+        """Stand-in for websockets.exceptions.ConnectionClosed: subclasses
+        Exception directly, not RuntimeError/OSError (same MRO shape)."""
+
+    monkeypatch.setenv("DEVICE_CONNECT_ESTOP_ALLOW", "safety-*")
+    hw = AsyncMock()
+    hw.send_cmd.side_effect = _ConnectionClosed("websocket closed during torque-off")
+    drv = _bare(rmd, _hw=hw)
+    with patch.object(rmd, "api", return_value={"ok": True}) as fake_api:
+        with caplog.at_level("CRITICAL"):
+            _run(drv.onEmergencyStop("safety-007", "emergencyStop", {}))
+    # Torque-off raised a non-OSError/RuntimeError transport error, but the REST
+    # stop was still attempted on its separate channel.
+    assert any(call.args[2] == "/api/move/stop" for call in fake_api.call_args_list)
+    # The torque-off failure surfaced loudly rather than crashing the handler.
+    assert any("did NOT fully complete" in r.message for r in caplog.records)
+
+
+def test_stop_motion_impl_raises_on_transport_error(rmd):
+    """The stopMotion core raises when the daemon REST call errors, so a caller
+    cannot mistake a dead-daemon ``{"error": ...}`` for a real stop."""
+    import pytest
+
+    drv = _bare(rmd)
+    with patch.object(rmd, "api", return_value={"error": "boom"}):
+        with pytest.raises(RuntimeError, match="transport failure"):
+            _run(drv._stop_motion_impl())

@@ -1,6 +1,9 @@
 """Tests for Gr00tPolicy - unit tests WITHOUT Isaac-GR00T installed."""
 
 import asyncio
+import sys
+import types
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -20,6 +23,7 @@ from strands_robots.policies.groot.data_config import Gr00tDataConfig  # noqa: E
 from strands_robots.policies.groot.policy import (  # noqa: E402
     _auto_infer_action_mapping,
     _auto_infer_observation_mapping,
+    _coerce_action_row,
     _detect_groot_version,
     _match_keys,
     _parse_action_mapping,
@@ -184,6 +188,138 @@ class TestConstruction:
         """set_robot_state_keys is a documented no-op."""
         p = Gr00tPolicy()
         p.set_robot_state_keys(["a", "b"])  # should not raise
+
+
+# (section)
+# Local model loading (version dispatch + per-version loaders)
+# (section)
+
+
+def _fake_module(name, **attrs):
+    m = types.ModuleType(name)
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    return m
+
+
+@contextmanager
+def _inject_modules(mods):
+    """Register a fake gr00t package subtree in sys.modules for the block.
+
+    ``mods`` maps a dotted module name to a module object. Parent packages are
+    created automatically so ``from a.b.c import d`` resolves against the stubs
+    instead of the (uninstalled) real gr00t package.
+    """
+    full = dict(mods)
+    for name in list(mods):
+        parts = name.split(".")
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[:i])
+            full.setdefault(parent, types.ModuleType(parent))
+    with patch.dict(sys.modules, full):
+        yield
+
+
+class _FakeEmbodimentTag:
+    """Stand-in for gr00t's EmbodimentTag enum with a getattr-able attribute."""
+
+    GR1 = "GR1_TAG"
+    NEW_EMBODIMENT = "NEW_TAG"
+
+
+class TestLocalLoad:
+    """The local (in-process) load path routes by detected GR00T version and
+    builds the version-specific policy with the right kwargs. These paths import
+    the uninstalled ``gr00t`` package, so they are exercised against stub modules.
+    """
+
+    def test_dispatch_routes_by_version(self):
+        for version, method in (("n1.7", "_load_n17"), ("n1.6", "_load_n16"), ("n1.5", "_load_n15")):
+            p = _make_policy(version=version)
+            with patch.object(p, method) as loader:
+                p._load_local_policy("/model", "TAG", "cpu")
+            loader.assert_called_once_with("/model", "TAG", "cpu")
+
+    def test_n15_native_config_uses_gr00t_modality_config_and_transform(self):
+        p = _make_policy(version="n1.5")
+        p.data_config_name = "so100_dualcam"
+        native = MagicMock()
+        native.modality_config.return_value = {"mc": 1}
+        native.transform.return_value = {"mt": 1}
+        n15policy = MagicMock(name="N15Policy")
+        with _inject_modules(
+            {
+                "gr00t.experiment.data_config": _fake_module(
+                    "gr00t.experiment.data_config", DATA_CONFIG_MAP={"so100_dualcam": native}
+                ),
+                "gr00t.model.policy": _fake_module("gr00t.model.policy", Gr00tPolicy=n15policy),
+            }
+        ):
+            p._load_n15("/model", "NEW_EMBODIMENT", "cpu")
+        kw = n15policy.call_args.kwargs
+        assert kw["model_path"] == "/model"
+        assert kw["embodiment_tag"] == "NEW_EMBODIMENT"
+        assert kw["modality_config"] == {"mc": 1}
+        assert kw["modality_transform"] == {"mt": 1}
+        assert kw["device"] == "cpu"
+        assert p._local_policy is n15policy.return_value
+
+    def test_n15_unknown_config_falls_back_and_drops_none_transform(self):
+        p = _make_policy(version="n1.5")
+        p.data_config_name = "not_a_gr00t_config"
+        p.data_config = MagicMock()
+        p.data_config.modality_config.return_value = {"fallback": 1}
+        n15policy = MagicMock(name="N15Policy")
+        with _inject_modules(
+            {
+                "gr00t.experiment.data_config": _fake_module("gr00t.experiment.data_config", DATA_CONFIG_MAP={}),
+                "gr00t.model.policy": _fake_module("gr00t.model.policy", Gr00tPolicy=n15policy),
+            }
+        ):
+            p._load_n15("/model", "NEW_EMBODIMENT", "cuda")
+        kw = n15policy.call_args.kwargs
+        assert kw["modality_config"] == {"fallback": 1}
+        # transform is None for the fallback path and must be filtered out.
+        assert "modality_transform" not in kw
+        assert p._local_policy is n15policy.return_value
+
+    def test_n16_resolves_known_embodiment_tag_and_forwards_strict(self):
+        p = _make_policy(version="n1.6")
+        p._strict = True
+        n16policy = MagicMock(name="N16Policy")
+        with _inject_modules(
+            {
+                "gr00t.data.embodiment_tags": _fake_module(
+                    "gr00t.data.embodiment_tags", EmbodimentTag=_FakeEmbodimentTag
+                ),
+                "gr00t.policy.gr00t_policy": _fake_module("gr00t.policy.gr00t_policy", Gr00tPolicy=n16policy),
+            }
+        ):
+            p._load_n16("/model", "gr1", "cuda")
+        kw = n16policy.call_args.kwargs
+        assert kw["embodiment_tag"] == "GR1_TAG"
+        assert kw["model_path"] == "/model"
+        assert kw["device"] == "cuda"
+        assert kw["strict"] is True
+        assert p._local_policy is n16policy.return_value
+
+    def test_n17_unknown_embodiment_falls_back_to_new_embodiment(self):
+        p = _make_policy(version="n1.7")
+        p._strict = False
+        n17policy = MagicMock(name="N17Policy")
+        with _inject_modules(
+            {
+                "gr00t.data.embodiment_tags": _fake_module(
+                    "gr00t.data.embodiment_tags", EmbodimentTag=_FakeEmbodimentTag
+                ),
+                "gr00t.policy.gr00t_policy": _fake_module("gr00t.policy.gr00t_policy", Gr00tPolicy=n17policy),
+            }
+        ):
+            p._load_n17("/model", "does_not_exist", "cpu")
+        kw = n17policy.call_args.kwargs
+        assert kw["embodiment_tag"] == "NEW_TAG"
+        assert kw["strict"] is False
+        assert p._local_policy is n17policy.return_value
 
 
 # (section)
@@ -439,6 +575,19 @@ class TestStrictKeys:
         assert m.video.get("webcam") == "ego_view_bg_crop_pad_res256_freq20"
         assert any("positional" in r.message for r in caplog.records)
 
+    def test_action_nonstrict_maps_positionally_and_warns(self, caplog):
+        # Symmetric to the observation case: so100 action keys
+        # (single_arm, gripper) share no name with GR1's action keys
+        # (left_arm, right_arm, ...), so strict_keys=False must fall back to
+        # positional pairing in declaration order (zip stops at the shorter
+        # list) and emit an INFO log per auto-mapped key.
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            m = _auto_infer_action_mapping(DATA_CONFIG_MAP["so100"], GR1_MMC, strict_keys=False)
+        assert m.actions == {"left_arm": "single_arm", "right_arm": "gripper"}
+        assert any("positional" in r.message for r in caplog.records)
+
     def test_obs_exact_match_never_raises_in_strict_mode(self):
         # so100 <-> SO100_MMC matches by exact name, so strict_keys=True is a no-op.
         m = _auto_infer_observation_mapping(DATA_CONFIG_MAP["so100"], SO100_MMC, strict_keys=True)
@@ -482,6 +631,13 @@ class TestShapes:
     def test_state_from_list(self):
         r = _to_state_batch([1.0, 2.0, 3.0])
         assert r.shape == (1, 1, 3) and r.dtype == np.float32
+
+    def test_state_3d_and_higher_passthrough(self):
+        # Already-batched (B, T, D) state is left as-is (only dtype is
+        # coerced to float32), so callers may pre-shape their own batches.
+        r = _to_state_batch(np.zeros((2, 3, 4), dtype=np.float64))
+        assert r.shape == (2, 3, 4) and r.dtype == np.float32
+        assert _to_state_batch(np.zeros((1, 2, 3, 4))).shape == (1, 2, 3, 4)
 
     def test_ref_from_mapped_video_keys(self):
         """Should only look at keys in the video_keys set."""
@@ -562,6 +718,52 @@ class TestPrepareObs:
         assert "gripper" not in b["state"]
         assert "single_arm" in b["state"]
 
+    def test_warns_and_zero_fills_when_robot_omits_expected_streams(self, caplog):
+        """Missing mapped streams degrade gracefully: warn per key, then zero-fill.
+
+        A robot may not publish every camera/state stream the checkpoint was
+        trained on (e.g. a head camera is unplugged, or a joint group is absent
+        on this embodiment). The policy must not crash or silently emit a
+        malformed observation. For each mapped robot key absent from the raw
+        observation it logs a WARNING, and the model-side keys are then
+        zero-filled from the modality config so the wire payload keeps the exact
+        shape the model expects.
+        """
+        import logging
+
+        p = _make_policy(
+            obs_mapping=ObservationMapping(
+                video={"cam": "ego_view_bg_crop_pad_res256_freq20"},
+                state={"j": "left_arm"},
+                language_key="task",
+            ),
+            mmc=GR1_MMC,
+        )
+        # Robot publishes neither the mapped camera ("cam") nor the mapped
+        # state stream ("j") this tick.
+        with caplog.at_level(logging.WARNING):
+            b = p._prepare_observation({}, "pick cube")
+
+        messages = [r.message for r in caplog.records]
+        assert any("cam" in m and "missing" in m for m in messages)
+        assert any("j" in m and "missing" in m for m in messages)
+
+        # Video: the absent mapped camera is zero-filled from the modality
+        # config using the default reference shape (no video present to size
+        # against), keeping the (B=1, T=1, H, W, 3) uint8 layout.
+        vid = b["video"]["ego_view_bg_crop_pad_res256_freq20"]
+        assert vid.shape == (1, 1, 256, 256, 3)
+        assert vid.dtype == np.uint8
+        assert not vid.any()
+
+        # State: every model state key is zero-filled at its discovered DOF.
+        for key, dof in (("left_arm", 7), ("right_arm", 7), ("waist", 3)):
+            assert b["state"][key].shape == (1, 1, dof)
+            assert not b["state"][key].any()
+
+        # Language is unaffected by the missing sensor streams.
+        assert b["language"]["task"] == [["pick cube"]]
+
 
 # (section)
 # _unpack_actions
@@ -611,6 +813,32 @@ class TestUnpackActions:
 
     def test_empty(self):
         assert _make_policy(action_mapping=ActionMapping())._unpack_actions({}) == []
+
+
+class TestCoerceActionRow:
+    """_coerce_action_row pins the get_actions() -> list[dict] output typing
+    contract shared by the local and service unpack paths: per-joint values are
+    python float (0-D) or list[float] (vector), never raw np.ndarray."""
+
+    def test_numpy_scalar_becomes_python_float(self):
+        out = _coerce_action_row(np.float32(1.5))
+        assert out == 1.5 and type(out) is float
+
+    def test_numpy_vector_becomes_python_float_list(self):
+        out = _coerce_action_row(np.array([1.0, 2.0], dtype=np.float32))
+        assert out == [1.0, 2.0]
+        assert isinstance(out, list) and all(type(x) is float for x in out)
+
+    def test_python_scalar_without_tolist_becomes_float(self):
+        # Values that do not expose .tolist() (a bare python number) still
+        # coerce to a python float via the ndim==0 branch.
+        out = _coerce_action_row(3)
+        assert out == 3.0 and type(out) is float
+
+    def test_python_sequence_without_tolist_becomes_list(self):
+        # A python list/tuple has no .tolist(); the ndim!=0 branch returns list().
+        assert _coerce_action_row([1.0, 2.0]) == [1.0, 2.0]
+        assert _coerce_action_row((1.0, 2.0)) == [1.0, 2.0]
 
 
 # (section)
@@ -1252,6 +1480,52 @@ class TestServiceUnpackWithMapping:
         p._action_mapping = ActionMapping(actions={})
         result = p._unpack_service_actions({"action.single_arm": np.ones((1, 2, 5))})
         assert "single_arm" in result[0]
+
+
+class TestUnpackMalformedActionChunk:
+    """Both unpack paths must survive degenerate server/model action chunks.
+
+    A well-formed chunk carries a leading time axis on every value, so the
+    unpackers read ``.shape[0]`` for the horizon. An empty chunk yields no
+    actions; a scalar (0-D) value has no time axis and must raise an actionable
+    ``ValueError`` rather than the opaque ``IndexError: tuple index out of
+    range`` that ``.shape[0]`` on a 0-D array would otherwise surface.
+    """
+
+    def test_service_empty_chunk_returns_no_actions(self):
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._action_mapping = None
+        assert p._unpack_service_actions({}) == []
+
+    def test_local_empty_chunk_returns_no_actions(self):
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._action_mapping = ActionMapping(actions={"single_arm": "joints"})
+        assert p._unpack_actions({}) == []
+
+    def test_service_scalar_value_raises_actionable_error(self):
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._action_mapping = None
+        with pytest.raises(ValueError, match=r"scalar \(0-D\) action value"):
+            p._unpack_service_actions({"action.single_arm": 5.0})
+
+    def test_local_scalar_value_raises_actionable_error(self):
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._action_mapping = ActionMapping(actions={"single_arm": "joints"})
+        with pytest.raises(ValueError, match=r"scalar \(0-D\) action value"):
+            p._unpack_actions({"action.single_arm": 5.0})
+
+    def test_scalar_error_names_offending_key(self):
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._action_mapping = None
+        with pytest.raises(ValueError, match="single_arm"):
+            p._unpack_service_actions({"action.single_arm": np.float64(1.0)})
+
+    def test_one_d_value_is_a_valid_horizon(self):
+        """A 1-D value is a horizon of scalars, not a malformed chunk."""
+        p = Gr00tPolicy(data_config="so100", host="localhost", port=19999)
+        p._action_mapping = None
+        result = p._unpack_service_actions({"action.single_arm": np.ones(3)})
+        assert result == [{"single_arm": 1.0}, {"single_arm": 1.0}, {"single_arm": 1.0}]
 
 
 # (section)

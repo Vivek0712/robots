@@ -84,10 +84,14 @@ class TestNormalizeSize:
         # An ellipsoid's three full diameters become per-axis radii (each /2).
         assert _normalize_size("ellipsoid", [0.1, 0.2, 0.3]) == [0.05, 0.1, 0.15]
 
-    def test_ellipsoid_falls_back_to_default_radii_when_size_too_short(self):
-        # A malformed (<3 component) size must not raise; it falls back to the
-        # documented 0.05 default extents (-> 0.025 per-axis radius).
-        assert _normalize_size("ellipsoid", []) == [0.025, 0.025, 0.025]
+    def test_ellipsoid_size_too_short_raises_instead_of_defaulting(self):
+        # Corrected contract: a <3 component ellipsoid size cannot express the
+        # request, and completing it from a hardcoded default compiled a
+        # differently-sized geom while add_object reported success (echoing the
+        # size the caller asked for). It is now rejected, so the caller learns
+        # which components the shape consumes.
+        with pytest.raises(ValueError, match=r"needs 3 'size' component"):
+            _normalize_size("ellipsoid", [])
 
     def test_unknown_shape_raises(self):
         with pytest.raises(ValueError, match="Cannot normalize size"):
@@ -365,6 +369,27 @@ class TestMutation:
         spec = SpecBuilder.build(SimWorld())
         assert SpecBuilder.remove_body(spec, "ghost") is False
 
+    def test_remove_body_added_since_the_last_compile(self):
+        """A body inserted after the last compile is still removable.
+
+        ``spec.body(name)`` resolves only names present at the last
+        ``compile()``/``recompile()``, so a just-added body is invisible to it
+        and reachable only through the ``spec.bodies`` enumeration. Without the
+        fallback scan, rolling back a half-added body removed nothing and the
+        orphan made every later recompile fail on the duplicate name.
+        """
+        spec = SpecBuilder.build(SimWorld())
+        model = spec.compile()
+        data = mujoco.MjData(model)
+
+        spec.worldbody.add_body(name="latecomer")
+        assert spec.body("latecomer") is None, "precondition: invisible to the typed accessor"
+
+        assert SpecBuilder.remove_body(spec, "latecomer") is True
+        assert [b.name for b in spec.bodies] == ["world"]
+        # The spec still compiles, and the name is free for a real object.
+        spec.recompile(model, data)
+
     def test_add_camera_then_recompile(self):
         w = SimWorld()
         spec = SpecBuilder.build(w)
@@ -436,6 +461,64 @@ class TestMutation:
         assert SpecBuilder.remove_camera(spec, "c") is True
         new_model, _ = spec.recompile(model, data)
         assert mujoco.mj_name2id(new_model, mujoco.mjtObj.mjOBJ_CAMERA, "c") < 0
+
+    def test_remove_camera_missing_is_safe_no_op(self):
+        # Removing a camera that was never added is a documented safe no-op:
+        # return False without touching the (still compile-valid) spec.
+        w = SimWorld()
+        w.cameras["keep"] = SimCamera(
+            name="keep", position=[1, 0, 0.5], target=[0, 0, 0], fov=60, width=640, height=480
+        )
+        spec = SpecBuilder.build(w)
+
+        assert SpecBuilder.remove_camera(spec, "ghost") is False
+        # The pre-existing camera survives and the spec still compiles.
+        model = spec.compile()
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "keep") >= 0
+
+    def test_readd_object_after_remove_reuses_material_and_texture_names(self):
+        # Regression guard for the re-add-after-remove asset collision.
+        #
+        # remove_body() deletes only the body; a textured object's
+        # ``<name>_mat`` / ``<name>_tex`` assets are left behind (remove_body
+        # docstring: actuators/sensors/assets are cleaned up separately). If a
+        # later add_object reuses the same object name, MuJoCo would raise
+        # "repeated name" for the duplicate material/texture at compile unless
+        # add_object first drops the orphaned assets. This pins that cleanup.
+        def make_tile() -> SimObject:
+            return SimObject(
+                name="tile",
+                shape="box",
+                position=[0, 0, 0.1],
+                size=[0.1, 0.1, 0.1],
+                color=[1, 0, 0, 1],
+                is_static=False,
+                mass=0.1,
+                material={
+                    "builtin": "checker",
+                    "rgb1": [0.2, 0.2, 0.2],
+                    "rgb2": [0.8, 0.8, 0.8],
+                },
+            )
+
+        w = SimWorld()
+        w.objects["tile"] = make_tile()
+        spec = SpecBuilder.build(w)
+        spec.compile()
+
+        # remove_body drops the body but leaves the material/texture orphaned.
+        assert SpecBuilder.remove_body(spec, "tile") is True
+        assert "tile_mat" in [m.name for m in spec.materials]
+        assert "tile_tex" in [t.name for t in spec.textures]
+
+        # Re-adding the same-named object must drop the stale assets, not
+        # duplicate them, so the spec recompiles cleanly.
+        SpecBuilder.add_object(spec, make_tile())
+        assert [m.name for m in spec.materials].count("tile_mat") == 1
+        assert [t.name for t in spec.textures].count("tile_tex") == 1
+        model = spec.compile()
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "tile") >= 0
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, "tile_mat") >= 0
 
 
 # Mesh-shaped objects + robot-owned camera skip
@@ -794,3 +877,159 @@ class TestFromSources:
         spec = SpecBuilder.from_file(str(p))
         model = spec.compile()
         assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "y") >= 0
+
+
+# MjSpec accessor-drift resilience (defensive branches)
+
+
+class _RecordingBody:
+    """A minimal ``MjsBody``-like stub that records ``add_camera`` calls.
+
+    Only the attributes ``SpecBuilder.add_camera`` touches are implemented:
+    a ``name`` and an ``add_camera(**kwargs)`` sink. This lets the fallback
+    body-scan branch be asserted by its observable effect (the camera landing
+    on the intended parent) rather than by inspecting internal state.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.added_cameras: list[dict] = []
+
+    def add_camera(self, **kwargs) -> None:
+        self.added_cameras.append(kwargs)
+
+
+class _StubSpec:
+    """A tiny ``MjSpec``-like stub with configurable accessor behaviour.
+
+    ``SpecBuilder``'s mutation helpers defensively handle two MjSpec API
+    shapes that differ across mujoco versions: a typed accessor
+    (``spec.body(name)`` / ``spec.mesh(name)``) that either returns ``None``
+    for a missing name OR raises ``KeyError``/``ValueError``. Current mujoco
+    returns ``None``, so the raising branch is never taken with a real spec;
+    this stub drives it deterministically.
+
+    Args:
+        bodies: bodies enumerable via ``spec.bodies`` (the fallback scan).
+        body_raises: if True, ``body()`` raises ``KeyError`` (drift shape).
+        body_hidden: if True, ``body()`` always returns ``None`` even for a
+            name present in ``bodies`` - mirrors a post-``spec.attach()`` body
+            that the typed accessor cannot resolve yet but which is enumerable.
+        mesh_raises: if True, ``mesh()`` raises ``ValueError`` (drift shape).
+        cameras: value returned for the ``cameras`` attribute (``None`` models
+            an MjSpec build that never exposes the camera list).
+    """
+
+    def __init__(
+        self,
+        *,
+        bodies=(),
+        body_raises: bool = False,
+        body_hidden: bool = False,
+        mesh_raises: bool = False,
+        cameras=(),
+    ) -> None:
+        self._bodies = list(bodies)
+        self._body_raises = body_raises
+        self._body_hidden = body_hidden
+        self._mesh_raises = mesh_raises
+        self.cameras = cameras
+        self.worldbody = _RecordingBody("world")
+        self.deleted: list = []
+
+    def body(self, name: str):
+        if self._body_raises:
+            raise KeyError(name)
+        if self._body_hidden:
+            return None
+        for b in self._bodies:
+            if b.name == name:
+                return b
+        return None
+
+    @property
+    def bodies(self):
+        return self._bodies
+
+    def mesh(self, name: str):
+        if self._mesh_raises:
+            raise ValueError(name)
+        return None
+
+    def delete(self, obj) -> None:  # pragma: no cover - not reached in these paths
+        self.deleted.append(obj)
+
+
+class TestSpecAccessorDriftResilience:
+    """SpecBuilder mutation helpers stay safe when the backing MjSpec accessor
+    raises ``KeyError``/``ValueError`` instead of returning ``None``, and mount
+    a camera on a body that only the enumeration (not the typed accessor)
+    can resolve. These defensive branches are dead on mujoco versions whose
+    accessors return ``None``, so they are pinned here to guard against a
+    well-meaning "remove the unreachable except" regression."""
+
+    def test_remove_body_returns_false_when_accessor_raises(self):
+        spec = _StubSpec(body_raises=True)
+        assert SpecBuilder.remove_body(spec, "anything") is False
+        assert spec.deleted == []
+
+    def test_remove_mesh_returns_false_when_accessor_raises(self):
+        spec = _StubSpec(mesh_raises=True)
+        assert SpecBuilder.remove_mesh(spec, "mesh_thing") is False
+        assert spec.deleted == []
+
+    def test_remove_camera_returns_false_when_camera_list_absent(self):
+        spec = _StubSpec(cameras=None)
+        assert SpecBuilder.remove_camera(spec, "cam") is False
+
+    def test_add_camera_raises_actionable_error_when_accessor_raises(self):
+        spec = _StubSpec(body_raises=True)
+        with pytest.raises(ValueError, match="parent_body"):
+            SpecBuilder.add_camera(
+                spec,
+                SimCamera(name="wrist", position=[0, 0, 0.1], target=[0, 0, 0], parent_body="ghost"),
+            )
+
+    def test_add_camera_mounts_on_body_found_only_by_fallback_scan(self):
+        gripper = _RecordingBody("so101/gripper")
+        # body_hidden: the typed accessor cannot resolve the parent (as with a
+        # freshly attached robot body) but it is present in ``spec.bodies``.
+        spec = _StubSpec(bodies=[gripper], body_hidden=True)
+        SpecBuilder.add_camera(
+            spec,
+            SimCamera(name="wrist", position=[0, 0, 0.1], target=[0, 0, 0], parent_body="so101/gripper"),
+        )
+        assert len(gripper.added_cameras) == 1
+        assert gripper.added_cameras[0]["name"] == "wrist"
+        # The camera went to the scanned parent, not the worldbody fallback.
+        assert spec.worldbody.added_cameras == []
+
+
+class TestPublicApiSurface:
+    """``__all__`` declares the public API; private helpers must stay out of it.
+
+    The underscore-prefixed module helpers (``_geom_type`` et al.) are internal
+    implementation detail consumed by sibling modules via explicit-name imports,
+    not through ``from spec_builder import *``. Listing them in ``__all__`` both
+    contradicts their private naming and pollutes the documented public surface.
+    """
+
+    def test_all_declares_only_public_names(self):
+        from strands_robots.simulation.mujoco import spec_builder
+
+        assert spec_builder.__all__ == ["SpecBuilder"]
+        assert all(not name.startswith("_") for name in spec_builder.__all__)
+
+    def test_private_helpers_remain_importable_by_name(self):
+        # Removing them from __all__ must not remove them as module attributes;
+        # scene_ops and simulation import them by explicit name.
+        from strands_robots.simulation.mujoco import spec_builder
+
+        for name in (
+            "_is_z0_ground_plane",
+            "_geom_type",
+            "_normalize_size",
+            "_validate_size",
+            "_target_quat",
+        ):
+            assert callable(getattr(spec_builder, name)), name

@@ -39,6 +39,8 @@ def _make_dummy_engine_class() -> type[SimEngine]:
             timestep: float | None = None,
             gravity: list[float] | None = None,
             ground_plane: bool = True,
+            terrain: str | None = None,
+            difficulty: float = 1.0,
         ) -> dict[str, Any]:
             return {}
 
@@ -61,6 +63,7 @@ def _make_dummy_engine_class() -> type[SimEngine]:
             data_config: str | None = None,
             position: list[float] | None = None,
             orientation: list[float] | None = None,
+            keyframe: str | int | None = None,
         ) -> dict[str, Any]:
             return {}
 

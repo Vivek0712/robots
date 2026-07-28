@@ -103,8 +103,8 @@ graph TB
 
 | Extra | Pulls in | When |
 |-------|----------|------|
-| `[sim-mujoco]` | `mujoco`, `numpy`, `imageio`, `imageio-ffmpeg` | `Robot(mode="sim")` |
-| `[lerobot]` | `lerobot>=0.5.0,<0.6.0`, `torch` | Real hardware OR `LerobotLocalPolicy` |
+| `[sim-mujoco]` | `mujoco`, `numpy`, `imageio`, `imageio-ffmpeg`, `mink`, `qpsolvers` | `Robot(mode="sim")`; `mink`/`qpsolvers` solve IK for the `move_to` primitive |
+| `[lerobot]` | `lerobot>=0.6.0,<0.7.0`, `torch` | Real hardware OR `LerobotLocalPolicy` |
 | `[groot-service]` | `pyzmq`, `msgpack` | `Gr00tPolicy` ZMQ |
 | `[cosmos3-service]` | `msgpack`, `websockets` | `Cosmos3Policy` WebSocket |
 | `[mesh]` | `eclipse-zenoh`, `json5` | Multi-robot mesh |

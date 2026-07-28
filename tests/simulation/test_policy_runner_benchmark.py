@@ -29,7 +29,7 @@ from strands_robots.simulation.benchmark import (
     StepInfo,
     register_benchmark,
 )
-from strands_robots.simulation.policy_runner import PolicyRunner
+from strands_robots.simulation.policy_runner import CooperativeStop, PolicyRunner
 
 # Fixtures
 
@@ -735,7 +735,7 @@ class TestActionHorizon:
 
 
 class TestEvalSeeding:
-    """Round 38 (#168): ``_evaluate_with_spec`` calls ``_set_eval_seed``
+    """Round 38 (#168): ``_evaluate_with_spec`` calls ``set_eval_seed``
     once before the episode loop to seed Python / NumPy / torch / cuDNN
     so policy stochastic ops (e.g. sampling, dropout) are reproducible
     across re-runs.
@@ -749,37 +749,37 @@ class TestEvalSeeding:
     """
 
     def test_set_eval_seed_seeds_python_random(self):
-        """Round 38 (#168): ``_set_eval_seed`` seeds the Python ``random``
+        """Round 38 (#168): ``set_eval_seed`` seeds the Python ``random``
         module so two calls with the same seed produce the same draw.
 
         Pin the basic contract in case future refactors move the seeding
         out of the helper."""
         import random as _stdlib_random
 
-        from strands_robots.simulation.policy_runner import _set_eval_seed
+        from strands_robots.simulation.policy_runner import set_eval_seed
 
-        _set_eval_seed(42)
+        set_eval_seed(42)
         first = [_stdlib_random.random() for _ in range(5)]
-        _set_eval_seed(42)
+        set_eval_seed(42)
         second = [_stdlib_random.random() for _ in range(5)]
         assert first == second
 
     def test_set_eval_seed_seeds_numpy(self):
-        """Round 38 (#168): ``_set_eval_seed`` seeds NumPy's legacy
+        """Round 38 (#168): ``set_eval_seed`` seeds NumPy's legacy
         global RNG (``np.random.seed``). Pin so policies that use
         ``np.random.rand`` etc. are reproducible across re-runs."""
         import numpy as np
 
-        from strands_robots.simulation.policy_runner import _set_eval_seed
+        from strands_robots.simulation.policy_runner import set_eval_seed
 
-        _set_eval_seed(42)
+        set_eval_seed(42)
         first = np.random.rand(5).tolist()
-        _set_eval_seed(42)
+        set_eval_seed(42)
         second = np.random.rand(5).tolist()
         assert first == second
 
     def test_set_eval_seed_tolerates_missing_torch(self, monkeypatch):
-        """Round 38 (#168): ``_set_eval_seed`` no-ops the torch branch
+        """Round 38 (#168): ``set_eval_seed`` no-ops the torch branch
         when torch isn't importable (mock-policy / minimal-CI installs).
 
         Pin so the function works on installs without torch - the
@@ -787,7 +787,7 @@ class TestEvalSeeding:
         import builtins
         import sys
 
-        from strands_robots.simulation.policy_runner import _set_eval_seed
+        from strands_robots.simulation.policy_runner import set_eval_seed
 
         real_import = builtins.__import__
 
@@ -797,14 +797,14 @@ class TestEvalSeeding:
             return real_import(name, *args, **kwargs)
 
         # Drop any cached torch modules so the lazy import inside
-        # _set_eval_seed actually goes through fake_import.
+        # set_eval_seed actually goes through fake_import.
         for mod in list(sys.modules):
             if mod == "torch" or mod.startswith("torch."):
                 monkeypatch.delitem(sys.modules, mod, raising=False)
         monkeypatch.setattr(builtins, "__import__", fake_import)
 
         # Should not raise.
-        _set_eval_seed(42)
+        set_eval_seed(42)
 
     def test_evaluate_benchmark_re_run_yields_same_episode_count(self):
         """Round 38 (#168): re-running ``evaluate_benchmark`` with the
@@ -844,29 +844,47 @@ class TestEvalSeeding:
         assert spec_a.on_step_calls == spec_b.on_step_calls
 
     def test_set_eval_seed_is_public(self):
-        """#179 - ``set_eval_seed`` is part of the public API surface
+        """``set_eval_seed`` is the single public RNG-seeding entry point
         (no leading underscore, exported via ``__all__``).
 
-        Pre-#179 the function was named ``_set_eval_seed`` and only
-        invoked from ``_evaluate_with_spec``. Standalone integration
-        tests in ``tests_integ/.../test_libero_10_scene5_mujoco_engine_success_rate``
-        bypass ``evaluate_benchmark`` and need to call this directly to
-        get reproducible policy rollouts. Pin both the public name and
-        the backward-compat alias so neither rename breaks consumers
-        silently.
+        The helper was renamed from a private ``_set_eval_seed`` to the
+        public ``set_eval_seed`` so standalone callers (integration tests
+        that drive a rollout without ``evaluate_benchmark``) can seed
+        directly. A private back-compat alias lingered afterwards; it is
+        now removed so the module exposes exactly one name. Pin that
+        single-name contract: the private alias must not reappear.
         """
         from strands_robots.simulation import policy_runner
-        from strands_robots.simulation.policy_runner import (
-            _set_eval_seed,
-            set_eval_seed,
-        )
+        from strands_robots.simulation.policy_runner import set_eval_seed
 
         # Public function exists.
         assert callable(set_eval_seed)
-        # Backward-compat alias points at the same function.
-        assert _set_eval_seed is set_eval_seed
         # Exposed in __all__.
         assert "set_eval_seed" in policy_runner.__all__
+        # The private back-compat alias is gone (single public name only).
+        assert not hasattr(policy_runner, "_set_eval_seed")
+
+    def test_set_eval_seed_docstring_matches_public_contract(self):
+        """The docstring must describe the function as it actually is:
+        a public, no-underscore name.
+
+        Regression pin: the docstring previously carried a stale line
+        ("Despite the leading ``_``...") from before the private-to-public
+        rename, and cited a specific test-file path. Both contradict the
+        docstring convention (describe the public contract, reference
+        behavior not test files) and confuse a reader who sees no leading
+        underscore on the actual symbol.
+        """
+        from strands_robots.simulation.policy_runner import set_eval_seed
+
+        doc = set_eval_seed.__doc__ or ""
+        # No stale claim of a leading-underscore / private name.
+        assert "leading ``_``" not in doc
+        assert "leading _" not in doc
+        # No test-file-path citation embedded in the public docstring.
+        assert "tests_integ/" not in doc
+        # The symbol itself is public.
+        assert not set_eval_seed.__name__.startswith("_")
 
     def test_set_eval_seed_torch_reproducibility(self):
         """#179 - ``set_eval_seed`` seeds torch's CPU + CUDA RNGs and
@@ -1155,6 +1173,51 @@ class TestSpecInstructionFallback:
         warnings = [r for r in caplog.records if "instruction is empty" in r.getMessage()]
         assert warnings, "expected a warning about empty instruction"
 
+    def test_degrades_when_spec_instruction_property_raises(self, caplog):
+        """A spec whose ``instruction`` property *raises* (a custom
+        ``BenchmarkProtocol`` built against an older API, or one that computes
+        its instruction lazily and hits an error) must not crash the eval.
+        ``_evaluate_with_spec`` swallows the lookup error, degrades to the
+        empty instruction, and still emits the empty-instruction warning so
+        the operator knows a language-conditioned policy is running blind. Pin
+        so a future refactor does not drop the defensive fallback and turn a
+        broken property into an uncaught crash mid-benchmark."""
+        import logging as _logging
+
+        captured: list[str] = []
+
+        class _LangPolicy(MockPolicy):
+            async def get_actions(self, observation_dict, instruction, **kwargs):
+                captured.append(instruction)
+                return [{}]
+
+        class _SpecWithRaisingInstruction(_CountingBenchmark):
+            @property
+            def instruction(self) -> str:
+                raise RuntimeError("instruction backend not wired up")
+
+        sim = FakeSim()
+        policy = _LangPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        with caplog.at_level(_logging.DEBUG, logger="strands_robots.simulation.policy_runner"):
+            result = PolicyRunner(sim).evaluate(
+                "fake_robot", policy, spec=_SpecWithRaisingInstruction(), n_episodes=1, seed=42
+            )
+
+        # Eval completed instead of crashing on the raising property.
+        assert result["status"] == "success", f"eval should survive a raising spec.instruction; got {result}"
+        # The policy ran with the degraded empty instruction, not a partial value.
+        assert captured, "expected at least one get_actions call"
+        assert all(c == "" for c in captured), f"expected empty instruction, got {captured!r}"
+        # The lookup failure is surfaced at DEBUG, not silently swallowed.
+        assert any("spec.instruction lookup raised" in r.getMessage() for r in caplog.records), (
+            "expected a DEBUG log noting the spec.instruction lookup raised"
+        )
+        # The operator still gets the empty-instruction WARNING after degrading.
+        assert any("instruction is empty" in r.getMessage() for r in caplog.records), (
+            "expected the empty-instruction warning after degrading"
+        )
+
 
 class TestOnFrameHookForSpec:
     """#191: ``policy_runner._evaluate_with_spec`` invokes ``on_frame``
@@ -1439,3 +1502,109 @@ class TestDegeneratePolicyInBenchmarkLoop:
         assert result["status"] == "error"
         assert "on_step failed" in result["content"][0]["text"]
         assert "on_step boom" in result["content"][0]["text"]
+
+
+class TestCooperativeStop:
+    """A CooperativeStop from on_frame ends a benchmark eval gracefully."""
+
+    def test_spec_cooperative_stop_ends_gracefully(self):
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+
+        def hook(step, obs, action):
+            if step >= 4:
+                raise CooperativeStop("user stopped benchmark")
+
+        result = PolicyRunner(sim).evaluate(
+            "fake_robot",
+            policy,
+            spec=_CountingBenchmark(),
+            n_episodes=5,
+            on_frame=hook,
+        )
+        # Pre-fix: uncaught CooperativeStop propagated out and crashed the eval.
+        assert result["status"] == "success"
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        assert payload["stopped_early"] is True
+        # _CountingBenchmark runs 20 steps/episode, so the stop fires during
+        # episode 0 -> no episode fully completed.
+        assert payload["episodes_completed"] == 0
+        assert payload["n_episodes"] == 5
+
+    def test_spec_without_cooperative_stop_not_flagged(self):
+        sim = FakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+        result = PolicyRunner(sim).evaluate("fake_robot", policy, spec=_CountingBenchmark(), n_episodes=2)
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        assert payload["stopped_early"] is False
+        assert payload["episodes_completed"] == 2
+
+    def test_evaluate_benchmark_docstring_documents_cooperative_stop(self):
+        """The ``evaluate_benchmark`` facade must document the cooperative-stop
+        contract, matching its ``eval_policy`` / ``run_policy`` siblings.
+
+        A caller relying only on the facade docstring otherwise cannot discover
+        that raising ``CooperativeStop`` from ``on_frame`` ends the eval
+        gracefully (rather than crashing with an uncaught ``BaseException``) and
+        that the result reports ``stopped_early`` / ``episodes_completed``.
+        """
+        doc = SimEngine.evaluate_benchmark.__doc__ or ""
+        assert "CooperativeStop" in doc, "evaluate_benchmark doc must name CooperativeStop"
+        assert "stopped_early" in doc, "evaluate_benchmark doc must document stopped_early"
+        assert "episodes_completed" in doc, "evaluate_benchmark doc must document episodes_completed"
+
+    def test_spec_cooperative_stop_closes_in_progress_video(self, tmp_path: Path):
+        """A cooperative stop mid-episode with recording active closes the
+        in-progress episode's video writer cleanly and drops it from
+        ``video_paths`` (the episode never completed), while the eval still
+        returns a graceful ``stopped_early`` result.
+        """
+        import base64
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        def _png_b64() -> str:
+            buf = io.BytesIO()
+            Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8)).save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode()
+
+        class _RenderingFakeSim(FakeSim):
+            """FakeSim that returns a decodable PNG so the rollout video writer
+            actually opens and captures frames (base FakeSim renders no image)."""
+
+            def render(self, camera_name="default", width=None, height=None):
+                return {
+                    "status": "success",
+                    "content": [{"image": {"format": "png", "source": {"bytes": _png_b64()}}}],
+                }
+
+        sim = _RenderingFakeSim()
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim.robot_joint_names("fake_robot"))
+
+        def hook(step, obs, action):
+            # Fire during episode 0 (max_steps=20) so the episode never completes
+            # and its video writer is still open when the stop propagates.
+            if step >= 4:
+                raise CooperativeStop("user stopped benchmark")
+
+        video_path = tmp_path / "rollout.mp4"
+        result = PolicyRunner(sim).evaluate(
+            "fake_robot",
+            policy,
+            spec=_CountingBenchmark(),
+            n_episodes=5,
+            on_frame=hook,
+            video={"path": str(video_path), "fps": 30, "camera": "default"},
+        )
+        assert result["status"] == "success"
+        payload = next(c["json"] for c in result["content"] if "json" in c)
+        assert payload["stopped_early"] is True
+        # Stop fired inside episode 0 -> no episode fully completed.
+        assert payload["episodes_completed"] == 0
+        # The interrupted episode's partial video is closed but never reported.
+        assert payload["video_paths"] == []

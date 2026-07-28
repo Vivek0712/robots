@@ -5,8 +5,7 @@ serialised ``access_control`` block ready for
 ``zenoh.Config.insert_json5``. When the env var is unset, returns the
 permissive :func:`default_acl` skeleton.
 
-Zenoh 1.x quirks (each verified against a live session in
-``tests/mesh/test_zenoh_transport_security.py``):
+Zenoh 1.x quirks (each verified against a live session):
 
 * ``enabled: true`` is required -- without it the entire block is a
   no-op even if rules and subjects are populated.
@@ -84,7 +83,7 @@ ACL_FILE_MAX_BYTES: int = 256 * 1024
 
 # json5 is imported lazily inside
 # ``_parse_json5`` rather than at module top-level. Importing it eagerly every
-# import of ``strands_robots.mesh`` (including ``session.py`` for
+# import of ``strands_robots.mesh`` (including ``strands_robots.mesh.session`` for
 # ``auth_mode=none`` dev paths) triggered the json5 import even when
 # no ACL file is loaded. Operators running with no ACL file (the
 # permissive default) and no ``mesh`` extra installed got an
@@ -100,7 +99,7 @@ def _parse_json5(raw: str, path: Path) -> Any:
     boundary: a malformed file does NOT silently degrade to the
     permissive default.
     """
-    # Review thread _acl_config.py:85 -- use the project-standard
+    # Use the project-standard
     # ``require_optional`` helper so the operator-facing import error
     # carries the canonical install-hint format used elsewhere in the
     # SDK (groot, libero, etc.). This still lazy-imports
@@ -142,7 +141,7 @@ def _load_acl_file(path: Path) -> dict[str, Any]:
     # ACL_FILE_MAX_BYTES + 1 so an attacker who races content between
     # stat() and read() cannot bypass the size cap. Mirrors the
     # O_NOFOLLOW + bounded-read discipline used for the audit log
-    # (audit.py:_ensure_paths). The ACL file gates wire authorisation,
+    # (``strands_robots.mesh.audit._ensure_paths``). The ACL file gates wire authorisation,
     # so the same TOCTOU + symlink-swap defences apply.
     if path.is_symlink():
         raise ValueError(
@@ -205,8 +204,8 @@ def _load_acl_file(path: Path) -> dict[str, Any]:
         # ``allow`` + non-empty ``rules``. The built-in ``default_acl()``
         # (used when STRANDS_MESH_ACL_FILE is unset) ships ``allow +
         # empty rules/subjects/policies``; warning operators who copy
-        # that shape into a file is asymmetric scolding. Per review
-        # thread _acl_config.py:199, scope the trigger to ``rules``
+        # that shape into a file is asymmetric scolding. Scope
+        # the trigger to ``rules``
         # specifically (the load-bearing part of the blacklist
         # anti-pattern) and phrase the warning to match: "allow +
         # rules" is the foot-gun, not "allow + anything".
@@ -237,7 +236,7 @@ def _load_acl_file(path: Path) -> dict[str, Any]:
                     f"{len(data['rules'])} rule(s) -- a blacklist policy where any "
                     "rule gap exposes the mesh. Refusing to load. Remediate one of:\n"
                     "  1. Rewrite the ACL with default_permission='deny' and "
-                    "explicit allow rules (see examples/mesh_acl_example.json5).\n"
+                    "explicit allow rules (see examples/mesh/mesh_acl_example.json5).\n"
                     "  2. Set STRANDS_MESH_ACCEPT_PERMISSIVE_ACL=1 to acknowledge "
                     "the dev/lab posture."
                 )
@@ -259,7 +258,7 @@ def _load_acl_file(path: Path) -> dict[str, Any]:
                 "DENY (every key denied for every peer). If intentional this is the "
                 "'firewall mesh off' posture; otherwise add at least one "
                 "allow-permission rule plus a matching policy/subject "
-                "(see examples/mesh_acl_example.json5).",
+                "(see examples/mesh/mesh_acl_example.json5).",
                 path,
             )
     _validate_acl_shape(data, path)
@@ -352,7 +351,7 @@ def _validate_acl_shape(data: dict[str, Any], path: Path) -> None:
                 f"ACL file {path}: subjects[{i}={sid!r}].cert_common_names must be a list "
                 f"(or omitted), got {type(cns).__name__}. Common typo: cert_common_name (singular)."
             )
-        # Review thread _acl_config.py:279/293 -- HARD-REJECT subjects
+        # HARD-REJECT subjects
         # that constrain neither ``interfaces`` nor
         # ``cert_common_names``. A subject with only an ``id`` (or
         # with both fields explicitly empty) maps to
@@ -435,7 +434,7 @@ def default_acl(namespace: str) -> dict[str, Any]:
     Operators who want per-role enforcement supply their own ACL via
     ``STRANDS_MESH_ACL_FILE`` enumerating each peer's exact cert CN
     (Zenoh 1.x cert_common_names does not support globs -- see
-    ``examples/mesh_acl_example.json5`` for the canonical template).
+    ``examples/mesh/mesh_acl_example.json5`` for the canonical template).
 
     Why permissive default rather than default-deny: a default-deny
     skeleton with no enumerated subjects rejects every legitimate
@@ -451,7 +450,7 @@ def default_acl(namespace: str) -> dict[str, Any]:
     # special-casing ``default_acl``. The built-in default ACL itself is
     # namespace-independent (Zenoh's namespace config does the routing
     # isolation; ACL key_exprs are RELATIVE to the active namespace and
-    # do not need a namespace prefix). Review thread PR#224 _acl_config.py:343.
+    # do not need a namespace prefix).
     _ = namespace  # noqa: F841 -- kept for API symmetry
     return {
         "enabled": True,
@@ -459,7 +458,7 @@ def default_acl(namespace: str) -> dict[str, Any]:
         # publish and subscribe on any key. This is the documented behaviour
         # (CHANGELOG section 8, README "Default ACL -- permissive by design").
         # Operators wanting per-role enforcement supply STRANDS_MESH_ACL_FILE
-        # (see examples/mesh_acl_example.json5 for the canonical template).
+        # (see examples/mesh/mesh_acl_example.json5 for the canonical template).
         #
         # Earlier versions of this default mixed default_permission='deny'
         # with two key_exprs=['**'] allow-rules; the effective behaviour was
@@ -510,7 +509,7 @@ def _load_acl_cached(path: Path) -> dict[str, Any]:
     with _ACL_CACHE_LOCK:
         cached = _ACL_CACHE.get(identity)
         if cached is not None:
-            # Review thread _acl_config.py:429 -- return a deep copy so
+            # Return a deep copy so
             # caller mutation does not poison the cache for subsequent
             # callers. The cost is a small dict copy on every hit (ACL
             # files are tiny by ACL_FILE_MAX_BYTES = 256KiB).
@@ -523,10 +522,10 @@ def _load_acl_cached(path: Path) -> dict[str, Any]:
         if len(_ACL_CACHE) >= 4:
             _ACL_CACHE.pop(next(iter(_ACL_CACHE)))
         # Store a deep copy in the cache so caller mutation of the
-        # returned dict does NOT poison the cached entry (review
-        # _acl_config.py:429). Symmetric with the deep-copy on hit.
+        # returned dict does NOT poison the cached entry. Symmetric
+        # with the deep-copy on hit.
         _ACL_CACHE[identity] = copy.deepcopy(loaded)
-    # Review thread _acl_config.py:458 -- return a deep copy on miss
+    # Return a deep copy on miss
     # too, so the FIRST caller for a given file identity sees the same
     # immutability contract subsequent callers get from the hit branch.
     # The previous code returned ``loaded`` directly, giving the first
@@ -545,7 +544,7 @@ def _clear_acl_cache_for_test() -> None:
         _ACL_CACHE.clear()
 
 
-# Issue #218 / review session.py:296 -- thread-local single-flight ACL
+# Issue #218 -- thread-local single-flight ACL
 # snapshot. ``Mesh.start`` calls ``snapshot_acl`` once at the gate, then
 # ``session._build_config`` runs inside the same call stack and would
 # call ``snapshot_acl`` AGAIN. The previous identity-tuple cache could
@@ -571,7 +570,7 @@ def _set_thread_snapshot(
     """Stash a resolved ACL dict (and optional ``auth_mode``) on the
     current thread for downstream reuse.
 
-    Review thread core.py:139 -- the ``auth_mode`` env var
+    The ``auth_mode`` env var
     (``STRANDS_MESH_AUTH_MODE``) is read independently by
     ``Mesh._refuse_under_permissive_default_acl`` and
     ``session._build_config``. A flip between the two reads (concurrent
@@ -644,7 +643,7 @@ def _is_permissive_acl_shape(data: dict[str, Any]) -> bool:
        ``SubjectProperty::Wildcard`` on every dimension), AND that
        subject is referenced by the wildcard rule's policy.
 
-       This is the gap flagged in review at _acl_config.py:456 --
+       This is the permissive-bypass gap:
        ``default_permission: "deny"`` plus a single ``key_exprs:
        ["**"]/permission: "allow"`` rule plus a wildcard subject
        ("any CA-signed peer publishes/subscribes everywhere") was
@@ -774,7 +773,7 @@ def resolve_acl(namespace: str) -> dict[str, Any]:
 def snapshot_acl(namespace: str = "strands") -> tuple[bool, dict[str, Any]]:
     """Atomically resolve the ACL and report its permissive-by-shape state.
 
-    Issue #218 + review thread session.py:296: closes the TOCTOU window
+    Issue #218: closes the TOCTOU window
     between the ``Mesh.start`` refuse-to-start gate and the
     ``session._build_config`` wire-config builder.
 

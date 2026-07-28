@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 # the lazy attributes below (the runtime __getattr__ resolves them to Any
 # from the static analyzer's perspective). PEP 562.
 if TYPE_CHECKING:
+    from strands_robots.dataset_recorder import sync_dataset_to_bucket
     from strands_robots.device_connect import (
         ReachyMiniDriver,
         RobotDeviceDriver,
@@ -58,10 +59,11 @@ if TYPE_CHECKING:
         list_backends,
         register_backend,
     )
-    from strands_robots.streaming_dataset import StreamingDatasetReader
+    from strands_robots.streaming_dataset import StreamingDatasetReader, stream_dataset
     from strands_robots.teleoperator import Teleoperator
     from strands_robots.tools.download_assets import download_assets
     from strands_robots.tools.gr00t_inference import gr00t_inference
+    from strands_robots.tools.harness_memory import harness_memory
     from strands_robots.tools.lerobot_calibrate import lerobot_calibrate
     from strands_robots.tools.lerobot_camera import lerobot_camera
     from strands_robots.tools.lerobot_teleoperate import lerobot_teleoperate
@@ -119,6 +121,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # Tools
     "download_assets": ("strands_robots.tools.download_assets", "download_assets"),
     "gr00t_inference": ("strands_robots.tools.gr00t_inference", "gr00t_inference"),
+    "harness_memory": ("strands_robots.tools.harness_memory", "harness_memory"),
     "lerobot_calibrate": ("strands_robots.tools.lerobot_calibrate", "lerobot_calibrate"),
     "lerobot_camera": ("strands_robots.tools.lerobot_camera", "lerobot_camera"),
     "lerobot_teleoperate": ("strands_robots.tools.lerobot_teleoperate", "lerobot_teleoperate"),
@@ -139,6 +142,12 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "SimulationDeviceDriver": ("strands_robots.device_connect", "SimulationDeviceDriver"),
     "ReachyMiniDriver": ("strands_robots.device_connect", "ReachyMiniDriver"),
     "StreamingDatasetReader": ("strands_robots.streaming_dataset", "StreamingDatasetReader"),
+    # Simulator-free dataset read-back: thin alias for StreamingDatasetReader.open.
+    # Lazy so training/eval scripts pay the torch/lerobot import only on first call.
+    "stream_dataset": ("strands_robots.streaming_dataset", "stream_dataset"),
+    # Lifecycle-independent bucket sync for on-disk LeRobotDataset dirs. Lazy
+    # because strands_robots.dataset_recorder imports numpy at module level.
+    "sync_dataset_to_bucket": ("strands_robots.dataset_recorder", "sync_dataset_to_bucket"),
 }
 
 __all__ = [
@@ -169,6 +178,7 @@ __all__ = [
     "register_backend",
     "download_assets",
     "gr00t_inference",
+    "harness_memory",
     "lerobot_camera",
     "lerobot_teleoperate",
     "lerobot_train",
@@ -187,6 +197,8 @@ __all__ = [
     "SimulationDeviceDriver",
     "ReachyMiniDriver",
     "StreamingDatasetReader",
+    "stream_dataset",
+    "sync_dataset_to_bucket",
 ]
 
 

@@ -31,7 +31,10 @@ methods (e.g. MuJoCo acquires a lock inside ``send_action`` / ``step``).
 
 from __future__ import annotations
 
+import difflib
 import logging
+import math
+import numbers
 import os
 import random
 import time
@@ -43,7 +46,7 @@ import numpy as np
 
 from strands_robots._async_utils import _resolve_coroutine
 from strands_robots.policies.base import resolve_chunk_length
-from strands_robots.utils import process_rss_mb, require_optional
+from strands_robots.utils import positive_whole_number_error, process_rss_mb, require_optional
 
 if TYPE_CHECKING:
     from strands_robots.policies.base import Policy
@@ -89,12 +92,11 @@ def set_eval_seed(seed: int) -> None:
       are scoped to torch (not the broader environment) so the side
       effect surface is acceptable.
 
-    Public since #179: standalone integration tests
-    (``tests_integ/.../test_libero_10_scene5_mujoco_engine_success_rate``)
-    bypass :meth:`evaluate_benchmark` and need to call this directly to
-    get reproducible policy rollouts. The leading ``_`` was an oversight
-    from #168 round 38; the function is the supported way to seed an
-    eval and is part of the public API.
+    Public API - the single supported RNG-seeding entry point, exported
+    via ``__all__``. :meth:`evaluate_benchmark` calls it once before an
+    eval, but standalone callers that drive a policy rollout without
+    going through ``evaluate_benchmark`` can call it directly to get
+    reproducible rollouts.
 
     NumPy / torch are imported lazily so this helper works on minimal
     installs that don't have torch (e.g. ``policy_provider="mock"``
@@ -119,12 +121,6 @@ def set_eval_seed(seed: int) -> None:
         pass
 
 
-# Backward-compatibility alias for the pre-#179 private name. Internal
-# callers (this module's :class:`PolicyRunner`) still use it; the public
-# :func:`set_eval_seed` is the supported entry point.
-_set_eval_seed = set_eval_seed
-
-
 # Hook signature: called every control step after send_action.
 # on_frame(step_idx, observation, action) -> None
 OnFrame = Callable[[int, dict[str, Any], dict[str, Any]], None]
@@ -141,8 +137,12 @@ def _extract_frame_ndarray(render_result: dict) -> np.ndarray | None:
     ``{"image": {"format": "png", "source": {"bytes": <str|bytes>}}}``.
     The ``bytes`` field may contain raw bytes (legacy) or a base64-encoded
     string (current). This helper walks that structure, decodes the PNG,
-    and returns a (H, W, 3|4) numpy array. Returns ``None`` if no image is
-    found - the recorder then skips the frame rather than aborting the rollout.
+    and returns a contiguous (H, W, 3) RGB numpy array - the source is
+    always run through ``PIL.Image.convert("RGB")`` so any alpha channel
+    is dropped and the shape is a fixed 3-channel array. Returns ``None``
+    if no decodable image is found (missing/malformed content blocks, an
+    empty ``bytes`` field, or a PNG that fails to decode) - the recorder
+    then skips the frame rather than aborting the rollout.
     """
     if not isinstance(render_result, dict):
         return None
@@ -176,6 +176,21 @@ def _extract_frame_ndarray(render_result: dict) -> np.ndarray | None:
     return None
 
 
+# Canonical :class:`VideoConfig` field -> the dict keys accepted for it, canonical
+# key first followed by the legacy/tool_spec aliases. Single source of truth for
+# both the schema check (``VideoConfig.validation_error``) and the value lookup
+# (``VideoConfig.from_dict``), so the accepted set cannot drift between the two.
+_VIDEO_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "path": ("path", "record_video", "output_path"),
+    "fps": ("fps", "video_fps"),
+    "camera": ("camera", "video_camera", "camera_name"),
+    "width": ("width", "video_width"),
+    "height": ("height", "video_height"),
+}
+
+_VIDEO_ACCEPTED_KEYS: tuple[str, ...] = tuple(sorted(key for aliases in _VIDEO_KEY_ALIASES.values() for key in aliases))
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """Configuration for optional MP4 recording during :meth:`PolicyRunner.run`.
@@ -191,7 +206,10 @@ class VideoConfig:
             separators, shell metacharacters, or symlinked target) before a
             writer is opened; set ``STRANDS_ROBOTS_VIDEO_ROOT`` to confine it
             to a sandbox.
-        fps: Frames per second to write.
+        fps: Frames per second to write. Capped at ``control_frequency``
+            when it would exceed it, so the rollout always plays back at
+            real time (a rollout renders at most one frame per control
+            step and cannot be up-sampled).
         camera: Camera name to render from. ``None`` → backend default.
         width: Render width in pixels.
         height: Render height in pixels.
@@ -205,21 +223,278 @@ class VideoConfig:
 
     @property
     def enabled(self) -> bool:
+        """Whether recording is on: ``True`` iff an output ``path`` was set.
+
+        The other fields (``fps``, ``camera``, ``width``, ``height``) are
+        ignored when this is ``False`` -- a falsy ``path`` opts the whole
+        rollout out of MP4 capture.
+        """
         return bool(self.path)
+
+    @staticmethod
+    def _pick(d: dict[str, Any], field: str, default: Any = None) -> Any:
+        """First present, non-``None`` value among ``field``'s accepted keys.
+
+        Looks the canonical key up first, then the legacy aliases, so
+        ``{"path": ..., "output_path": ...}`` resolves to the canonical one.
+        Membership - not truthiness - decides: a caller-supplied ``0`` is
+        returned as ``0`` (and rejected by :meth:`validation_error`) instead of
+        collapsing into ``default`` the way an ``or`` chain would.
+
+        Args:
+            d: The caller's video-config dict.
+            field: Canonical field name (a key of the alias map).
+            default: Returned when no accepted key carries a value.
+
+        Returns:
+            The caller's value, or ``default``.
+        """
+        for key in _VIDEO_KEY_ALIASES[field]:
+            value = d.get(key)
+            if value is not None:
+                return value
+        return default
+
+    @staticmethod
+    def _positive_int_error(value: Any, key: str) -> str | None:
+        """Error text when a ``video`` dict value is not a positive whole number.
+
+        Thin binding of the shared frame/pixel-count domain
+        (:func:`positive_whole_number_error`) to the ``video:`` message prefix,
+        so this dict schema and the plain-MP4 recorder's keyword parameters
+        cannot drift apart on what counts as a usable ``fps`` / ``width`` /
+        ``height``.
+
+        Args:
+            value: The caller-supplied value.
+            key: The dict key it came from, used in the message.
+
+        Returns:
+            An error message, or ``None`` when the value is usable.
+        """
+        return positive_whole_number_error(value, key, "video")
+
+    @classmethod
+    def validation_error(cls, d: Any) -> str | None:
+        """Error text when ``d`` is not a video config this class can honor.
+
+        Recording options arrive as a free-form dict (LLM tool call or direct
+        API), so a mistyped key has no signature to bounce off. Silently
+        ignoring one is the worst outcome: ``{"filename": "/tmp/a.mp4"}``
+        leaves ``path`` unset and the rollout reports ``status="success"``
+        with no MP4 anywhere, and ``{"path": p, "resolution": [320, 240]}``
+        records at the default 640x480 while the caller believes otherwise.
+        This rejects any key outside the accepted set (with a closest-match
+        hint) and any known key whose value cannot be honored.
+
+        Args:
+            d: The caller's ``video`` argument. ``None`` (recording off) and an
+                empty dict are valid.
+
+        Returns:
+            An error message describing the first problem found, or ``None``
+            when the config is usable.
+        """
+        if d is None:
+            return None
+        if not isinstance(d, dict):
+            return f"video must be a dict of recording options, got {type(d).__name__}."
+        accepted = ", ".join(_VIDEO_ACCEPTED_KEYS)
+        for key in d:
+            if key in _VIDEO_ACCEPTED_KEYS:
+                continue
+            # Match case-insensitively so "FPS"/"Path" suggest their canonical
+            # spelling; the cutoff is deliberately tight so an unrelated key
+            # ("filename", "resolution") gets the accepted list rather than a
+            # misleading nearest-neighbour.
+            close = difflib.get_close_matches(str(key).lower(), _VIDEO_ACCEPTED_KEYS, n=1, cutoff=0.7)
+            hint = f" Did you mean {close[0]!r}?" if close else ""
+            return f"video: unknown key {key!r}.{hint} Accepted keys: {accepted}."
+        for field in ("path", "camera"):
+            value = cls._pick(d, field)
+            if value is not None and not isinstance(value, str):
+                return f"video: {field} must be a string, got {value!r}."
+        for field in ("fps", "width", "height"):
+            value = cls._pick(d, field)
+            if value is None:
+                continue
+            if error := cls._positive_int_error(value, field):
+                return error
+        return None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> VideoConfig | None:
-        """Build from a plain dict (tool_spec dispatcher path). ``None`` passthrough."""
+        """Build from a plain dict (tool_spec dispatcher path). ``None`` passthrough.
+
+        Accepts both canonical keys and the legacy/tool_spec aliases listed in
+        :meth:`validation_error`.
+
+        Args:
+            d: Video-config dict, or ``None``/empty for "no recording".
+
+        Returns:
+            The config, or ``None`` when ``d`` is empty.
+
+        Raises:
+            ValueError: When ``d`` carries a key or value that cannot be
+                honored (see :meth:`validation_error`). Public entry points
+                (``run_policy`` / ``eval_policy`` / ``evaluate_benchmark`` /
+                ``start_policy``) check first and return a structured tool
+                error, so this raise is the guard for direct construction.
+        """
         if not d:
             return None
-        # Accept both canonical keys and legacy/tool_spec aliases.
+        if error := cls.validation_error(d):
+            raise ValueError(error)
         return cls(
-            path=d.get("path") or d.get("record_video") or d.get("output_path"),
-            fps=int(d.get("fps") or d.get("video_fps") or 30),
-            camera=d.get("camera") or d.get("video_camera") or d.get("camera_name"),
-            width=int(d.get("width") or d.get("video_width") or 640),
-            height=int(d.get("height") or d.get("video_height") or 480),
+            path=cls._pick(d, "path"),
+            fps=int(cls._pick(d, "fps", 30)),
+            camera=cls._pick(d, "camera"),
+            width=int(cls._pick(d, "width", 640)),
+            height=int(cls._pick(d, "height", 480)),
         )
+
+
+class _RolloutVideoWriter:
+    """Optional per-rollout MP4 writer: validate the (LLM-supplied) output path,
+    probe the camera, open an imageio writer, append frames at the requested fps
+    cadence, and finalize on close.
+
+    Extracted from :meth:`PolicyRunner.run` so the multi-episode evaluation loop
+    (:meth:`PolicyRunner.evaluate`) records rollout video identically - one
+    source of truth for the security-sensitive path validation (see PR #930)
+    and the frame-capture cadence, rather than two copies that can drift.
+    """
+
+    def __init__(
+        self,
+        sim: Any,
+        video: VideoConfig,
+        writer: Any,
+        resolved_path: str,
+        control_frequency: float,
+    ) -> None:
+        self.sim = sim
+        self.video = video
+        self.path = resolved_path
+        self._writer = writer
+        self.frame_count = 0
+        self._frame_interval = control_frequency / max(video.fps, 1)
+        self._next_frame_step = 0.0
+
+    @classmethod
+    def open(
+        cls, sim: Any, video: VideoConfig | None, control_frequency: float
+    ) -> tuple[_RolloutVideoWriter | None, dict[str, Any] | None]:
+        """Return ``(writer, error)``.
+
+        ``(None, None)``   -> recording disabled (``video`` is falsy); proceed.
+        ``(None, error)``  -> setup failed; the caller returns ``error`` verbatim.
+        ``(writer, None)`` -> writer ready.
+        """
+        if video is None or not video.enabled:
+            return None, None
+        # video.enabled guarantees video.path is a non-empty str; narrow for mypy.
+        assert video.path is not None
+        # video.path is LLM-supplied: reject shell metacharacters, backslash
+        # separators, ".." traversal, and a symlinked target before we makedirs +
+        # open a writer on it. Absolute paths stay allowed (the historic
+        # contract); set STRANDS_ROBOTS_VIDEO_ROOT to sandbox them.
+        _sb_root, _allow_abs = video_sandbox_args()
+        try:
+            resolved = str(
+                validate_output_path(video.path, sandbox_root=_sb_root, allow_abs=_allow_abs, label="video path")
+            )
+        except ValueError as _e:
+            return None, {"status": "error", "content": [{"text": f"video recording: {_e}"}]}
+
+        # Pre-validate the camera name ONCE before the step loop. This surfaces
+        # "camera not found" as a clean up-front error rather than silently
+        # writing a 0-byte MP4 (sim.render() returns status=error, the rollout
+        # runs to completion, and the user gets an empty file with no hint).
+        probe_cam = video.camera or "default"
+        try:
+            _probe = sim.render(camera_name=probe_cam, width=video.width, height=video.height)
+        except Exception as e:
+            return None, {
+                "status": "error",
+                "content": [{"text": f"Video recording requested but render probe crashed: {e}"}],
+            }
+        if _probe.get("status") != "success":
+            probe_text = (_probe.get("content") or [{}])[0].get("text", "")
+            return None, {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"Video recording requested but camera "
+                            f"'{probe_cam}' is not renderable.\n"
+                            f"{probe_text}\n"
+                            "Hint: robot cameras are namespaced, e.g. a "
+                            "camera named 'side' inside robot 'arm1' compiles "
+                            "as 'arm1/side'. Pass video={'camera': 'arm1/side', ...}."
+                        )
+                    }
+                ],
+            }
+
+        imageio = require_optional(
+            "imageio",
+            pip_install="imageio imageio-ffmpeg",
+            extra="sim-mujoco",
+            purpose="video recording",
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(resolved)), exist_ok=True)
+        # A rollout renders at most one frame per applied control step, so the
+        # video cannot carry more than ``control_frequency`` unique frames per
+        # second of sim time. When the requested ``fps`` exceeds
+        # ``control_frequency`` the capture cadence still grabs every step (it
+        # cannot up-sample), so writing the MP4 at the requested ``fps`` would
+        # play the rollout back FASTER than real time (by ``fps /
+        # control_frequency``). Cap the writer fps at ``control_frequency`` so
+        # the rollout always plays back at real time. When ``fps <=
+        # control_frequency`` the capture cadence down-samples and the video is
+        # already real time at the requested ``fps`` (unchanged).
+        write_fps = video.fps
+        if control_frequency > 0 and video.fps > control_frequency:
+            write_fps = max(1, round(control_frequency))
+            logger.warning(
+                "Video fps=%d exceeds control_frequency=%.1f Hz; a rollout can "
+                "render at most one frame per control step, so the MP4 is "
+                "written at %d fps to play back at real time (requesting a "
+                "higher fps would only speed the video up).",
+                video.fps,
+                control_frequency,
+                write_fps,
+            )
+        writer = imageio.get_writer(  # type: ignore[attr-defined]
+            resolved, fps=write_fps, quality=8, macro_block_size=1
+        )
+        return cls(sim, video, writer, resolved, control_frequency), None
+
+    def capture(self, step_count: int) -> None:
+        """Append one frame if the fps cadence is due at ``step_count``.
+
+        Call once per applied control step; the cadence (``control_frequency /
+        fps``) decides which steps actually render. A render/decode failure is
+        skipped silently rather than aborting the rollout (a renderer hiccup
+        must not kill training).
+        """
+        if step_count < self._next_frame_step:
+            return
+        frame = self.sim.render(
+            camera_name=self.video.camera or "default",
+            width=self.video.width,
+            height=self.video.height,
+        )
+        img_arr = _extract_frame_ndarray(frame)
+        if img_arr is not None:
+            self._writer.append_data(img_arr)
+            self.frame_count += 1
+        self._next_frame_step += self._frame_interval
+
+    def close(self) -> None:
+        self._writer.close()
 
 
 # on_frame hooks that raise are logged at WARN - user-provided telemetry is
@@ -261,13 +536,64 @@ def _extract_result_json(result: object) -> dict[str, Any] | None:
     return None
 
 
+def _validate_action_key_map(action_key_map: Any) -> dict[str, Any] | None:
+    """Reject a ``replay`` ``action_key_map`` no backend could honor.
+
+    ``action_key_map`` binds recorded action-vector indices to the action keys
+    ``send_action`` resolves, so it must be an ordered collection of unique
+    strings. Three shapes are silently unusable and are rejected here:
+
+    * a bare ``str`` - ``list("gripper")`` yields one key per character;
+    * a non-string entry - it cannot name an actuator or joint;
+    * a duplicate key - two recorded indices would write the same actuator,
+      the later index silently overwriting the earlier one.
+
+    An empty collection is rejected too: it maps no recorded value at all.
+
+    Args:
+        action_key_map: The caller-supplied map (``None`` selects the default
+            ``robot_action_keys`` ordering and is always accepted).
+
+    Returns:
+        An agent-tool error dict describing the problem, or ``None`` when the
+        map is usable.
+    """
+    if action_key_map is None:
+        return None
+
+    def _error(text: str) -> dict[str, Any]:
+        return {"status": "error", "content": [{"text": f"replay: {text}"}]}
+
+    if isinstance(action_key_map, str | bytes):
+        return _error(
+            f"action_key_map must be a list of action keys, not a bare string (got {action_key_map!r}); "
+            "a string is consumed one character per action index."
+        )
+    if not isinstance(action_key_map, list | tuple):
+        return _error(f"action_key_map must be a list or tuple of action keys (got {type(action_key_map).__name__}).")
+    if not action_key_map:
+        return _error("action_key_map is empty; pass one action key per recorded action-vector index.")
+    bad = [key for key in action_key_map if not isinstance(key, str)]
+    if bad:
+        return _error(f"action_key_map entries must be action-key strings; got non-string entries {bad!r}.")
+    duplicates = sorted({key for key in action_key_map if action_key_map.count(key) > 1})
+    if duplicates:
+        return _error(
+            f"action_key_map has duplicate keys {duplicates}; each recorded action index needs its own key "
+            "(a repeated key silently overwrites the earlier index's value)."
+        )
+    return None
+
+
 class CooperativeStop(BaseException):
     """Raised by an ``on_frame`` hook to cooperatively stop a run.
 
     Inherits ``BaseException`` (not ``Exception``) so hook authors don't
-    accidentally swallow it with a broad ``except Exception``. Re-raised
-    by ``PolicyRunner.run`` and caught at the top of the loop to return
-    a normal stopped-early success result.
+    accidentally swallow it with a broad ``except Exception``. Honored by
+    ``PolicyRunner.run`` and by the ``evaluate``/``evaluate_benchmark``
+    paths: it is caught at the episode loop to return a normal
+    stopped-early success result (``stopped_early=True``) rather than
+    propagating as an uncaught exception.
     """
 
 
@@ -455,9 +781,28 @@ class PolicyRunner:
         ``mj_step``), so the arm integrated ~10% of the way toward each target
         before the next action overwrote ``ctrl`` - rollouts looked like the
         policy was a no-op even when commanding valid targets.
+
+        Args:
+            control_frequency: Control-loop rate in Hz, used with the backend's
+                physics timestep to derive the substep count.
+            override: Explicit substeps per action, or ``None`` to derive.
+
+        Returns:
+            Physics steps to advance per applied action (always ``>= 1``).
+
+        Raises:
+            ValueError: If ``override`` is not a positive integer. It used to be
+                clamped with ``max(1, int(override))``, so ``0``/``-5`` silently
+                collapsed to a single physics step - reinstating the exact
+                under-integration this helper exists to prevent - and a float
+                was truncated. The public entry points reject such a value with
+                a structured error before reaching the runner; this raise is the
+                guarantee for callers driving ``PolicyRunner`` directly.
         """
         if override is not None:
-            return max(1, int(override))
+            if isinstance(override, bool) or not isinstance(override, int) or override < 1:
+                raise ValueError(f"control_substeps must be a positive integer, got {override!r}.")
+            return override
         dt = None
         try:
             dt = self.sim.physics_timestep()
@@ -527,6 +872,7 @@ class PolicyRunner:
         *,
         instruction: str = "",
         duration: float = 10.0,
+        n_steps: int | None = None,
         control_frequency: float = 50.0,
         action_horizon: int = 8,
         fast_mode: bool = False,
@@ -538,6 +884,7 @@ class PolicyRunner:
         seed: int | None = None,
         async_rtc: bool | None = None,
         rtc_inference_timeout_s: float | None = None,
+        stop_when: Callable[[SimEngine], bool] | None = None,
     ) -> dict[str, Any]:
         """Run ``policy`` on ``robot_name`` for ``duration`` seconds.
 
@@ -548,7 +895,11 @@ class PolicyRunner:
                 construction so tests can inject mocks trivially.
             instruction: Natural-language instruction forwarded to the policy.
             duration: Wall-clock seconds to run (interpreted as control steps
-                via ``control_frequency``).
+                via ``control_frequency``). Used only when ``n_steps`` is None.
+            n_steps: Explicit integer step-count horizon resolved by the caller
+                from ``n_steps`` / the legacy ``max_steps`` alias. When set (and
+                > 0) it is the exact number of control steps executed, bypassing
+                the lossy ``int(duration * control_frequency)`` recomputation.
             control_frequency: Target Hz for ``policy.get_actions`` calls.
             action_horizon: Max actions consumed per policy call before
                 requerying observation. Clamped up to the policy's own
@@ -599,11 +950,18 @@ class PolicyRunner:
                 latency is at most the chunk's execution time then pays
                 (almost) zero visible stall at the chunk seam - the same way an
                 async real-time controller hides inference latency on real
-                hardware. RTC-capable policies (pi0, pi0.5, SmolVLA, MolmoAct2)
-                blend the seam internally through their own prev-chunk state
-                (``rtc_config.execution_horizon``); this flag only schedules the
-                overlap and never touches the policy's RTC machinery, so it is
-                provider-agnostic. ``False`` keeps the historical
+                hardware. Whether the chunk SEAM is additionally blended is a
+                separate, checkpoint-level property (``supports_rtc``): a policy
+                loaded from a checkpoint with an enabled ``rtc_config`` (e.g.
+                pi0 / pi0.5, or a SmolVLA checkpoint configured for RTC) carries
+                prev-chunk state across the seam and joins consecutive chunks
+                smoothly, whereas a chunk-emitting policy WITHOUT an
+                ``rtc_config`` - MolmoAct2, ACT, diffusion, and the public
+                ``lerobot/smolvla_base`` checkpoint - gets the overlap (latency
+                masking) but a plain chunk swap at the seam. This flag only
+                schedules the overlap; it never enables or touches the policy's
+                RTC machinery, so it is provider-agnostic. ``False`` keeps the
+                historical
                 synchronous chunk-then-drain loop, which is correct for
                 single-step policies and any policy whose ``get_actions`` reads
                 live sim state. ``None`` (default) auto-resolves the flag from
@@ -627,13 +985,38 @@ class PolicyRunner:
                 :meth:`run` returns), so the abort is bounded by ONE inference,
                 not the whole rollout. ``None`` (default) waits without a deadline
                 (historical behaviour). Ignored on the synchronous path.
+            stop_when: Optional semantic early-return condition - a callable
+                ``(sim) -> bool`` evaluated against the LIVE sim after every
+                applied action, on BOTH the synchronous and async-RTC paths.
+                The first ``True`` ends the rollout cleanly with
+                ``stopped_reason="predicate"``; the remaining actions of an
+                in-flight chunk are dropped, so the early-return latency bound
+                is ONE control step regardless of the policy's chunk length
+                (on the async-RTC path any in-flight prefetch is still joined
+                before :meth:`run` returns). Callers driving the runner
+                through :meth:`SimEngine.run_policy` pass a predicate-DSL dict
+                compiled via
+                :func:`~strands_robots.simulation.benchmark_spec.compile_stop_when`;
+                programmatic callers may pass any callable (mirroring
+                :meth:`evaluate`'s ``success_fn``). A raising ``stop_when`` is
+                fatal (``status="error"``): the caller asked for an
+                early-return semantics the runner can no longer honor, and
+                silently running to the step budget would misreport the
+                rollout. ``None`` (default) preserves the pure step-budget
+                horizon.
 
         Returns:
             ``{"status": "success"|"error", "content": [{"text": ...},
             {"json": {...}}]}``. The ``json`` block is agent-consumable and
             carries the rollout facts as typed fields - ``robot_name``,
-            ``policy``, ``instruction``, ``n_steps``, ``elapsed_s``,
-            ``stopped_early``, ``action_errors``, ``video_path`` (``None`` when
+            ``policy``, ``instruction``, ``n_steps``, ``steps_used`` (the
+            control steps actually executed, equal to ``n_steps``),
+            ``elapsed_s``, ``stopped_early``, ``stopped_reason``
+            (``"predicate"`` - the ``stop_when`` condition fired; ``"budget"``
+            - the step/duration horizon was exhausted; ``"cancelled"`` - a
+            cooperative stop, e.g. ``stop_policy``; on ``status="error"``
+            results the field is ``"error"``), ``action_errors``,
+            ``video_path`` (``None`` when
             no MP4 was written), ``video_frames`` and ``sim_time_s`` (when the
             backend reports sim time) - so callers can self-correct without
             regex-parsing the human-readable ``text``. The block also carries the
@@ -720,76 +1103,28 @@ class PolicyRunner:
                 "rtc_max_inference_ms": round(max(inference_ms), 3) if _n else 0.0,
             }
 
-        # Lazy optional import - only imageio is optional.
-        writer = None
-        frame_count = 0
-        frame_interval = 0.0
-        next_frame_step = 0.0
-        video_path: str | None = None
-        if video is not None and video.enabled:
-            # video.enabled guarantees video.path is a non-empty str; narrow for mypy.
-            assert video.path is not None
-            # video.path is LLM-supplied: reject shell metacharacters, backslash
-            # separators, ".." traversal, and a symlinked target before we
-            # makedirs + open a writer on it. Absolute paths stay allowed (the
-            # historic contract); set STRANDS_ROBOTS_VIDEO_ROOT to sandbox them.
-            _sb_root, _allow_abs = video_sandbox_args()
-            try:
-                video_path = str(
-                    validate_output_path(video.path, sandbox_root=_sb_root, allow_abs=_allow_abs, label="video path")
-                )
-            except ValueError as _e:
-                return {"status": "error", "content": [{"text": f"video recording: {_e}"}]}
-
-            # Pre-validate the camera name ONCE before the step loop. This
-            # surfaces "camera not found" as a clean up-front error rather
-            # than silently writing a 0-byte MP4 (sim.render() returns
-            # status=error, _extract_frame_ndarray() returns None, the
-            # rollout runs to completion, writer.close() produces an empty
-            # file, and the user gets no hint in the result text).
-            probe_cam = video.camera or "default"
-            try:
-                _probe = self.sim.render(
-                    camera_name=probe_cam,
-                    width=video.width,
-                    height=video.height,
-                )
-            except Exception as e:
-                return {
-                    "status": "error",
-                    "content": [{"text": f"Video recording requested but render probe crashed: {e}"}],
-                }
-            if _probe.get("status") != "success":
-                probe_text = (_probe.get("content") or [{}])[0].get("text", "")
-                return {
-                    "status": "error",
-                    "content": [
-                        {
-                            "text": (
-                                f"Video recording requested but camera "
-                                f"'{probe_cam}' is not renderable.\n"
-                                f"{probe_text}\n"
-                                "Hint: robot cameras are namespaced, e.g. a "
-                                "camera named 'side' inside robot 'arm1' compiles "
-                                "as 'arm1/side'. Pass video={'camera': 'arm1/side', ...}."
-                            )
-                        }
-                    ],
-                }
-
-            imageio = require_optional(
-                "imageio",
-                pip_install="imageio imageio-ffmpeg",
-                extra="sim-mujoco",
-                purpose="video recording",
+        # Video recording lifecycle (path validation + camera probe + writer)
+        # lives in _RolloutVideoWriter so run() and evaluate() record identically.
+        vwriter, _video_err = _RolloutVideoWriter.open(self.sim, video, control_frequency)
+        if _video_err is not None:
+            # Every error result carries the stopped_reason="error" json block
+            # (the "recorded on ALL exit paths" contract); the writer's error
+            # dict is text-only because evaluate() shares it, so tag it here.
+            _video_err.setdefault("content", []).append(
+                {"json": {"stopped_reason": "error", "steps_used": 0, "n_steps": 0}}
             )
-            os.makedirs(os.path.dirname(os.path.abspath(video_path)), exist_ok=True)
-            writer = imageio.get_writer(  # type: ignore[attr-defined]
-                video_path, fps=video.fps, quality=8, macro_block_size=1
-            )
-            frame_interval = control_frequency / video.fps
+            return _video_err
 
         stopped_early = False
+        # Why the rollout ended, reported in the result json so an agent
+        # deciding whether to retry can distinguish "the world reached the
+        # goal state" from "the step budget ran out" from "the user cancelled"
+        # (stopped_early alone conflates the last two). "budget" is the
+        # default (the loop ran its full horizon); the CooperativeStop handler
+        # re-tags it "cancelled", a fired stop_when re-tags it "predicate",
+        # and every error return reports "error".
+        stopped_reason = "budget"
+        stop_predicate_fired = False
         # T26: skip camera rendering when the policy does not need images.
         _skip_images = not getattr(policy, "requires_images", True)
         # Open-loop chunk replay consumes H actions from ONE observation. That
@@ -823,7 +1158,16 @@ class PolicyRunner:
         start_time = time.time()
         step_count = 0
         try:
-            total_steps = int(duration * control_frequency)
+            # Prefer an explicit integer step count when the caller resolved one
+            # from ``n_steps`` (or the legacy ``max_steps`` alias). Recomputing
+            # ``int(duration * control_frequency)`` from the float ``duration =
+            # n_steps / control_frequency`` truncates on any frequency that does
+            # not divide evenly (e.g. n_steps=1 @ 49 Hz -> 0 steps reported as
+            # success). Forwarding the count verbatim keeps the horizon exact.
+            if n_steps is not None and n_steps > 0:
+                total_steps = int(n_steps)
+            else:
+                total_steps = int(duration * control_frequency)
             action_sleep = 1.0 / control_frequency
 
             # Control-rate substepping: a position-servo robot needs the physics
@@ -834,18 +1178,10 @@ class PolicyRunner:
             # per action and barely moves - the policy looks like a no-op even
             # though it is sending valid targets. Derive substeps from the
             # backend's physics timestep; fall back to 1 when unknown.
-            if control_substeps is not None:
-                n_substeps = max(1, int(control_substeps))
-            else:
-                _dt = None
-                try:
-                    _dt = self.sim.physics_timestep()
-                except Exception:  # noqa: BLE001 - never fail the run on a probe
-                    _dt = None
-                if _dt and _dt > 0 and control_frequency > 0:
-                    n_substeps = max(1, round((1.0 / control_frequency) / _dt))
-                else:
-                    n_substeps = 1
+            # Single source of truth for the derivation AND for the
+            # positive-integer contract on an explicit override: an inline copy
+            # here drifted from the shared helper the eval paths use.
+            n_substeps = self._control_substeps(control_frequency, control_substeps)
             logger.info(
                 "PolicyRunner: control_frequency=%.1f Hz, physics substeps/action=%d",
                 control_frequency,
@@ -876,7 +1212,6 @@ class PolicyRunner:
             # the two paths.
             def _apply(observation: dict[str, Any], action_dict: dict[str, Any]) -> None:
                 nonlocal step_count, _action_errors, consecutive_onframe_failures
-                nonlocal frame_count, next_frame_step
                 nonlocal _total_failure_steps, _last_unresolved
 
                 _send_result = self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
@@ -968,25 +1303,41 @@ class PolicyRunner:
                         f"'{robot_name}')."
                     )
 
-                if writer is not None and step_count >= next_frame_step:
-                    assert video is not None  # for mypy: writer only set when video.enabled
-                    frame = self.sim.render(
-                        camera_name=video.camera or "default",
-                        width=video.width,
-                        height=video.height,
-                    )
-                    # sim.render() returns {status, content:[{text},{image:{source:{bytes}}}]}
-                    # Decode the PNG bytes from the content block and hand an ndarray
-                    # to imageio. Silently skips when the PNG decode fails rather than
-                    # aborting the whole rollout (renderer errors shouldn't kill training).
-                    img_arr = _extract_frame_ndarray(frame)
-                    if img_arr is not None:
-                        writer.append_data(img_arr)
-                        frame_count += 1
-                    next_frame_step += frame_interval
+                if vwriter is not None:
+                    vwriter.capture(step_count)
 
                 if not fast_mode:
                     time.sleep(action_sleep)
+
+            def _stop_when_fired() -> bool:
+                """Evaluate the caller's ``stop_when`` clause against the live sim.
+
+                Called after every applied action on BOTH the synchronous and
+                async-RTC paths, so the early-return latency bound is ONE
+                control step regardless of chunk length: the check fires
+                within the current chunk-slice and the remaining actions of
+                the chunk are dropped. Call sites guard on ``stop_when is not
+                None`` so the no-clause hot path pays no per-step call. A
+                raising clause is fatal - the caller asked for early-return
+                semantics the runner can no longer honor, and silently
+                running to the step budget would misreport the rollout - so
+                it surfaces as ``status="error"`` via the outer handler
+                rather than being warn-and-continued.
+                """
+                nonlocal stop_predicate_fired
+                assert stop_when is not None  # call sites hoist the None guard
+                try:
+                    fired = bool(stop_when(self.sim))
+                except Exception as e:
+                    raise RuntimeError(
+                        f"stop_when predicate raised at step {step_count}: {e!r}. The early-return "
+                        "condition cannot be evaluated, so the rollout is aborted rather than "
+                        "silently running to its step budget."
+                    ) from e
+                if fired:
+                    stop_predicate_fired = True
+                    logger.info("stop_when fired at step %d; ending rollout early", step_count)
+                return fired
 
             def _query_chunk(observation: dict[str, Any], observed_delay: int = 0) -> list[dict[str, Any]]:
                 # Resolve ONE action chunk from the policy. Never truncate below
@@ -1140,6 +1491,15 @@ class PolicyRunner:
                             step_obs = cur_obs
                         _apply(step_obs, cur_chunk[idx])
                         idx += 1
+                        # Semantic early return: checked after EVERY applied
+                        # action, so the stop lands within one control step of
+                        # the world reaching the condition - the rest of the
+                        # in-flight chunk (and any prefetched chunk) is
+                        # dropped; the executor shutdown below joins the
+                        # in-flight prefetch worker. The None guard is hoisted
+                        # so the no-clause hot path pays no per-step call.
+                        if stop_when is not None and _stop_when_fired():
+                            break
                 finally:
                     # Wait for any in-flight inference so no background thread
                     # touches the policy/sim after run() returns (the caller may
@@ -1164,30 +1524,55 @@ class PolicyRunner:
                         else:
                             step_obs = observation
                         _apply(step_obs, action_dict)
+                        # Semantic early return: checked after EVERY applied
+                        # action (same cadence as the benchmark eval loop), so
+                        # the remaining actions of the chunk are dropped as
+                        # soon as the condition holds. The None guard is
+                        # hoisted so the no-clause hot path pays no per-step
+                        # call.
+                        if stop_when is not None and _stop_when_fired():
+                            break
+                    if stop_predicate_fired:
+                        break
 
         except CooperativeStop:
             stopped_early = True
+            stopped_reason = "cancelled"
         except Exception as e:
-            if writer is not None:
-                writer.close()
+            if vwriter is not None:
+                vwriter.close()
             logger.exception("PolicyRunner.run failed")
             return {
                 "status": "error",
-                "content": [{"text": f"Policy failed: {e}"}, {"json": _rtc_telemetry()}],
+                "content": [
+                    {"text": f"Policy failed: {e}"},
+                    {"json": {**_rtc_telemetry(), "stopped_reason": "error", "steps_used": step_count}},
+                ],
             }
 
-        # Either finished all steps or was cooperatively stopped
+        # Either finished all steps, hit the stop_when condition, or was
+        # cooperatively stopped.
+        if stop_predicate_fired:
+            stopped_early = True
+            stopped_reason = "predicate"
         elapsed = time.time() - start_time
         sim_time = self._maybe_sim_time()
-        prefix = "Policy stopped" if stopped_early else "Policy complete"
+        if not stopped_early:
+            prefix = "Policy complete"
+        elif stopped_reason == "predicate":
+            prefix = "Policy stopped early (stop_when condition met)"
+        else:
+            prefix = "Policy stopped"
         text = (
             f"{prefix} on '{robot_name}'\n{type(policy).__name__} | {instruction}\n{elapsed:.1f}s | {step_count} steps"
         )
         if sim_time is not None:
             text += f" | sim_t={sim_time:.3f}s"
-        if writer is not None:
-            assert video is not None and video_path is not None
-            writer.close()
+        if vwriter is not None:
+            assert video is not None
+            video_path = vwriter.path
+            frame_count = vwriter.frame_count
+            vwriter.close()
             if frame_count > 0 and os.path.exists(video_path):
                 file_kb = os.path.getsize(video_path) / 1024
                 text += (
@@ -1220,8 +1605,14 @@ class PolicyRunner:
             "policy": type(policy).__name__,
             "instruction": instruction,
             "n_steps": step_count,
+            # Alias of n_steps under the retry-loop name: the control steps
+            # actually executed before the rollout ended. Paired with
+            # stopped_reason it makes "the predicate fired after 37 of 200
+            # steps" queryable without arithmetic on the caller side.
+            "steps_used": step_count,
             "elapsed_s": round(elapsed, 3),
             "stopped_early": stopped_early,
+            "stopped_reason": stopped_reason,
             "action_errors": _action_errors,
             "video_path": None,
             "video_frames": 0,
@@ -1243,6 +1634,7 @@ class PolicyRunner:
             # Defaults False for policies without the attribute (e.g. MockPolicy).
             "positional_fallback_used": bool(getattr(policy, "positional_fallback_used", False)),
             "generic_state_keys_used": bool(getattr(policy, "generic_state_keys_used", False)),
+            "missing_state_keys_used": bool(getattr(policy, "missing_state_keys_used", False)),
             # Process RSS (MB) at result time: confirms a heavy model is resident
             # and, across a loop, that it stays resident instead of oscillating
             # as it would on a per-episode reload. None when unmeasurable.
@@ -1250,10 +1642,11 @@ class PolicyRunner:
         }
         if sim_time is not None:
             payload["sim_time_s"] = round(sim_time, 3)
-        if writer is not None and video is not None and video_path is not None:
-            wrote_video = frame_count > 0 and os.path.exists(video_path)
-            payload["video_path"] = video_path if wrote_video else None
-            payload["video_frames"] = frame_count
+        if vwriter is not None and video is not None:
+            _vp = vwriter.path
+            wrote_video = vwriter.frame_count > 0 and os.path.exists(_vp)
+            payload["video_path"] = _vp if wrote_video else None
+            payload["video_frames"] = vwriter.frame_count
         payload.update(_rtc_telemetry())
 
         # Per-actuator resolution stats (issue #165): the fraction of steps each
@@ -1287,14 +1680,25 @@ class PolicyRunner:
             payload["action_resolution_rate"] = {}
             payload["partial_action_failure_rate"] = 0.0
 
-        # If every send_action call failed (all keys unresolved), the robot
-        # never moved -- report this as an error rather than a false success.
-        if _action_errors > 0 and _action_errors >= step_count and step_count > 0:
+        # If EVERY step was a TOTAL failure (the policy emitted keys but none
+        # resolved to an actuator), the robot never moved -- report this as an
+        # error rather than a false success. This mirrors the fail-fast probe
+        # and must key off ``_total_failure_steps``, NOT ``_action_errors``:
+        # ``_action_errors`` also counts PARTIAL steps (some keys resolve, the
+        # robot moves), so a policy that drives valid keys plus one extra
+        # unresolved key every step (e.g. a 7-DOF-trained policy on a 6-DOF arm)
+        # would otherwise be misreported as "the robot did not move". A partial
+        # rollout is operational -- surfaced via partial_action_failure_rate.
+        if _total_failure_steps >= step_count and step_count > 0:
             text += (
-                f"\n\nALL {_action_errors} action steps had unresolved keys "
+                f"\n\nALL {step_count} action steps had 100% unresolved keys "
                 f"-- the robot did not move. Check that the policy's output keys "
                 f"match the robot's actuator names."
             )
+            # An error result always reports stopped_reason="error": the
+            # rollout may have run its full budget, but the outcome is not a
+            # retryable "budget" completion.
+            payload["stopped_reason"] = "error"
             return {"status": "error", "content": [{"text": text}, {"json": payload}]}
         if _action_errors > 0:
             text += f"\n\n{_action_errors}/{step_count} action steps had unresolved keys."
@@ -1314,6 +1718,14 @@ class PolicyRunner:
     ) -> dict[str, Any]:
         """Replay a recorded LeRobotDataset episode through ``send_action``.
 
+        Each recorded frame is one control step taken at the dataset's fps, so
+        replay advances physics for a full control period per frame (derived
+        from the dataset fps and physics timestep, the same integration the
+        recording used) rather than a single physics dt. This lets a
+        position-servo robot track the recorded targets and reproduce the
+        recorded trajectory; ``speed`` scales only the wall-clock playback
+        rate, not the physics per frame.
+
         Args:
             repo_id: HuggingFace dataset id (e.g. ``lerobot/pusht``).
             robot_name: Target robot. Defaults to the first robot in the sim
@@ -1323,8 +1735,10 @@ class PolicyRunner:
             episode: Episode index in the dataset (non-negative).
             root: Optional local dataset root override.
             speed: Playback speed multiplier (1.0 = real time). Must be a
-                positive number; a non-positive or non-numeric value is
-                rejected with a structured error.
+                positive, finite number (any real scalar, including a NumPy
+                scalar such as ``np.float32(2.0)``); a non-positive,
+                non-finite or non-numeric value is rejected with a structured
+                error.
             action_key_map: Optional list of action keys, one per action
                 vector index. Required when dataset action ordering differs
                 from ``robot_action_keys(robot_name)``. If ``None``, positional
@@ -1332,24 +1746,67 @@ class PolicyRunner:
                 *actuator* keys, which is the ordering the LeRobotDataset
                 recorder writes the ``action`` column in (a robot's actuators
                 are not always its joints; see :meth:`SimEngine.robot_action_keys`).
+                Must be a non-empty list/tuple of unique strings; a bare
+                string, a non-string entry or a duplicate key is rejected with
+                a structured error. Its length must equal the recorded action
+                vector's width - a mismatch is rejected rather than
+                positionally truncated.
 
         Returns:
-            Standard status dict with per-frame stats.
+            Standard status dict with per-frame stats. Replay aborts with an
+            ``"error"`` status when a recorded frame cannot actually be applied
+            (unresolvable action keys, or a recorded vector whose width does not
+            match the action-key map), reporting how many frames were applied
+            before the abort. A successful status therefore means every frame
+            reached the actuators.
         """
         # ``speed`` is a playback-rate multiplier used as the divisor in
-        # ``frame_interval = 1 / (dataset_fps * speed)``. A value of 0 raised a
-        # bare ZeroDivisionError (breaking the documented "returns a status
-        # dict" contract) and a negative value silently played the episode
-        # forward at full speed while reporting success with a meaningless
-        # "Speed: -1.0x". Reject a non-positive or non-numeric speed up front,
-        # before the (potentially multi-minute) dataset download. ``bool`` is
-        # an ``int`` subclass, so ``True`` is rejected explicitly rather than
-        # acting as a silent 1.0x.
-        if isinstance(speed, bool) or not isinstance(speed, (int, float)) or speed <= 0:
+        # ``frame_interval = 1 / (dataset_fps * speed)`` and, once computed,
+        # flows into ``time.sleep(frame_interval - elapsed)`` on the real-time
+        # playback path. A value of 0 raised a bare ZeroDivisionError (breaking
+        # the documented "returns a status dict" contract) and a negative value
+        # silently played the episode forward at full speed while reporting
+        # success with a meaningless "Speed: -1.0x". Reject a non-positive or
+        # non-numeric speed up front, before the (potentially multi-minute)
+        # dataset download. Accept any real scalar (``numbers.Real``) so a
+        # NumPy-scalar speed such as ``np.float32(2.0)`` or ``np.int64(2)``
+        # (e.g. read from a config array) is not rejected:
+        # ``isinstance(x, (int, float))`` is ``False`` for every NumPy scalar
+        # except ``np.float64``. ``bool`` is still rejected explicitly (an
+        # ``int`` subclass, so ``True`` would act as a silent 1.0x), and
+        # non-finite values (``nan``/``inf``) are rejected via ``math.isfinite``
+        # before the ``<= 0`` comparison so a ``nan`` -- which is never
+        # ``<= 0`` -- cannot slip through into the ``1 / (fps * speed)``
+        # arithmetic and reach ``time.sleep(nan)``. Mirrors the ``numbers.Real``
+        # + finiteness contract applied to ``control_frequency`` and
+        # ``add_camera(fov=...)``.
+        if (
+            isinstance(speed, bool)
+            or not isinstance(speed, numbers.Real)
+            or not math.isfinite(float(speed))
+            or float(speed) <= 0
+        ):
             return {
                 "status": "error",
                 "content": [{"text": f"replay: speed must be a positive number (got {speed!r})."}],
             }
+        # Coerce to a plain Python float: a validated NumPy scalar still flows
+        # into ``time.sleep(frame_interval - ...)`` and the returned
+        # ``"speed": speed`` status field, where a ``numpy.float32`` raises a
+        # bare "object cannot be interpreted as an integer" TypeError in
+        # ``time.sleep`` and is not natively JSON-serialisable.
+        speed = float(speed)
+
+        # ``action_key_map`` binds recorded action-vector indices to action keys
+        # ``send_action`` must resolve. A malformed map cannot be honored by any
+        # backend, and pre-fix nothing checked its shape: a bare string was
+        # ``list()``-ed into one key PER CHARACTER, a duplicate key made two
+        # recorded indices write the same actuator (the later one silently
+        # winning), and neither showed up in the result. Reject the shape here,
+        # before the (potentially multi-minute) dataset download.
+        key_map_error = _validate_action_key_map(action_key_map)
+        if key_map_error is not None:
+            return key_map_error
 
         try:
             from strands_robots.dataset_recorder import load_lerobot_episode
@@ -1390,6 +1847,20 @@ class PolicyRunner:
 
         dataset_fps = getattr(ds, "fps", 30)
         frame_interval = 1.0 / (dataset_fps * speed)
+        # Step a FULL control period per recorded frame, not a single physics
+        # dt. The recorded control frequency IS the dataset fps, so derive the
+        # physics substeps from it (same convention as run() and evaluate()).
+        # Without this, replay fell through to ``send_action``'s default
+        # ``n_substeps=1`` - a single ~2 ms physics step per recorded frame -
+        # while the recording integrated a full ~1/fps control period per
+        # frame. A position-servo robot could not track the recorded targets in
+        # ~2 ms, so replay produced a heavily under-integrated, attenuated
+        # trajectory that did NOT reproduce the recording (the arm barely moved)
+        # while still reporting ``Frames: N/N`` and ``status="success"`` - a
+        # silent record -> replay fidelity gap. ``speed`` scales only the
+        # wall-clock playback rate (frame_interval), never the physics per
+        # frame, so it is deliberately excluded here.
+        n_substeps = self._control_substeps(dataset_fps)
         frames_applied = 0
         start_time = time.time()
 
@@ -1419,8 +1890,9 @@ class PolicyRunner:
 
             action_vals = frame.get("action") if isinstance(frame, dict) else None
             if action_vals is None:
-                # No action at this index - just advance physics one step.
-                self.sim.step(n_steps=1)
+                # No action at this index - advance physics one full control
+                # period so the frame still occupies its recorded time slice.
+                self.sim.step(n_steps=n_substeps)
                 frames_applied += 1
             else:
                 if hasattr(action_vals, "numpy"):
@@ -1428,13 +1900,85 @@ class PolicyRunner:
                 if hasattr(action_vals, "tolist"):
                     action_vals = action_vals.tolist()
 
-                action_dict: dict[str, Any] = {}
-                for i, val in enumerate(action_vals):
-                    if i >= len(action_keys):
-                        break
-                    action_dict[action_keys[i]] = float(val)
+                # A recorded vector whose width differs from the action-key
+                # map cannot be replayed faithfully: the surplus values have no
+                # key (silently DROPPED pre-fix, e.g. a 2-key map swallowing a
+                # 6-DOF recording's last four joints) or the surplus keys never
+                # receive a value. Reject it with the recorded-vs-expected
+                # widths, mirroring how ``send_action`` rejects a raw action
+                # vector whose length does not match the actuator count instead
+                # of truncating it.
+                if len(action_vals) != len(action_keys):
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"Replay aborted at frame {frame_idx}: recorded action vector has "
+                                    f"{len(action_vals)} values but {len(action_keys)} action keys are "
+                                    f"mapped ({action_keys}). Applied {frames_applied}/{episode_length} "
+                                    "frames. Pass an action_key_map with one key per recorded action "
+                                    f"value, or replay onto a robot whose actuators match the recording."
+                                )
+                            },
+                            {
+                                "json": {
+                                    "episode": episode,
+                                    "robot_name": resolved_robot,
+                                    "frame": frame_idx,
+                                    "recorded_action_width": len(action_vals),
+                                    "action_keys": action_keys,
+                                    "frames_applied": frames_applied,
+                                    "total_frames": episode_length,
+                                }
+                            },
+                        ],
+                    }
 
-                self.sim.send_action(action_dict, robot_name=resolved_robot)
+                action_dict: dict[str, Any] = {action_keys[i]: float(val) for i, val in enumerate(action_vals)}
+
+                # ``send_action`` reports unresolvable keys as an "error" status
+                # (with an ``unresolved_keys`` json block). Pre-fix that result
+                # was DISCARDED, so a typo'd action_key_map dropped every value
+                # at the actuator boundary while replay still reported
+                # ``status="success"`` and ``Frames: N/N`` - the recorded
+                # trajectory never reached the robot. Abort on the first
+                # unapplied frame instead of finishing a replay that is not
+                # happening.
+                send_result = self.sim.send_action(action_dict, robot_name=resolved_robot, n_substeps=n_substeps)
+                if isinstance(send_result, dict) and send_result.get("status") == "error":
+                    detail = next(
+                        (
+                            str(block["text"])
+                            for block in send_result.get("content", []) or []
+                            if isinstance(block, dict) and "text" in block
+                        ),
+                        "",
+                    )
+                    payload: dict[str, Any] = {
+                        "episode": episode,
+                        "robot_name": resolved_robot,
+                        "frame": frame_idx,
+                        "action_keys": action_keys,
+                        "frames_applied": frames_applied,
+                        "total_frames": episode_length,
+                    }
+                    send_json = _extract_result_json(send_result)
+                    if send_json is not None:
+                        payload.update(send_json)
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"Replay aborted at frame {frame_idx}: the recorded action could not be "
+                                    f"applied to '{resolved_robot}'. Applied {frames_applied}/{episode_length} "
+                                    f"frames. {detail}"
+                                )
+                            },
+                            {"json": payload},
+                        ],
+                    }
                 frames_applied += 1
 
             sleep_time = frame_interval - (time.time() - step_start)
@@ -1485,6 +2029,7 @@ class PolicyRunner:
         async_rtc: bool = False,
         rtc_inference_timeout_s: float | None = None,
         policy_kwargs: dict[str, Any] | None = None,
+        video: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Evaluate ``policy`` for ``n_episodes`` episodes.
 
@@ -1519,8 +2064,12 @@ class PolicyRunner:
                 fired per applied control step on the eval thread, after
                 ``sim.send_action``. Forwarded on BOTH the ``spec=`` and the
                 legacy ``success_fn`` paths; ``step`` is a monotonic index
-                that continues across episode boundaries. A hook exception is
-                logged at WARN and never aborts the eval. Use this for
+                that continues across episode boundaries. A non-
+                ``CooperativeStop`` hook exception is logged at WARN and never
+                aborts the eval; raising :class:`CooperativeStop` stops the
+                evaluation gracefully after the episodes completed so far
+                (the result carries ``stopped_early=True`` and
+                ``episodes_completed``), matching :meth:`run`. Use this for
                 synchronous recording when the eval runs on a thread distinct
                 from the script main (e.g. Strands ``Agent`` tool dispatch
                 under asyncio) - see #191 and
@@ -1549,6 +2098,16 @@ class PolicyRunner:
                 (WBC ``target_velocity``; cuRobo/MoveIt2 ``target_pose`` /
                 ``target_joints`` / ``world_update`` - the issue #300 keys) need
                 this to be evaluated against a goal at all.
+            video: Optional per-episode MP4 recording config (same dict schema
+                as :meth:`run` / ``run_policy``: ``path`` enables it, plus
+                ``fps`` / ``camera`` / ``width`` / ``height``). One file per
+                episode with ``_ep{i}`` inserted into the filename; the written
+                paths are returned in the result json ``video_paths``. Recorded
+                on BOTH eval routes: the ``success_fn`` path and the
+                ``spec``/benchmark path (:meth:`_evaluate_with_spec`). Frames are
+                captured synchronously on the eval thread at the ``on_frame``
+                point (after ``send_action``), so recording never perturbs the
+                bit-stable spec-path rollout.
 
         Returns:
             Standard status dict. The JSON payload carries an RTC telemetry
@@ -1565,6 +2124,13 @@ class PolicyRunner:
             reported ``success_rate`` is a hard ``0.0`` that measures nothing
             (no episode can be marked successful without a criterion), and a
             warning is logged - check this flag before trusting ``success_rate``.
+
+            The payload also carries ``episodes_completed`` (episodes that ran
+            to completion) and ``stopped_early`` (bool). When an ``on_frame``
+            hook raises :class:`CooperativeStop`, the eval ends gracefully after
+            the completed episodes: ``stopped_early=True`` and the aggregate
+            metrics are computed over ``episodes_completed`` (which may be less
+            than the requested ``n_episodes``).
         """
         if spec is not None and success_fn is not None:
             return {
@@ -1615,6 +2181,7 @@ class PolicyRunner:
                 control_frequency=control_frequency,
                 control_substeps=control_substeps,
                 policy_kwargs=_policy_kwargs,
+                video=video,
             )
 
         try:
@@ -1683,98 +2250,150 @@ class PolicyRunner:
         # episode boundaries, exactly like the spec eval path and ``run()``.
         global_step = 0
 
-        def _fire_on_frame(obs: dict[str, Any], action: dict[str, Any]) -> None:
+        # Optional per-episode rollout video (eval_policy video=). One MP4 per
+        # episode via the _ep{i} filename templating that run_policy's
+        # multi-episode loop already uses, so an eval can be watched to see WHY
+        # episodes fail - not just read as an aggregate success_rate. The writer
+        # is opened per episode below; _fire_on_frame appends a frame at the fps
+        # cadence on the same synchronous eval-thread point as the on_frame hook.
+        video_paths: list[str] = []
+        current_vwriter: _RolloutVideoWriter | None = None
+
+        def _fire_on_frame(obs: dict[str, Any], action: dict[str, Any], ep_step: int) -> None:
             # Fire AFTER ``send_action`` (post-action obs unavailable yet, so
             # pass the pre-action obs the chunk was queried with - matches
             # ``_evaluate_with_spec``). The hook is best-effort telemetry: a
             # failure is logged at WARN and never aborts the eval.
             nonlocal global_step
+            if current_vwriter is not None:
+                current_vwriter.capture(ep_step)
             if on_frame is not None:
                 try:
                     on_frame(global_step, obs, action)
+                except CooperativeStop:
+                    # Documented graceful early-stop (the same signal run()
+                    # honors). Propagate to the episode loop; never swallow
+                    # it as a best-effort telemetry failure.
+                    raise
                 except Exception as e:  # noqa: BLE001 - hook is best-effort telemetry
                     logger.warning("on_frame hook failed at global_step=%d: %s", global_step, e)
             global_step += 1
 
-        for ep in range(n_episodes):
-            self.sim.reset()
-            success = False
-            steps = 0
+        stopped_early = False
+        try:
+            for ep in range(n_episodes):
+                self.sim.reset()
+                success = False
+                steps = 0
 
-            if async_rtc:
-                # Opt-in async overlap: a single background worker computes the
-                # next chunk while the current one drains, so a chunk-emitting
-                # policy is evaluated under the realistic inference latency it
-                # faces in deployment. The pipeline only ever calls the policy
-                # off-thread; the sim is stepped solely here, so there is no
-                # data race. The context manager joins the worker on exit even
-                # when we break mid-chunk on success.
-                pipeline = _ChunkPipeline(
-                    _query_chunk,
-                    _observation_fn,
-                    async_rtc=True,
-                    rtc_inference_timeout_s=rtc_inference_timeout_s,
-                )
-                with pipeline as chunks:
-                    for _observation, action_dict in chunks:
-                        if steps >= max_steps:
-                            break
-                        self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
-                        _fire_on_frame(_observation, action_dict)
-                        steps += 1
-                        # Check success against the LIVE post-action observation
-                        # (mirrors the synchronous path / _evaluate_with_spec).
-                        if resolved_check is not None and resolved_check(_observation_fn()):
-                            success = True
-                            break
-                rtc_chunks_acquired += pipeline.chunks_acquired
-                rtc_prefetch_hits += pipeline.prefetch_hits
-                rtc_prefetch_blocks += pipeline.prefetch_blocks
-            else:
-                while steps < max_steps:
-                    observation = _observation_fn()
-                    chunk = _query_chunk(observation, 0)
-                    rtc_chunks_acquired += 1
+                # Per-episode MP4 (foo_ep{i}.mp4). Validation + camera probe happen
+                # here; a bad path/camera fails the eval up-front (on ep 0) instead
+                # of running N episodes and writing nothing.
+                ep_vcfg = self.sim._episode_video_config(video, ep)
+                current_vwriter, _video_err = _RolloutVideoWriter.open(self.sim, ep_vcfg, control_frequency)
+                if _video_err is not None:
+                    return _video_err
 
-                    if not chunk:
-                        # Policy returned nothing - still advance one physics
-                        # step so episodes don't hang on degenerate policies,
-                        # then check the post-step observation (same post-action
-                        # semantics as the chunk branch below).
-                        self.sim.step(n_steps=1)
-                        steps += 1
-                        if resolved_check is not None and resolved_check(_observation_fn()):
-                            success = True
-                            break
-                        continue
+                if async_rtc:
+                    # Opt-in async overlap: a single background worker computes the
+                    # next chunk while the current one drains, so a chunk-emitting
+                    # policy is evaluated under the realistic inference latency it
+                    # faces in deployment. The pipeline only ever calls the policy
+                    # off-thread; the sim is stepped solely here, so there is no
+                    # data race. The context manager joins the worker on exit even
+                    # when we break mid-chunk on success.
+                    pipeline = _ChunkPipeline(
+                        _query_chunk,
+                        _observation_fn,
+                        async_rtc=True,
+                        rtc_inference_timeout_s=rtc_inference_timeout_s,
+                    )
+                    with pipeline as chunks:
+                        for _observation, action_dict in chunks:
+                            if steps >= max_steps:
+                                break
+                            self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
+                            _fire_on_frame(_observation, action_dict, steps)
+                            steps += 1
+                            # Check success against the LIVE post-action observation
+                            # (mirrors the synchronous path / _evaluate_with_spec).
+                            if resolved_check is not None and resolved_check(_observation_fn()):
+                                success = True
+                                break
+                    rtc_chunks_acquired += pipeline.chunks_acquired
+                    rtc_prefetch_hits += pipeline.prefetch_hits
+                    rtc_prefetch_blocks += pipeline.prefetch_blocks
+                else:
+                    while steps < max_steps:
+                        observation = _observation_fn()
+                        chunk = _query_chunk(observation, 0)
+                        rtc_chunks_acquired += 1
 
-                    for action_dict in chunk:
-                        if steps >= max_steps:
-                            break
-                        self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
-                        _fire_on_frame(observation, action_dict)
-                        steps += 1
-                        # Check success against the LIVE post-action observation,
-                        # not the stale pre-action obs. Checking the pre-action
-                        # obs detects success one step late and never records a
-                        # task that completes on the final step -> under-reported
-                        # success_rate / inflated avg_steps. Mirrors
-                        # _evaluate_with_spec's post-send is_success.
-                        if resolved_check is not None and resolved_check(_observation_fn()):
-                            success = True
-                            break
-                    if success:
-                        break
+                        if not chunk:
+                            # Policy returned nothing - still advance one physics
+                            # step so episodes don't hang on degenerate policies,
+                            # then check the post-step observation (same post-action
+                            # semantics as the chunk branch below).
+                            self.sim.step(n_steps=1)
+                            steps += 1
+                            if resolved_check is not None and resolved_check(_observation_fn()):
+                                success = True
+                                break
+                            continue
 
-            results.append({"episode": ep, "steps": steps, "success": success})
-            # #708 - roll the attached recorder over to a new episode so the
-            # dataset records per-episode boundaries rather than collapsing
-            # every rollout into one mega-episode.
-            self._finalize_recorder_episode()
+                        for action_dict in chunk:
+                            if steps >= max_steps:
+                                break
+                            self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
+                            _fire_on_frame(observation, action_dict, steps)
+                            steps += 1
+                            # Check success against the LIVE post-action observation,
+                            # not the stale pre-action obs. Checking the pre-action
+                            # obs detects success one step late and never records a
+                            # task that completes on the final step -> under-reported
+                            # success_rate / inflated avg_steps. Mirrors
+                            # _evaluate_with_spec's post-send is_success.
+                            if resolved_check is not None and resolved_check(_observation_fn()):
+                                success = True
+                                break
+                        if success:
+                            break
 
+                results.append({"episode": ep, "steps": steps, "success": success})
+                # #708 - roll the attached recorder over to a new episode so the
+                # dataset records per-episode boundaries rather than collapsing
+                # every rollout into one mega-episode.
+                self._finalize_recorder_episode()
+
+                if current_vwriter is not None:
+                    current_vwriter.close()
+                    if current_vwriter.frame_count > 0 and os.path.exists(current_vwriter.path):
+                        video_paths.append(current_vwriter.path)
+                    else:
+                        logger.warning(
+                            "eval_policy episode %d: video requested but wrote 0 frames to %s",
+                            ep,
+                            current_vwriter.path,
+                        )
+                    current_vwriter = None
+
+        except CooperativeStop:
+            # A user/backend on_frame hook requested a graceful stop (the
+            # same signal run() honors). End the evaluation over the episodes
+            # completed so far instead of crashing with an uncaught
+            # BaseException. Close any in-progress episode video cleanly.
+            stopped_early = True
+            logger.info(
+                "on_frame requested a cooperative stop; ending evaluation after %d completed episode(s)",
+                len(results),
+            )
+            if current_vwriter is not None:
+                current_vwriter.close()
+                current_vwriter = None
+        n_completed = len(results)
         n_success = sum(1 for r in results if r["success"])
-        success_rate = n_success / max(n_episodes, 1)
-        avg_steps = sum(r["steps"] for r in results) / max(n_episodes, 1)
+        success_rate = n_success / max(n_completed, 1)
+        avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         _n_infer = len(inference_ms)
         rtc_telemetry = {
             "rtc_async_enabled": bool(async_rtc),
@@ -1791,8 +2410,9 @@ class PolicyRunner:
                 {
                     "text": (
                         f"Evaluation: {type(policy).__name__} on '{robot_name}'\n"
-                        f"Episodes: {n_episodes} | Success: {n_success}/{n_episodes} "
-                        f"({success_rate:.1%})"
+                        f"Episodes: {n_completed}"
+                        + (f" of {n_episodes} (stopped early)" if stopped_early else "")
+                        + f" | Success: {n_success}/{n_completed} ({success_rate:.1%})"
                         + ("" if success_measured else " [no success criterion - not measured]")
                         + "\n"
                         f"Avg steps: {avg_steps:.0f}/{max_steps}"
@@ -1803,6 +2423,8 @@ class PolicyRunner:
                         "success_rate": round(success_rate, 4),
                         "success_measured": success_measured,
                         "n_episodes": n_episodes,
+                        "episodes_completed": n_completed,
+                        "stopped_early": stopped_early,
                         "n_success": n_success,
                         "avg_steps": round(avg_steps, 1),
                         "max_steps": max_steps,
@@ -1810,9 +2432,11 @@ class PolicyRunner:
                         "policy_load_cache_hit": bool(getattr(policy, "load_cache_hit", False)),
                         "positional_fallback_used": bool(getattr(policy, "positional_fallback_used", False)),
                         "generic_state_keys_used": bool(getattr(policy, "generic_state_keys_used", False)),
+                        "missing_state_keys_used": bool(getattr(policy, "missing_state_keys_used", False)),
                         **rtc_telemetry,
                         "policy_resident_rss_mb": process_rss_mb(),
                         "episodes": results,
+                        "video_paths": video_paths,
                     }
                 },
             ],
@@ -1832,6 +2456,7 @@ class PolicyRunner:
         control_frequency: float = 50.0,
         control_substeps: int | None = None,
         policy_kwargs: dict[str, Any] | None = None,
+        video: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Drive a :class:`BenchmarkProtocol` for ``n_episodes`` episodes.
 
@@ -1855,6 +2480,12 @@ class PolicyRunner:
         are logged WARNING; the rollout continues. The hook receives a
         global step counter (across episodes), so callers that need
         per-episode buckets should track episode boundaries themselves.
+
+        ``video`` (optional) records one rollout MP4 per episode (``_ep{i}``
+        filename templating), captured synchronously on the eval thread at the
+        same point as ``on_frame`` - render is read-only over ``mjData`` so it
+        does not perturb the bit-stable spec-path rollout. Written paths are
+        returned in the result json ``video_paths``.
         """
         # Lazy import to avoid circular reference (benchmark module imports
         # `SimEngine` from base which imports this module under TYPE_CHECKING).
@@ -1873,7 +2504,7 @@ class PolicyRunner:
         # Per-episode reproducibility still flows through ``episode_rng``
         # below for the spec's per-episode RNG-driven init / jitter.
         if seed is not None:
-            _set_eval_seed(seed)
+            set_eval_seed(seed)
         master_rng = random.Random(seed)
         spec_name = type(spec).__name__
         max_steps = spec.max_steps
@@ -1909,142 +2540,202 @@ class PolicyRunner:
                 spec_instruction,
             )
 
-        for ep in range(n_episodes):
-            self.sim.reset()
-            # Per-episode seeded RNG - deterministic given the master seed
-            # and the episode index.
-            episode_seed = master_rng.randint(0, 2**31 - 1)
-            episode_rng = random.Random(episode_seed)
+        # Optional per-episode rollout video (evaluate_benchmark video=). One
+        # MP4 per episode via the _ep{i} filename templating, so a benchmark
+        # eval can be watched to see WHY episodes fail - not just read as an
+        # aggregate success_rate (parity with eval_policy). The writer is opened
+        # per episode below and frames are captured synchronously on the eval
+        # thread at the on_frame point, so recording never perturbs the
+        # bit-stable spec-path rollout (render is read-only over mjData).
+        video_paths: list[str] = []
+        current_vwriter: _RolloutVideoWriter | None = None
 
-            # #179 - re-seed Python / NumPy / torch / cuDNN at the start
-            # of EACH episode (not just once before the loop). Without
-            # the per-episode reseed, every torch op draws from a global
-            # RNG state that mutates across episodes, so the diffusion
-            # sampler in policies like ``nvidia/GR00T-N1.7-LIBERO`` produces
-            # different action chunks per re-run even at the same
-            # ``seed=42``. With the per-episode reseed, episode N always
-            # starts from the same RNG state regardless of what happened
-            # in episodes 0..N-1.
-            #
-            # Validated on libero-10/SCENE5: pre-#179 5-ep eval ranged
-            # 0.40-1.00 across runs; post-#179 the same eval is bit-stable
-            # (same successes list every run).
-            set_eval_seed(episode_seed)
+        stopped_early = False
+        try:
+            for ep in range(n_episodes):
+                self.sim.reset()
+                # Per-episode MP4 (foo_ep{i}.mp4). Path/camera validation +
+                # probe render happen here; a bad path/camera fails the eval
+                # up-front (on ep 0) instead of running N episodes and writing
+                # nothing. No-op (returns None) when video is unset.
+                ep_vcfg = self.sim._episode_video_config(video, ep)
+                current_vwriter, _video_err = _RolloutVideoWriter.open(self.sim, ep_vcfg, control_frequency)
+                if _video_err is not None:
+                    return _video_err
+                # Per-episode seeded RNG - deterministic given the master seed
+                # and the episode index.
+                episode_seed = master_rng.randint(0, 2**31 - 1)
+                episode_rng = random.Random(episode_seed)
 
-            # #187 - for SERVICE-mode policies (e.g. Gr00tPolicy over
-            # ZMQ), set_eval_seed only seeds the client process. The
-            # remote inference server has its own torch/CUDA RNG that
-            # drifts across calls. Forward the per-episode seed via
-            # policy.reset(seed=...) so server-side state can be
-            # re-initialised. Default Policy.reset is a no-op; concrete
-            # policies override (Gr00tPolicy forwards to the server's
-            # `reset` endpoint).
-            try:
-                policy.reset(seed=episode_seed)
-            except Exception as e:  # noqa: BLE001 - reset is best-effort
-                logger.warning(
-                    "policy.reset(seed=%d) raised %s; continuing without per-episode reset",
-                    episode_seed,
-                    e,
-                )
+                # #179 - re-seed Python / NumPy / torch / cuDNN at the start
+                # of EACH episode (not just once before the loop). Without
+                # the per-episode reseed, every torch op draws from a global
+                # RNG state that mutates across episodes, so the diffusion
+                # sampler in policies like ``nvidia/GR00T-N1.7-LIBERO`` produces
+                # different action chunks per re-run even at the same
+                # ``seed=42``. With the per-episode reseed, episode N always
+                # starts from the same RNG state regardless of what happened
+                # in episodes 0..N-1.
+                #
+                # Validated on libero-10/SCENE5: pre-#179 5-ep eval ranged
+                # 0.40-1.00 across runs; post-#179 the same eval is bit-stable
+                # (same successes list every run).
+                set_eval_seed(episode_seed)
 
-            try:
-                spec.on_episode_start(self.sim, episode_rng)
-            except BenchmarkCompatibilityError as e:
-                # Surface the structured error with the supported list -
-                # agents can fix this without retrying.
-                return {
-                    "status": "error",
-                    "content": [
-                        {
-                            "text": (
-                                f"Benchmark compatibility error: robot '{e.robot_name}' "
-                                f"has data_config={e.data_config!r}, but benchmark "
-                                f"{spec_name} supports {e.supported}."
-                            )
-                        }
-                    ],
-                }
-            except Exception as e:  # noqa: BLE001 - surface as structured error
-                logger.exception("on_episode_start failed")
-                return {
-                    "status": "error",
-                    "content": [{"text": f"on_episode_start failed in {spec_name}: {e}"}],
-                }
-
-            success = False
-            failure = False
-            steps = 0
-            cumulative_reward = 0.0
-            last_info: dict[str, Any] = {}
-
-            for _ in range(max_steps):
-                observation = self.sim.get_observation(robot_name=robot_name, skip_images=_skip_images)
-                # Hook: benchmarks may bridge the sim's observation schema
-                # (typically joint-space) to whatever the policy was trained
-                # on (e.g. LIBERO's Cartesian state.x/y/z/roll/pitch/yaw/gripper).
-                # Default impl on BenchmarkProtocol is identity. Failures
-                # surface as structured errors rather than silent fall-through
-                # since "policy got the wrong obs schema" is a common bug
-                # source.
+                # #187 - for SERVICE-mode policies (e.g. Gr00tPolicy over
+                # ZMQ), set_eval_seed only seeds the client process. The
+                # remote inference server has its own torch/CUDA RNG that
+                # drifts across calls. Forward the per-episode seed via
+                # policy.reset(seed=...) so server-side state can be
+                # re-initialised. Default Policy.reset is a no-op; concrete
+                # policies override (Gr00tPolicy forwards to the server's
+                # `reset` endpoint).
                 try:
-                    observation = spec.augment_observation(self.sim, observation)
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("augment_observation failed in %s", spec_name)
+                    policy.reset(seed=episode_seed)
+                except Exception as e:  # noqa: BLE001 - reset is best-effort
+                    logger.warning(
+                        "policy.reset(seed=%d) raised %s; continuing without per-episode reset",
+                        episode_seed,
+                        e,
+                    )
+
+                try:
+                    spec.on_episode_start(self.sim, episode_rng)
+                except BenchmarkCompatibilityError as e:
+                    # Surface the structured error with the supported list -
+                    # agents can fix this without retrying.
                     return {
                         "status": "error",
-                        "content": [{"text": f"augment_observation failed in {spec_name}: {e}"}],
-                    }
-                coro_or_result = policy.get_actions(observation, effective_instruction, **(policy_kwargs or {}))
-                actions = _resolve_coroutine(coro_or_result)
-
-                # #168: consume up to ``action_horizon`` actions
-                # per inference. Default ``action_horizon=8`` matches NVIDIA's
-                # upstream GR00T LIBERO eval (``MultiStepWrapper`` with
-                # ``n_action_steps=8``) - the GR00T-N1.7-LIBERO checkpoints
-                # were trained against an 8-step open-loop chunk replay.
-                # The earlier ``=1`` default (closed-loop OpenVLA
-                # convention) put eval out-of-distribution from training
-                # and was a contributing factor to ``success_rate=0``.
-                # Set to ``1`` for closed-loop receding-horizon control.
-                # ``on_step`` and success/failure checks run after EACH
-                # applied action so per-step rewards / early termination
-                # work whether action_horizon is 1 or 8.
-                action_applied: dict[str, Any] = {}
-                stop_episode = False
-                if not actions:
-                    # Degenerate policy - advance physics so loop terminates.
-                    self.sim.step(n_steps=1)
-                else:
-                    _chunk = resolve_chunk_length(policy, action_horizon)
-                    for action_in_chunk in actions[:_chunk]:
-                        if steps >= max_steps:
-                            break
-                        action_applied = dict(action_in_chunk)
-                        self.sim.send_action(action_applied, robot_name=robot_name, n_substeps=n_substeps)
-                        # #191 - synchronous on_frame hook fires on the
-                        # eval thread, after send_action + before
-                        # on_step's reward bookkeeping. Use this for
-                        # synchronous frame recording when the eval is
-                        # dispatched from a thread distinct from the
-                        # script main (e.g. Strands Agent worker thread
-                        # under asyncio); the daemon-thread recorder
-                        # races mjData mutations on the eval thread and
-                        # produces 2-3% frame-capture rates with greenish
-                        # GL clear-colour artifacts. See
-                        # ``Simulation.start_cameras_recording_synchronous``
-                        # for the recorder side of this contract.
-                        if on_frame is not None:
-                            try:
-                                on_frame(global_step, observation, action_applied)
-                            except Exception as e:  # noqa: BLE001 - hook is best-effort
-                                logger.warning(
-                                    "on_frame hook failed at global_step=%d (ep=%d, ep_step=%d): %s",
-                                    global_step,
-                                    ep,
-                                    steps,
-                                    e,
+                        "content": [
+                            {
+                                "text": (
+                                    f"Benchmark compatibility error: robot '{e.robot_name}' "
+                                    f"has data_config={e.data_config!r}, but benchmark "
+                                    f"{spec_name} supports {e.supported}."
                                 )
+                            }
+                        ],
+                    }
+                except Exception as e:  # noqa: BLE001 - surface as structured error
+                    logger.exception("on_episode_start failed")
+                    return {
+                        "status": "error",
+                        "content": [{"text": f"on_episode_start failed in {spec_name}: {e}"}],
+                    }
+
+                success = False
+                failure = False
+                steps = 0
+                cumulative_reward = 0.0
+                last_info: dict[str, Any] = {}
+
+                for _ in range(max_steps):
+                    observation = self.sim.get_observation(robot_name=robot_name, skip_images=_skip_images)
+                    # Hook: benchmarks may bridge the sim's observation schema
+                    # (typically joint-space) to whatever the policy was trained
+                    # on (e.g. LIBERO's Cartesian state.x/y/z/roll/pitch/yaw/gripper).
+                    # Default impl on BenchmarkProtocol is identity. Failures
+                    # surface as structured errors rather than silent fall-through
+                    # since "policy got the wrong obs schema" is a common bug
+                    # source.
+                    try:
+                        observation = spec.augment_observation(self.sim, observation)
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("augment_observation failed in %s", spec_name)
+                        return {
+                            "status": "error",
+                            "content": [{"text": f"augment_observation failed in {spec_name}: {e}"}],
+                        }
+                    coro_or_result = policy.get_actions(observation, effective_instruction, **(policy_kwargs or {}))
+                    actions = _resolve_coroutine(coro_or_result)
+
+                    # #168: consume up to ``action_horizon`` actions
+                    # per inference. Default ``action_horizon=8`` matches NVIDIA's
+                    # upstream GR00T LIBERO eval (``MultiStepWrapper`` with
+                    # ``n_action_steps=8``) - the GR00T-N1.7-LIBERO checkpoints
+                    # were trained against an 8-step open-loop chunk replay.
+                    # The earlier ``=1`` default (closed-loop OpenVLA
+                    # convention) put eval out-of-distribution from training
+                    # and was a contributing factor to ``success_rate=0``.
+                    # Set to ``1`` for closed-loop receding-horizon control.
+                    # ``on_step`` and success/failure checks run after EACH
+                    # applied action so per-step rewards / early termination
+                    # work whether action_horizon is 1 or 8.
+                    action_applied: dict[str, Any] = {}
+                    stop_episode = False
+                    if not actions:
+                        # Degenerate policy - advance physics so loop terminates.
+                        self.sim.step(n_steps=1)
+                    else:
+                        _chunk = resolve_chunk_length(policy, action_horizon)
+                        for action_in_chunk in actions[:_chunk]:
+                            if steps >= max_steps:
+                                break
+                            action_applied = dict(action_in_chunk)
+                            self.sim.send_action(action_applied, robot_name=robot_name, n_substeps=n_substeps)
+                            # #191 - synchronous on_frame hook fires on the
+                            # eval thread, after send_action + before
+                            # on_step's reward bookkeeping. Use this for
+                            # synchronous frame recording when the eval is
+                            # dispatched from a thread distinct from the
+                            # script main (e.g. Strands Agent worker thread
+                            # under asyncio); the daemon-thread recorder
+                            # races mjData mutations on the eval thread and
+                            # produces 2-3% frame-capture rates with greenish
+                            # GL clear-colour artifacts. See
+                            # ``Simulation.start_cameras_recording_synchronous``
+                            # for the recorder side of this contract.
+                            # Capture the rollout video frame synchronously on
+                            # the eval thread (same point + ep-local cadence as
+                            # eval_policy's _fire_on_frame). Independent of the
+                            # user on_frame hook so video records with or without
+                            # one. ``steps`` is the pre-increment ep-local index.
+                            if current_vwriter is not None:
+                                current_vwriter.capture(steps)
+                            if on_frame is not None:
+                                try:
+                                    on_frame(global_step, observation, action_applied)
+                                except CooperativeStop:
+                                    # Documented graceful early-stop; propagate
+                                    # to the episode loop instead of swallowing.
+                                    raise
+                                except Exception as e:  # noqa: BLE001 - hook is best-effort
+                                    logger.warning(
+                                        "on_frame hook failed at global_step=%d (ep=%d, ep_step=%d): %s",
+                                        global_step,
+                                        ep,
+                                        steps,
+                                        e,
+                                    )
+                            steps += 1
+                            global_step += 1
+                            try:
+                                info = spec.on_step(self.sim, observation, action_applied)
+                            except Exception as e:  # noqa: BLE001
+                                logger.exception("on_step failed in %s", spec_name)
+                                return {
+                                    "status": "error",
+                                    "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
+                                }
+                            cumulative_reward += float(info.reward)
+                            last_info = dict(info.info) if info.info else {}
+                            if info.done:
+                                stop_episode = True
+                                break
+                            if spec.is_failure(self.sim):
+                                failure = True
+                                stop_episode = True
+                                break
+                            if spec.is_success(self.sim):
+                                success = True
+                                stop_episode = True
+                                break
+                    if stop_episode:
+                        break
+                    if not actions:
+                        # Degenerate-policy branch already advanced steps via
+                        # sim.step(n_steps=1); count it like an applied step
+                        # so the outer loop terminates.
                         steps += 1
                         global_step += 1
                         try:
@@ -2058,62 +2749,58 @@ class PolicyRunner:
                         cumulative_reward += float(info.reward)
                         last_info = dict(info.info) if info.info else {}
                         if info.done:
-                            stop_episode = True
                             break
                         if spec.is_failure(self.sim):
                             failure = True
-                            stop_episode = True
                             break
                         if spec.is_success(self.sim):
                             success = True
-                            stop_episode = True
                             break
-                if stop_episode:
-                    break
-                if not actions:
-                    # Degenerate-policy branch already advanced steps via
-                    # sim.step(n_steps=1); count it like an applied step
-                    # so the outer loop terminates.
-                    steps += 1
-                    global_step += 1
-                    try:
-                        info = spec.on_step(self.sim, observation, action_applied)
-                    except Exception as e:  # noqa: BLE001
-                        logger.exception("on_step failed in %s", spec_name)
-                        return {
-                            "status": "error",
-                            "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
-                        }
-                    cumulative_reward += float(info.reward)
-                    last_info = dict(info.info) if info.info else {}
-                    if info.done:
-                        break
-                    if spec.is_failure(self.sim):
-                        failure = True
-                        break
-                    if spec.is_success(self.sim):
-                        success = True
-                        break
 
-            results.append(
-                {
-                    "episode": ep,
-                    "steps": steps,
-                    "success": success,
-                    "failure": failure,
-                    "cumulative_reward": round(cumulative_reward, 4),
-                    "seed": episode_seed,
-                    "info": last_info,
-                }
+                results.append(
+                    {
+                        "episode": ep,
+                        "steps": steps,
+                        "success": success,
+                        "failure": failure,
+                        "cumulative_reward": round(cumulative_reward, 4),
+                        "seed": episode_seed,
+                        "info": last_info,
+                    }
+                )
+                # #708 - same per-episode recorder boundary as evaluate().
+                self._finalize_recorder_episode()
+
+                if current_vwriter is not None:
+                    current_vwriter.close()
+                    if current_vwriter.frame_count > 0 and os.path.exists(current_vwriter.path):
+                        video_paths.append(current_vwriter.path)
+                    else:
+                        logger.warning(
+                            "evaluate_benchmark episode %d: video requested but wrote 0 frames to %s",
+                            ep,
+                            current_vwriter.path,
+                        )
+                    current_vwriter = None
+
+        except CooperativeStop:
+            # A user/backend on_frame hook requested a graceful stop (the
+            # same signal run() honors). End the benchmark over the episodes
+            # completed so far instead of crashing with an uncaught
+            # BaseException. Close any in-progress episode video cleanly.
+            if current_vwriter is not None:
+                current_vwriter.close()
+            stopped_early = True
+            logger.info(
+                "on_frame requested a cooperative stop; ending benchmark after %d completed episode(s)",
+                len(results),
             )
-            # #708 - same per-episode recorder boundary as evaluate().
-            self._finalize_recorder_episode()
-
+        n_completed = len(results)
         n_success = sum(1 for r in results if r["success"])
         n_failure = sum(1 for r in results if r["failure"])
-        success_rate = n_success / max(n_episodes, 1)
-        avg_steps = sum(r["steps"] for r in results) / max(n_episodes, 1)
-        avg_reward = sum(r["cumulative_reward"] for r in results) / max(n_episodes, 1)
+        success_rate = n_success / max(n_completed, 1)
+        avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
+        avg_reward = sum(r["cumulative_reward"] for r in results) / max(n_completed, 1)
 
         return {
             "status": "success",
@@ -2121,8 +2808,9 @@ class PolicyRunner:
                 {
                     "text": (
                         f"Benchmark: {spec_name} | policy {type(policy).__name__} on '{robot_name}'\n"
-                        f"Episodes: {n_episodes} | Success: {n_success} | Failure: {n_failure} "
-                        f"({success_rate:.1%} success)\n"
+                        f"Episodes: {n_completed}"
+                        + (f" of {n_episodes} (stopped early)" if stopped_early else "")
+                        + f" | Success: {n_success} | Failure: {n_failure} ({success_rate:.1%} success)\n"
                         f"Avg reward: {avg_reward:.2f} | Avg steps: {avg_steps:.0f}/{max_steps}"
                     )
                 },
@@ -2131,6 +2819,8 @@ class PolicyRunner:
                         "success_rate": round(success_rate, 4),
                         "success_measured": True,
                         "n_episodes": n_episodes,
+                        "episodes_completed": n_completed,
+                        "stopped_early": stopped_early,
                         "n_success": n_success,
                         "n_failure": n_failure,
                         "avg_steps": round(avg_steps, 1),
@@ -2142,8 +2832,10 @@ class PolicyRunner:
                         "policy_load_cache_hit": bool(getattr(policy, "load_cache_hit", False)),
                         "positional_fallback_used": bool(getattr(policy, "positional_fallback_used", False)),
                         "generic_state_keys_used": bool(getattr(policy, "generic_state_keys_used", False)),
+                        "missing_state_keys_used": bool(getattr(policy, "missing_state_keys_used", False)),
                         "policy_resident_rss_mb": process_rss_mb(),
                         "episodes": results,
+                        "video_paths": video_paths,
                     }
                 },
             ],

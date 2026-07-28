@@ -36,7 +36,7 @@ from strands.types._events import ToolResultEvent
 from strands.types.tools import ToolResult, ToolSpec, ToolUse
 
 from strands_robots.teleop_mixin import TeleopMixin
-from strands_robots.utils import require_optional
+from strands_robots.utils import positive_finite_number_error, require_optional
 
 if TYPE_CHECKING:
     from lerobot.robots.config import RobotConfig
@@ -239,7 +239,12 @@ class Robot(TeleopMixin, AgentTool):
                 {"wrist": {"type": "opencv", "index_or_path": "/dev/video0", "fps": 30}}
             action_horizon: Actions per inference step
             data_config: Data configuration (for GR00T compatibility)
-            control_frequency: Control loop frequency in Hz (default: 50Hz)
+            control_frequency: Control loop frequency in Hz (default: 50Hz).
+                Must be a positive finite number - it is the divisor of the
+                loop's per-action period (``1 / control_frequency``), the only
+                throttle between two servo commands. A ``0``, negative,
+                ``nan`` or ``inf`` rate raises ``ValueError`` here rather than
+                leaving the loop unthrottled against real hardware.
             ros2_bridge: When True, publish this robot's live observation
                 (``joint_states`` + one ``image_raw`` per camera) on a ROS 2
                 domain so external ROS 2 nodes can subscribe to the physical
@@ -283,6 +288,20 @@ class Robot(TeleopMixin, AgentTool):
         self.tool_name_str = tool_name
         self.action_horizon = action_horizon
         self.data_config = data_config
+        # ``action_sleep_time`` is ``1 / control_frequency`` and is the ONLY
+        # thing bounding how fast the task loop commands the physical servo
+        # bus: it is what ``_execute_task_async`` awaits between two
+        # ``send_action`` calls. A non-positive or non-finite rate turns that
+        # period into ``<= 0`` (``asyncio.sleep`` then returns immediately) or
+        # into ``nan`` (``asyncio.sleep`` raises mid-task, after the first
+        # action has already been applied), so the same rollout the simulation
+        # refuses outright would run here against real hardware. The identical
+        # domain is enforced on the rollout knobs of the simulation
+        # (``SimEngine._validate_positive_frequency``); validated BEFORE
+        # ``_initialize_robot`` opens the serial port, so a rejected rate never
+        # touches the arm.
+        if rate_error := positive_finite_number_error(control_frequency, "control_frequency", "Robot"):
+            raise ValueError(rate_error)
         self.control_frequency = control_frequency
         self.action_sleep_time = 1.0 / control_frequency  # Time between actions
 
@@ -698,7 +717,7 @@ class Robot(TeleopMixin, AgentTool):
             for name, config in cameras.items():
                 cam_type = config.get("type", "opencv")
                 if cam_type == "opencv":
-                    camera_configs[name] = OpenCVCameraConfig(
+                    _cam_kwargs = dict(
                         index_or_path=config["index_or_path"],
                         fps=config.get("fps", 30),
                         width=config.get("width", 640),
@@ -706,6 +725,12 @@ class Robot(TeleopMixin, AgentTool):
                         rotation=config.get("rotation", 0),
                         color_mode=config.get("color_mode", "rgb"),
                     )
+                    # Forward fourcc (e.g. "MJPG") when provided so high-res
+                    # cameras can hit 30fps -- many UVC cams only offer 30fps
+                    # under MJPG; the YUYV default caps at ~5fps @1080p.
+                    if config.get("fourcc") is not None:
+                        _cam_kwargs["fourcc"] = config["fourcc"]
+                    camera_configs[name] = OpenCVCameraConfig(**_cam_kwargs)
                 else:
                     raise ValueError(f"Unsupported camera type: {cam_type}")
 
@@ -971,8 +996,16 @@ class Robot(TeleopMixin, AgentTool):
         policy_host: str = "localhost",
         policy_provider: str = "groot",
         duration: float = 30.0,
+        policy_object: Policy | None = None,
+        n_steps: int | None = None,
     ) -> None:
-        """Execute robot task in background thread (internal method)."""
+        """Execute robot task in background thread (internal method).
+
+        ``policy_object`` (when given) is driven as-is and the provider/port
+        arguments are ignored - the ``run_policy`` path. ``n_steps`` caps the
+        number of applied actions; the loop stops at whichever of
+        ``duration`` / ``n_steps`` comes first.
+        """
         # resolve_chunk_length lives in the light policies.base module (no torch);
         # imported lazily to match this file's policy-import convention.
         from .policies.base import resolve_chunk_length
@@ -992,8 +1025,12 @@ class Robot(TeleopMixin, AgentTool):
                 self._task_state.error_message = connect_error or f"Failed to connect to {self.tool_name_str}"
                 return
 
-            # Get policy instance
-            policy_instance = await self._get_policy(policy_port, policy_host, policy_provider)
+            # Get policy instance: a caller-supplied pre-built object wins;
+            # otherwise build the server-backed one from provider + port.
+            if policy_object is not None:
+                policy_instance = policy_object
+            else:
+                policy_instance = await self._get_policy(policy_port, policy_host, policy_provider)
 
             # Initialize policy with robot state keys
             if not await self._initialize_policy(policy_instance):
@@ -1002,7 +1039,10 @@ class Robot(TeleopMixin, AgentTool):
                 return
 
             logger.info(f"Starting task: '{instruction}' on {self.tool_name_str}")
-            logger.info(f"Using policy: {policy_provider} on {policy_host}:{policy_port}")
+            if policy_object is not None:
+                logger.info(f"Using pre-built policy object: {type(policy_instance).__name__}")
+            else:
+                logger.info(f"Using policy: {policy_provider} on {policy_host}:{policy_port}")
 
             # Real-Time Chunking contract (mirror PolicyRunner._run_policy_rollout
             # in strands_robots/simulation/policy_runner.py): tell the policy the
@@ -1018,6 +1058,7 @@ class Robot(TeleopMixin, AgentTool):
 
             while (
                 time.time() - start_time < duration
+                and (n_steps is None or self._task_state.step_count < n_steps)
                 and self._task_state.status == TaskStatus.RUNNING
                 and not self._shutdown_event.is_set()
             ):
@@ -1053,6 +1094,8 @@ class Robot(TeleopMixin, AgentTool):
                 for action_dict in robot_actions[:chunk_len]:
                     if self._task_state.status != TaskStatus.RUNNING:
                         break
+                    if n_steps is not None and self._task_state.step_count >= n_steps:
+                        break
                     await asyncio.to_thread(self.robot.send_action, action_dict)
                     self._task_state.step_count += 1
                     # Wait for action to complete before sending next action
@@ -1079,6 +1122,8 @@ class Robot(TeleopMixin, AgentTool):
         policy_host: str = "localhost",
         policy_provider: str = "groot",
         duration: float = 30.0,
+        policy_object: Policy | None = None,
+        n_steps: int | None = None,
     ) -> dict[str, Any]:
         """Execute task synchronously in thread - no new event loop."""
 
@@ -1087,7 +1132,15 @@ class Robot(TeleopMixin, AgentTool):
 
         # Run task without creating new event loop - let it run in thread
         async def task_runner() -> None:
-            await self._execute_task_async(instruction, policy_port, policy_host, policy_provider, duration)
+            await self._execute_task_async(
+                instruction,
+                policy_port,
+                policy_host,
+                policy_provider,
+                duration,
+                policy_object=policy_object,
+                n_steps=n_steps,
+            )
 
         # Use asyncio.run only if no loop is running, otherwise run in existing loop
         try:
@@ -1104,13 +1157,18 @@ class Robot(TeleopMixin, AgentTool):
             asyncio.run(task_runner())
 
         # Return final status
+        policy_desc = (
+            f"{type(policy_object).__name__} (pre-built object)"
+            if policy_object is not None
+            else f"{policy_provider} on {policy_host}:{policy_port}"
+        )
         return {
             "status": "success" if self._task_state.status == TaskStatus.COMPLETED else "error",
             "content": [
                 {
                     "text": f"Task: '{instruction}' - {self._task_state.status.value}\n"
                     f"Robot: {self.tool_name_str} ({self.robot})\n"
-                    f"Policy: {policy_provider} on {policy_host}:{policy_port}\n"
+                    f"Policy: {policy_desc}\n"
                     f"Duration: {self._task_state.duration:.1f}s\n"
                     f"Steps: {self._task_state.step_count}"
                     + (f"\nError: {self._task_state.error_message}" if self._task_state.error_message else "")
@@ -1150,6 +1208,81 @@ class Robot(TeleopMixin, AgentTool):
                     f"Use action='stop' to interrupt"
                 }
             ],
+        }
+
+    def run_policy(
+        self,
+        policy_object: Policy,
+        instruction: str = "",
+        duration: float = 30.0,
+        n_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Run a pre-built policy object on the real robot (blocking).
+
+        Hardware counterpart of ``Simulation.run_policy(policy_object=...)``:
+        drive a policy already constructed in-process (e.g. via
+        ``create_policy(...)`` around a local checkpoint) without standing up
+        a policy server on a port. Reuses the exact ``start_task`` control
+        loop - connect (with half-open rollback), state-key initialization,
+        the RTC control-frequency / observed-delay contract, and
+        ``resolve_chunk_length`` chunk consumption - so a pre-built object
+        and a server-backed provider behave identically on the wire.
+
+        Blocking: returns when ``duration`` elapses, after ``n_steps``
+        applied actions, or when ``stop_task()`` is called from another
+        thread. For the server-backed provider path (and for fire-and-forget
+        execution) use ``start_task``.
+
+        Args:
+            policy_object: A constructed ``Policy`` instance. The object's
+                own device / embodiment / chunking configuration is honored;
+                the loop only injects the robot state keys and the RTC
+                control rate, exactly as it does for server-backed policies.
+            instruction: Natural-language instruction passed to the policy on
+                every ``get_actions`` call.
+            duration: Wall-clock budget in seconds (same default as
+                ``start_task``).
+            n_steps: Optional cap on applied actions (mirrors the sim
+                ``run_policy`` parameter); the loop stops at whichever of
+                ``duration`` / ``n_steps`` comes first.
+
+        Returns:
+            Tool-shaped result: a text summary plus a ``{"json": ...}`` block
+            carrying ``status`` / ``steps`` / ``duration_s`` / ``instruction``
+            / ``policy`` (and ``error`` when one occurred).
+        """
+        if policy_object is None:
+            return {
+                "status": "error",
+                "content": [{"text": "policy_object is required (for the provider+port path use start_task)"}],
+            }
+        if self._task_state.status == TaskStatus.RUNNING:
+            return {
+                "status": "error",
+                "content": [{"text": f"Task already running: {self._task_state.instruction}"}],
+            }
+
+        self._execute_task_sync(instruction, duration=duration, policy_object=policy_object, n_steps=n_steps)
+
+        succeeded = self._task_state.status == TaskStatus.COMPLETED
+        summary = (
+            f"Policy rollout {self._task_state.status.value}: "
+            f"{self._task_state.step_count} steps in {self._task_state.duration:.1f}s "
+            f"({type(policy_object).__name__} on {self.tool_name_str})"
+        )
+        payload: dict[str, Any] = {
+            "status": self._task_state.status.value,
+            "steps": self._task_state.step_count,
+            "duration_s": round(self._task_state.duration, 3),
+            "instruction": instruction,
+            "policy": type(policy_object).__name__,
+        }
+        if self._task_state.error_message:
+            payload["error"] = self._task_state.error_message
+            summary += f"\nError: {self._task_state.error_message}"
+        return {
+            "status": "success" if succeeded else "error",
+            "content": [{"text": summary}, {"json": payload}],
         }
 
     def get_task_status(self) -> dict[str, Any]:
@@ -1210,10 +1343,12 @@ class Robot(TeleopMixin, AgentTool):
 
     @property
     def tool_name(self) -> str:
+        """The Strands agent-tool name this robot registers itself under."""
         return self.tool_name_str
 
     @property
     def tool_type(self) -> str:
+        """The Strands tool category for this device (always ``"robot"``)."""
         return "robot"
 
     @property
@@ -1551,10 +1686,23 @@ class Robot(TeleopMixin, AgentTool):
             hz: Publishing frequency in Hz.
 
         Returns:
-            Status dict with topic and peer_id for the receiver to use.
+            Status dict with topic and peer_id for the receiver to use, or an
+            error dict when the mesh is inactive or ``device_name`` is not a
+            valid mesh identifier.
         """
         if not self.mesh or not self.mesh.alive:
             return {"status": "error", "content": [{"text": "Mesh not active. Cannot publish input."}]}
+
+        from strands_robots.mesh.security import ValidationError, validate_mesh_identifier
+
+        # ``device_name`` becomes a segment of the published key expression and
+        # a key in ``_input_publishers``. Validate before stopping any existing
+        # publisher for that name so a rejected call cannot tear down a live
+        # stream, and report through the tool envelope rather than raising.
+        try:
+            validate_mesh_identifier(device_name, "start_teleop_publish.device_name")
+        except ValidationError as exc:
+            return {"status": "error", "content": [{"text": str(exc)}]}
 
         from strands_robots.mesh import InputPublisher
 
@@ -1607,10 +1755,26 @@ class Robot(TeleopMixin, AgentTool):
                 Defaults to calling ``robot.send_action(action)``.
 
         Returns:
-            Status dict.
+            Status dict, or an error dict when the mesh is inactive or
+            ``source_peer_id`` / ``device_name`` is not a valid mesh
+            identifier.
         """
         if not self.mesh or not self.mesh.alive:
             return {"status": "error", "content": [{"text": "Mesh not active. Cannot receive input."}]}
+
+        from strands_robots.mesh.security import ValidationError, validate_mesh_identifier
+
+        # Both identifiers become segments of the subscribed key expression, so
+        # a Zenoh wildcard here would make this follower apply joint commands
+        # from every peer instead of the named leader. Validate before stopping
+        # any existing receiver for that key so a rejected call cannot tear
+        # down a live stream, and report through the tool envelope rather than
+        # raising past dispatch.
+        try:
+            validate_mesh_identifier(source_peer_id, "start_teleop_receive.source_peer_id")
+            validate_mesh_identifier(device_name, "start_teleop_receive.device_name")
+        except ValidationError as exc:
+            return {"status": "error", "content": [{"text": str(exc)}]}
 
         from strands_robots.mesh import InputReceiver
 

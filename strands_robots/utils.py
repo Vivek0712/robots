@@ -2,8 +2,11 @@
 
 import importlib
 import logging
+import math
+import numbers
 import os
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -186,22 +189,34 @@ def resolve_asset_path(relative_or_absolute: str | Path | None, default_name: st
 #
 
 
-def safe_join(base: Path, untrusted: str) -> Path:
+def safe_join(base: Path, untrusted: str, *, resolve_symlinks: bool = False) -> Path:
     """Join *base* with an untrusted relative path, rejecting traversal.
 
     Used to protect against ``../`` escapes in registry-sourced or
-    user-supplied path components before they reach the filesystem.
+    user-supplied path components before they reach the filesystem. Containment
+    is always verified lexically; set *resolve_symlinks* to additionally reject
+    symlinked components that escape *base* after resolution.
 
     Args:
         base: Trusted base directory.
         untrusted: Relative path component (may contain ``/`` but must not
             escape *base*).
+        resolve_symlinks: When ``True``, containment is re-verified after full
+            symlink resolution so a symlinked component that points outside
+            *base* (e.g. ``base/link -> /etc`` followed by ``link/passwd``) is
+            rejected. Enable this when *base* is an untrusted or externally
+            sourced tree - e.g. a freshly cloned repository - whose symlinks may
+            escape. Leave ``False`` (the default) for the managed asset cache,
+            whose robot directories are intentionally symlinked to installed
+            ``robot_descriptions`` packages that legitimately live outside the
+            cache; resolving those would wrongly reject them.
 
     Returns:
         Normalised absolute Path under *base*.
 
     Raises:
-        ValueError: If the resulting path would escape *base*.
+        ValueError: If the resulting path would escape *base* (lexically, or via
+            a symlink when *resolve_symlinks* is set).
 
     Example::
 
@@ -212,6 +227,17 @@ def safe_join(base: Path, untrusted: str) -> Path:
     base_norm = Path(os.path.normpath(base))
     if not (joined == base_norm or str(joined).startswith(str(base_norm) + os.sep)):
         raise ValueError(f"Path traversal blocked: {untrusted!r} escapes {base}")
+    if resolve_symlinks:
+        # Lexical normalisation cannot see through symlinks: a component such as
+        # ``link/passwd`` where ``base/link`` targets ``/etc`` stays lexically
+        # under *base* yet resolves outside it. ``resolve(strict=False)``
+        # resolves the existing prefix and appends the remainder lexically for
+        # not-yet-created files; resolving *base* too keeps a symlinked base
+        # prefix (e.g. /tmp on macOS) consistent on both sides.
+        base_resolved = base_norm.resolve()
+        joined_resolved = joined.resolve()
+        if not (joined_resolved == base_resolved or str(joined_resolved).startswith(str(base_resolved) + os.sep)):
+            raise ValueError(f"Path traversal blocked: {untrusted!r} escapes {base} via symlink")
     return joined
 
 
@@ -271,3 +297,85 @@ def process_rss_mb() -> float | None:
         return float(maxrss) / divisor
     except (ImportError, ValueError, OSError):
         return None
+
+
+def positive_finite_number_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable positive finite number.
+
+    Shared domain for every CONTINUOUS knob that names a rate or a span of
+    time - a control-loop frequency in Hz, a rollout or teleop ``duration`` in
+    seconds. Unlike :func:`positive_whole_number_error` a fractional value is
+    perfectly usable here (``2.5`` seconds, ``62.5`` Hz), so only the sign and
+    the finiteness are constrained. It lives here rather than beside one of its
+    callers because those callers sit in different layers
+    (:mod:`strands_robots.teleop_mixin` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them.
+
+    Only a positive finite value can be honored. Such a knob is always a
+    divisor (the loop period is ``1 / hz``) or a horizon (``duration *
+    frequency`` steps), so ``0`` makes the period undefined or the horizon
+    empty, a negative value inverts it, ``nan`` poisons every comparison it
+    reaches (``nan > 0`` and ``nan <= 0`` are both ``False``), and ``inf``
+    collapses the period to ``0`` - an unthrottled loop, not a fast one.
+    Accepts any real scalar (so a NumPy ``np.float32`` rate read from a config
+    array passes) and rejects ``bool`` explicitly - an ``int`` subclass whose
+    ``True`` would act as a silent ``1``.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            normally the public method name.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, numbers.Real)
+        # ``isfinite`` before the sign test: ``nan`` is never ``<= 0``, so
+        # ordering these the other way lets it through.
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        return f"{context}: {param} must be > 0, got {value!r}."
+    return None
+
+
+def positive_whole_number_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable positive whole number.
+
+    Shared domain for every media knob that counts frames or pixels - the
+    recorders' ``fps``, ``width``, ``height`` and in-memory frame cap, the
+    ``run_policy(video=...)`` dict fields, and the
+    :func:`~strands_robots.rendering.encode_clip` playback rate. It lives here
+    rather than beside one of its callers because those callers sit in different
+    layers (:mod:`strands_robots.rendering` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them. Only a positive whole number can be honored: ``0`` makes the capture loop's ``1 / fps``
+    period undefined, a negative rate is rejected by the ffmpeg writer, and a
+    zero/negative frame cap drops every frame. Accepts any real scalar with an
+    integral value (so a NumPy ``np.int64`` height or a ``30.0`` computed from a
+    config float passes) and rejects ``bool`` explicitly - an ``int`` subclass
+    whose ``True`` would act as a silent 1.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter (or dict key) it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            ``"video"`` for the :class:`VideoConfig` dict, the method name for a
+            keyword parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    message = f"{context}: {param} must be a positive whole number, got {value!r}."
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return message
+    numeric = float(value)
+    # ``isfinite`` first: ``int(nan)`` raises, and short-circuiting keeps it
+    # out of the integrality check below.
+    if not math.isfinite(numeric) or numeric != int(numeric) or numeric < 1:
+        return message
+    return None
