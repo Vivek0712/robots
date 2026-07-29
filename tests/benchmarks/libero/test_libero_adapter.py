@@ -468,6 +468,67 @@ class TestOnEpisodeStart:
         with pytest.raises(RuntimeError, match="load_scene"):
             adapter.on_episode_start(sim, random.Random(0))
 
+    def test_settle_action_sent_when_controller_installed(self):
+        """After scene load with an OSC action_controller installed,
+        ``on_episode_start`` emits one empty settle action.
+
+        Upstream LIBERO's ``OffScreenRenderEnv.reset`` does
+        ``set_init_state(...) + env.step(np.zeros(7))``, so the first
+        observation a policy sees is one control step past the raw
+        ``init_state``. The adapter mirrors that with a single
+        ``send_action({})`` (a zero OSC command). Without it, the first
+        observation is OOD versus the post-step training data.
+        """
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, scene_path="/fake/scene.xml")
+        sim = FakeSim(data_config="panda")
+        actions: list[Any] = []
+        sim.send_action = lambda action, robot_name=None, n_substeps=1: actions.append(action)  # type: ignore[assignment]
+        # Simulate a working OSC controller having been installed on the
+        # world (the real install needs robosuite + a compiled model).
+        sim._world._backend_state["action_controller"] = object()
+
+        adapter.on_episode_start(sim, random.Random(0))
+
+        assert {} in actions, "expected one empty settle send_action({})"
+
+    def test_settle_action_failure_does_not_abort_episode(self, caplog):
+        """A raising settle ``send_action`` must be swallowed with a
+        WARNING - a failed settle never aborts the eval.
+
+        The episode continues at the un-settled init pose rather than
+        propagating the exception out of ``on_episode_start``.
+        """
+        import logging
+
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, scene_path="/fake/scene.xml")
+        sim = FakeSim(data_config="panda")
+
+        def _boom(action, robot_name=None, n_substeps=1):
+            raise RuntimeError("settle boom")
+
+        sim.send_action = _boom  # type: ignore[assignment]
+        sim._world._backend_state["action_controller"] = object()
+
+        with caplog.at_level(logging.WARNING):
+            adapter.on_episode_start(sim, random.Random(0))  # must not raise
+
+        assert any("settle send_action" in r.getMessage() for r in caplog.records)
+
+    def test_no_settle_action_without_controller(self):
+        """With no OSC action_controller installed, the settle step is
+        skipped entirely - the adapter must not emit a spurious
+        ``send_action`` on the name-lookup (no-op controller) path.
+        """
+        adapter = LiberoAdapter.from_text(PICK_CUBE_BDDL, scene_path="/fake/scene.xml")
+        sim = FakeSim(data_config="panda")
+        actions: list[Any] = []
+        sim.send_action = lambda action, robot_name=None, n_substeps=1: actions.append(action)  # type: ignore[assignment]
+        # No "action_controller" key -> settle must not fire.
+
+        adapter.on_episode_start(sim, random.Random(0))
+
+        assert actions == [], "settle must not fire without an installed controller"
+
     def test_jitter_applied_when_init_declares_subject(self):
         adapter = LiberoAdapter.from_text(
             """
@@ -2312,6 +2373,134 @@ class TestRenameMjcfCameras:
         xml = '<camera pos="1 0 1" fovy="60" name="agentview"/>'
         out = _rename_mjcf_cameras(xml, {"agentview": "image"})
         assert 'name="image"' in out
+
+
+class TestExtractCompiledMjcf:
+    """``_extract_compiled_mjcf`` pulls the MJCF XML out of a libero
+    ControlEnv through a small ladder of robosuite accessors.
+
+    Robosuite renamed the accessor over the years, so the helper tries
+    ``env.env.model.get_xml()`` (pre-compile, preferred - preserves
+    ``<compiler>`` attributes like ``inertiagrouprange``), then
+    ``env.env.model.get_model_xml()``, then ``env.env.sim.model.get_xml()``
+    (post-compile, lossy) before giving up. These tests pin that
+    accessor-drift resilience and the fail-loud contract when every
+    accessor is unavailable - all dependency-free (no robosuite / mujoco).
+    """
+
+    @staticmethod
+    def _make_env(*, pre=None, model_xml=None, post=None):
+        """Build a fake libero ControlEnv exposing only the requested
+        accessors. A value that is an ``Exception`` instance makes that
+        accessor raise it; a string makes it return that string; omitting
+        it (None) means the attribute is absent so the call raises
+        ``AttributeError`` - exactly the robosuite-version-drift case.
+        """
+
+        def _accessor(value):
+            def _call():
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+            return _call
+
+        class _Model:
+            pass
+
+        model = _Model()
+        if pre is not None:
+            model.get_xml = _accessor(pre)  # type: ignore[attr-defined]
+        if model_xml is not None:
+            model.get_model_xml = _accessor(model_xml)  # type: ignore[attr-defined]
+
+        class _SimModel:
+            pass
+
+        sim_model = _SimModel()
+        if post is not None:
+            sim_model.get_xml = _accessor(post)  # type: ignore[attr-defined]
+
+        class _Sim:
+            pass
+
+        sim = _Sim()
+        sim.model = sim_model  # type: ignore[attr-defined]
+
+        class _Inner:
+            pass
+
+        inner = _Inner()
+        inner.model = model  # type: ignore[attr-defined]
+        inner.sim = sim  # type: ignore[attr-defined]
+
+        class _Env:
+            pass
+
+        env = _Env()
+        env.env = inner  # type: ignore[attr-defined]
+        return env
+
+    def test_prefers_precompile_accessor(self):
+        """When ``env.env.model.get_xml()`` is available it wins, even if
+        the lossy post-compile accessor would also succeed."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(pre="<mujoco>pre</mujoco>", post="<mujoco>post</mujoco>")
+        assert _extract_compiled_mjcf(env) == "<mujoco>pre</mujoco>"
+
+    def test_falls_back_to_get_model_xml(self):
+        """Missing ``get_xml`` (AttributeError) falls through to the older
+        ``get_model_xml`` accessor."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(model_xml="<mujoco>model_xml</mujoco>")
+        assert _extract_compiled_mjcf(env) == "<mujoco>model_xml</mujoco>"
+
+    def test_falls_back_to_postcompile_accessor(self):
+        """When both pre-compile accessors raise, the last-resort
+        post-compile ``env.env.sim.model.get_xml()`` is used."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(
+            pre=RuntimeError("robosuite drift"),
+            post="<mujoco>post</mujoco>",
+        )
+        assert _extract_compiled_mjcf(env) == "<mujoco>post</mujoco>"
+
+    def test_skips_empty_string_result(self):
+        """An accessor that returns an empty / whitespace string is not a
+        valid MJCF - the ladder continues to the next accessor."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(pre="   ", post="<mujoco>post</mujoco>")
+        assert _extract_compiled_mjcf(env) == "<mujoco>post</mujoco>"
+
+    def test_skips_non_string_result(self):
+        """An accessor that returns a non-string (e.g. a robosuite model
+        object) is skipped rather than returned or coerced."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(pre=object(), post="<mujoco>post</mujoco>")
+        assert _extract_compiled_mjcf(env) == "<mujoco>post</mujoco>"
+
+    def test_raises_when_all_accessors_fail(self):
+        """Every accessor unavailable -> fail loud with a RuntimeError that
+        names the last underlying error (never a silent empty string)."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(post=ValueError("post boom"))
+        with pytest.raises(RuntimeError, match="could not extract MJCF"):
+            _extract_compiled_mjcf(env)
+
+    def test_raise_message_includes_last_error(self):
+        """The raised RuntimeError chains the most recent accessor failure
+        so the operator can see *why* extraction failed."""
+        from strands_robots.benchmarks.libero.adapter import _extract_compiled_mjcf
+
+        env = self._make_env(post=ValueError("post boom"))
+        with pytest.raises(RuntimeError, match="post boom"):
+            _extract_compiled_mjcf(env)
 
 
 class TestCacheTransformVersion:

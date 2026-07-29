@@ -57,7 +57,7 @@ def resolve_policy(policy: str, **extra_kwargs) -> tuple[str, dict[str, Any]]:
 
     Resolution order:
         1. URL patterns (ws://, zmq://, grpc://, host:port)
-        2. Shorthand names (mock, groot, dreamgen, ...)
+        2. Shorthand names (mock, groot, lerobot_local, ...)
         3. HuggingFace model IDs (org/model)
         4. Registered provider name
         5. Fallback to lerobot_local
@@ -73,8 +73,11 @@ def resolve_policy(policy: str, **extra_kwargs) -> tuple[str, dict[str, Any]]:
         resolve_policy("lerobot/act_aloha_sim")
         # → ("lerobot_local", {"pretrained_name_or_path": "lerobot/act_aloha_sim"})
 
-        resolve_policy("localhost:8080")
-        # → ("lerobot_async", {"server_address": "localhost:8080"})
+        resolve_policy("zmq://localhost:5555")
+        # → ("groot", {"host": "localhost", "port": 5555})
+
+        resolve_policy("grpc://gpu-box:8080")
+        # → ("lerobot_async", {"server_address": "gpu-box:8080"})
 
         resolve_policy("mock")
         # → ("mock", {})
@@ -89,7 +92,11 @@ def resolve_policy(policy: str, **extra_kwargs) -> tuple[str, dict[str, Any]]:
         for pattern in prov_info.get("url_patterns", []):
             if re.match(pattern, policy):
                 if pattern.startswith("^wss?://"):
-                    match = re.match(r"wss?://([^:]+):?(\d+)?", policy)
+                    # Pass the full URL through as ``endpoint`` so the scheme
+                    # (ws:// vs wss://) and any path survive; also split out
+                    # host/port for providers that consume them directly.
+                    kwargs["endpoint"] = policy
+                    match = re.match(r"wss?://([^:/]+):?(\d+)?", policy)
                     if match:
                         kwargs["host"] = match.group(1)
                         kwargs["port"] = int(match.group(2) or 8000)
@@ -97,11 +104,24 @@ def resolve_policy(policy: str, **extra_kwargs) -> tuple[str, dict[str, Any]]:
                     # Cosmos 3 service-mode URL: cosmos3://[host[:port]] -> kwargs.
                     # Without this branch the pattern matches but no parser
                     # populates host/port, so create_policy("cosmos3://prod:9000")
-                    # silently falls back to the default localhost:8000 (#317 R3).
+                    # silently falls back to the default localhost:8000 (#317).
                     match = re.match(r"cosmos3://([^:/]+):?(\d+)?", policy)
                     if match:
                         kwargs["host"] = match.group(1)
                         kwargs["port"] = int(match.group(2) or 8000)
+                elif pattern.startswith("^vera://"):
+                    # VERA service-mode URL: vera://host[:port] -> kwargs.
+                    # Mirrors the cosmos3 branch (#317): the pattern matches but
+                    # without this parser nothing populates host/server_port, so
+                    # create_policy("vera://gpu-box:9000") silently connects to
+                    # the default 127.0.0.1. VERA's port kwarg is server_port;
+                    # leave it unset when the URL omits a port so the
+                    # per-embodiment default still applies.
+                    match = re.match(r"vera://([^:/]+):?(\d+)?", policy)
+                    if match:
+                        kwargs["host"] = match.group(1)
+                        if match.group(2):
+                            kwargs["server_port"] = int(match.group(2))
                 elif pattern.startswith("^zmq://"):
                     match = re.match(r"zmq://([^:]+):(\d+)", policy)
                     if match:
@@ -224,10 +244,10 @@ def build_policy_kwargs(
 
     Args:
         provider: Policy provider name.
-        policy_port: Port number (groot, lerobot_async).
+        policy_port: Port number (groot, cosmos3, moveit2, remote).
         policy_host: Hostname (default: "localhost").
         model_path: Local model path or HF ID.
-        server_address: Full gRPC address (lerobot_async).
+        server_address: Full server address host:port (grpc:// URLs, remote providers).
         policy_type: Sub-type (pi0, act, smolvla, ...).
         data_config: Data configuration for groot.
         **extra: Any additional provider-specific kwargs.

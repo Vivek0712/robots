@@ -62,6 +62,38 @@ ROBOT_XML = """
 """
 
 
+# Robot with a gripper-named end body. list_bodies(robot_name=...) advertises the
+# best-guess gripper/EEF mount so an agent can attach a wrist camera without
+# guessing a body name. The short name must contain gripper/hand/ee/tool.
+GRIPPER_ARM_XML = """
+<mujoco model="gripper_arm">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002"/>
+  <worldbody>
+    <light name="main" pos="0 0 3" dir="0 0 -1"/>
+    <geom name="ground" type="plane" size="5 5 0.01" rgba="0.9 0.9 0.9 1"/>
+    <body name="base" pos="0 0 0.1">
+      <geom type="cylinder" size="0.05 0.05" rgba="0.3 0.3 0.8 1"/>
+      <joint name="shoulder_pan" type="hinge" axis="0 0 1" range="-3.14 3.14"/>
+      <body name="link1" pos="0 0 0.1">
+        <geom type="capsule" size="0.03" fromto="0 0 0 0 0 0.2" rgba="0.8 0.3 0.3 1"/>
+        <joint name="elbow" type="hinge" axis="0 1 0" range="-2.0 2.0"/>
+        <body name="gripper" pos="0 0 0.2">
+          <geom type="box" size="0.02 0.02 0.02" rgba="0.2 0.2 0.2 1"/>
+          <joint name="jaw" type="slide" axis="0 1 0" range="0 0.04"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="shoulder_pan_act" joint="shoulder_pan" kp="50"/>
+    <position name="elbow_act" joint="elbow" kp="50"/>
+    <position name="jaw_act" joint="jaw" kp="20"/>
+  </actuator>
+</mujoco>
+"""
+
+
 # Free-base (floating) robot - a 1-DoF "leg" on a free joint, like the G1's
 # floating base. Used to test that get_observation surfaces base_quat /
 # base_ang_vel for locomotion controllers (WBC).
@@ -185,6 +217,21 @@ def sim_with_robot(sim_with_world, robot_xml_path):
     result = sim_with_world.add_robot("arm1", urdf_path=robot_xml_path)
     assert result["status"] == "success"
     return sim_with_world
+
+
+@pytest.fixture
+def sim_with_gripper_robot(sim_with_world):
+    """Simulation with world + a robot whose end body is named ``gripper``."""
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "gripper_arm.xml")
+    with open(path, "w") as f:
+        f.write(GRIPPER_ARM_XML)
+    try:
+        result = sim_with_world.add_robot("griparm", urdf_path=path)
+        assert result["status"] == "success"
+        yield sim_with_world
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # World Management
@@ -312,6 +359,27 @@ class TestWorldLifecycle:
     def test_load_scene_nonexistent(self, sim):
         result = sim.load_scene("/nonexistent/path.xml")
         assert result["status"] == "error"
+
+    def test_load_scene_malformed_mjcf_returns_error(self, sim, tmp_path):
+        """A syntactically-present but semantically-invalid MJCF must resolve to
+        a structured error dict, not an escaped exception.
+
+        ``load_scene`` guards the missing-file case up front, but a file that
+        exists and passes that guard can still fail deep in the MuJoCo compile
+        (bad attribute value, inconsistent joints, unknown element). That failure
+        must be converted into the ``{"status": "error"}`` contract every facade
+        method upholds so a caller/agent never has to catch a raw compile
+        exception mid-dispatch.
+        """
+        bad = tmp_path / "malformed.xml"
+        bad.write_text(
+            '<mujoco model="bad"><worldbody><body><geom type="box" size="not-a-number"/></body></worldbody></mujoco>'
+        )
+
+        result = sim.load_scene(str(bad))
+
+        assert result["status"] == "error"
+        assert "Failed to load scene" in result["content"][0]["text"]
 
 
 # Object Management
@@ -708,6 +776,82 @@ class TestListBodies:
         assert "arm1/base" in described["bodies"]
         assert "list_bodies" in described["methods"]
 
+    def test_describe_advertises_get_features_the_action_key_source(self, sim_with_robot):
+        """describe() must advertise get_features -- the joint/actuator/camera-
+        name discovery method that is the source of truth for the action keys a
+        policy must emit. The advertisement is only useful if the method it names
+        is real and returns those names, so assert both: the signature is on the
+        discovery surface, and calling it yields a non-empty actuator listing."""
+        described = sim_with_robot.describe()
+        assert "get_features" in described["methods"]
+        assert "robot_name" in described["methods"]["get_features"]
+
+        feats = sim_with_robot.get_features(robot_name="arm1")
+        assert feats["status"] == "success", feats
+        payload = next(c["json"] for c in feats["content"] if isinstance(c, dict) and "json" in c)
+        assert payload["features"]["actuator_names"], "get_features must list actuator names"
+
+    def test_fail_fast_recommended_method_is_discoverable_via_describe(self, sim_with_robot):
+        """Closed loop: when a policy's action keys resolve to no actuator,
+        run_policy's fail-fast error tells the caller to inspect the expected
+        keys via get_features(robot_name=...). The method that error names must
+        be discoverable on the primary discovery surface (describe), so an agent
+        recovering from the error does not have to scrape a method name out of an
+        error string only to find describe() never listed it."""
+        from strands_robots.policies.base import Policy
+
+        class _WrongKeysPolicy(Policy):
+            @property
+            def provider_name(self) -> str:
+                return "wrong_keys_test"
+
+            @property
+            def requires_images(self) -> bool:
+                return False
+
+            def set_robot_state_keys(self, robot_state_keys):
+                pass
+
+            async def get_actions(self, observation_dict, instruction, **kwargs):
+                # A key no actuator can absorb -> 100% unresolved every step.
+                return [{"definitely_not_a_joint": 0.5}]
+
+        result = sim_with_robot.run_policy(
+            robot_name="arm1",
+            policy_object=_WrongKeysPolicy(),
+            n_steps=50,
+            control_frequency=20.0,
+            fast_mode=True,
+        )
+        assert result["status"] == "error", result
+        err_text = result["content"][0]["text"]
+        # The diagnostic recommends get_features by name...
+        assert "get_features" in err_text
+        # ...and that method is discoverable on describe()'s method surface.
+        assert "get_features" in sim_with_robot.describe()["methods"]
+
+    def test_list_bodies_reports_gripper_mount_when_present(self, sim_with_gripper_robot):
+        """A robot with a gripper-like body gets its wrist/EEF mount resolved
+        automatically. This is the payoff of the discovery surface: the agent
+        reads ``gripper_body`` and mounts a wrist camera in one turn instead of
+        guessing the body name. The detection matches on the short (namespace-
+        stripped) body name, so the reported mount stays namespaced."""
+        result = sim_with_gripper_robot.list_bodies(robot_name="griparm")
+        assert result["status"] == "success"
+        payload = result["content"][1]["json"]
+        assert payload["gripper_body"] == "griparm/gripper"
+        # The human-readable text advertises the same mount point.
+        assert "Gripper/EEF mount: 'griparm/gripper'" in result["content"][0]["text"]
+        # And the discovered mount actually works as an add_camera parent_body.
+        cam = sim_with_gripper_robot.add_camera(
+            "wrist",
+            position=[0.0, 0.0, 0.05],
+            target=[0.0, 0.0, 0.0],
+            parent_body=payload["gripper_body"],
+        )
+        assert cam["status"] == "success"
+        assert sim_with_gripper_robot._world.cameras["wrist"].parent_body == "griparm/gripper"
+
 
 # Scene Injection (XML round-trip)
 
@@ -994,6 +1138,76 @@ class TestPolicyExecution:
     def test_start_policy_invalid_robot(self, sim_with_world):
         result = sim_with_world.start_policy("ghost")
         assert result["status"] == "error"
+
+    def test_describe_advertises_background_policy_lifecycle(self, sim_with_robot):
+        """describe() advertises the whole start/stop/list background-policy
+        lifecycle, not just start_policy.
+
+        The MuJoCo backend overrides start_policy to run in a background thread
+        (non-blocking), unlike the base engine's synchronous passthrough, and
+        provides stop_policy + list_policies_running to manage it. describe()
+        already advertised start_policy (inherited from the base surface), but
+        omitted its lifecycle siblings -- so an agent that discovered
+        start_policy here and launched a rollout could not learn how to stop it
+        or inspect what is running without guessing the names, a resource-leak
+        trap. Both are first-class actions in the tool spec + dispatcher and
+        belong on the discovery surface alongside start_policy.
+        """
+        methods = sim_with_robot.describe()["methods"]
+        for name in ("start_policy", "stop_policy", "list_policies_running"):
+            assert name in methods, f"describe() omits policy-lifecycle method {name!r}"
+        # Advertised signatures name the real parameters / return shape so a
+        # caller can invoke them without reading the source.
+        assert "robot_name" in methods["stop_policy"]
+        assert "-> dict" in methods["list_policies_running"]
+
+        # The advertisement is only useful if the methods it names are real and
+        # invocable: list before start reports none, stop is idempotent.
+        listed = sim_with_robot.list_policies_running()
+        assert listed["status"] == "success"
+        assert "No policies running" in listed["content"][0]["text"]
+        idempotent = sim_with_robot.stop_policy("arm1")
+        assert idempotent["status"] == "success"
+        assert "Was not running" in idempotent["content"][0]["text"]
+
+    def test_describe_advertises_multi_robot_rollout_family(self, sim_with_robot):
+        """describe() advertises run_multi_policy and the per-robot action/joint
+        introspection a multi-policy caller needs to wire each robot.
+
+        describe() advertises run_policy (drive ONE robot with a created policy)
+        and the background start/stop/list lifecycle, but omitted
+        run_multi_policy -- the facade that drives SEVERAL robots, each with its
+        own Policy, in one synchronized loop (the correct path for bimanual /
+        multi-agent data collection). It also omitted the two per-robot
+        introspection primitives a caller uses to build that {robot_name:
+        Policy} map: robot_action_keys (the actuator short-names a policy must
+        emit -- NOT always the joint names) and robot_joint_names (the ordered
+        observation.state vector). An agent enumerating the sim from describe()
+        alone could drive one robot but had to guess how to drive many, or key a
+        policy by joint name and watch tendon/mimic DOFs silently no-op.
+        """
+        methods = sim_with_robot.describe()["methods"]
+        for name in ("run_multi_policy", "robot_action_keys", "robot_joint_names"):
+            assert name in methods, f"describe() omits multi-robot method {name!r}"
+        # Advertised signatures name the real parameters / return shape so a
+        # caller can invoke them without reading the source.
+        assert "policies" in methods["run_multi_policy"]
+        assert "-> dict" in methods["run_multi_policy"]
+        assert "-> list[str]" in methods["robot_action_keys"]
+        assert "-> list[str]" in methods["robot_joint_names"]
+        # The advertisement names actuator-vs-joint distinction that makes
+        # robot_action_keys the correct key source over robot_joint_names.
+        assert "send_action" in methods["robot_action_keys"]
+
+        # The advertisement is only useful if the methods it names are real and
+        # return the exact per-robot lists a policy is keyed on.
+        joints = sim_with_robot.robot_joint_names("arm1")
+        keys = sim_with_robot.robot_action_keys("arm1")
+        assert isinstance(joints, list) and joints, "robot_joint_names('arm1') is empty"
+        assert isinstance(keys, list) and keys, "robot_action_keys('arm1') is empty"
+        # Unknown robots return an empty list rather than raising.
+        assert sim_with_robot.robot_joint_names("ghost") == []
+        assert sim_with_robot.robot_action_keys("ghost") == []
 
 
 # Action Dispatch

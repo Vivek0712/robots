@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from .. import Policy
-from .embodiment import ZeroActionMonitor, diagnose_action_dim
+from .embodiment import ZeroActionMonitor, diagnose_action_dim, hardware_pos_keys
 from .processor import ProcessorBridge
 from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_hub
 
@@ -340,6 +340,10 @@ class LerobotLocalPolicy(Policy):
         self.load_time_s: float = 0.0
         self.load_cache_hit: bool = False
         self._processor_bridge: ProcessorBridge | None = None
+        # Set True when the pipeline loaded and was active but the caller's
+        # embodiment / image_keys were incompatible with the model's declared
+        # features, so the bridge was discarded (see _load_processor_bridge).
+        self._embodiment_config_failed = False
         self._tokenizer: Any = None
         self._tokenizer_max_length: int = tokenizer_max_length
         self._tokenizer_padding_side: str = tokenizer_padding_side
@@ -375,6 +379,21 @@ class LerobotLocalPolicy(Policy):
         # vs named-joint mismatch). Keeps the state-key fallback loud, not
         # silent (see _resolve_state_order).
         self._state_key_mismatch_warned: bool = False
+        # Warn at most once per policy when SOME (but not all) configured
+        # robot_state_keys are absent from the observation - the
+        # partial-mismatch case. Previously the absent keys were silently
+        # dropped from the state vector, shifting every following joint
+        # value into the wrong index before a trailing zero-pad (the
+        # canonical trigger is a mimic/tendon gripper whose actuator name
+        # differs from the observation's finger-joint names, e.g. aloha).
+        # Missing dims are now zero-filled IN PLACE so present dims keep
+        # their model index, and the degradation is surfaced rather than
+        # silent (mirrors _resolve_state_order's all-missing guard).
+        self._state_missing_keys_warned: bool = False
+        # Telemetry parallel to generic_state_keys_used: flipped True the
+        # first time a resolved state key is missing from the observation
+        # so run_policy / eval_policy can surface a machine-checkable signal.
+        self.missing_state_keys_used = False
 
         # Action diagnostics: surface a model<->embodiment action-dim mismatch
         # (zero-filled actuators) and a persistent near-zero action stream
@@ -387,6 +406,7 @@ class LerobotLocalPolicy(Policy):
 
     @property
     def provider_name(self) -> str:
+        """Registry key for this provider (``"lerobot_local"``)."""
         return "lerobot_local"
 
     @property
@@ -798,34 +818,95 @@ class LerobotLocalPolicy(Policy):
                     action_dim - 1,
                 )
 
-        # Load processor pipeline (preprocessor + postprocessor)
-        if self.use_processor and self.pretrained_name_or_path:
-            try:
-                self._processor_bridge = ProcessorBridge.from_pretrained(
-                    self.pretrained_name_or_path,
-                    device=str(self._device) if self._device else None,
-                    overrides=self.processor_overrides or {},
-                    policy_type=self.policy_type,
-                )
-                if self._processor_bridge.is_active:
-                    logger.info("Processor bridge loaded: %s", self._processor_bridge)
-                    # SOLUTION.md: configure the declarative embodiment map into
-                    # the pipeline ONCE (rename_map + pack-state step), validated
-                    # fail-fast against the model's declared features. After this,
-                    # the hot path feeds RAW obs straight to preprocess().
+        # Load processor pipeline (preprocessor + postprocessor), configure the
+        # declarative embodiment map, and emit load-time diagnostics.
+        self._load_processor_bridge()
+
+        # Initialize RTC if supported by this policy
+        self._init_rtc()
+
+    def _load_processor_bridge(self) -> None:
+        """Load the processor pipeline, configure the embodiment, and emit load-time diagnostics.
+
+        Two distinct failure modes were previously conflated into one silent,
+        debug-level discard of the whole pipeline:
+
+        * ``ProcessorBridge.from_pretrained`` raises (no processor configs are
+          shipped, or an optional import is missing): the checkpoint legitimately
+          has no pipeline, so fall back to the raw obs/action flow. This is a
+          common, benign shape - logged at debug, and the missing-postprocessor
+          warning below still fires so a raw-action checkpoint is not mistaken for
+          a frozen policy.
+        * ``_configure_embodiment`` raises ``ValueError``: the pipeline loaded and
+          was ACTIVE, but the caller's embodiment / ``image_keys`` are incompatible
+          with the model's declared features. Discarding it silently degrades a
+          WORKING normalization pipeline to the raw flow AND misdirects the
+          downstream "no policy_postprocessor.json" diagnostic (the checkpoint
+          shipped one - it was discarded here). Surface the real cause as a
+          warning, or raise when ``processor_overrides`` were given (mirroring the
+          from_pretrained path).
+
+        A malformed embodiment *spec* (bad name / dict) raises ``RuntimeError``
+        from ``load_embodiment`` and is intentionally NOT caught here - that is a
+        caller error that should abort the load loudly.
+        """
+        self._embodiment_config_failed = False
+        if not (self.use_processor and self.pretrained_name_or_path):
+            return
+
+        try:
+            self._processor_bridge = ProcessorBridge.from_pretrained(
+                self.pretrained_name_or_path,
+                device=str(self._device) if self._device else None,
+                overrides=self.processor_overrides or {},
+                policy_type=self.policy_type,
+                policy_config=getattr(self._policy, "config", None),
+                revision=self.revision,
+                norm_tag=self._molmoact2_norm_tag,
+            )
+        except (FileNotFoundError, ValueError, ImportError) as exc:
+            # Processor bridge is optional - models work without it via the raw
+            # obs/action flow. Fail-fast only if the caller requested overrides.
+            if self.processor_overrides:
+                raise RuntimeError(
+                    f"Processor bridge failed to load but processor_overrides were specified: {exc}"
+                ) from exc
+            logger.debug("Processor bridge not loaded: %s", exc)
+            self._processor_bridge = None
+        else:
+            if self._processor_bridge.is_active:
+                logger.info("Processor bridge loaded: %s", self._processor_bridge)
+                # SOLUTION.md: configure the declarative embodiment map into the
+                # pipeline ONCE (rename_map + pack-state step), validated fail-fast
+                # against the model's declared features. After this, the hot path
+                # feeds RAW obs straight to preprocess().
+                try:
                     self._configure_embodiment()
-                else:
+                except ValueError as exc:
+                    # The pipeline loaded and was active, but the embodiment /
+                    # image_keys do not match the model's declared features. Do NOT
+                    # swallow this at debug: discarding an otherwise-working
+                    # normalization pipeline is a silent behaviour change, and the
+                    # missing-postprocessor warning below would misattribute it to a
+                    # checkpoint lacking a policy_postprocessor.json.
+                    if self.processor_overrides:
+                        raise RuntimeError(
+                            f"Embodiment configuration failed but processor_overrides were specified: {exc}"
+                        ) from exc
+                    logger.warning(
+                        "lerobot_local: %s loaded an ACTIVE processor pipeline but its "
+                        "embodiment could not be configured (%s). The pipeline (including "
+                        "normalization) was discarded and the policy falls back to the raw "
+                        "obs/action flow -- align the embodiment / image_keys with the "
+                        "model's declared input/output features.",
+                        self.pretrained_name_or_path or "<model>",
+                        exc,
+                    )
                     self._processor_bridge = None
-                    logger.debug("No processor configs found, using raw obs/action flow")
-            except (FileNotFoundError, ValueError, ImportError) as exc:
-                # Processor bridge is optional - models work without it via raw obs/action flow.
-                # Fail-fast only if the user explicitly requested processor overrides.
-                if self.processor_overrides:
-                    raise RuntimeError(
-                        f"Processor bridge failed to load but processor_overrides were specified: {exc}"
-                    ) from exc
-                logger.debug("Processor bridge not loaded: %s", exc)
+                    self._embodiment_config_failed = True
+            else:
                 self._processor_bridge = None
+                logger.debug("No processor configs found, using raw obs/action flow")
 
         # Action unnormalization only happens when a postprocessor pipeline is
         # present (get_actions: ``if self._processor_bridge.has_postprocessor``).
@@ -833,7 +914,10 @@ class LerobotLocalPolicy(Policy):
         # normalized actions (~[-1, 1] or z-scored) straight to the robot. Fed
         # to a radian-joint sim those are micro-motions and the arm barely
         # moves. Warn once at load so this isn't debugged as a frozen policy.
-        if self.use_processor:
+        # Skipped when the pipeline was discarded by an embodiment-config failure
+        # above (already warned with the accurate cause), so we do not emit the
+        # misleading "no policy_postprocessor.json" message for that case.
+        if self.use_processor and not self._embodiment_config_failed:
             bridge = self._processor_bridge
             if bridge is None or not bridge.has_postprocessor:
                 logger.warning(
@@ -876,9 +960,6 @@ class LerobotLocalPolicy(Policy):
                         inert,
                     )
 
-        # Initialize RTC if supported by this policy
-        self._init_rtc()
-
     def _auto_detect_actions_per_step(self) -> None:
         """Select the inference regime the loaded checkpoint was trained for.
 
@@ -900,12 +981,22 @@ class LerobotLocalPolicy(Policy):
             Many policies declare ``config.n_action_steps`` - the number of
             actions emitted per inference that the model was trained to replay
             open-loop before requerying observation (e.g. MolmoAct2 SO-100/101 =
-            30, ACT = 100, Diffusion = 32). The default ``actions_per_step=1`` is
+            30, ACT = 100). The default ``actions_per_step=1`` is
             a closed-loop convention that re-queries every step; for a chunk-
             trained model that is out of distribution and the shift compounds
             every chunk. When left at the default ``1`` we adopt
             ``n_action_steps`` so the chunk is consumed as trained. An explicit
             ``actions_per_step > 1`` from the caller is respected here.
+
+        Observation history (``config.n_obs_steps > 1``):
+            Diffusion (2) and VQBeT (5) consume a short observation history and
+            MUST run through ``select_action()`` (it maintains the obs-history
+            queue). Their ``predict_action_chunk()`` offline branch stacks a
+            single live frame as ``n_obs_steps=1`` and ``generate_actions()``
+            asserts, so the ``actions_per_step > 1`` regime crashes them. We keep
+            ``actions_per_step=1`` for these checkpoints; ``select_action()``
+            still replays the ``n_action_steps`` chunk from its internal queue,
+            so open-loop chunk replay is preserved - just correctly.
 
         Logged at INFO so the active regime is always visible.
         """
@@ -937,6 +1028,29 @@ class LerobotLocalPolicy(Policy):
             return
         if self.actions_per_step != 1:
             return  # caller pinned an explicit horizon - never override it
+        # Observation-history policies (``n_obs_steps > 1``, e.g. Diffusion=2,
+        # VQBeT=5) MUST be driven per-step through ``select_action()``. That path
+        # maintains the required ``n_obs_steps`` observation queue AND still
+        # caches the model's ``n_action_steps`` chunk internally (re-querying the
+        # model only when the queue drains - the same open-loop chunk replay,
+        # done correctly). The ``actions_per_step > 1`` regime instead calls
+        # ``predict_action_chunk()`` on a SINGLE live observation frame; its
+        # offline branch stacks that lone frame as ``n_obs_steps=1``, so
+        # ``generate_actions()`` trips ``assert n_obs_steps == config.n_obs_steps``
+        # and crashes. Keep ``actions_per_step=1`` for these checkpoints so the
+        # per-step ``select_action()`` path is used.
+        n_obs_steps = getattr(config, "n_obs_steps", 1)
+        if isinstance(n_obs_steps, int) and n_obs_steps > 1:
+            logger.info(
+                "lerobot_local: %s consumes an observation history "
+                "(n_obs_steps=%d) - driving per-step via select_action() (which "
+                "keeps the obs-history queue and still replays the model's "
+                "n_action_steps chunk from its internal queue). Keeping "
+                "actions_per_step=1.",
+                type(self._policy).__name__,
+                n_obs_steps,
+            )
+            return
         n_action_steps = getattr(config, "n_action_steps", None)
         if isinstance(n_action_steps, int) and n_action_steps > 1:
             self.actions_per_step = n_action_steps
@@ -1289,17 +1403,16 @@ class LerobotLocalPolicy(Policy):
             logger.debug("RTC disabled for policy '%s'", type(self._policy).__name__)
             return
 
-        # Read RTC parameters from config, with user overrides
-        if rtc_config is not None:
-            if self._rtc_execution_horizon is None:
-                self._rtc_execution_horizon = getattr(rtc_config, "execution_horizon", 10)
-            if self._rtc_max_guidance_weight is None:
-                self._rtc_max_guidance_weight = getattr(rtc_config, "max_guidance_weight", 10.0)
-        else:
-            if self._rtc_execution_horizon is None:
-                self._rtc_execution_horizon = 10
-            if self._rtc_max_guidance_weight is None:
-                self._rtc_max_guidance_weight = 10.0
+        # Read RTC parameters from config, honoring user-provided overrides.
+        # Reaching this point guarantees rtc_config is not None: RTC is only
+        # enabled when a non-None rtc_config was found (see the auto-detect and
+        # explicit-enable branches above), so no rtc_config-is-None fallback is
+        # needed here. getattr still supplies the 10 / 10.0 defaults when the
+        # config object omits the attributes.
+        if self._rtc_execution_horizon is None:
+            self._rtc_execution_horizon = getattr(rtc_config, "execution_horizon", 10)
+        if self._rtc_max_guidance_weight is None:
+            self._rtc_max_guidance_weight = getattr(rtc_config, "max_guidance_weight", 10.0)
 
         logger.info(
             "RTC enabled for '%s': execution_horizon=%d, max_guidance_weight=%.1f",
@@ -1594,6 +1707,42 @@ class LerobotLocalPolicy(Policy):
 
     # Inference
 
+    def _hardware_action_keys(self, observation_dict: dict[str, Any]) -> list[str] | None:
+        """Actuator names to emit actions under when a SIM embodiment is driven from hardware.
+
+        lerobot ``SOFollower`` & friends key joint scalars as ``'<motor>.pos'``.
+        When a SIM embodiment (numeric / named sim joints) is fed a hardware
+        observation, the action tensor must still be emitted under those
+        ``'.pos'`` names, and WITHOUT the sim unit conversion, for
+        ``SOFollower.send_action`` to accept it.
+
+        Detection uses the same :func:`hardware_pos_keys` predicate as the state
+        side (``PackStateProcessorStep``). The two used to be written separately
+        and could disagree: this side ran a plain-``float`` pass and only tried a
+        numpy pass ``if not _pos:``, so a PARTIALLY matching first pass poisoned
+        the retry and left the override unset, while the state side - one
+        combined pass - succeeded on the same observation. The model was then fed
+        raw hardware degrees while its action was emitted with the sim
+        radian->degree conversion applied (~57x under-scaled), and nothing
+        warned, because the state side had succeeded.
+
+        Args:
+            observation_dict: The raw observation for this step.
+
+        Returns:
+            The hardware actuator names to bind the action vector to, or ``None``
+            when this is not a hardware observation (or the embodiment already
+            declares ``'.pos'`` action keys, making the override a no-op).
+        """
+        if self._embodiment is None or not self._embodiment.action_keys:
+            return None
+        if any(str(key).endswith(".pos") for key in self._embodiment.action_keys):
+            return None
+        pos_keys = hardware_pos_keys(observation_dict)
+        if len(pos_keys) < len(self._embodiment.action_keys):
+            return None
+        return pos_keys[: len(self._embodiment.action_keys)]
+
     async def get_actions(self, observation_dict: dict[str, Any], instruction: str, **kwargs) -> list[dict[str, Any]]:
         """Get actions from policy given observation and instruction.
 
@@ -1618,6 +1767,8 @@ class LerobotLocalPolicy(Policy):
         observation = dict(observation_dict)
         if instruction and "task" not in observation:
             observation["task"] = instruction
+
+        _hw_action_keys = self._hardware_action_keys(observation_dict)
 
         # When the processor bridge has a preprocessor, delegate normalization
         # and tokenization to it, then fix up any remaining raw arrays/tensors
@@ -1699,7 +1850,7 @@ class LerobotLocalPolicy(Policy):
         if self._processor_bridge and self._processor_bridge.has_postprocessor:
             action_tensor = self._processor_bridge.postprocess(action_tensor)
 
-        return self._tensor_to_action_dicts(action_tensor)
+        return self._tensor_to_action_dicts(action_tensor, hw_action_keys=_hw_action_keys)
 
     # Observation batch building
 
@@ -1899,6 +2050,78 @@ class LerobotLocalPolicy(Policy):
             self._state_key_mismatch_warned = True
         return scalar_keys
 
+    def _collect_state_values(self, observation_dict: dict[str, Any], order: list[str]) -> list[float]:
+        """Pull the joint-state vector from ``observation_dict`` in ``order``.
+
+        Every key in ``order`` contributes exactly one slot, in order, so the
+        emitted vector is index-aligned with the resolved key list. A key that
+        is present as a scalar (Python/NumPy number or 0-d array) contributes
+        its value; a key that is ABSENT from the observation (or present but
+        non-scalar) contributes ``0.0`` IN PLACE - it is never dropped.
+
+        Dropping an absent key instead (the prior behaviour) shifted every
+        following joint value up by one index before the caller's trailing
+        zero-pad, silently mis-aligning ``observation.state``. The canonical
+        trigger is a mimic/tendon gripper whose actuator name (e.g. aloha's
+        ``left/gripper``) is not among the observation's finger-joint names
+        while the arm joints are: the arm values slid into the gripper slots.
+        ``so101`` and any robot whose keys are all present are unaffected.
+
+        When ``order`` is ``robot_state_keys`` and some of them are missing
+        (a partial mismatch), the degradation is surfaced - ``strict_keys``
+        raises, otherwise it warns once and sets ``missing_state_keys_used`` -
+        mirroring :meth:`_resolve_state_order`'s all-missing guard. The
+        observation's own scalar-key fallback (``order`` != ``robot_state_keys``)
+        has no missing keys by construction, so this never double-fires with
+        the all-missing path.
+
+        Args:
+            observation_dict: Raw strands/sim observation for this step.
+            order: Resolved key ordering from :meth:`_resolve_state_order`.
+
+        Returns:
+            One float per key in ``order`` (missing keys zero-filled in place).
+
+        Raises:
+            ValueError: When ``strict_keys`` is set and a resolved
+                ``robot_state_keys`` entry is missing from the observation.
+        """
+        values: list[float] = []
+        missing: list[str] = []
+        for key in order:
+            v = observation_dict.get(key)
+            if isinstance(v, bool):
+                # bool is an int subclass but never a joint reading.
+                missing.append(key)
+                values.append(0.0)
+            elif isinstance(v, (int, float, np.floating, np.integer)):
+                values.append(float(v))
+            elif isinstance(v, np.ndarray) and v.ndim == 0:
+                values.append(float(v))
+            else:
+                missing.append(key)
+                values.append(0.0)
+        # Only a robot_state_keys ordering can contain a key absent from the
+        # observation; the scalar-key fallback is built from present keys.
+        if missing and order is self.robot_state_keys:
+            shown = missing[:8]
+            ellipsis = "..." if len(missing) > 8 else ""
+            msg = (
+                f"{len(missing)} configured robot_state_keys are not present in the "
+                f"observation: {shown}{ellipsis}. Present joints keep their index and the "
+                "missing dims are zero-filled in place, but the sim/robot does not report "
+                "those joints - commonly a mimic/tendon gripper whose actuator name differs "
+                "from the observation's finger-joint names. Pass embodiment='<name>' or call "
+                "set_robot_state_keys([...]) with names the observation actually contains."
+            )
+            if self.strict_keys:
+                raise ValueError("strict_keys=True: " + msg)
+            self.missing_state_keys_used = True
+            if not self._state_missing_keys_warned:
+                logger.warning(msg)
+                self._state_missing_keys_warned = True
+        return values
+
     def _to_lerobot_observation(self, observation_dict: dict[str, Any]) -> dict[str, Any]:
         """Remap a strands-native observation to LeRobot feature keys.
 
@@ -2002,14 +2225,10 @@ class LerobotLocalPolicy(Policy):
         # generic joint_0..N vs named-joint mismatch) instead of silently
         # producing a zero/empty state (see _resolve_state_order).
         order = self._resolve_state_order(observation_dict, scalar_keys)
-        state_vals = []
-        for k in order:
-            if k in observation_dict:
-                v = observation_dict[k]
-                if isinstance(v, (int, float, np.floating, np.integer)):
-                    state_vals.append(float(v))
-                elif isinstance(v, np.ndarray) and v.ndim == 0:
-                    state_vals.append(float(v))
+        # Build the vector index-aligned with ``order`` - a resolved key absent
+        # from the observation is zero-filled IN PLACE (not dropped, which would
+        # shift following joints into the wrong slots) and surfaced loudly.
+        state_vals = self._collect_state_values(observation_dict, order)
         if state_vals:
             # Adapt state dim to the model's declared observation.state shape.
             # The preprocessor's normalizer does element-wise ops against fixed
@@ -2330,18 +2549,11 @@ class LerobotLocalPolicy(Policy):
         ]
         order = self._resolve_state_order(observation_dict, scalar_keys)
 
-        # Collect state values in resolved order. Each key maps to a single
-        # float value representing one joint/motor position.
-        state_values = []
-        for key in order:
-            if key in observation_dict:
-                value = observation_dict[key]
-                if isinstance(value, (int, float)):
-                    state_values.append(float(value))
-                elif isinstance(value, (np.floating, np.integer)):
-                    state_values.append(float(value))
-                elif isinstance(value, np.ndarray) and value.ndim == 0:
-                    state_values.append(float(value))
+        # Collect state values index-aligned with the resolved order. A key in
+        # ``order`` absent from the observation is zero-filled IN PLACE (not
+        # dropped, which would shift following joints into the wrong slots) and
+        # surfaced loudly. Each key maps to one joint/motor position.
+        state_values = self._collect_state_values(observation_dict, order)
 
         if state_values:
             # Auto-adapt state dimension to match what the model expects.
@@ -2432,7 +2644,9 @@ class LerobotLocalPolicy(Policy):
             return True
         return type(policy).__name__ == "MolmoAct2Policy"
 
-    def _tensor_to_action_dicts(self, action_tensor: torch.Tensor) -> list[dict[str, Any]]:
+    def _tensor_to_action_dicts(
+        self, action_tensor: torch.Tensor, hw_action_keys: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         """Convert action tensor to list of robot action dicts.
 
         Maps tensor values to robot_state_keys by index. Handles:
@@ -2501,18 +2715,29 @@ class LerobotLocalPolicy(Policy):
         # arm freezes. EmbodimentMap.model_action_to_sim is a no-op when
         # action_units == "native" (the default / real-hardware path).
         emb = self._embodiment
-        convert = emb is not None and getattr(emb, "action_units", "native") != "native"
+        # HARDWARE OVERRIDE: when the caller detected real-hardware '.pos' obs
+        # keys (see get_actions), emit actions under those '.pos' names and SKIP
+        # the sim unit conversion. A SIM embodiment (e.g. so101, action_units=
+        # "degrees") would otherwise (a) key the action by numeric sim joints
+        # ('1'..'6') that the lerobot SOFollower.send_action does not accept, and
+        # (b) convert model DEGREES -> sim RADIANS, feeding ~0.003 rad to a
+        # hardware bus that expects degrees. Both are wrong on the physical arm.
+        # The '.pos' keys are already the model's native units, so pack raw.
+        if hw_action_keys:
+            out_keys = list(hw_action_keys)
+            convert = False
+        else:
+            out_keys = list(self.robot_state_keys)
+            convert = emb is not None and getattr(emb, "action_units", "native") != "native"
 
         result = []
         for action_values in actions_list:
-            vals = [
-                float(action_values[i]) if i < len(action_values) else 0.0 for i in range(len(self.robot_state_keys))
-            ]
+            vals = [float(action_values[i]) if i < len(action_values) else 0.0 for i in range(len(out_keys))]
             # `convert` already implies `emb is not None`; the explicit guard lets
             # the type checker narrow `emb` from `EmbodimentMap | None` at the call.
             if convert and emb is not None:
                 vals = emb.model_action_to_sim(vals)
-            action_dict = {key: vals[index] for index, key in enumerate(self.robot_state_keys)}
+            action_dict = {key: vals[index] for index, key in enumerate(out_keys)}
             result.append(action_dict)
 
         return result

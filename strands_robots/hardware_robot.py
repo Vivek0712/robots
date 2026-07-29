@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import difflib
 import functools
 import importlib
 import logging
@@ -24,7 +25,7 @@ import pkgutil
 import shutil
 import threading
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -36,7 +37,7 @@ from strands.types._events import ToolResultEvent
 from strands.types.tools import ToolResult, ToolSpec, ToolUse
 
 from strands_robots.teleop_mixin import TeleopMixin
-from strands_robots.utils import require_optional
+from strands_robots.utils import positive_finite_number_error, require_optional
 
 if TYPE_CHECKING:
     from lerobot.robots.config import RobotConfig
@@ -96,6 +97,111 @@ _FORWARDABLE_KWARGS = (
     "max_relative_target",
     "disable_torque_on_disconnect",
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-camera config construction.
+# ---------------------------------------------------------------------------
+#
+# ``Robot(..., cameras={"front": {...}})`` describes each camera with a
+# free-form dict whose keys are the fields of lerobot's camera config
+# dataclass. The accepted vocabulary is therefore derived from
+# ``dataclasses.fields()`` rather than hand-picked: a hand-picked list leaves
+# every field it forgets unreachable (no caller can set it at all) and silently
+# discards every key it does not recognise, so a typo like ``heigth=1080``
+# reports success having configured the default resolution.
+#
+# ``strands_robots`` supplies its own defaults for the three fields lerobot
+# leaves as ``None`` (meaning "whatever the device negotiates") so an
+# unconfigured camera has a predictable, documented stream. Every other field
+# keeps lerobot's own default.
+#
+# Invariant: every key here must be a field lerobot still declares. If one is
+# renamed upstream the stale key reaches ``OpenCVCameraConfig(**options)`` and
+# fails loudly for every camera rather than being silently dropped -- and the
+# test suite asserts the containment directly, so the drift is caught before a
+# release rather than at an operator's ``Robot()`` call.
+_OPENCV_CAMERA_DEFAULTS: dict[str, Any] = {"fps": 30, "width": 640, "height": 480}
+
+# ``type`` selects which camera backend to build. It is consumed by the
+# dispatch below, not forwarded to the config dataclass.
+_CAMERA_TYPE_KEY = "type"
+
+
+def _build_camera_config(camera_name: str, config: Any) -> Any:
+    """Build the lerobot camera config for one entry of a ``cameras`` dict.
+
+    Args:
+        camera_name: The key this camera was registered under. Named in every
+            error so a multi-camera rig reports which entry is at fault.
+        config: The per-camera options. Accepted keys are the declared fields
+            of lerobot's ``OpenCVCameraConfig`` plus ``type``, which selects
+            the camera backend (``opencv`` is the only one implemented).
+
+    Returns:
+        The constructed ``OpenCVCameraConfig``.
+
+    Raises:
+        ValueError: If ``config`` is not a mapping, names an unimplemented
+            camera ``type``, carries a key that is not a declared field, omits
+            a field that has no default, or holds a value lerobot's own config
+            validation refuses. An unknown key is refused rather than dropped
+            per AGENTS.md > Review Learnings (#86): a silently discarded option
+            reports success while the camera streams at the default.
+    """
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+
+    if not isinstance(config, Mapping):
+        raise ValueError(
+            f"Camera {camera_name!r} config must be a mapping of option name to value, "
+            f"got {type(config).__name__}: {config!r}."
+        )
+
+    cam_type = config.get(_CAMERA_TYPE_KEY, "opencv")
+    if cam_type != "opencv":
+        raise ValueError(f"Unsupported camera type: {cam_type}")
+
+    fields = {f.name: f for f in dataclasses.fields(OpenCVCameraConfig)}
+    accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
+
+    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
+    if unknown:
+        hints = []
+        for key in unknown:
+            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
+            if close:
+                hints.append(f"{key!r} -> {close[0]!r}")
+        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
+        raise ValueError(
+            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
+            f"OpenCVCameraConfig accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
+            f"the camera backend). (If this is a typo, fix it.)"
+        )
+
+    missing = sorted(
+        name
+        for name, field in fields.items()
+        if name not in config
+        and name not in _OPENCV_CAMERA_DEFAULTS
+        and field.default is dataclasses.MISSING
+        and field.default_factory is dataclasses.MISSING
+    )
+    if missing:
+        raise ValueError(
+            f"Camera {camera_name!r} is missing required option(s): {missing}. OpenCVCameraConfig accepts: {accepted}."
+        )
+
+    # strands defaults first so an explicitly configured value always wins.
+    options = {**_OPENCV_CAMERA_DEFAULTS, **{name: config[name] for name in fields if name in config}}
+    try:
+        return OpenCVCameraConfig(**options)
+    except (TypeError, ValueError) as exc:
+        # Names the camera, which lerobot's own message cannot: its
+        # ``__post_init__`` validation (e.g. a 3-character ``fourcc``) raises
+        # with no idea which entry of the ``cameras`` dict it came from.
+        raise ValueError(
+            f"Failed to construct OpenCVCameraConfig for camera {camera_name!r}: {exc}. Options: {options}"
+        ) from exc
 
 
 @functools.cache
@@ -239,7 +345,12 @@ class Robot(TeleopMixin, AgentTool):
                 {"wrist": {"type": "opencv", "index_or_path": "/dev/video0", "fps": 30}}
             action_horizon: Actions per inference step
             data_config: Data configuration (for GR00T compatibility)
-            control_frequency: Control loop frequency in Hz (default: 50Hz)
+            control_frequency: Control loop frequency in Hz (default: 50Hz).
+                Must be a positive finite number - it is the divisor of the
+                loop's per-action period (``1 / control_frequency``), the only
+                throttle between two servo commands. A ``0``, negative,
+                ``nan`` or ``inf`` rate raises ``ValueError`` here rather than
+                leaving the loop unthrottled against real hardware.
             ros2_bridge: When True, publish this robot's live observation
                 (``joint_states`` + one ``image_raw`` per camera) on a ROS 2
                 domain so external ROS 2 nodes can subscribe to the physical
@@ -283,6 +394,20 @@ class Robot(TeleopMixin, AgentTool):
         self.tool_name_str = tool_name
         self.action_horizon = action_horizon
         self.data_config = data_config
+        # ``action_sleep_time`` is ``1 / control_frequency`` and is the ONLY
+        # thing bounding how fast the task loop commands the physical servo
+        # bus: it is what ``_execute_task_async`` awaits between two
+        # ``send_action`` calls. A non-positive or non-finite rate turns that
+        # period into ``<= 0`` (``asyncio.sleep`` then returns immediately) or
+        # into ``nan`` (``asyncio.sleep`` raises mid-task, after the first
+        # action has already been applied), so the same rollout the simulation
+        # refuses outright would run here against real hardware. The identical
+        # domain is enforced on the rollout knobs of the simulation
+        # (``SimEngine._validate_positive_frequency``); validated BEFORE
+        # ``_initialize_robot`` opens the serial port, so a rejected rate never
+        # touches the arm.
+        if rate_error := positive_finite_number_error(control_frequency, "control_frequency", "Robot"):
+            raise ValueError(rate_error)
         self.control_frequency = control_frequency
         self.action_sleep_time = 1.0 / control_frequency  # Time between actions
 
@@ -684,30 +809,22 @@ class Robot(TeleopMixin, AgentTool):
         typos like ``prot=`` (instead of ``port=``) at config-build time
         rather than as a delayed connection failure with no kwarg in
         sight.
+
+        Each entry of ``cameras`` follows the same contract, resolved against
+        the fields of lerobot's ``OpenCVCameraConfig`` -- see
+        :func:`_build_camera_config`.
         """
         # ``lerobot`` is already a hard dep at this point (``_initialize_robot``
         # imports it eagerly). Importing the camera + config modules here is
         # cheap and the only reason it isn't at module top is that some
         # downstream packagers tree-shake unused submodules.
-        from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
         from lerobot.robots.config import RobotConfig
 
         # Convert cameras to lerobot format.
         camera_configs: dict[str, Any] = {}
         if cameras:
             for name, config in cameras.items():
-                cam_type = config.get("type", "opencv")
-                if cam_type == "opencv":
-                    camera_configs[name] = OpenCVCameraConfig(
-                        index_or_path=config["index_or_path"],
-                        fps=config.get("fps", 30),
-                        width=config.get("width", 640),
-                        height=config.get("height", 480),
-                        rotation=config.get("rotation", 0),
-                        color_mode=config.get("color_mode", "rgb"),
-                    )
-                else:
-                    raise ValueError(f"Unsupported camera type: {cam_type}")
+                camera_configs[name] = _build_camera_config(name, config)
 
         # Trigger lerobot's lazy registration. Each robot driver registers
         # its config via @RobotConfig.register_subclass at module-import
@@ -979,7 +1096,13 @@ class Robot(TeleopMixin, AgentTool):
         ``policy_object`` (when given) is driven as-is and the provider/port
         arguments are ignored - the ``run_policy`` path. ``n_steps`` caps the
         number of applied actions; the loop stops at whichever of
-        ``duration`` / ``n_steps`` comes first.
+        ``duration`` / ``n_steps`` comes first. The two conditions are ANDed,
+        so ``duration`` bounds the rollout even with a step cap - it is
+        validated at every public entry point rather than only when it is the
+        sole horizon.
+
+        Either way the policy's per-episode state is reset before the rollout,
+        so a task never begins from the state the previous task left behind.
         """
         # resolve_chunk_length lives in the light policies.base module (no torch);
         # imported lazily to match this file's policy-import convention.
@@ -1027,6 +1150,28 @@ class Robot(TeleopMixin, AgentTool):
             # sim. Without it a wrong assumed rate corrupts RTC blending at every
             # frequency except the assumed one. No-op for non-RTC policies.
             policy_instance.set_control_frequency(self.control_frequency)
+
+            # Clear per-episode policy state before the rollout, mirroring the
+            # per-episode reset PolicyRunner performs in
+            # strands_robots/simulation/policy_runner.py. A caller may drive one
+            # policy object through several tasks (that is the documented
+            # ``run_policy(policy_object=...)`` usage), and Policy.reset exists
+            # to clear exactly the state that must not cross that boundary -
+            # action chunk caches, sampler RNG, KV-caches. Without it the first
+            # actions of a task can be the PREVIOUS task's cached chunk, so the
+            # arm executes commands inferred for a different instruction.
+            # No seed is passed: a hardware task has no per-episode seed to
+            # forward, so this asks only for a state clear.
+            #
+            # Fail-soft, matching PolicyRunner: a policy whose reset raises
+            # still gets driven, with the stale state named in the warning.
+            try:
+                policy_instance.reset()
+            except Exception as e:  # noqa: BLE001 - reset is best-effort
+                logger.warning(
+                    "policy.reset() raised %s; continuing with possibly stale per-episode state",
+                    e,
+                )
 
             self._task_state.status = TaskStatus.RUNNING
             start_time = time.time()
@@ -1090,6 +1235,47 @@ class Robot(TeleopMixin, AgentTool):
             self._task_state.status = TaskStatus.ERROR
             self._task_state.error_message = str(e)
 
+    @staticmethod
+    def _duration_error(duration: Any, method: str) -> dict[str, Any] | None:
+        """Reject a task ``duration`` the control loop cannot honor.
+
+        ``duration`` is the wall-clock budget the loop compares against
+        (``time.time() - start_time < duration``), and on hardware it bounds
+        every rollout: unlike the simulation's ``run_policy`` - where an
+        ``n_steps`` recomputes ``duration`` and supersedes it - the two
+        conditions are ANDed here, so ``duration`` is the effective horizon
+        even when a step cap is given.
+
+        Only a positive finite value can be honored. A value ``<= 0`` (and
+        ``nan``, which is never ``<= 0`` but fails every comparison it reaches)
+        makes the loop condition false on its first evaluation: the task used
+        to report ``status="success"`` for a rollout that never queried the
+        policy and never commanded the arm. ``inf`` is worse than a fast
+        budget - it never becomes false, so the loop commands the servo bus
+        indefinitely and the blocking entry point never returns. A
+        non-numeric value reached the comparison intact and surfaced a bare
+        ``TypeError`` naming a comparison internal ("'<' not supported between
+        instances of 'float' and 'str'") rather than the parameter.
+
+        The accepted domain is
+        :func:`~strands_robots.utils.positive_finite_number_error`, shared with
+        the loop's ``control_frequency`` guard and with the simulation's
+        :meth:`~strands_robots.simulation.base.SimEngine._validate_duration`,
+        so the same budget cannot be refused for a digital twin and accepted
+        for the arm it mirrors.
+
+        Args:
+            duration: The caller-supplied value to validate.
+            method: Public entry point name, used to prefix the message.
+
+        Returns:
+            A tool-shaped error dict naming ``duration``, or ``None`` when the
+            value can be honored.
+        """
+        if error := positive_finite_number_error(duration, "duration", method):
+            return {"status": "error", "content": [{"text": error}]}
+        return None
+
     def _execute_task_sync(
         self,
         instruction: str,
@@ -1101,6 +1287,12 @@ class Robot(TeleopMixin, AgentTool):
         n_steps: int | None = None,
     ) -> dict[str, Any]:
         """Execute task synchronously in thread - no new event loop."""
+        # Validated here as well as at the public methods below: this is the
+        # chokepoint the agent-tool "execute" action and the mesh "execute"
+        # dispatch reach directly, so a peer-supplied budget is refused before
+        # the arm is commanded rather than after.
+        if err := self._duration_error(duration, "execute_task"):
+            return err
 
         # Import here to avoid conflicts
         import asyncio
@@ -1159,7 +1351,27 @@ class Robot(TeleopMixin, AgentTool):
         policy_provider: str = "groot",
         duration: float = 30.0,
     ) -> dict[str, Any]:
-        """Start robot task asynchronously and return immediately."""
+        """Start robot task asynchronously and return immediately.
+
+        Args:
+            instruction: Natural-language instruction passed to the policy.
+            policy_port: Port of the policy server to query.
+            policy_host: Host of the policy server.
+            policy_provider: Provider name used to build the policy.
+            duration: Wall-clock budget in seconds. Must be positive and
+                finite; it is validated before the task is submitted, so a
+                budget the loop cannot honor is reported here instead of as a
+                started task that commands nothing (or never ends).
+
+        Returns:
+            Tool-shaped result confirming the task started, or an error naming
+            the offending parameter.
+        """
+        # Before the submit: the work happens on a background thread, so a
+        # budget checked inside it would still report "Task started" to the
+        # caller for a task that commands nothing (or never ends).
+        if err := self._duration_error(duration, "start_task"):
+            return err
 
         # Check if task is already running
         if self._task_state.status == TaskStatus.RUNNING:
@@ -1213,10 +1425,16 @@ class Robot(TeleopMixin, AgentTool):
                 own device / embodiment / chunking configuration is honored;
                 the loop only injects the robot state keys and the RTC
                 control rate, exactly as it does for server-backed policies.
+                Its per-episode state is cleared via ``Policy.reset`` at the
+                start of every task, so one object can be reused across tasks
+                without the previous task's cached action chunk being driven.
             instruction: Natural-language instruction passed to the policy on
                 every ``get_actions`` call.
             duration: Wall-clock budget in seconds (same default as
-                ``start_task``).
+                ``start_task``). Must be positive and finite; the loop bounds
+                the rollout by it even when ``n_steps`` is given, so a value it
+                cannot honor is refused rather than reported as a rollout that
+                commanded nothing.
             n_steps: Optional cap on applied actions (mirrors the sim
                 ``run_policy`` parameter); the loop stops at whichever of
                 ``duration`` / ``n_steps`` comes first.
@@ -1236,6 +1454,8 @@ class Robot(TeleopMixin, AgentTool):
                 "status": "error",
                 "content": [{"text": f"Task already running: {self._task_state.instruction}"}],
             }
+        if err := self._duration_error(duration, "run_policy"):
+            return err
 
         self._execute_task_sync(instruction, duration=duration, policy_object=policy_object, n_steps=n_steps)
 
@@ -1318,10 +1538,12 @@ class Robot(TeleopMixin, AgentTool):
 
     @property
     def tool_name(self) -> str:
+        """The Strands agent-tool name this robot registers itself under."""
         return self.tool_name_str
 
     @property
     def tool_type(self) -> str:
+        """The Strands tool category for this device (always ``"robot"``)."""
         return "robot"
 
     @property
@@ -1363,7 +1585,11 @@ class Robot(TeleopMixin, AgentTool):
                         },
                         "duration": {
                             "type": "number",
-                            "description": "Maximum execution time in seconds",
+                            "description": (
+                                "Maximum execution time in seconds. Must be a positive finite "
+                                "number: the loop compares elapsed time against it, so 0 or a "
+                                "negative value commands nothing and infinity never ends."
+                            ),
                             "default": 30.0,
                         },
                     },
@@ -1656,13 +1882,34 @@ class Robot(TeleopMixin, AgentTool):
                 KeyboardTeleop, Phone).
             device_name: Name for this input stream (e.g. "leader", "gamepad").
             method: Input method label ("arm", "gamepad", "keyboard", "phone").
-            hz: Publishing frequency in Hz.
+            hz: Publishing frequency in Hz. Must be a positive finite number;
+                the publish loop's period is ``1 / hz``.
 
         Returns:
-            Status dict with topic and peer_id for the receiver to use.
+            Status dict with topic and peer_id for the receiver to use, or an
+            error dict when the mesh is inactive, ``device_name`` is not a
+            valid mesh identifier, or ``hz`` is not a rate the publish loop
+            can honor.
         """
         if not self.mesh or not self.mesh.alive:
             return {"status": "error", "content": [{"text": "Mesh not active. Cannot publish input."}]}
+
+        from strands_robots.mesh.security import ValidationError, validate_mesh_identifier
+
+        # Both arguments are validated up front, before the teardown of any
+        # publisher already registered under this device name: a rejected call
+        # must not stop a live stream. ``device_name`` becomes a segment of the
+        # published key expression and a key in ``_input_publishers``, and
+        # ``hz`` sets the publish loop's ``1 / hz`` period. Report through the
+        # tool envelope rather than raising.
+        try:
+            validate_mesh_identifier(device_name, "start_teleop_publish.device_name")
+        except ValidationError as exc:
+            return {"status": "error", "content": [{"text": str(exc)}]}
+
+        error = positive_finite_number_error(hz, "hz", "start_teleop_publish")
+        if error:
+            return {"status": "error", "content": [{"text": error}]}
 
         from strands_robots.mesh import InputPublisher
 
@@ -1715,10 +1962,26 @@ class Robot(TeleopMixin, AgentTool):
                 Defaults to calling ``robot.send_action(action)``.
 
         Returns:
-            Status dict.
+            Status dict, or an error dict when the mesh is inactive or
+            ``source_peer_id`` / ``device_name`` is not a valid mesh
+            identifier.
         """
         if not self.mesh or not self.mesh.alive:
             return {"status": "error", "content": [{"text": "Mesh not active. Cannot receive input."}]}
+
+        from strands_robots.mesh.security import ValidationError, validate_mesh_identifier
+
+        # Both identifiers become segments of the subscribed key expression, so
+        # a Zenoh wildcard here would make this follower apply joint commands
+        # from every peer instead of the named leader. Validate before stopping
+        # any existing receiver for that key so a rejected call cannot tear
+        # down a live stream, and report through the tool envelope rather than
+        # raising past dispatch.
+        try:
+            validate_mesh_identifier(source_peer_id, "start_teleop_receive.source_peer_id")
+            validate_mesh_identifier(device_name, "start_teleop_receive.device_name")
+        except ValidationError as exc:
+            return {"status": "error", "content": [{"text": str(exc)}]}
 
         from strands_robots.mesh import InputReceiver
 

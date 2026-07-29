@@ -13,6 +13,7 @@ structures, round-trips) rather than implementation details.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +190,65 @@ def test_restore_skips_existing_without_overwrite(populated: Path, tmp_path: Pat
     assert dest.load_calibration("robots", "so101_follower", "orange_arm") == _calib(6)
 
 
+def test_structure_skips_absent_device_type_directory(tmp_path: Path) -> None:
+    """Discovery tolerates a missing top-level device-type directory.
+
+    The manager materializes ``teleoperators`` and ``robots`` on construction,
+    but a hand-managed tree may lack one. ``get_calibration_structure`` must
+    skip the absent directory and still report the other, rather than raising.
+    """
+    mgr = LeRobotCalibrationManager(tmp_path)
+    mgr.save_calibration("robots", "so101_follower", "arm1", _calib(3))
+    # Remove the (empty) teleoperators directory so the branch that skips a
+    # non-existent device-type path is exercised.
+    mgr.teleop_path.rmdir()
+
+    structure = mgr.get_calibration_structure()
+    assert structure["teleoperators"] == {}
+    assert structure["robots"] == {"so101_follower": ["arm1"]}
+
+
+def test_backup_default_location_is_timestamped_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backup with no explicit output_dir writes to a timestamped default dir."""
+    monkeypatch.setattr("strands_robots.tools.lerobot_calibrate.BACKUP_DIR", tmp_path / "default_backups")
+    mgr = LeRobotCalibrationManager(tmp_path / "src")
+    mgr.save_calibration("robots", "so101_follower", "arm1", _calib(2))
+
+    ok, location, count = mgr.backup_calibrations()
+    assert ok is True
+    assert count == 1
+    dest = Path(location)
+    assert dest.parent == tmp_path / "default_backups"
+    assert dest.name.startswith("backup_")
+    assert (dest / "backup_manifest.json").is_file()
+
+
+def test_backup_filters_by_device_model(populated: Path, tmp_path: Path) -> None:
+    """A device_model filter backs up only matching models across every type."""
+    mgr = LeRobotCalibrationManager(populated)
+    ok, _location, count = mgr.backup_calibrations(
+        output_dir=tmp_path / "followers_only", device_model="so101_follower"
+    )
+    assert ok is True
+    # so101_follower has two calibrations; the so101_leader teleoperator is skipped.
+    assert count == 2
+
+
+def test_restore_ignores_nondirectory_entries(tmp_path: Path) -> None:
+    """Restore skips stray files at the model level and restores real dirs."""
+    backup = tmp_path / "backup_src"
+    (backup / "robots" / "so101_follower").mkdir(parents=True)
+    (backup / "robots" / "so101_follower" / "arm1.json").write_text('{"shoulder": {"id": 1}}')
+    # A regular file sitting where a model directory would be must be ignored.
+    (backup / "robots" / "stray.txt").write_text("not a model directory")
+
+    mgr = LeRobotCalibrationManager(tmp_path / "live")
+    ok, _message, restored = mgr.restore_calibrations(backup)
+    assert ok is True
+    assert restored == 1
+    assert mgr.calibration_exists("robots", "so101_follower", "arm1")
+
+
 # --- tool action contract --------------------------------------------------
 
 
@@ -352,6 +412,70 @@ def test_path_action_base_paths(tmp_path: Path) -> None:
     assert result["status"] == "success"
     assert tool_json(result)["teleop_path"].endswith("teleoperators")
     assert tool_json(result)["robot_path"].endswith("robots")
+
+
+# --- get_calibration_path security contract (path-traversal guard) ---------
+
+
+def test_get_calibration_path_allows_valid_components(tmp_path: Path) -> None:
+    """A well-formed (type, model, id) triple maps to a path under base_path."""
+    mgr = LeRobotCalibrationManager(tmp_path)
+    path = mgr.get_calibration_path("teleoperators", "so101_leader", "blue_arm")
+    assert path == tmp_path / "teleoperators" / "so101_leader" / "blue_arm.json"
+
+
+def test_get_calibration_path_rejects_unknown_device_type(tmp_path: Path) -> None:
+    """device_type outside {teleoperators, robots} is refused, not silently used."""
+    mgr = LeRobotCalibrationManager(tmp_path)
+    with pytest.raises(ValueError, match="device_type must be one of"):
+        mgr.get_calibration_path("weapons", "so101", "arm")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "..",  # parent-dir escape
+        "so101/../evil",  # embedded traversal
+        "a/b",  # path separator
+        ".hidden",  # leading dot (relative/hidden segment)
+        "arm id",  # whitespace
+        "arm;rm",  # shell metacharacter
+        "",  # empty component
+    ],
+)
+def test_get_calibration_path_rejects_unsafe_device_model(tmp_path: Path, bad: str) -> None:
+    """A device_model that could escape base_path is rejected with a clear error."""
+    mgr = LeRobotCalibrationManager(tmp_path)
+    with pytest.raises(ValueError, match="device_model contains invalid characters"):
+        mgr.get_calibration_path("robots", bad, "arm")
+
+
+@pytest.mark.parametrize("bad", ["..", "../evil", "a/b", ".hidden", "arm id", ""])
+def test_get_calibration_path_rejects_unsafe_device_id(tmp_path: Path, bad: str) -> None:
+    """A device_id that could escape base_path is rejected with a clear error."""
+    mgr = LeRobotCalibrationManager(tmp_path)
+    with pytest.raises(ValueError, match="device_id contains invalid characters"):
+        mgr.get_calibration_path("robots", "so101", bad)
+
+
+def test_get_calibration_path_keeps_resolved_path_inside_base(tmp_path: Path) -> None:
+    """Every accepted path stays within base_path (no traversal slips through)."""
+    mgr = LeRobotCalibrationManager(tmp_path)
+    path = mgr.get_calibration_path("robots", "so101_follower", "orange_arm")
+    assert tmp_path.resolve() in path.resolve().parents
+
+
+def test_path_action_surfaces_traversal_as_tool_error(tmp_path: Path) -> None:
+    """A traversal identifier reaches the tool as a clean error dict, not a crash."""
+    result = lerobot_calibrate(
+        action="path",
+        device_type="robots",
+        device_model="..",
+        device_id="arm",
+        base_path=str(tmp_path),
+    )
+    assert result["status"] == "error"
+    assert "invalid characters" in result["content"][0]["text"]
 
 
 def test_unknown_action_errors(tmp_path: Path) -> None:
@@ -518,3 +642,148 @@ def test_list_marks_unreadable_calibration_without_failing(populated: Path, monk
     result = lerobot_calibrate(action="list", base_path=str(populated))
     assert result["status"] == "success"
     assert "error reading file" in result["content"][0]["text"]
+
+
+# --- Well-formed markdown headers (no orphan whitespace) --------------------
+# Emoji sweeps that stripped a leading icon from a header line ("## icon Foo")
+# leave orphan whitespace behind ("##  Foo", " **Foo**"), which renders as a
+# malformed heading with a stray leading space or a double space after the
+# hashes. These tests pin the rendered heading lines of the list-heavy actions
+# so that regression cannot silently reappear.
+
+
+def _assert_no_orphan_header_whitespace(text: str) -> None:
+    """Fail if any rendered line has orphan markdown-header whitespace.
+
+    Rejects a line that leads with a space before a bold ``**`` title
+    (e.g. ``" **Foo**"``) and a heading whose hashes are followed by more than
+    one space (e.g. ``"##  Foo"``). Nested list items (``"  - ..."``) are
+    legitimately indented and are left untouched.
+    """
+    for line in text.splitlines():
+        stripped = line.lstrip(" ")
+        if stripped.startswith("- "):
+            continue  # nested list item; indentation is intentional
+        assert not (line.startswith(" ") and stripped.startswith("**")), (
+            f"header line leads with orphan whitespace: {line!r}"
+        )
+        assert not re.match(r"#{1,6}\s{2,}", stripped), f"heading has double space after hashes: {line!r}"
+
+
+def test_list_headers_have_no_orphan_whitespace(populated: Path) -> None:
+    """``list`` renders its title and per-type/model headings without orphan gaps."""
+    result = lerobot_calibrate(action="list", base_path=str(populated))
+    assert result["status"] == "success"
+    text = result["content"][0]["text"]
+    _assert_no_orphan_header_whitespace(text)
+    # The section headings must render as clean single-space markdown.
+    assert "## **Teleoperators**" in text or "## **Robots**" in text
+    assert text.startswith("**LeRobot Calibrations**")
+
+
+def test_analyze_headers_have_no_orphan_whitespace(populated: Path) -> None:
+    """``analyze`` renders its title and stat sub-headings without orphan gaps."""
+    result = lerobot_calibrate(action="analyze", base_path=str(populated))
+    assert result["status"] == "success"
+    text = result["content"][0]["text"]
+    _assert_no_orphan_header_whitespace(text)
+    assert text.startswith("**Calibration Analysis**")
+    assert "### **Summary Statistics**" in text
+    assert "### **Device Model Breakdown**" in text
+
+
+def test_backup_summary_headers_have_no_orphan_whitespace(populated: Path, tmp_path: Path) -> None:
+    """``backup`` renders its completion and filter headings without orphan gaps."""
+    result = lerobot_calibrate(
+        action="backup",
+        output_dir=str(tmp_path / "bk"),
+        device_type="robots",
+        base_path=str(populated),
+    )
+    assert result["status"] == "success"
+    text = result["content"][0]["text"]
+    _assert_no_orphan_header_whitespace(text)
+    assert text.startswith("**Backup Completed Successfully**")
+    assert "**Filters applied:**" in text
+
+
+# --- Error-path return contracts (tool surfaces failures as status=error) ---
+# The @tool contract requires failures to be returned as
+# {"status": "error", ...} rather than raised past dispatch. These pin the
+# manager-failure and empty-branch paths of the list/backup/restore/delete
+# actions that the happy-path tests above do not exercise.
+
+
+def test_list_skips_device_type_with_no_calibrations(tmp_path: Path) -> None:
+    """``list`` renders only device types that actually have models.
+
+    When one device type is populated and the other is empty, the empty type
+    is skipped from the rendered listing rather than emitting a bare heading.
+    """
+    mgr = LeRobotCalibrationManager(tmp_path)
+    mgr.save_calibration("robots", "so101_follower", "orange_arm", _calib(3))
+    # teleoperators dir exists (created by the manager) but holds no models.
+
+    result = lerobot_calibrate(action="list", base_path=str(tmp_path))
+
+    assert result["status"] == "success"
+    text = result["content"][0]["text"]
+    assert "**Robots**" in text
+    assert "**Teleoperators**" not in text
+    assert tool_json(result)["count"] == 1
+
+
+def test_backup_action_failure_surfaces_error(populated: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing backup is returned as status=error, not raised."""
+    monkeypatch.setattr(
+        LeRobotCalibrationManager,
+        "backup_calibrations",
+        lambda self, *a, **k: (False, "disk full", 0),
+    )
+
+    result = lerobot_calibrate(
+        action="backup",
+        output_dir=str(tmp_path / "out"),
+        base_path=str(populated),
+    )
+
+    assert result["status"] == "error"
+    assert "Backup failed" in result["content"][0]["text"]
+    assert "disk full" in result["content"][0]["text"]
+
+
+def test_restore_action_missing_backup_dir_surfaces_error(populated: Path, tmp_path: Path) -> None:
+    """``restore`` from a non-existent backup directory returns status=error."""
+    result = lerobot_calibrate(
+        action="restore",
+        backup_dir=str(tmp_path / "no_such_backup"),
+        base_path=str(populated),
+    )
+
+    assert result["status"] == "error"
+    assert "Restore failed" in result["content"][0]["text"]
+
+
+def test_delete_action_failure_surfaces_error(populated: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a calibration exists but deletion fails, the tool returns error.
+
+    Guards the window where ``calibration_exists`` is True yet the unlink
+    fails (permission error, race) - the tool must surface that as
+    status=error rather than falsely reporting success.
+    """
+    monkeypatch.setattr(
+        LeRobotCalibrationManager,
+        "delete_calibration",
+        lambda self, *a, **k: False,
+    )
+
+    result = lerobot_calibrate(
+        action="delete",
+        device_type="robots",
+        device_model="so101_follower",
+        device_id="green_arm",
+        base_path=str(populated),
+    )
+
+    assert result["status"] == "error"
+    assert "Failed to delete" in result["content"][0]["text"]

@@ -51,6 +51,44 @@ class TestConfig:
         assert env["VERA_CKPT_ROOT"] == "/data/ckpts"
         assert env["VERA_TRACKER_BACKEND"] == "cotracker"
 
+    def test_server_env_overlay_forwards_wan_ckpt_and_dynamics_run(self):
+        """server_env() must forward every checkpoint/tracker knob the server
+        subprocess reads, including the frozen WAN base and the IDM run id."""
+        c = VeraConfig(
+            embodiment="mimicgen",
+            wan_ckpt_root="/data/wan",
+            dynamics_run_id="idm-run-42",
+        )
+        env = c.server_env()
+        assert env["VERA_WAN_CKPT_ROOT"] == "/data/wan"
+        assert env["VERA_DYNAMICS_RUN_ID"] == "idm-run-42"
+
+    def test_malformed_numeric_env_degrades_to_defaults(self, monkeypatch):
+        """A non-numeric env override must be ignored, not crash construction.
+
+        Deploy/CI environments frequently carry typo'd or empty numeric knobs
+        (e.g. VERA_SERVER_PORT=""). The int/float env parsers swallow the
+        ValueError and return None so config falls back to the per-embodiment
+        default instead of raising on import of the policy.
+        """
+        monkeypatch.setenv("VERA_SERVER_PORT", "not-a-port")
+        monkeypatch.setenv("VERA_VIS_PORT", "xyz")
+        monkeypatch.setenv("VERA_RENDER_WIDTH", "wide")
+        monkeypatch.setenv("VERA_SAMPLE_STEPS", "ten")
+        monkeypatch.setenv("VERA_N_ACTION_STEPS", "")
+        monkeypatch.setenv("VERA_MOTION_PLAN_SCALE", "fast")
+
+        c = VeraConfig(embodiment="pusht")
+
+        # Non-numeric int knobs fall back to the pusht per-embodiment defaults.
+        assert c.server_port == 8820
+        assert c.vis_port == 8821
+        assert c.render_width == 252  # pusht per-embodiment default
+        # Non-numeric optional knobs stay unset (planner yaml decides).
+        assert c.sample_steps is None
+        assert c.n_action_steps is None
+        assert c.motion_plan_scale is None
+
 
 # --------------------------------------------------------------------------- #
 # Factory registration
@@ -80,6 +118,39 @@ class TestMsgpackNumpy:
         a = np.random.randn(10, 8).astype(np.float32)
         out = mnp.unpackb(mnp.packb({"action": a}))
         assert np.allclose(out["action"], a)
+
+    def test_npscalar_encoded_as_tagged_map_and_roundtrips(self):
+        # np.generic scalars pack as a tagged __npscalar__ map (not a bare
+        # value) so the wire form is self-describing and dtype survives.
+        v = np.float32(1.5)
+        enc = mnp._encode(v)
+        assert enc[b"__npscalar__"] is True
+        assert enc[b"dtype"] == v.dtype.str
+        out = mnp.unpackb(mnp.packb({"s": v}))
+        assert out["s"] == pytest.approx(1.5)
+
+    def test_npscalar_decode_reconstructs_dtype(self):
+        # Decode side reconstructs the exact numpy dtype from the tag.
+        dec = mnp._decode({b"__npscalar__": True, b"data": 7, b"dtype": "<i8"})
+        assert dec == 7
+        assert np.dtype(getattr(dec, "dtype", "<i8")) == np.dtype("<i8")
+
+    def test_encode_passthrough_for_native_types(self):
+        # Non-numpy, JSON-native values are handed back untouched so msgpack
+        # serializes them directly.
+        assert mnp._encode(42) == 42
+        assert mnp._encode("hi") == "hi"
+        assert mnp._encode([1, 2]) == [1, 2]
+
+    def test_non_wire_safe_ndarray_dtype_rejected(self):
+        # object/void dtype arrays cannot go over the wire and must raise
+        # rather than silently emitting an undecodable blob.
+        obj_arr = np.array([{"not": "wire-safe"}], dtype=object)
+        with pytest.raises(ValueError, match="cannot serialize ndarray"):
+            mnp.packb({"x": obj_arr})
+        void_arr = np.zeros(2, dtype=np.dtype([("f", np.int32)]))
+        with pytest.raises(ValueError, match="cannot serialize ndarray"):
+            mnp.packb({"x": void_arr})
 
 
 # --------------------------------------------------------------------------- #

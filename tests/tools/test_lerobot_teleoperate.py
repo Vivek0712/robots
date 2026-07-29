@@ -258,6 +258,139 @@ def test_build_start_record_argv_matches_lerobot_record_fields() -> None:
             assert flag in record_fields, f"{flag} not a RecordConfig field"
 
 
+# ---------------------------------------------------------------------------
+# lerobot HEAD repo_id stamping: record must pin --dataset.root + expose --resume
+#
+# At lerobot HEAD, lerobot-record calls ``cfg.dataset.stamp_repo_id()`` on every
+# fresh recording, rewriting repo_id to ``{repo_id}_YYYYMMDD_HHMMSS``. Without an
+# explicit ``--dataset.root`` the on-disk dataset (and Hub push) moves to the
+# stamped id, so downstream train/verify/path-reporting look at the requested id
+# and find nothing. The record command must therefore always pin an explicit
+# root and expose ``--resume`` for appending.
+
+
+def test_build_record_command_always_pins_dataset_root_when_root_omitted() -> None:
+    """Fresh record with no explicit root must still emit --dataset.root.
+
+    lerobot HEAD timestamp-stamps a fresh record's repo_id; pinning an explicit
+    root (resolved from the repo_id under $HF_LEROBOT_HOME) keeps the on-disk
+    dataset at the requested location regardless of the stamp.
+    """
+    from strands_robots.dataset_recorder import resolve_dataset_dir
+
+    cmd = build_lerobot_command(
+        action="start",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+        dataset_repo_id="user/cubes",
+    )
+    assert "lerobot.scripts.lerobot_record" in cmd
+    assert "--dataset.root" in cmd
+    assert cmd[cmd.index("--dataset.root") + 1] == str(resolve_dataset_dir("user/cubes", None))
+
+
+def test_build_record_command_respects_explicit_dataset_root() -> None:
+    """An explicit dataset_root is forwarded verbatim (overrides the resolved default)."""
+    cmd = build_lerobot_command(
+        action="start",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+        dataset_repo_id="user/cubes",
+        dataset_root="/data/lerobot/cubes",
+    )
+    assert cmd[cmd.index("--dataset.root") + 1] == "/data/lerobot/cubes"
+
+
+def test_build_record_command_emits_resume_flag_when_requested() -> None:
+    """record_resume=True must emit lerobot-record's --resume true for appending."""
+    cmd = build_lerobot_command(
+        action="start",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+        dataset_repo_id="user/cubes",
+        record_resume=True,
+    )
+    assert "--resume" in cmd
+    assert cmd[cmd.index("--resume") + 1] == "true"
+
+
+def test_build_record_command_omits_resume_by_default() -> None:
+    """A fresh record (record_resume left False) must not emit --resume."""
+    cmd = build_lerobot_command(
+        action="start",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+        dataset_repo_id="user/cubes",
+    )
+    assert "--resume" not in cmd
+
+
+def test_build_teleop_command_has_no_dataset_root_or_resume() -> None:
+    """Plain teleoperation (no dataset) must not carry record-only flags."""
+    cmd = build_lerobot_command(
+        action="start",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+    )
+    assert "lerobot.scripts.lerobot_teleoperate" in cmd
+    assert "--dataset.root" not in cmd
+    assert "--resume" not in cmd
+
+
+def test_record_result_reports_pinned_dataset_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A background record start returns the true on-disk dataset root + repo_id.
+
+    Downstream consumers (train, verify, path reporting) read ``dataset_root``
+    from the result rather than deriving it from the requested repo_id, which
+    lerobot HEAD would have stamped.
+    """
+    from strands_robots.dataset_recorder import resolve_dataset_dir
+
+    monkeypatch.setattr(tele_mod.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=os.getpid()))
+    result = lerobot_teleoperate(
+        action="start",
+        session_name="rec_report",
+        robot_type="so101_follower",
+        teleop_type="so101_leader",
+        dataset_repo_id="user/cubes",
+        auto_accept_calibration=False,
+    )
+    assert result["status"] == "success"
+    payload = tool_json(result)
+    assert payload["dataset_repo_id"] == "user/cubes"
+    assert payload["dataset_root"] == str(resolve_dataset_dir("user/cubes", None))
+    assert payload["resume"] is False
+    _assert_ascii(_texts(result))
+
+
+def test_record_result_reports_resume_when_appending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """record_resume=True is reflected in the session result payload."""
+    monkeypatch.setattr(tele_mod.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=os.getpid()))
+    result = lerobot_teleoperate(
+        action="start",
+        session_name="rec_resume",
+        robot_type="so101_follower",
+        teleop_type="so101_leader",
+        dataset_repo_id="user/cubes",
+        record_resume=True,
+        auto_accept_calibration=False,
+    )
+    assert result["status"] == "success"
+    payload = tool_json(result)
+    assert payload["resume"] is True
+    assert "--resume true" in payload["command"]
+
+
 def test_build_start_teleop_command_without_dataset() -> None:
     cmd = build_lerobot_command(
         action="start",
@@ -294,6 +427,96 @@ def test_build_start_command_emits_nested_camera_config() -> None:
 def test_build_command_rejects_unknown_action() -> None:
     with pytest.raises(ValueError, match="Unknown action"):
         build_lerobot_command(action="bogus", robot_type="so101_follower")
+
+
+def test_build_replay_command_forwards_dataset_root() -> None:
+    """Replay must forward ``--dataset.root`` so it reads from the given cache dir.
+
+    ``dataset_root`` overrides lerobot's default ``~/.cache/huggingface/lerobot``
+    location. If the replay builder drops it, playback silently targets the wrong
+    (or a missing) on-disk dataset, so the flag/value pairing is pinned here.
+    """
+    cmd = build_lerobot_command(
+        action="replay",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        dataset_repo_id="user/fold",
+        replay_episode=3,
+        dataset_root="/data/lerobot/fold",
+    )
+    assert "lerobot.scripts.lerobot_replay" in cmd
+    assert cmd[cmd.index("--dataset.root") + 1] == "/data/lerobot/fold"
+
+
+def test_build_teleop_command_forwards_display_data() -> None:
+    """Plain teleop (no dataset) must emit ``--display_data true`` when requested.
+
+    The viewer flag lives on a different code path than record/dagger mode; a
+    teleoperation session with ``display_data=True`` must still open the rerun
+    viewer, so the explicit "true" value form is pinned for the teleop branch.
+    """
+    cmd = build_lerobot_command(
+        action="start",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+        display_data=True,
+    )
+    # No dataset given -> plain teleoperate entrypoint (not record).
+    assert "lerobot.scripts.lerobot_teleoperate" in cmd
+    assert cmd[cmd.index("--display_data") + 1] == "true"
+
+
+def test_build_dagger_command_forwards_dataset_root_and_display_data() -> None:
+    """DAgger correction runs must forward ``--dataset.root`` and ``--display_data``.
+
+    Corrections are appended to an existing dataset; ``dataset_root`` picks the
+    on-disk location and ``display_data`` opens the viewer during takeover. Both
+    optional flags share the dagger (lerobot-rollout) code path, so pin that they
+    map to their nested/top-level CLI arguments with the supplied values.
+    """
+    cmd = build_lerobot_command(
+        action="dagger",
+        robot_type="so101_follower",
+        robot_port="/dev/ttyACM0",
+        teleop_type="so101_leader",
+        teleop_port="/dev/ttyACM1",
+        policy_path="user/act_fold",
+        dataset_repo_id="user/fold_corrections",
+        dataset_root="/data/lerobot/fold_corrections",
+        display_data=True,
+    )
+    assert "lerobot.scripts.lerobot_rollout" in cmd
+    assert cmd[cmd.index("--dataset.root") + 1] == "/data/lerobot/fold_corrections"
+    assert cmd[cmd.index("--display_data") + 1] == "true"
+
+
+def test_build_dagger_command_preflights_missing_rollout_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DAgger shells ``python -m lerobot.scripts.lerobot_rollout``, which only
+    exists in lerobot>=0.6.0. On an older install the tool must fail fast with
+    an actionable upgrade hint rather than let the subprocess die with an opaque
+    ``No module named`` error."""
+    import importlib.util as _iu
+
+    real_find_spec = _iu.find_spec
+
+    def fake_find_spec(name: str, *args: Any, **kw: Any):
+        if name == "lerobot.scripts.lerobot_rollout":
+            return None
+        return real_find_spec(name, *args, **kw)
+
+    monkeypatch.setattr(tele_mod.importlib.util, "find_spec", fake_find_spec)
+    with pytest.raises(RuntimeError, match=r"dagger requires lerobot>=0\.6\.0"):
+        build_lerobot_command(
+            action="dagger",
+            robot_type="so101_follower",
+            robot_port="/dev/ttyACM0",
+            teleop_type="so101_leader",
+            teleop_port="/dev/ttyACM1",
+            policy_path="user/act_fold",
+            dataset_repo_id="user/fold_corrections",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +593,7 @@ def test_status_running_session_is_ascii(monkeypatch: pytest.MonkeyPatch) -> Non
     mgr.add_session("live", {"pid": os.getpid(), "action": "record", "start_time": 0.0, "robot_type": "so101_follower"})
     result = lerobot_teleoperate(action="status", session_name="live")
     assert result["status"] == "success"
-    assert result["is_running"]
+    assert tool_json(result)["is_running"]
     _assert_ascii(_texts(result))
 
 
@@ -740,3 +963,112 @@ def test_dagger_dispatch_starts_session(monkeypatch: pytest.MonkeyPatch) -> None
     _assert_ascii(_texts(result))
     listed = lerobot_teleoperate(action="list")
     assert "dagger_test" in tool_json(listed)["sessions"]
+
+
+# ---------------------------------------------------------------------------
+# Degrade + error contracts: the dispatcher must return a structured
+# ``{"status": "error"}`` (never raise past dispatch) for missing arguments,
+# command-build failures, and unexpected internal faults, and the SessionManager
+# must survive an unreadable/unwritable store and a vanished process.
+# ---------------------------------------------------------------------------
+class _RaisingProcessPsutil:
+    """psutil stand-in whose ``Process`` lookup raises ``NoSuchProcess``.
+
+    Models the race where ``pid_exists`` is briefly true but the process is
+    reaped before ``Process()`` inspects it - the prune loop must drop the
+    session rather than propagate the exception.
+    """
+
+    NoSuchProcess = Exception  # replaced below with the real class handles
+    AccessDenied = Exception
+
+    @staticmethod
+    def pid_exists(pid: int) -> bool:
+        return True
+
+    @staticmethod
+    def Process(pid: int):  # noqa: N802 - mirror psutil.Process
+        raise _RaisingProcessPsutil.NoSuchProcess(pid)
+
+
+def test_load_sessions_drops_process_that_vanished_mid_prune(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session whose process disappears between ``pid_exists`` and
+    ``Process()`` is pruned, not surfaced, and does not raise."""
+    mgr = SessionManager()
+    mgr.sessions_file.write_text(json.dumps({"racy": {"pid": 4242}}))
+    _RaisingProcessPsutil.NoSuchProcess = tele_mod.psutil.NoSuchProcess
+    _RaisingProcessPsutil.AccessDenied = tele_mod.psutil.AccessDenied
+    monkeypatch.setattr(tele_mod, "psutil", _RaisingProcessPsutil)
+    assert mgr.list_sessions() == {}
+
+
+def test_save_sessions_swallows_oserror(tmp_path, caplog: pytest.LogCaptureFixture) -> None:
+    """``_save_sessions`` logs and returns when the store path is unwritable
+    (parent directory missing) instead of raising."""
+    mgr = SessionManager()
+    mgr.sessions_file = tmp_path / "missing_dir" / "active_sessions.json"
+    with caplog.at_level("ERROR"):
+        mgr._save_sessions({"s": {"pid": 1}})  # must not raise
+    assert any("Error saving sessions" in r.message for r in caplog.records)
+
+
+def test_start_without_session_name_autogenerates_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting ``session_name`` on start mints a ``teleop_<ts>`` name so the
+    session is still trackable via ``list``."""
+    monkeypatch.setattr(tele_mod.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=os.getpid()))
+    result = lerobot_teleoperate(action="start", robot_type="so101_follower", auto_accept_calibration=False)
+    assert result["status"] == "success"
+    names = list(tool_json(lerobot_teleoperate(action="list"))["sessions"])
+    assert any(n.startswith("teleop_") for n in names)
+
+
+def test_start_command_build_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raising command builder degrades to a structured error naming the
+    build step, not an uncaught exception."""
+    monkeypatch.setattr(tele_mod, "build_lerobot_command", lambda **k: (_ for _ in ()).throw(ValueError("bad opts")))
+    result = lerobot_teleoperate(action="start", session_name="s", auto_accept_calibration=False)
+    assert result["status"] == "error"
+    assert "Command build failed" in _texts(result)
+    _assert_ascii(_texts(result))
+
+
+def test_replay_command_build_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The replay branch reports its own build-failure message distinctly from
+    the start branch."""
+    monkeypatch.setattr(tele_mod, "build_lerobot_command", lambda **k: (_ for _ in ()).throw(ValueError("bad opts")))
+    result = lerobot_teleoperate(action="replay", dataset_repo_id="user/cubes")
+    assert result["status"] == "error"
+    assert "Replay command build failed" in _texts(result)
+    _assert_ascii(_texts(result))
+
+
+def test_status_without_name_errors() -> None:
+    """Status needs a session name; omitting it is a structured error."""
+    result = lerobot_teleoperate(action="status")
+    assert result["status"] == "error"
+    assert "Session name required" in _texts(result)
+
+
+def test_status_log_tail_read_error_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the recorded log path exists but cannot be read (here it is a
+    directory), status still succeeds and folds the read error into the body
+    instead of aborting."""
+    log_dir = tele_mod.SESSION_DIR / "unreadable.log"
+    log_dir.mkdir()  # exists() is true but open() raises IsADirectoryError
+    SessionManager().add_session("withbadlog", {"pid": os.getpid(), "start_time": 0.0, "log_file": str(log_dir)})
+    result = lerobot_teleoperate(action="status", session_name="withbadlog")
+    assert result["status"] == "success"
+    assert "Error reading log" in _texts(result)
+    _assert_ascii(_texts(result))
+
+
+def test_unexpected_internal_failure_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unexpected fault inside dispatch is caught and returned as a tool
+    error - the tool contract forbids raising past dispatch."""
+    monkeypatch.setattr(
+        tele_mod.SessionManager, "list_sessions", lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    result = lerobot_teleoperate(action="list")
+    assert result["status"] == "error"
+    assert "Tool execution failed" in _texts(result)
+    _assert_ascii(_texts(result))

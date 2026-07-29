@@ -15,13 +15,16 @@ Spec schema (top-level keys)::
     supported_robots: list[str]           # default [] (any)
     default_robot: string                 # required - registry data_config
     scene: string                         # optional MJCF/URDF path for sim.load_scene()
+    instruction: string                   # optional natural-language task command
+                                          #   for language-conditioned policies (GR00T, ...)
     success:
-      all: [<predicate_call>, ...]        # all must be true
-      any: [<predicate_call>, ...]        # at least one must be true
+      all: [<bool predicate_call>, ...]   # all must be true (reward terms rejected)
+      any: [<bool predicate_call>, ...]   # at least one must be true
     failure:
-      all: [<predicate_call>, ...]
-      any: [<predicate_call>, ...]
-    dense_reward: [<predicate_call>, ...] # summed per step
+      all: [<bool predicate_call>, ...]
+      any: [<bool predicate_call>, ...]
+    dense_reward: [<predicate_call>, ...] # reward terms summed per step (a bool
+                                          #   predicate here contributes a sparse 0/1)
 
 A ``<predicate_call>`` is a dict with a ``predicate`` key naming the
 predicate and any remaining keys forwarded as kwargs::
@@ -64,7 +67,7 @@ from strands_robots.simulation.benchmark import (
     StepInfo,
     register_benchmark,
 )
-from strands_robots.simulation.predicates import make_predicate
+from strands_robots.simulation.predicates import PREDICATE_REGISTRY, make_predicate, predicate_kind
 from strands_robots.utils import require_optional
 
 if TYPE_CHECKING:
@@ -83,6 +86,7 @@ _ALLOWED_TOP_LEVEL = frozenset(
         "supported_robots",
         "default_robot",
         "scene",
+        "instruction",
         "success",
         "failure",
         "dense_reward",
@@ -122,8 +126,8 @@ def _compile_bool_group(
     if unknown:
         raise ValueError(f"{context}: unknown keys {sorted(unknown)}; allowed: ['all', 'any']")
 
-    all_calls = [_compile_call(c, context=f"{context}.all") for c in (clause.get("all") or [])]
-    any_calls = [_compile_call(c, context=f"{context}.any") for c in (clause.get("any") or [])]
+    all_calls = [_compile_call(c, context=f"{context}.all", require_kind="bool") for c in (clause.get("all") or [])]
+    any_calls = [_compile_call(c, context=f"{context}.any", require_kind="bool") for c in (clause.get("any") or [])]
 
     if not all_calls and not any_calls:
         return lambda _sim: default
@@ -138,13 +142,28 @@ def _compile_bool_group(
     return check
 
 
-def _compile_call(entry: Any, *, context: str) -> Callable[[SimEngine], Any]:
-    """Compile one ``{predicate: <name>, **kwargs}`` entry to a callable."""
+def _compile_call(entry: Any, *, context: str, require_kind: str | None = None) -> Callable[[SimEngine], Any]:
+    """Compile one ``{predicate: <name>, **kwargs}`` entry to a callable.
+
+    ``require_kind="bool"`` (success / failure clauses) rejects a float-valued
+    reward term up front: used as a success predicate it is read as
+    ``bool(<term(sim)>)`` - a reward term returns a (usually nonzero) float, so
+    that is almost always ``True``, silently making the benchmark report instant
+    success. Reward terms belong in ``dense_reward``.
+    """
     if not isinstance(entry, dict):
         raise ValueError(f"{context}: expected a dict like {{predicate: <name>, ...}}, got {type(entry).__name__}")
     pred_name = entry.get("predicate")
     if not isinstance(pred_name, str) or not pred_name:
         raise ValueError(f"{context}: each entry must have a non-empty 'predicate' string")
+    if require_kind == "bool" and predicate_kind(pred_name) == "float":
+        bool_preds = sorted(n for n in PREDICATE_REGISTRY if predicate_kind(n) == "bool")
+        raise ValueError(
+            f"{context}: predicate {pred_name!r} is a reward term (float-valued) but a success / "
+            "failure clause requires a bool predicate - used here it is read as bool(<nonzero "
+            f"float>) and silently reports instant success. Move it to dense_reward. Bool "
+            f"predicates: {bool_preds}"
+        )
     kwargs = {k: v for k, v in entry.items() if k != "predicate"}
     try:
         return make_predicate(pred_name, **kwargs)
@@ -154,6 +173,125 @@ def _compile_call(entry: Any, *, context: str) -> Callable[[SimEngine], Any]:
     except TypeError as e:
         # Bad kwargs; wrap so the caller knows which predicate failed to compile.
         raise ValueError(f"{context}: predicate '{pred_name}' compilation failed: {e}") from e
+
+
+def compile_stop_when(stop_when: Any, *, context: str = "stop_when") -> Callable[[SimEngine], bool]:
+    """Compile a ``stop_when`` early-return clause into a ``(sim) -> bool`` callable.
+
+    This is the ``run_policy(stop_when=...)`` compiler: the clause uses the
+    same predicate-DSL schema as a benchmark spec's ``success`` clause, so an
+    agent that can author a success condition can gate a rollout with the
+    identical vocabulary. Two shapes are accepted - a single predicate call::
+
+        {"predicate": "grasped", "body": "cube", "gripper_prefix": "so100"}
+
+    or an ``all`` / ``any`` group of predicate calls::
+
+        {"all": [{"predicate": "body_above_z", "body": "cube", "z": 0.2},
+                 {"predicate": "body_upright", "body": "cube"}]}
+
+    Predicates resolve through the closed registry
+    (:func:`~strands_robots.simulation.predicates.make_predicate`) - nothing
+    here reaches ``eval`` / ``exec``, so the clause is safe to accept from an
+    LLM tool call. Float-valued reward terms are rejected up front (a nonzero
+    float reads as always-``True`` and would stop the rollout on step 1), and
+    an empty clause is rejected rather than compiling to a check that never
+    fires (which would silently run the rollout to its step budget).
+
+    Args:
+        stop_when: The clause dict (single predicate call or ``all``/``any``
+            group).
+        context: Label used to prefix error messages.
+
+    Returns:
+        A side-effect-free callable evaluating the clause against the sim
+        (predicates only read sim state), suitable for per-step checking.
+
+    Raises:
+        ValueError: On a non-dict clause, an empty / never-firing clause, a
+            clause mixing the single-call and group forms, an unknown
+            predicate name (the message lists the valid set), a float-valued
+            predicate, or bad predicate kwargs.
+    """
+    if not isinstance(stop_when, dict):
+        raise ValueError(
+            f"{context}: expected a predicate call like {{'predicate': 'grasped', ...}} or an "
+            f"'all'/'any' group of them, got {type(stop_when).__name__}"
+        )
+    if "predicate" in stop_when:
+        group_keys = {"all", "any"} & set(stop_when.keys())
+        if group_keys:
+            raise ValueError(
+                f"{context}: a clause is either a single predicate call or an 'all'/'any' group, "
+                f"not both (got 'predicate' plus {sorted(group_keys)})"
+            )
+        return _compile_call(stop_when, context=context, require_kind="bool")
+    unknown = set(stop_when.keys()) - {"all", "any"}
+    if unknown:
+        raise ValueError(
+            f"{context}: unknown keys {sorted(unknown)}; pass a single "
+            "{'predicate': <name>, ...} call or an 'all'/'any' group of them"
+        )
+    if not (stop_when.get("all") or stop_when.get("any")):
+        raise ValueError(
+            f"{context}: empty clause - it would never fire and the rollout would silently run "
+            "to its step budget. Pass a predicate call or a non-empty 'all'/'any' group, or "
+            f"omit {context} entirely."
+        )
+    return _compile_bool_group(stop_when, default=False, context=context)
+
+
+# Predicate kwargs that name scene entities, per kind. A stop_when clause is
+# probed against the LIVE sim before the rollout starts (see
+# SimEngine.run_policy): a typo'd name would otherwise compile clean, degrade
+# to a constant False at evaluation time, and burn the whole step budget
+# reporting stopped_reason="budget" - indistinguishable from an honest miss.
+_BODY_NAME_KWARGS = frozenset({"body", "body_a", "body_b", "container"})
+_JOINT_NAME_KWARGS = frozenset({"joint"})
+
+
+def stop_when_referenced_entities(stop_when: Any) -> tuple[list[str], list[str]]:
+    """Collect the body and joint names a ``stop_when`` clause references.
+
+    Walks the same shapes :func:`compile_stop_when` accepts (a single
+    predicate call or an ``all``/``any`` group) and gathers the values of the
+    entity-naming kwargs (``body`` / ``body_a`` / ``body_b`` / ``container``
+    for bodies, ``joint`` for joints) so the caller can probe each one
+    against the live sim before arming the clause. Geom names
+    (``contact_between``) are not collected - there is no generic geom
+    lookup on the engine ABC to probe them with.
+
+    Args:
+        stop_when: A clause dict already validated by
+            :func:`compile_stop_when` (unrecognized shapes yield empty
+            results rather than raising - validation is the compiler's job).
+
+    Returns:
+        ``(bodies, joints)`` - deduplicated, insertion-ordered name lists.
+    """
+    bodies: dict[str, None] = {}
+    joints: dict[str, None] = {}
+
+    def _collect(call: Any) -> None:
+        if not isinstance(call, dict):
+            return
+        for key, value in call.items():
+            if isinstance(value, str) and value:
+                if key in _BODY_NAME_KWARGS:
+                    bodies.setdefault(value)
+                elif key in _JOINT_NAME_KWARGS:
+                    joints.setdefault(value)
+
+    if isinstance(stop_when, dict):
+        if "predicate" in stop_when:
+            _collect(stop_when)
+        else:
+            for group_key in ("all", "any"):
+                entries = stop_when.get(group_key)
+                if isinstance(entries, list):
+                    for entry in entries:
+                        _collect(entry)
+    return list(bodies), list(joints)
 
 
 def _compile_reward_terms(terms: list[Any] | None) -> list[Callable[[SimEngine], float]]:
@@ -192,6 +330,7 @@ class DeclarativeBenchmark(BenchmarkProtocol):
         failure_fn: Callable[[SimEngine], bool],
         reward_terms: list[Callable[[SimEngine], float]],
         scene: str | None = None,
+        instruction: str = "",
     ):
         self._name = name
         self._supported_robots = list(supported_robots)
@@ -201,18 +340,49 @@ class DeclarativeBenchmark(BenchmarkProtocol):
         self._failure_fn = failure_fn
         self._reward_terms = list(reward_terms)
         self._scene = scene
+        self._instruction = instruction
 
     @property
     def name(self) -> str:
+        """Unique benchmark id, from the spec's required ``name`` key.
+
+        Used as the registry key by :func:`register_benchmark_from_file`;
+        registering two specs with the same ``name`` overwrites the first.
+        """
         return self._name
 
     @property
     def supported_robots(self) -> list[str]:
+        """Registry ``data_config`` names this benchmark accepts (spec ``supported_robots``).
+
+        Implements :attr:`BenchmarkProtocol.supported_robots`. Returns a fresh
+        copy so callers cannot mutate the compiled spec. An empty list (the
+        spec omitted the key) means "any robot".
+        """
         return list(self._supported_robots)
 
     @property
     def default_robot(self) -> str:
+        """Robot loaded when the sim is empty, from the spec's required ``default_robot``.
+
+        Implements :attr:`BenchmarkProtocol.default_robot`;
+        :meth:`on_episode_start` adds it via ``sim.add_robot`` before the first
+        observation when no robot is present.
+        """
         return self._default_robot
+
+    @property
+    def instruction(self) -> str:
+        """Natural-language task command declared in the spec (default ``""``).
+
+        Overrides :attr:`BenchmarkProtocol.instruction` so a spec-authored
+        (declarative) benchmark can carry a task description without a Python
+        subclass -- the ``PolicyRunner`` eval loop falls back to this when the
+        caller passes no ``instruction=`` to ``evaluate_benchmark``, so a
+        language-conditioned policy (GR00T, OpenVLA, ...) receives the command
+        instead of an empty string (the #187 off-task failure mode).
+        """
+        return self._instruction
 
     def on_episode_start(self, sim: SimEngine, rng: random.Random) -> None:
         """Load the declared scene (if any) before delegating to the base impl.
@@ -256,9 +426,23 @@ class DeclarativeBenchmark(BenchmarkProtocol):
         return StepInfo(reward=reward, done=False)
 
     def is_success(self, sim: SimEngine) -> bool:
+        """Evaluate the compiled ``success`` clause against ``sim``.
+
+        Implements :meth:`BenchmarkProtocol.is_success`. Side-effect-free (the
+        predicate closures only read sim state), so the eval loop may call it
+        multiple times per step. Returns ``True`` once the spec's ``success``
+        all/any predicates are satisfied, ending the episode with success.
+        """
         return bool(self._success_fn(sim))
 
     def is_failure(self, sim: SimEngine) -> bool:
+        """Evaluate the compiled ``failure`` clause against ``sim``.
+
+        Implements :meth:`BenchmarkProtocol.is_failure`. Side-effect-free;
+        returns ``True`` when the spec's ``failure`` all/any predicates are
+        satisfied (a spec that omits ``failure`` compiles to an always-``False``
+        clause). Failure ends the episode without marking success.
+        """
         return bool(self._failure_fn(sim))
 
     @classmethod
@@ -300,6 +484,10 @@ class DeclarativeBenchmark(BenchmarkProtocol):
         if scene is not None and not isinstance(scene, str):
             raise ValueError(f"spec.scene: must be a string path or omitted, got {type(scene).__name__}")
 
+        instruction = spec.get("instruction", "")
+        if not isinstance(instruction, str):
+            raise ValueError(f"spec.instruction: must be a string or omitted, got {type(instruction).__name__}")
+
         success_fn = _compile_bool_group(spec.get("success"), default=False, context="success")
         failure_fn = _compile_bool_group(spec.get("failure"), default=False, context="failure")
         reward_terms = _compile_reward_terms(spec.get("dense_reward"))
@@ -313,6 +501,7 @@ class DeclarativeBenchmark(BenchmarkProtocol):
             failure_fn=failure_fn,
             reward_terms=reward_terms,
             scene=scene,
+            instruction=instruction,
         )
 
 
@@ -380,8 +569,13 @@ def register_benchmark_from_file(
     if not isinstance(name, str) or not name:
         raise ValueError(f"register_benchmark_from_file: name must be a non-empty string, got {name!r}")
     spec_dict = _load_spec_file(spec_path)
-    # Spec-internal name is informational; the registry name always wins.
-    spec_dict.setdefault("name", name)
+    # The registry name always wins: unconditionally override any spec-internal
+    # ``name`` so the instance's ``.name`` matches the key it is registered under
+    # (the documented contract). ``setdefault`` was insufficient - a spec that
+    # declared its own ``name`` kept it, so the same spec registered under two
+    # keys produced two instances that both reported the spec-internal name and
+    # neither matched its registry key.
+    spec_dict["name"] = name
     benchmark = DeclarativeBenchmark.from_dict(spec_dict)
     register_benchmark(name, benchmark)
     return benchmark
@@ -389,5 +583,7 @@ def register_benchmark_from_file(
 
 __all__ = [
     "DeclarativeBenchmark",
+    "compile_stop_when",
     "register_benchmark_from_file",
+    "stop_when_referenced_entities",
 ]

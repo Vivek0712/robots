@@ -25,6 +25,7 @@ Modes:
 Backward-compatible additions (new actions, new parameters) are NOT breaking and
 are reported separately as informational.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -85,10 +86,7 @@ def diff(old: dict[str, list[str]], new: dict[str, list[str]]) -> tuple[list[str
 
 def render_markdown(breaking: list[str], info: list[str]) -> str:
     if not breaking and not info:
-        return (
-            "## No AgentTool API Changes Detected\n\n"
-            + "No changes to the dispatched action contract in this PR."
-        )
+        return "## No AgentTool API Changes Detected\n\n" + "No changes to the dispatched action contract in this PR."
     lines: list[str] = []
     if breaking:
         # Built as a single explicit expression (not two adjacent literals in a
@@ -113,7 +111,7 @@ def render_markdown(breaking: list[str], info: list[str]) -> str:
     footer = (
         "> Automated static check of the AgentTool action contract. Removed or "
         + "renamed actions/parameters break agent code that calls them. If a change "
-        + "is intentional, add a `CHANGELOG.md` entry or a deprecation notice."
+        + "is intentional, add a `changelog.d/` fragment or a deprecation notice."
     )
     lines += ["", "---", footer]
     return "\n".join(lines)

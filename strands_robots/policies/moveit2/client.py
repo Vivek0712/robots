@@ -47,6 +47,7 @@ class MsgSerializer:
 
     @staticmethod
     def to_bytes(data: dict[str, Any]) -> bytes:
+        """Pack a JSON-shaped request dict to msgpack bytes (``use_bin_type`` keeps str and bytes distinct on the wire)."""
         msgpack = _load_msgpack()
         # use_bin_type=True keeps str / bytes distinct on the wire
         # (matches msgpack >=1.0 default but explicit is better than
@@ -55,6 +56,7 @@ class MsgSerializer:
 
     @staticmethod
     def from_bytes(data: bytes) -> dict[str, Any]:
+        """Unpack msgpack bytes into a dict, decoding msgpack ``str`` back to Python ``str`` (``raw=False``)."""
         msgpack = _load_msgpack()
         # raw=False decodes msgpack ``str`` types back to Python ``str``
         # (msgpack >=1.0 default); strict_map_key=False allows
@@ -113,6 +115,11 @@ class MoveIt2InferenceClient:
         self.socket = self.context.socket(self._zmq.REQ)
         self.socket.setsockopt(self._zmq.RCVTIMEO, self.timeout_ms)
         self.socket.setsockopt(self._zmq.SNDTIMEO, self.timeout_ms)
+        # LINGER=0 so socket.close() / context.term() never block waiting to
+        # flush undelivered requests to a dead sidecar. Without it the default
+        # linger is infinite, so a queued request to an unreachable server
+        # hangs teardown (and interpreter shutdown / GC of __del__) forever.
+        self.socket.setsockopt(self._zmq.LINGER, 0)
         self.socket.connect(f"tcp://{self.host}:{self.port}")
 
     def reconnect(self) -> None:
@@ -201,6 +208,13 @@ class MoveIt2InferenceClient:
         flags non-trivial logic in ``__del__`` because exceptions raised
         during interpreter shutdown are swallowed silently and can mask
         resource leaks.
+
+        The socket is created with ``LINGER=0`` (see ``_init_socket``) so
+        ``close()`` discards any undelivered request immediately instead of
+        blocking to flush it to a dead sidecar; ``term()`` then returns once
+        the (now-closed) socket is gone. Without the zero linger, a request
+        queued to an unreachable server would hang teardown - and the GC that
+        drives ``__del__`` / interpreter shutdown - indefinitely.
         """
         try:
             if hasattr(self, "socket"):

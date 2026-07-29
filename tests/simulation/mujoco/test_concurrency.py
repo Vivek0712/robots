@@ -142,8 +142,8 @@ class TestApplyForceLatchedBehavior:
     def test_force_persists_across_multiple_steps(self, sim_with_robot):
         """Apply lateral force to a body, step 50 times, verify body moved.
 
-        This validates the docstring contract: force is latched in
-        qfrc_applied and applied on every subsequent step.
+        This validates the docstring contract: the wrench is latched on the
+        body and applied on every subsequent step.
 
         NOTE: We use an X-force (lateral) because a Z-force along the
         kinematic chain of hinge joints produces zero generalized torque
@@ -177,17 +177,26 @@ class TestApplyForceLatchedBehavior:
         )
 
     def test_zero_force_stops_effect(self, sim_with_robot):
-        """Apply force, then zero it, verify force buffer is cleared."""
+        """Apply force, then zero it, verify the latched wrench is cleared.
+
+        The wrench is latched in the target body's own ``xfrc_applied`` row, so
+        after zeroing it no body in the world is left holding an external
+        wrench.
+        """
         sim = sim_with_robot
+        model, data = sim._world._model, sim._world._data
+        body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "arm1/link2")
+        if body_id < 0:
+            body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "link2")
+        assert body_id >= 0
 
-        # Apply lateral (X) force - produces non-zero generalized torques
+        # Apply lateral (X) force - it is latched on link2 and nowhere else
         sim.apply_force("link2", force=[50.0, 0, 0])
-        assert np.any(sim._world._data.qfrc_applied != 0), "X-force on link2 should produce non-zero generalized forces"
+        assert np.any(data.xfrc_applied[body_id] != 0), "X-force on link2 should be latched on link2"
 
-        # Zero it - apply_force zeros buffer first, then applies zero force
+        # Zero it - this body's latched wrench is replaced by nothing
         sim.apply_force("link2", force=[0, 0, 0])
-        # After zeroing + applying zero force/torque, buffer should be all zeros
-        assert np.allclose(sim._world._data.qfrc_applied, 0.0)
+        assert np.allclose(data.xfrc_applied, 0.0)
 
 
 class TestThreadSafety:
@@ -616,6 +625,95 @@ class TestSceneMutationBlockedDuringPolicy:
         # Now it should work
         result = sim.move_object("cube", position=[0.5, 0, 0.1])
         assert result["status"] == "success"
+
+        sim.cleanup()
+
+    def test_add_robot_blocked_during_other_policy(self, robot_path):
+        """add_robot recompiles the whole XML and swaps the model/data
+        pointers, so it must hard-fail while ANY policy is live - a running
+        PolicyRunner on a different arm holds cached joint/actuator IDs that
+        the round-trip invalidates. (Global-scope guard.)
+        """
+        sim = Simulation(tool_name="test_guard_add_robot", mesh=False)
+        assert sim.create_world(gravity=[0, 0, -9.81])["status"] == "success"
+        assert sim.add_robot("arm1", urdf_path=robot_path)["status"] == "success"
+
+        result = sim.start_policy("arm1", policy_provider="mock", duration=2.0, fast_mode=True)
+        assert result["status"] == "success"
+
+        # Adding a second arm while arm1's policy runs is refused.
+        result = sim.add_robot("arm2", urdf_path=robot_path)
+        assert result["status"] == "error"
+        assert "policy is running" in result["content"][0]["text"].lower()
+
+        sim.stop_policy("arm1")
+        if "arm1" in sim._policy_threads:
+            sim._policy_threads["arm1"].result(timeout=10.0)
+
+        # Now it works.
+        assert sim.add_robot("arm2", urdf_path=robot_path)["status"] == "success"
+
+        sim.cleanup()
+
+    def test_remove_object_blocked_during_policy(self, robot_path):
+        """remove_object ejects a body from the live MjSpec and recompiles,
+        swapping model/data - blocked while a policy is running so a worker
+        never mj_steps stale pointers.
+        """
+        sim = Simulation(tool_name="test_guard_remove_obj", mesh=False)
+        assert sim.create_world(gravity=[0, 0, -9.81])["status"] == "success"
+        assert sim.add_robot("arm1", urdf_path=robot_path)["status"] == "success"
+        # Object must exist before the policy starts (add is itself guarded).
+        assert sim.add_object("cube", shape="box", position=[0.3, 0, 0.05])["status"] == "success"
+
+        result = sim.start_policy("arm1", policy_provider="mock", duration=2.0, fast_mode=True)
+        assert result["status"] == "success"
+
+        # Removing the object while the policy runs is refused.
+        result = sim.remove_object("cube")
+        assert result["status"] == "error"
+        assert "policy is running" in result["content"][0]["text"].lower()
+        # The object survives the refused mutation.
+        assert "cube" in sim._world.objects
+
+        sim.stop_policy("arm1")
+        if "arm1" in sim._policy_threads:
+            sim._policy_threads["arm1"].result(timeout=10.0)
+
+        # Now it works.
+        assert sim.remove_object("cube")["status"] == "success"
+        assert "cube" not in sim._world.objects
+
+        sim.cleanup()
+
+    def test_remove_camera_blocked_during_policy(self, robot_path):
+        """remove_camera deletes the camera from the MjSpec and recompiles,
+        so - like the other scene mutations - it is refused while a policy is
+        running rather than swapping model/data under a live worker.
+        """
+        sim = Simulation(tool_name="test_guard_remove_cam", mesh=False)
+        assert sim.create_world(gravity=[0, 0, -9.81])["status"] == "success"
+        assert sim.add_robot("arm1", urdf_path=robot_path)["status"] == "success"
+        # Camera must exist before the policy starts (add is itself guarded).
+        assert sim.add_camera("top_cam", position=[0, 0, 2], target=[0, 0, 0])["status"] == "success"
+
+        result = sim.start_policy("arm1", policy_provider="mock", duration=2.0, fast_mode=True)
+        assert result["status"] == "success"
+
+        # Removing the camera while the policy runs is refused.
+        result = sim.remove_camera("top_cam")
+        assert result["status"] == "error"
+        assert "policy is running" in result["content"][0]["text"].lower()
+        # The camera survives the refused mutation.
+        assert "top_cam" in sim._world.cameras
+
+        sim.stop_policy("arm1")
+        if "arm1" in sim._policy_threads:
+            sim._policy_threads["arm1"].result(timeout=10.0)
+
+        # Now it works.
+        assert sim.remove_camera("top_cam")["status"] == "success"
+        assert "top_cam" not in sim._world.cameras
 
         sim.cleanup()
 

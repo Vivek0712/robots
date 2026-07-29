@@ -22,12 +22,14 @@ Public API:
 
 Every function takes a ``SimWorld`` whose ``_backend_state["spec"]`` holds the
 live ``MjSpec``. They return ``True`` on success, ``False`` on failure (matching
-the legacy API) so call sites in ``simulation.py`` don't need to change.
+the legacy API) so call sites in :mod:`simulation` don't need to change.
 """
 
 from __future__ import annotations
 
+import difflib
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from strands_robots.simulation.models import SimCamera, SimObject, SimRobot, SimWorld
@@ -50,7 +52,62 @@ def _get_spec(world: SimWorld) -> Any | None:
     return world._backend_state.get("spec")
 
 
-def _recompile_preserving_state(world: SimWorld, spec: Any) -> bool:
+def _sync_cached_xml(world: SimWorld, spec: Any) -> None:
+    """Refresh the legacy XML cache in ``world._backend_state["xml"]`` from ``spec``.
+
+    Some readers (the ``load_scene`` + ``add_robot`` round-trip) consume the
+    cached XML string rather than the live ``MjSpec``, so it must be refreshed
+    after every recompile. ``spec.to_xml()`` can fail on specs MuJoCo cannot
+    serialise; that is never fatal to the mutation (the live model/spec are
+    already updated), so we leave the previous cache in place - but we always
+    log the reason at debug so a silently stale cache stays diagnosable rather
+    than being swallowed.
+    """
+    try:
+        with filter_mujoco_attach_noise():
+            world._backend_state["xml"] = spec.to_xml()
+    except Exception as xml_err:
+        logger.debug("spec.to_xml() failed; cached XML left stale: %s", xml_err)
+
+
+def _snapshot_spec(spec: Any, *, context: str) -> Any | None:
+    """Deep-copy ``spec`` so a refused mutation can be rolled back losslessly.
+
+    A spec mutation that is only validated by the recompile it precedes needs a
+    way back. Rebuilding the spec from the registered objects / cameras / robots
+    is not it: the live spec can carry mutations that exist ONLY on the spec and
+    are absent from that registry - weld equalities from ``attach_bodies``,
+    actuators from :func:`actuate_robot_in_scene`, bodies from
+    :func:`patch_scene_mjcf`, whole scenes from :func:`replace_scene_mjcf`. A
+    rebuild silently drops every one of them, which is why
+    :meth:`Simulation.remove_robot` refuses outright while an attachment is
+    live rather than rebuilding over it.
+
+    ``MjSpec.copy`` is used rather than a ``spec.to_xml()`` round-trip because
+    the round-trip is not faithful for a scene holding attached robots: the
+    emitted MJCF loses the asset search paths its mesh references were resolved
+    against and re-declares the attached model's keyframes, so the restored spec
+    no longer compiles ("Error opening file 'link2.stl'", "repeated name
+    'panda/home' in key") - a rollback that leaves the scene as broken as the
+    orphan it removed.
+
+    Args:
+        spec: live scene spec to snapshot.
+        context: short description of the caller, used in log messages.
+
+    Returns:
+        An independent copy of ``spec``, or ``None`` when the copy failed (the
+        reason is logged). A caller that cannot snapshot must refuse its
+        mutation rather than proceed with no way back.
+    """
+    try:
+        return spec.copy()
+    except (ValueError, RuntimeError) as e:
+        logger.error("%s: cannot snapshot the scene spec: %s", context, e)
+        return None
+
+
+def _recompile_preserving_state(world: SimWorld, spec: Any, *, raise_on_refusal: bool = False) -> bool:
     """Recompile ``spec`` in place, replacing ``world._model`` and ``_data``.
 
     Uses ``spec.recompile(model, data)`` which auto-preserves qpos/qvel for
@@ -60,6 +117,16 @@ def _recompile_preserving_state(world: SimWorld, spec: Any) -> bool:
     Also re-discovers per-robot joint and actuator IDs (they may have shifted
     as new bodies were inserted earlier in the body tree). Returns True on
     success, False on compile failure (logged).
+
+    Args:
+        world: The scene whose model/data are replaced on success.
+        spec: The ``MjSpec`` to compile.
+        raise_on_refusal: Re-raise the compiler's exception instead of folding
+            it into a ``False`` return. A refusal message names what the
+            compiler could not honor, and a ``bool`` cannot carry it: a caller
+            that reports the reason to a user needs it, whereas a caller that
+            only rolls back does not. Off by default so existing callers keep
+            the ``bool`` contract.
     """
     mj = _ensure_mujoco()
     try:
@@ -67,11 +134,17 @@ def _recompile_preserving_state(world: SimWorld, spec: Any) -> bool:
             new_model, new_data = spec.recompile(world._model, world._data)
     except (ValueError, RuntimeError) as e:
         logger.error("spec.recompile failed: %s", e)
+        if raise_on_refusal:
+            raise
         return False
 
     world._model = new_model
     world._data = new_data
 
+    # Bump recompile generation so save_state/load_state can detect stale
+    # checkpoints even when nq/nv/na/nu happen to stay the same (e.g.
+    # remove one free-jointed object, add another of the same shape).
+    world._recompile_generation += 1
     # Forward pass so newly-injected bodies have valid xpos/xquat and any
     # camera xforms are populated. Without this, the next render() call
     # after add_object / add_robot / add_camera returns a 100% black frame
@@ -80,11 +153,7 @@ def _recompile_preserving_state(world: SimWorld, spec: Any) -> bool:
 
     # Keep the cached XML in sync with the spec for legacy readers (e.g.
     # load_scene + add_robot round-trip).
-    try:
-        with filter_mujoco_attach_noise():
-            world._backend_state["xml"] = spec.to_xml()
-    except Exception as xml_err:
-        logger.debug("spec.to_xml() failed: %s", xml_err)
+    _sync_cached_xml(world, spec)
 
     # Re-discover per-robot IDs. Names inside MuJoCo are namespaced under
     # robot.namespace (e.g. "arm1/shoulder_pan") when robots were attached
@@ -113,6 +182,183 @@ def _recompile_preserving_state(world: SimWorld, spec: Any) -> bool:
     return True
 
 
+# Persist
+
+
+_NO_SPEC_REASON = "the scene has no live spec, so the change cannot be recorded durably"
+
+
+def _spec_element_by_id(elements: Any, entity_id: int, kind: str) -> tuple[Any | None, str | None]:
+    """Return the spec element a compiled entity id was built from.
+
+    The compiler emits one model entity per spec element in declaration order and
+    records the resulting index on the element, so a compiled id indexes the
+    spec's element list directly. That mapping is what lets an UNNAMED element be
+    addressed at all: most geoms in a robot scene carry no name, so resolving by
+    name would silently cover almost none of them.
+
+    The recorded ``id`` is verified rather than assumed. Writing a property onto
+    the wrong entity is a worse outcome than not recording it, so a spec that no
+    longer agrees with the compiled model is reported instead of written to.
+
+    Args:
+        elements: The spec's element list (``spec.geoms`` / ``spec.bodies``).
+        entity_id: Compiled index of the entity, as resolved by the caller.
+        kind: Entity name used in the reason text (``"geom"`` / ``"body"``).
+
+    Returns:
+        ``(element, None)`` when the element was located, otherwise
+        ``(None, reason)`` naming why it was not.
+    """
+    count = len(elements)
+    if entity_id < 0 or entity_id >= count:
+        return None, f"{kind} id {entity_id} is outside the scene spec's {count} {kind}(s)"
+    element = elements[entity_id]
+    if element.id != entity_id:
+        return None, (
+            f"the scene spec no longer agrees with the compiled model: the {kind} at index "
+            f"{entity_id} reports id {element.id}"
+        )
+    return element, None
+
+
+def persist_geom_properties(
+    world: SimWorld,
+    geom_id: int,
+    *,
+    color: list[float] | None = None,
+    friction: list[float] | None = None,
+    size: list[float] | None = None,
+) -> str | None:
+    """Record a runtime geom property write in the spec the model is compiled from.
+
+    ``world._model`` is DERIVED state: every scene mutation recompiles the spec
+    over it (see :func:`_recompile_preserving_state`), so a value written only
+    into the model is discarded by the next ``add_object`` / ``add_camera`` /
+    ``add_robot`` call and the geom reverts to whatever it was compiled with -
+    after the setter already reported the new value. Writing the same value into
+    the spec is what makes that reported result durable.
+
+    Nothing is written when a reason is returned, so a caller can refuse before it
+    touches the model and keep the two representations in step.
+
+    Args:
+        world: The scene holding the live spec.
+        geom_id: Compiled geom index, already resolved by the caller.
+        color: RGBA components, already validated.
+        friction: The three friction coefficients, already validated.
+        size: Half-extents, already validated. Only the components the caller
+            supplied are written, matching the model write: the unused tail of
+            the spec's 3-wide row keeps its declared value.
+
+    Returns:
+        ``None`` once the value is recorded, otherwise the reason it could not be.
+    """
+    spec = _get_spec(world)
+    if spec is None:
+        return _NO_SPEC_REASON
+    spec_geom, reason = _spec_element_by_id(spec.geoms, geom_id, "geom")
+    if spec_geom is None:
+        return reason
+
+    if color is not None:
+        spec_geom.rgba = list(color)
+    if friction is not None:
+        spec_geom.friction[:] = friction
+    if size is not None:
+        spec_geom.size[: len(size)] = size
+    return None
+
+
+def persist_body_mass(world: SimWorld, body_id: int, *, mass_ratio: float) -> str | None:
+    """Record a runtime body mass change in the spec the model is compiled from.
+
+    Recording the change as a scale is what keeps the two representations equal:
+    ``set_body_properties`` documents a mass change as a uniform density change at
+    fixed geometry, and both mass and inertia are linear in density, so applying
+    one ratio reproduces exactly the inertial the setter reported.
+
+    A body's compiled inertial comes from one of two places, and only the one in
+    force is writable. A body that declares an explicit ``<inertial>`` carries its
+    own mass and inertia (``explicitinertial``); every other body has both
+    integrated from its geoms, and there assigning ``mass`` on the body element is
+    silently ignored by the compiler - the geoms' mass or density is what has to
+    move.
+
+    Args:
+        world: The scene holding the live spec.
+        body_id: Compiled body index, already resolved by the caller.
+        mass_ratio: The new mass divided by the compiled mass. Finite and ``> 0``,
+            which the caller guarantees by refusing a body with no mass to scale.
+
+    Returns:
+        ``None`` once the change is recorded, otherwise the reason it could not be.
+    """
+    spec = _get_spec(world)
+    if spec is None:
+        return _NO_SPEC_REASON
+    spec_body, reason = _spec_element_by_id(spec.bodies, body_id, "body")
+    if spec_body is None:
+        return reason
+
+    if spec_body.explicitinertial:
+        spec_body.mass *= mass_ratio
+        # A body states its inertia as either the principal diagonal or the six
+        # unique components of the full tensor; whichever form is not in use is
+        # all zeros, so scaling both is exact and needs no branch.
+        spec_body.inertia[:] = [value * mass_ratio for value in spec_body.inertia]
+        spec_body.fullinertia[:] = [value * mass_ratio for value in spec_body.fullinertia]
+        return None
+
+    spec_geoms = list(spec_body.geoms)
+    if not spec_geoms:
+        return (
+            "the body declares no explicit inertial and owns no geom, so it holds "
+            "nothing whose mass the change could scale"
+        )
+    for spec_geom in spec_geoms:
+        # A geom states either an explicit mass or a density, and the compiler
+        # uses the mass only when it is set (an unset mass reads as nan, which
+        # fails every comparison). Scaling whichever one is in force scales that
+        # geom's contribution, so the body total scales by the same ratio.
+        if spec_geom.mass > 0:
+            spec_geom.mass *= mass_ratio
+        else:
+            spec_geom.density *= mass_ratio
+    return None
+
+
+def persist_world_option(
+    world: SimWorld,
+    *,
+    gravity: list[float] | None = None,
+    timestep: float | None = None,
+) -> str | None:
+    """Record a runtime physics-option write in the spec the model is compiled from.
+
+    ``model.opt`` is compiled from ``spec.option``, so a gravity or timestep
+    written only into the model is restored to the scene's declared value by the
+    next recompile - putting a lunar-gravity world back to 9.81 m/s^2 on the next
+    ``add_object``.
+
+    Args:
+        world: The scene holding the live spec.
+        gravity: The three gravity components, already validated.
+        timestep: The integration step in seconds, already validated.
+
+    Returns:
+        ``None`` once the value is recorded, otherwise the reason it could not be.
+    """
+    spec = _get_spec(world)
+    if spec is None:
+        return _NO_SPEC_REASON
+    if gravity is not None:
+        spec.option.gravity[:] = gravity
+    if timestep is not None:
+        spec.option.timestep = timestep
+    return None
+
+
 # Inject
 
 
@@ -130,10 +376,38 @@ def inject_robot_into_scene(
     Registers the robot's source joint names on ``robot.joint_names`` so
     downstream observation/policy code can resolve them via
     ``{robot.namespace}{joint_name}``.
+
+    ``spec.attach`` mutates the scene spec before the recompile that validates
+    the result, so a refused recompile - e.g. the robot model references a mesh
+    file that cannot be opened - leaves the robot's whole namespaced subtree in
+    the live spec. Every later scene mutation then recompiles that same broken
+    spec and fails too, so one unloadable robot bricked the world: subsequent
+    ``add_object`` / ``add_camera`` / ``add_robot`` calls all reported "spec
+    recompile refused" with nothing wrong with them, and each failed retry left
+    another orphan subtree behind. The attach is therefore rolled back out
+    before returning ``False``, mirroring :func:`inject_object_into_scene` and
+    :func:`inject_camera_into_scene`, so a refused robot costs exactly the add
+    that was refused.
+
+    The rollback reinstalls a snapshot taken before the attach
+    (:func:`_snapshot_spec`) rather than rebuilding the scene from ``world``: a
+    rebuild would drop the spec-only mutations the scene may already hold (weld
+    equalities, added actuators, agent-authored bodies), turning a correctly
+    refused add into corruption of a scene that was healthy before it. The
+    refused ``spec.recompile`` leaves ``world._model`` and ``_data`` untouched,
+    so putting the spec back is the whole rollback - no state restore, forward
+    pass or ID rediscovery is needed.
     """
     spec = _get_spec(world)
     if spec is None or world._model is None:
         logger.error("inject_robot: no spec or model in world")
+        return False
+
+    # Snapshot BEFORE mutating. Without a way back the add is refused here,
+    # while the scene is still exactly as it was found.
+    context = f"inject_robot {robot.name!r}"
+    backup_spec = _snapshot_spec(spec, context=context)
+    if backup_spec is None:
         return False
 
     try:
@@ -141,10 +415,22 @@ def inject_robot_into_scene(
             joint_names = SpecBuilder.attach_robot(spec, robot, robot_xml_path)
         robot.joint_names = joint_names
     except (ValueError, RuntimeError, OSError) as e:
+        # attach_robot can insert its worldbody frame before the call that
+        # raised. That leftover compiles, so it never broke the scene, but the
+        # snapshot is already in hand - restoring it costs nothing and puts
+        # every failure path on one rule: the spec is left as it was found.
         logger.error("Robot attach failed for '%s': %s", robot.name, e)
+        world._backend_state["spec"] = backup_spec
         return False
 
-    return _recompile_preserving_state(world, spec)
+    if _recompile_preserving_state(world, spec):
+        return True
+
+    # The attach landed in the spec but the model it produced was refused, so
+    # the robot's whole namespaced subtree is sitting in the live spec while the
+    # caller is about to report a failed add. Put the pre-attach spec back.
+    world._backend_state["spec"] = backup_spec
+    return False
 
 
 def inject_object_into_scene(world: SimWorld, obj: SimObject) -> bool:
@@ -165,6 +451,14 @@ def inject_object_into_scene(world: SimWorld, obj: SimObject) -> bool:
     Without the rollback the orphan lingers and every later scene mutation,
     including a corrected retry under the same name, keeps failing to recompile
     (``repeated name`` collisions), bricking the whole scene after one bad add.
+
+    The same rollback applies when ``SpecBuilder.add_object`` itself raises
+    part-way through, which it can do *after* inserting the body (the geom's
+    type lookup rejects an unsupported shape; the mass write rejects a
+    non-numeric value). That error is then re-raised rather than folded into a
+    ``False`` return, so the caller can report the actual reason - a swallowed
+    ``ValueError`` left the caller with nothing but "spec recompile refused"
+    while the actionable message went to the log.
     """
     spec = _get_spec(world)
     if spec is None or world._model is None:
@@ -178,16 +472,39 @@ def inject_object_into_scene(world: SimWorld, obj: SimObject) -> bool:
         if obj.shape == "mesh" and obj.mesh_path:
             spec.add_mesh(name=f"mesh_{obj.name}", file=obj.mesh_path)
         SpecBuilder.add_object(spec, obj)
-    except (ValueError, RuntimeError) as e:
-        logger.error("Object add failed for '%s': %s", obj.name, e)
+    except (ValueError, RuntimeError):
+        # add_object is atomic over its own body mutation: a raise there (an
+        # unsupported shape, or a name that collides with an existing scene
+        # body) rolls the half-built body back out itself, so only the mesh
+        # asset registered here still needs undoing. Removing it keeps the spec
+        # compilable, then the error propagates: the caller turns it into a
+        # structured result, and the reason - e.g. the exact unsupported shape
+        # and the supported list - is what a caller needs instead of a generic
+        # recompile refusal.
         SpecBuilder.remove_mesh(spec, f"mesh_{obj.name}")
-        return False
+        raise
 
-    if not _recompile_preserving_state(world, spec):
-        # Roll the just-added body (and any mesh asset) back out so the spec
-        # returns to its last good, compilable state (a worldbody body delete
-        # is safe - the attach/delete segfault only affects spec.attach()
-        # child specs).
+    # Roll the just-added body (and any mesh asset) back out so the spec
+    # returns to its last good, compilable state (a worldbody body delete is
+    # safe - the attach/delete segfault only affects spec.attach() child specs).
+    #
+    # Ask for the compiler's own reason rather than a bare False. Because the
+    # object's mass is declared on its geom, MuJoCo integrates the inertia from
+    # the shape, so its "mass and inertia of moving bodies must be larger than
+    # mjMINVAL" floor is shape-dependent: a mass above mjMINVAL can still
+    # integrate to an inertia below it on a small geom. add_object's numeric
+    # pre-check cannot express that floor without duplicating the compiler's
+    # per-shape integration, so the residual case has to arrive as the reason
+    # the compiler gives. Folded into a False it became "spec recompile
+    # refused." with the actionable text left in the log - the same dead end
+    # the unsupported-shape path was fixed to stop producing.
+    try:
+        recompiled = _recompile_preserving_state(world, spec, raise_on_refusal=True)
+    except (ValueError, RuntimeError):
+        SpecBuilder.remove_body(spec, obj.name)
+        SpecBuilder.remove_mesh(spec, f"mesh_{obj.name}")
+        raise
+    if not recompiled:
         SpecBuilder.remove_body(spec, obj.name)
         SpecBuilder.remove_mesh(spec, f"mesh_{obj.name}")
         return False
@@ -446,11 +763,7 @@ def eject_robot_from_scene(world: SimWorld, robot_name: str) -> bool:
     world._model = new_model
     world._data = new_data
     world._backend_state["spec"] = new_spec
-    try:
-        with filter_mujoco_attach_noise():
-            world._backend_state["xml"] = new_spec.to_xml()
-    except Exception as xml_err:
-        logger.debug("spec.to_xml() failed: %s", xml_err)
+    _sync_cached_xml(world, new_spec)
 
     # Step 4: restore state for every joint that survived the rebuild. Joints
     # belonging to the ejected robot simply don't resolve and get skipped.
@@ -490,6 +803,175 @@ def eject_robot_from_scene(world: SimWorld, robot_name: str) -> bool:
     return True
 
 
+# Runtime attach / actuate primitives (GH #1533, PR 1)
+
+
+def add_weld_constraint(
+    world: SimWorld,
+    *,
+    name: str,
+    parent: str,
+    child: str,
+    relpos: list[float],
+    relquat: list[float],
+    torquescale: float = 1.0,
+) -> bool:
+    """Add a named weld equality constraint between two bodies and recompile.
+
+    ``relpos`` / ``relquat`` are the pose of ``child`` expressed in ``parent``'s
+    frame - callers capture the CURRENT runtime relative pose so the weld holds
+    the bodies exactly where they are (MuJoCo's all-zero ``relpose`` quat would
+    instead bake in the compile-time ``qpos0`` pose, which is wrong for a
+    runtime grasp-attach). The equality is stored on the live spec so it
+    survives later recompiles (``add_object`` etc.).
+
+    Returns ``True`` on success. On recompile failure the just-added equality
+    is deleted again so the spec stays compilable, and ``False`` is returned.
+    """
+    spec = _get_spec(world)
+    if spec is None or world._model is None:
+        logger.error("add_weld_constraint: no spec or model in world")
+        return False
+    mj = _ensure_mujoco()
+
+    eq = spec.add_equality()
+    eq.name = name
+    eq.type = mj.mjtEq.mjEQ_WELD
+    eq.objtype = mj.mjtObj.mjOBJ_BODY
+    eq.name1 = parent
+    eq.name2 = child
+    # mjEQ_WELD data layout (mjNEQDATA=11): [anchor(3), relpose pos(3),
+    # relpose quat(4), torquescale(1)]. anchor stays zero - relpose fully
+    # determines the held configuration.
+    data = [0.0] * 11
+    data[3:6] = [float(v) for v in relpos]
+    data[6:10] = [float(v) for v in relquat]
+    data[10] = float(torquescale)
+    eq.data = data
+
+    if not _recompile_preserving_state(world, spec):
+        spec.delete(eq)
+        return False
+    return True
+
+
+def remove_equality_constraint(world: SimWorld, name: str) -> bool:
+    """Delete a named equality constraint from the live spec and recompile.
+
+    Returns ``False`` (logged) when the constraint is missing or the recompile
+    fails, so callers can surface a clean error instead of a silent no-op.
+    """
+    spec = _get_spec(world)
+    if spec is None or world._model is None:
+        logger.error("remove_equality_constraint: no spec or model in world")
+        return False
+    for eq in spec.equalities:
+        if eq.name == name:
+            spec.delete(eq)
+            return _recompile_preserving_state(world, spec)
+    logger.warning("Equality constraint '%s' not found in spec - nothing removed", name)
+    return False
+
+
+def actuate_robot_in_scene(
+    world: SimWorld,
+    robot: SimRobot,
+    kp_by_joint: dict[str, float],
+    *,
+    damping: float,
+    armature: float,
+    gravity_compensation: bool,
+    disable_self_collision: bool,
+) -> bool:
+    """Add position-servo actuators to a robot's joints and recompile.
+
+    The supported form of the private-spec surgery the ``so101_curobo`` example
+    performed by hand (GH #1533): converts an actuator-less (URDF-loaded) arm
+    into a position-controlled one so ``send_action`` / ``run_policy`` can
+    drive it. Per joint in ``kp_by_joint`` (SHORT joint names, values = kp):
+
+    * a position actuator (``set_to_position``: fixed gain kp, affine bias with
+      ``dampratio=1.0`` for ~critical damping, ctrlrange inherited from the
+      joint's range when it declares one),
+    * joint ``damping`` / ``armature`` floors (bare URDFs ship none, which
+      blows up explicit integration),
+
+    plus, scene-wide, the stable ``implicitfast`` integrator, and optionally
+    gravity compensation on the robot's bodies and self-collision disable on
+    the robot's own geoms (cuRobo-style planners ignore adjacent-link
+    contacts, which otherwise block planned motion).
+
+    Atomicity: the spec is snapshotted (XML round-trip) before surgery; any
+    failure restores the snapshot so no partial edit (integrator flip, gravcomp,
+    half the actuators) lingers on the live spec. Returns ``True`` on success.
+    """
+    spec = _get_spec(world)
+    if spec is None or world._model is None:
+        logger.error("actuate_robot_in_scene: no spec or model in world")
+        return False
+    mj = _ensure_mujoco()
+    pfx = robot.namespace or ""
+
+    # Snapshot for atomic rollback (mirrors patch_scene_mjcf): the surgery
+    # touches option/bodies/joints/actuators/geoms, too many objects to undo
+    # piecewise.
+    backup_spec = _snapshot_spec(spec, context="actuate_robot_in_scene")
+    if backup_spec is None:
+        return False
+
+    try:
+        # Bare URDF chains (no damping/armature) diverge under the default
+        # Euler integrator once stiff position servos are added; implicitfast
+        # integrates joint damping implicitly and stays stable.
+        spec.option.integrator = mj.mjtIntegrator.mjINT_IMPLICITFAST
+
+        for body in spec.bodies:
+            body_name = body.name or ""
+            if pfx and body_name.startswith(pfx):
+                if gravity_compensation:
+                    body.gravcomp = 1.0
+                if disable_self_collision:
+                    for geom in body.geoms:
+                        geom.contype = 0
+                        geom.conaffinity = 0
+
+        for joint in spec.joints:
+            joint_name = joint.name or ""
+            if not (pfx and joint_name.startswith(pfx)):
+                continue
+            short = joint_name[len(pfx) :]
+            if short not in kp_by_joint:
+                continue
+            joint.damping[0] = max(float(joint.damping[0]), damping)
+            joint.armature = max(float(joint.armature), armature)
+
+        for short, kp in kp_by_joint.items():
+            act = spec.add_actuator()
+            act.name = f"{robot.name}_act_{short}"
+            act.target = f"{pfx}{short}"
+            act.trntype = mj.mjtTrn.mjTRN_JOINT
+            # Find the joint's spec range: inheritrange clamps ctrl to the
+            # joint's limits when it declares any (URDF limits map here);
+            # unlimited joints keep an unlimited ctrlrange.
+            jnt_range_defined = False
+            for joint in spec.joints:
+                if (joint.name or "") == f"{pfx}{short}":
+                    jnt_range_defined = bool(float(joint.range[0]) < float(joint.range[1]))
+                    break
+            act.set_to_position(kp=float(kp), dampratio=1.0, inheritrange=jnt_range_defined)
+    except (ValueError, RuntimeError, TypeError) as e:
+        logger.error("actuate_robot_in_scene: spec surgery failed for '%s': %s", robot.name, e)
+        world._backend_state["spec"] = backup_spec
+        return False
+
+    if not _recompile_preserving_state(world, spec):
+        # Restore the pre-surgery spec so the failed edit doesn't poison
+        # later scene mutations.
+        world._backend_state["spec"] = backup_spec
+        return False
+    return True
+
+
 # Agent-authored raw MJCF (Stage 6)
 
 
@@ -521,27 +1003,67 @@ def replace_scene_mjcf(world: SimWorld, xml: str) -> bool:
     # _compile_world() which also calls mj_forward after MjData construction.
     mj.mj_forward(new_model, new_data)
 
-    try:
-        with filter_mujoco_attach_noise():
-            world._backend_state["xml"] = new_spec.to_xml()
-    except Exception:
-        pass
+    _sync_cached_xml(world, new_spec)
     return True
 
 
 # Structured-op patching of the live spec (Stage 6, part 2 - GH #125)
 
-# Supported ops for patch_scene_mjcf. Kept narrow on purpose - adding unchecked
-# attribute setters would make the tool an arbitrary-code hole. Agents that
-# need exotic MJCF should go through replace_scene_mjcf with a full XML.
-_PATCH_OPS = {
-    "add_body",
-    "add_geom",
-    "add_site",
-    "set_body_pos",
-    "set_body_quat",
-    "delete_body",
+# Supported ops for patch_scene_mjcf, each mapped to the complete set of keys
+# that op reads. Kept narrow on purpose - adding unchecked attribute setters
+# would make the tool an arbitrary-code hole. Agents that need exotic MJCF
+# should go through replace_scene_mjcf with a full XML.
+#
+# This mapping is the single source of truth for the op vocabulary: it names
+# the supported ops AND, per op, every key that reaches MuJoCo. Any other key
+# is refused, because each field below is read with a fallback default - a
+# misspelled key would otherwise apply that default and report success, so
+# ``{"op": "set_body_pos", "name": "crate", "position": [...]}`` would move the
+# body to the origin rather than to the requested pose.
+_PATCH_OP_KEYS: dict[str, frozenset[str]] = {
+    "add_body": frozenset({"op", "parent", "name", "pos", "quat"}),
+    "add_geom": frozenset({"op", "body", "type", "size", "rgba", "name", "pos", "quat"}),
+    "add_site": frozenset({"op", "body", "name", "pos", "size", "rgba"}),
+    "set_body_pos": frozenset({"op", "name", "pos"}),
+    "set_body_quat": frozenset({"op", "name", "quat"}),
+    "delete_body": frozenset({"op", "name"}),
 }
+
+
+def _unknown_op_keys_error(kind: str, op: Mapping[str, Any]) -> str | None:
+    """Reject keys a patch op does not read, before its defaults are applied.
+
+    Every field of every op is read with a fallback default (``pos`` defaults
+    to the origin, ``quat`` to identity, ``type`` to ``"box"``, ``parent`` to
+    ``"world"``), so an unrecognised key is not an inert extra: the op runs
+    with that default and reports success. A misspelled ``pos`` silently moves
+    a body to the world origin, a misspelled ``parent`` re-parents it to the
+    worldbody, and a misspelled ``type`` compiles a box where a sphere was
+    asked for.
+
+    Args:
+        kind: The op name, already known to be in :data:`_PATCH_OP_KEYS`.
+        op: The caller-supplied op dict.
+
+    Returns:
+        An error message naming the unknown key(s), a close-match suggestion
+        where one exists, and the keys this op accepts - or ``None`` when
+        every key is honored.
+    """
+    accepted = _PATCH_OP_KEYS[kind]
+    unknown = [key for key in op if key not in accepted]
+    if not unknown:
+        return None
+    known = sorted(accepted)
+    # Suggest field names only. "op" selects the op and is already validated
+    # above, so it is never what a misspelled field meant - offering it turns a
+    # real MJCF attribute like "group" into a nonsense hint.
+    candidates = [key for key in known if key != "op"]
+    described = []
+    for key in sorted(unknown, key=str):
+        close = difflib.get_close_matches(str(key).lower(), candidates, n=1, cutoff=0.5)
+        described.append(f"{key!r}" + (f" (did you mean {close[0]!r}?)" if close else ""))
+    return f"{kind}: unknown op key(s): {', '.join(described)}. Accepted keys: {', '.join(known)}."
 
 
 def _find_body(spec: Any, name: str, new_bodies: dict[str, Any]) -> Any:
@@ -581,8 +1103,10 @@ def _apply_patch_op(spec: Any, op: dict[str, Any], new_bodies: dict[str, Any]) -
         raise ValueError(f"each op must be a dict, got {type(op).__name__}")
 
     kind = op.get("op")
-    if kind not in _PATCH_OPS:
-        raise ValueError(f"unknown op '{kind}'. Supported: {sorted(_PATCH_OPS)}")
+    if kind not in _PATCH_OP_KEYS:
+        raise ValueError(f"unknown op '{kind}'. Supported: {sorted(_PATCH_OP_KEYS)}")
+    if err := _unknown_op_keys_error(str(kind), op):
+        raise ValueError(err)
 
     if kind == "add_body":
         parent = op.get("parent", "world")
@@ -687,6 +1211,10 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
         {"op": "set_body_pos", "name": "foo", "pos": [1,0,1]}
         {"op": "delete_body", "name": "foo"}
 
+    Each op accepts exactly the keys listed for it in :data:`_PATCH_OP_KEYS`;
+    anything else is rejected, because an unread key would leave the op running
+    on its fallback default (see :func:`_unknown_op_keys_error`).
+
     The list is applied atomically: if any op raises, the whole patch is
     rejected and the world is left in its original state. After all ops
     succeed, ``spec.recompile(model, data)`` is called once, so joint
@@ -703,14 +1231,11 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
     if spec is None:
         raise RuntimeError("world has no spec; patch_scene_mjcf requires a compiled world")
 
-    # Apply ops on a *clone* of the spec so we can atomically reject on failure.
-    # MjSpec doesn't expose a cheap deep-copy, but round-tripping through XML
-    # is safe: it's the same canonical form used by the compiler.
-    try:
-        with filter_mujoco_attach_noise():
-            backup_xml = spec.to_xml()
-    except Exception as e:  # pragma: no cover - spec.to_xml on brand-new specs is fine
-        raise RuntimeError(f"failed to snapshot spec before patch: {e}") from e
+    # Snapshot the spec so a failed op can be atomically rejected: the batch is
+    # applied to the live spec and the snapshot put back if any op fails.
+    backup_spec = _snapshot_spec(spec, context="patch_scene_mjcf")
+    if backup_spec is None:
+        raise RuntimeError("failed to snapshot spec before patch (see logs)")
 
     applied = 0
     new_bodies: dict[str, Any] = {}
@@ -719,15 +1244,7 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
             _apply_patch_op(spec, op, new_bodies)
             applied += 1
     except Exception as err:
-        # Restore from backup.
-        try:
-            restored = SpecBuilder.from_mjcf_string(backup_xml)
-            world._backend_state["spec"] = restored
-        except Exception:
-            # If even the backup round-trip fails, the world is in a bad state
-            # and the caller should rebuild. Propagate the original error
-            # either way so the user sees what went wrong.
-            pass
+        world._backend_state["spec"] = backup_spec
         raise ValueError(f"patch op #{applied + 1} failed: {err}") from err
 
     # One recompile for the whole batch - preserves qpos/qvel for unchanged joints.
@@ -740,9 +1257,5 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
     mj = _ensure_mujoco()
     mj.mj_forward(world._model, world._data)
 
-    try:
-        with filter_mujoco_attach_noise():
-            world._backend_state["xml"] = spec.to_xml()
-    except Exception:
-        pass
+    _sync_cached_xml(world, spec)
     return applied
