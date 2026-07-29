@@ -305,10 +305,47 @@ is actually called and `rclpy` is unavailable.
 | Method | ROS 2 action | Notes |
 |--------|--------------|-------|
 | `drive(linear, angular, duration=, count=)` | publish `Twist` to `cmd_vel_topic` | `duration` holds the command at `publish_rate` Hz |
-| `stop()` | publish zero `Twist` | |
+| `stop()` | publish zero `Twist` | never gated on anything |
 | `get_pose()` | echo `odom_topic` | |
-| `get_scan()` | echo `scan_topic` | error when no `scan_topic` configured |
+| `get_scan()` | echo `scan_topic` | tool exposed only when a `scan_topic` is wired |
+| `navigate_to(x, y, yaw=)` | `NavigateToPose` action goal | only when a `nav_action` is wired |
 | `.tools` | - | per-instance named agent tools |
+
+### The shared mobile-base contract
+
+`RosBridgedRobot` is a thin subclass of `MobileBaseRobot`, which owns the drive
+contract, the safety semantics and the `tools` property for **every** mobile
+robot in `strands_robots.mesh`. A robot class supplies only what actually
+varies: a `Transport` (how bytes move) and, when the platform is not
+differential-drive, a `_cmd_fields` override (what the command message looks
+like).
+
+Everything below therefore holds identically for any transport:
+
+- Non-finite `linear` / `angular` / `duration` are refused. `nan` passes
+  silently through a `min`/`max` clamp, so it has to be caught before clamping.
+- `duration` must be positive and finite, and within `max_duration` when the
+  platform sets one. An over-long hold is refused, never silently truncated -
+  and refused *before* any side effect, so an invalid request cannot be what
+  arms a vehicle.
+- Velocities are clamped to `max_linear` / `max_angular` when set. Left unset
+  they mean "this platform declares no limit", not zero.
+- Every timed or multi-message non-zero command is followed by a single zero
+  command, through `try`/`finally`, **even when the publish raised**. A timed
+  drive cannot leave a robot with a live velocity.
+- A bare single-shot `drive()` latches until `stop()`, exactly like a raw
+  `cmd_vel` publish. This is stated in the agent-facing tool description rather
+  than hidden.
+- `stop()` is never gated - not on the enable handshake, not on limits.
+- `init_services` declares an ordered enable/arm handshake that runs once before
+  the first command. It does not latch on failure, so a retry re-runs it. It
+  requires a transport that can call services, and is refused at construction on
+  one that cannot.
+
+Capabilities are reported, not assumed: `get_pose` appears only with an
+`odom_topic`, `get_scan` only with a `scan_topic`, `navigate` only with a
+`nav_action`, so an agent is never handed a tool that can only answer "not
+configured". `robot.supports("service_call")` asks the transport directly.
 
 See `examples/ros2/turtlebot_demo.py` for an end-to-end agent driving a turtle
 in `turtlesim` through the mesh bridge.

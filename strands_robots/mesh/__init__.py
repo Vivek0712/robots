@@ -23,6 +23,12 @@ Submodules
 - ``input`` - InputPublisher / InputReceiver for teleoperation over mesh
 """
 
+from strands_robots.mesh._mobile_base import (
+    ActionCapable,
+    MobileBaseRobot,
+    ServiceCapable,
+    Transport,
+)
 from strands_robots.mesh.audit import log_safety_event
 from strands_robots.mesh.core import (
     _LOCAL_ROBOTS,
@@ -51,6 +57,10 @@ __all__ = [
     "Mesh",
     "InputPublisher",
     "InputReceiver",
+    "MobileBaseRobot",
+    "Transport",
+    "ServiceCapable",
+    "ActionCapable",
     "RosBridgedRobot",
     "RtpsRobot",
     # Factory & registry

@@ -7,6 +7,10 @@ hardware robots. All ROS 2 I/O is forwarded through the
 :func:`strands_robots.tools.use_ros.use_ros` tool, so the bridge stays thin and
 inherits ``use_ros``'s in-process ``rclpy`` backend and input validation.
 
+The drive contract, its safety semantics, and the ``tools`` property live in
+:class:`~strands_robots.mesh._mobile_base.MobileBaseRobot`; this module supplies
+the ``use_ros`` transport and the ROS 2-specific Nav2 goal surface.
+
 Typical usage::
 
     from strands import Agent
@@ -32,11 +36,12 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any
+from typing import Any, cast
 
 from strands import tool
 from strands.types.tools import AgentTool
 
+from strands_robots.mesh._mobile_base import ActionCapable, MobileBaseRobot
 from strands_robots.tools.use_ros import use_ros
 
 _TWIST_TYPE = "geometry_msgs/msg/Twist"
@@ -45,17 +50,49 @@ _NAV_ACTION_TYPE = "nav2_msgs/action/NavigateToPose"
 # ROS 2 graph names: leading slash plus alnum / _ / ~ segments. Reject anything
 # else early so a malformed topic fails at construction with a clear message
 # rather than deep inside a forwarded ``use_ros`` call.
-_TOPIC_RE = re.compile(r"^[A-Za-z0-9_/~]+$")
+_ROS2_GRAPH_NAME_RE = re.compile(r"^[A-Za-z0-9_/~]+$")
 
 
 def _check_topic(label: str, value: str) -> str:
-    """Validate a ROS 2 topic/node name, returning it unchanged when valid."""
-    if not value or not _TOPIC_RE.match(value):
+    """Validate a ROS 2 topic/node name, returning it unchanged when valid.
+
+    Retained as a module-level function because it is the validator other ROS-
+    flavored bridges reach for. Prefer :meth:`RosBridgedRobot._check_topic`,
+    which picks up a subclass's own grammar.
+    """
+    if not value or not _ROS2_GRAPH_NAME_RE.match(value):
         raise ValueError(f"invalid {label}: {value!r} (expected a ROS 2 graph name like /turtle1/cmd_vel)")
     return value
 
 
-class RosBridgedRobot:
+class _UseRosTransport:
+    """Transport that forwards to the in-process ``rclpy`` ``use_ros`` tool.
+
+    Every method resolves ``use_ros`` through this module's globals rather than
+    capturing it at import, so tests (and any operator patching the tool) can
+    monkeypatch ``strands_robots.mesh.ros_bridge.use_ros`` and have the bridge
+    honor it. Implements the full optional surface: ROS 2 has services and
+    actions.
+    """
+
+    twist_type = _TWIST_TYPE
+
+    def publish(self, *, topic: str, type: str, fields: dict[str, Any], count: int, rate: float) -> dict[str, Any]:
+        return use_ros(action="publish", topic=topic, type=type, fields=fields, count=count, rate=rate)
+
+    def echo(self, *, topic: str, type: str | None, count: int, timeout: float) -> dict[str, Any]:
+        return use_ros(action="echo", topic=topic, type=type, count=count, timeout=timeout)
+
+    def service_call(self, *, service: str, type: str, fields: dict[str, Any]) -> dict[str, Any]:
+        return use_ros(action="service_call", service=service, type=type, fields=fields)
+
+    def action_send_goal(
+        self, *, action_name: str, type: str, fields: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        return use_ros(action="action_send_goal", action_name=action_name, type=type, fields=fields, timeout=timeout)
+
+
+class RosBridgedRobot(MobileBaseRobot):
     """A remote ROS 2 robot exposed as a strands-controllable robot.
 
     The bridge owns no ROS 2 state of its own; every method forwards to
@@ -72,7 +109,7 @@ class RosBridgedRobot:
         odom_topic: Topic carrying the robot's pose/odometry (e.g.
             ``/turtle1/pose`` or ``/odom``). Read by :meth:`get_pose`.
         scan_topic: Optional laser-scan topic (e.g. ``/scan``). Read by
-            :meth:`get_scan`; when omitted, :meth:`get_scan` returns an error.
+            :meth:`get_scan`; when omitted, no ``get_scan`` tool is exposed.
         cmd_vel_type: Interface type published to ``cmd_vel_topic``. Defaults to
             ``geometry_msgs/msg/Twist``.
         odom_type: Interface type of ``odom_topic``. Optional - when omitted,
@@ -80,6 +117,12 @@ class RosBridgedRobot:
         scan_type: Interface type of ``scan_topic``. Optional - resolved from
             the live graph when omitted.
         publish_rate: Default rate (Hz) for multi-message :meth:`drive` calls.
+        max_linear: Optional linear-velocity clamp (m/s). Unset by default: a
+            generic ROS 2 base declares no speed limit to this bridge, and
+            inventing one would silently cap an existing caller.
+        max_angular: Optional angular-velocity clamp (rad/s). Unset by default.
+        max_duration: Optional cap on a single :meth:`drive` hold, in seconds.
+            Unset by default; when set, a longer request is refused loudly.
         nav_action: Optional Nav2-style action server name (e.g.
             ``/navigate_to_pose``). When set, :meth:`navigate_to` sends
             goal-level navigation instead of raw velocity, and a
@@ -87,6 +130,13 @@ class RosBridgedRobot:
         nav_action_type: Action interface for ``nav_action``. Defaults to
             ``nav2_msgs/action/NavigateToPose``.
     """
+
+    # ROS 2 uses one grammar for node names and topics alike, so both seams
+    # point at the same pattern. Bound through a differently-named module global
+    # because `_TOPIC_RE = _TOPIC_RE` in a class body reads as a typo.
+    _NAME_RE = _ROS2_GRAPH_NAME_RE
+    _TOPIC_RE = _ROS2_GRAPH_NAME_RE
+    _NAME_HINT = " (expected a ROS 2 graph name like /turtle1/cmd_vel)"
 
     def __init__(
         self,
@@ -99,18 +149,32 @@ class RosBridgedRobot:
         odom_type: str | None = None,
         scan_type: str | None = None,
         publish_rate: float = 10.0,
+        max_linear: float | None = None,
+        max_angular: float | None = None,
+        max_duration: float | None = None,
         nav_action: str | None = None,
         nav_action_type: str = _NAV_ACTION_TYPE,
     ) -> None:
-        self.node_name = _check_topic("node_name", node_name)
-        self.cmd_vel_topic = _check_topic("cmd_vel_topic", cmd_vel_topic)
-        self.odom_topic = _check_topic("odom_topic", odom_topic)
-        self.scan_topic = _check_topic("scan_topic", scan_topic) if scan_topic else None
-        self.cmd_vel_type = cmd_vel_type
-        self.odom_type = odom_type
-        self.scan_type = scan_type
-        self.publish_rate = publish_rate
-        self.nav_action = _check_topic("nav_action", nav_action) if nav_action else None
+        # ``odom_topic`` is optional on the base (the DeepRacer has no
+        # odometry at all) but required here, so an empty value is a malformed
+        # argument rather than an omission and must be refused, not read as
+        # "no odometry wired".
+        self._check_topic("odom_topic", odom_topic)
+        super().__init__(
+            node_name,
+            cmd_vel_topic,
+            _UseRosTransport(),
+            odom_topic=odom_topic,
+            scan_topic=scan_topic,
+            cmd_vel_type=cmd_vel_type,
+            odom_type=odom_type,
+            scan_type=scan_type,
+            max_linear=max_linear,
+            max_angular=max_angular,
+            max_duration=max_duration,
+            publish_rate=publish_rate,
+        )
+        self.nav_action = self._check_topic("nav_action", nav_action) if nav_action else None
         self.nav_action_type = nav_action_type
 
     @classmethod
@@ -130,75 +194,6 @@ class RosBridgedRobot:
         node_name=..., cmd_vel_topic=...)``.
         """
         return cls(node_name, cmd_vel_topic, odom_topic, scan_topic, **kwargs)
-
-    def drive(
-        self,
-        linear: float = 0.0,
-        angular: float = 0.0,
-        duration: float | None = None,
-        count: int = 1,
-    ) -> dict[str, Any]:
-        """Publish a velocity command to the robot's ``cmd_vel`` topic.
-
-        Args:
-            linear: Forward linear velocity (m/s), mapped to ``linear.x``.
-            angular: Yaw angular velocity (rad/s), mapped to ``angular.z``.
-            duration: When given, hold the command for this many seconds by
-                publishing ``round(duration * publish_rate)`` messages. Takes
-                precedence over ``count``.
-            count: Number of messages to publish when ``duration`` is omitted.
-
-        Returns:
-            The ``use_ros`` publish result dict.
-        """
-        n = max(1, round(duration * self.publish_rate)) if duration is not None else count
-        fields = {"linear": {"x": float(linear)}, "angular": {"z": float(angular)}}
-        return use_ros(
-            action="publish",
-            topic=self.cmd_vel_topic,
-            type=self.cmd_vel_type,
-            fields=fields,
-            count=n,
-            rate=self.publish_rate,
-        )
-
-    def stop(self) -> dict[str, Any]:
-        """Publish a zero-velocity command to halt the robot."""
-        return self.drive(linear=0.0, angular=0.0, count=1)
-
-    def get_pose(self, timeout: float = 5.0) -> dict[str, Any]:
-        """Read one sample from the robot's odometry/pose topic.
-
-        Returns:
-            The ``use_ros`` echo result dict for ``odom_topic``.
-        """
-        return use_ros(
-            action="echo",
-            topic=self.odom_topic,
-            type=self.odom_type,
-            count=1,
-            timeout=timeout,
-        )
-
-    def get_scan(self, timeout: float = 5.0) -> dict[str, Any]:
-        """Read one sample from the robot's laser-scan topic.
-
-        Returns:
-            The ``use_ros`` echo result dict for ``scan_topic``, or an error
-            result when no ``scan_topic`` was configured.
-        """
-        if not self.scan_topic:
-            return {
-                "status": "error",
-                "content": [{"text": "get_scan: no scan_topic configured for this robot"}],
-            }
-        return use_ros(
-            action="echo",
-            topic=self.scan_topic,
-            type=self.scan_type,
-            count=1,
-            timeout=timeout,
-        )
 
     def navigate_to(
         self,
@@ -228,10 +223,7 @@ class RosBridgedRobot:
             samples), or an error result when no ``nav_action`` was configured.
         """
         if not self.nav_action:
-            return {
-                "status": "error",
-                "content": [{"text": "navigate_to: no nav_action configured for this robot"}],
-            }
+            return self._error("navigate_to: no nav_action configured for this robot")
         half = 0.5 * float(yaw)
         fields = {
             "pose": {
@@ -242,35 +234,18 @@ class RosBridgedRobot:
                 },
             }
         }
-        return use_ros(
-            action="action_send_goal",
+        return cast(ActionCapable, self.transport).action_send_goal(
             action_name=self.nav_action,
             type=self.nav_action_type,
             fields=fields,
             timeout=timeout,
         )
 
-    @property
-    def tools(self) -> list[AgentTool]:
-        """Return this robot's capabilities as named strands agent tools.
-
-        The returned tools are bound to this instance and uniquely named with
-        the ``node_name`` suffix so multiple bridged robots can coexist in a
-        single ``Agent(tools=[...])`` call without name collisions.
-        """
-        suffix = self.node_name.strip("/").replace("/", "_")
-
-        @tool(name=f"drive_{suffix}", description=f"Drive the {self.node_name} robot (linear/angular velocity).")
-        def drive(linear: float = 0.0, angular: float = 0.0, duration: float | None = None) -> dict[str, Any]:
-            return self.drive(linear=linear, angular=angular, duration=duration)
-
-        @tool(name=f"get_pose_{suffix}", description=f"Read the current pose/odometry of the {self.node_name} robot.")
-        def get_pose() -> dict[str, Any]:
-            return self.get_pose()
-
-        @tool(name=f"get_scan_{suffix}", description=f"Read one laser scan from the {self.node_name} robot.")
-        def get_scan() -> dict[str, Any]:
-            return self.get_scan()
+    def _extra_tools(self) -> list[AgentTool]:
+        """Expose ``navigate_<suffix>`` only when a nav action is wired."""
+        if not self.nav_action:
+            return []
+        suffix = self.tool_suffix
 
         @tool(
             name=f"navigate_{suffix}",
@@ -282,15 +257,4 @@ class RosBridgedRobot:
         def navigate(x: float, y: float, yaw: float = 0.0, timeout: float = 120.0) -> dict[str, Any]:
             return self.navigate_to(x=x, y=y, yaw=yaw, timeout=timeout)
 
-        agent_tools: list[AgentTool] = [drive, get_pose]
-        if self.scan_topic:
-            agent_tools.append(get_scan)
-        if self.nav_action:
-            agent_tools.append(navigate)
-        return agent_tools
-
-    def __repr__(self) -> str:
-        return (
-            f"RosBridgedRobot(node_name={self.node_name!r}, cmd_vel_topic={self.cmd_vel_topic!r}, "
-            f"odom_topic={self.odom_topic!r}, scan_topic={self.scan_topic!r})"
-        )
+        return [navigate]
