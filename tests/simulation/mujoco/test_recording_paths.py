@@ -221,6 +221,63 @@ def test_b12_multi_episode_resume_appends(sim_with_two_robots, tmp_path):
     assert ds.meta.total_episodes == 2, f"expected 2 episodes, got {ds.meta.total_episodes}"
 
 
+def test_resume_at_a_different_fps_is_refused_and_leaves_the_dataset_intact(sim_with_two_robots, tmp_path):
+    """Appending to an existing dataset at a different ``fps`` is rejected.
+
+    A resumed dataset keeps the rate it was created at (``LeRobotDataset.resume``
+    takes no ``fps``), so a differing request cannot be honored. Pre-fix the
+    second ``start_recording`` returned ``status="success"`` and reported the
+    requested rate while every appended frame was timestamped at the on-disk one
+    - two episodes captured at different cadences became indistinguishable on
+    disk. The refusal must also leave the existing dataset untouched.
+    """
+    from strands_robots.dataset_recorder import has_lerobot_dataset
+
+    if not has_lerobot_dataset():
+        pytest.skip("lerobot not installed")
+
+    sim = sim_with_two_robots
+    root = str(tmp_path / "fpsmix")
+
+    r = sim.start_recording(repo_id="local/fpsmix", fps=20, root=root, overwrite=True)
+    assert r["status"] == "success", r
+    sim.run_policy(
+        robot_name="alpha",
+        policy_provider="mock",
+        instruction="ep0",
+        duration=0.3,
+        control_frequency=20.0,
+        fast_mode=True,
+    )
+    assert sim.stop_recording()["status"] == "success"
+
+    r = sim.start_recording(repo_id="local/fpsmix", fps=40, root=root, overwrite=False)
+    assert r["status"] == "error", f"resume at a different fps must be refused: {r}"
+    text = r["content"][0]["text"]
+    assert "fps" in text and "on-disk=20" in text and "requested=40" in text, text
+
+    # The dataset the caller already recorded is intact and still at its rate.
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    ds = LeRobotDataset(repo_id="local/fpsmix", root=root)
+    assert ds.meta.fps == 20
+    assert ds.meta.total_episodes == 1
+
+    # The same rate still appends, so the guard only rejects the unhonorable case.
+    r = sim.start_recording(repo_id="local/fpsmix", fps=20, root=root, overwrite=False)
+    assert r["status"] == "success", r
+    sim.run_policy(
+        robot_name="alpha",
+        policy_provider="mock",
+        instruction="ep1",
+        duration=0.3,
+        control_frequency=20.0,
+        fast_mode=True,
+    )
+    assert sim.stop_recording()["status"] == "success"
+    assert LeRobotDataset(repo_id="local/fpsmix", root=root).meta.total_episodes == 2
+
+
 def test_b4_synchronized_multi_robot_recording(sim_with_two_robots, tmp_path):
     """B4 fix: run_multi_policy drives BOTH robots in one synchronized loop and
     records them into ONE merged frame per timestep - so every frame co-observes
@@ -605,14 +662,15 @@ def test_start_recording_without_lerobot_points_at_mp4_fallback(sim_with_two_rob
 
 def test_start_recording_resolves_namespaced_repo_id_under_hf_cache(sim_with_two_robots, monkeypatch, tmp_path):
     """With root=None and a 'user/name' repo_id, the dataset dir resolves under
-    the HuggingFace lerobot cache. We pin this by pointing Path.home at a temp
+    the HuggingFace lerobot cache. We pin this by pointing the resolver's HF-cache home at a temp
     dir, pre-seeding the resolved cache dir, and asserting overwrite=True wipes
     exactly that resolved path."""
     import strands_robots.dataset_recorder as dr
-    import strands_robots.simulation.mujoco.recording as rec
 
     monkeypatch.setattr(dr, "has_lerobot_dataset", lambda: True)
-    monkeypatch.setattr(rec.Path, "home", classmethod(lambda cls: tmp_path))
+    # Path resolution lives in dataset_recorder.resolve_dataset_dir(); pin the
+    # HF-cache home it uses so the resolved dir is deterministic under tmp_path.
+    monkeypatch.setattr(dr, "_lerobot_home", lambda: tmp_path / ".cache" / "huggingface" / "lerobot")
     monkeypatch.setattr(dr.DatasetRecorder, "create", classmethod(lambda cls, **kw: object()))
 
     cache_dir = tmp_path / ".cache" / "huggingface" / "lerobot" / "user" / "name"
@@ -907,6 +965,74 @@ def test_reset_empty_buffer_during_recording_does_not_create_episode(sim_with_on
     assert ds.meta.total_frames == 5
 
 
+def test_reset_surfaces_save_episode_failure_without_resetting(sim_with_one_robot, tmp_path):
+    """A ``reset()`` that auto-flushes a pending episode must SURFACE a flush
+    failure and leave the world untouched - not silently reset into an
+    undefined state.
+
+    ``reset()`` flushes buffered recording frames as an episode boundary before
+    teleporting the world (see
+    :func:`test_reset_flushes_pending_recording_episode`). If that flush fails,
+    the facade ``save_episode`` has already marked the recorder poisoned and
+    cleared the recording flag; ``reset()`` must propagate that error and abort
+    the reset rather than run ``mj_resetData`` on top of a half-written episode.
+    Otherwise a data-integrity failure would masquerade as a clean reset and the
+    caller would keep collecting into a broken dataset.
+    """
+    from strands_robots.dataset_recorder import has_lerobot_dataset
+
+    if not has_lerobot_dataset():
+        pytest.skip("lerobot not installed")
+
+    sim = sim_with_one_robot
+    root = str(tmp_path / "reset_flush_fail")
+    assert sim.start_recording(repo_id="local/reset_flush_fail", fps=20, root=root, overwrite=True)["status"] == (
+        "success"
+    )
+
+    # Buffer a real rollout so reset() takes the flush path (episode_frame_count > 0).
+    rp = sim.run_policy(
+        robot_name="arm",
+        policy_provider="mock",
+        n_steps=5,
+        control_frequency=20.0,
+        fast_mode=True,
+    )
+    assert rp["status"] == "success", rp
+
+    recorder = sim._world._backend_state["dataset_recorder"]
+    assert recorder is not None
+    assert getattr(recorder, "episode_frame_count", 0) > 0, "expected a non-empty buffer to flush"
+
+    # Force the underlying flush to fail. The facade save_episode turns a
+    # recorder error dict into a cleared-recording error return, which reset()
+    # must propagate verbatim.
+    def _boom() -> dict:
+        return {"status": "error", "message": "simulated lerobot flush failure"}
+
+    recorder.save_episode = _boom  # type: ignore[method-assign]
+
+    # Capture pre-reset world bookkeeping; a fail-fast reset must not touch it.
+    step_count_before = sim._world.step_count
+    sim_time_before = sim._world.sim_time
+    assert step_count_before > 0, "rollout should have advanced the step counter"
+
+    rr = sim.reset()
+
+    # 1. The failure is surfaced, not swallowed.
+    assert rr["status"] == "error", rr
+    assert "save_episode failed" in rr["content"][0]["text"]
+    assert "simulated lerobot flush failure" in rr["content"][0]["text"]
+
+    # 2. The world was NOT reset - no mj_resetData ran, so time/step survive.
+    assert sim._world.step_count == step_count_before
+    assert sim._world.sim_time == sim_time_before
+
+    # 3. The poisoned recorder was dropped so callers cannot append into it.
+    assert sim._world._backend_state.get("recording") is False
+    assert sim._world._backend_state.get("dataset_recorder") is None
+
+
 def test_start_recording_existing_empty_root_records(sim_with_two_robots, tmp_path):
     """An EXISTING empty ``root`` (e.g. from tempfile.mkdtemp()) must record.
 
@@ -944,3 +1070,120 @@ def test_start_recording_existing_empty_root_records(sim_with_two_robots, tmp_pa
     ds = LeRobotDataset(repo_id="local/empty_root_probe", root=root)
     assert ds.meta.total_episodes == 1, f"expected 1 episode, got {ds.meta.total_episodes}"
     assert ds.meta.total_frames > 0
+
+
+def test_run_multi_policy_single_robot_records_unnamespaced_columns(tmp_path):
+    """A single-robot world driven via ``run_multi_policy`` records BARE
+    (un-prefixed) action/observation columns.
+
+    ``run_multi_policy`` accepts a one-entry ``policies`` dict (e.g. a bimanual
+    rig temporarily driving a single arm). When the world holds exactly one
+    robot, ``multi_robot`` is False and the merged frame must carry the robot's
+    plain actuator/joint keys - NOT ``<name>__`` prefixed - so the dataset
+    schema is identical to a single-robot ``run_policy`` recording and a policy
+    trained on one layout can consume the other. This pins the un-namespaced
+    merge branch of the synchronized loop (the multi-robot namespaced branch is
+    covered by ``test_b4_synchronized_multi_robot_recording``).
+    """
+    from strands_robots.dataset_recorder import has_lerobot_dataset
+
+    if not has_lerobot_dataset():
+        pytest.skip("lerobot not installed")
+
+    import numpy as np
+
+    from strands_robots.policies import create_policy
+    from strands_robots.simulation import Simulation
+
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "test_arm.xml")
+    with open(path, "w") as f:
+        f.write(_ROBOT_XML)
+
+    sim = Simulation()
+    sim.create_world()
+    sim.add_robot("solo", urdf_path=path, position=[0, 0, 0])
+    sim.step(5)
+    try:
+        root = str(tmp_path / "solo")
+        r = sim.start_recording(repo_id="local/solo_multi", fps=20, root=root, overwrite=True)
+        assert r["status"] == "success", r
+
+        r = sim.run_multi_policy(
+            policies={"solo": create_policy("mock")},
+            instructions="wave",
+            duration=0.5,
+            control_frequency=20.0,
+        )
+        assert r["status"] == "success", r
+        assert tool_json(r)["steps"] > 0
+        sim.stop_recording()
+
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        ds = LeRobotDataset(repo_id="local/solo_multi", root=root)
+
+        af = ds.features["action"]
+        names = af["names"] if isinstance(af, dict) else getattr(af, "names", None)
+        assert names, names
+        # Single-robot world: columns are the bare actuator keys, un-prefixed.
+        assert all("__" not in n for n in names), f"expected un-namespaced columns, got {names}"
+        assert set(names) == {"shoulder_pan_act", "shoulder_lift_act", "elbow_act"}, names
+
+        # Frames were actually written with non-zero commanded actions.
+        assert len(ds) > 0
+        moved = 0
+        for i in range(len(ds)):
+            if float(np.abs(np.asarray(ds[i]["action"])).sum()) > 1e-6:
+                moved += 1
+        assert moved == len(ds), f"only {moved}/{len(ds)} frames carried a commanded action"
+    finally:
+        sim.destroy()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_get_state_reports_live_recording_progress(sim_with_two_robots, tmp_path):
+    """``get_state`` annotates the recorded step count while a recording is live.
+
+    ``Simulation.get_state`` is the human-readable introspection surface an
+    agent polls to monitor a data-collection episode. When a LeRobotDataset
+    recording is active it appends a ``[recording] N steps`` line so the caller
+    can watch the buffer fill mid-rollout; on an idle world that line is absent.
+    The count reflects the trajectory buffer the run_policy hook fills, so it is
+    strictly positive once frames have been rolled out under an active recorder.
+    """
+    import re
+
+    from strands_robots.dataset_recorder import has_lerobot_dataset
+
+    if not has_lerobot_dataset():
+        pytest.skip("lerobot not installed")
+
+    sim = sim_with_two_robots
+
+    # Idle world: no recording annotation on the state summary.
+    idle = sim.get_state()
+    assert idle["status"] == "success"
+    assert "[recording]" not in idle["content"][0]["text"]
+
+    r = sim.start_recording(repo_id="local/state_progress", fps=20, root=str(tmp_path), overwrite=True)
+    assert r["status"] == "success", r
+
+    from strands_robots.policies.mock import MockPolicy
+
+    policy = MockPolicy()
+    policy.set_robot_state_keys(sim.robot_joint_names("alpha"))
+    r = sim.run_policy("alpha", policy_object=policy, duration=0.5, control_frequency=20.0)
+    assert r["status"] == "success", r
+
+    # Recording still active: the summary reports a positive buffered count.
+    active_text = sim.get_state()["content"][0]["text"]
+    match = re.search(r"\[recording\] (\d+) steps", active_text)
+    assert match is not None, active_text
+    assert int(match.group(1)) > 0, active_text
+
+    sim.stop_recording()
+
+    # Back to idle: the annotation is gone once the recording is finalized.
+    done_text = sim.get_state()["content"][0]["text"]
+    assert "[recording]" not in done_text

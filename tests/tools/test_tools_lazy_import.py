@@ -28,6 +28,7 @@ def test_all_lists_every_lazy_import_name() -> None:
     assert set(tools_pkg.__all__) == {
         "download_assets",
         "gr00t_inference",
+        "harness_memory",
         "lerobot_calibrate",
         "lerobot_camera",
         "lerobot_teleoperate",
@@ -39,6 +40,7 @@ def test_all_lists_every_lazy_import_name() -> None:
         "train_policy",
         "use_lerobot",
         "use_ros",
+        "use_rosbridge",
         "use_rtps",
     }
 

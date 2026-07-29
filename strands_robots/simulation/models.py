@@ -52,6 +52,11 @@ class SimRobot:
     joint_names: list[str] = field(default_factory=list)
     actuator_ids: list[int] = field(default_factory=list)
     namespace: str = ""
+    # Canonical home pose applied by ``add_robot(keyframe=...)`` and re-applied
+    # on ``reset()``. Maps each (namespaced) joint name to its qpos slice. Empty
+    # for robots spawned without a keyframe (the default zero pose), so reset()
+    # stays byte-identical for those robots.
+    home_qpos: dict[str, list[float]] = field(default_factory=dict)
     policy_running: bool = False
     policy_steps: int = 0
     policy_instruction: str = ""
@@ -163,6 +168,13 @@ class SimWorld:
     timestep: float = 0.002  # 500Hz physics
     gravity: list[float] = field(default_factory=lambda: [0.0, 0.0, -9.81])
     ground_plane: bool = True
+    # Heightfield terrain kind (e.g. "rough"/"stairs"/"pyramid"); None -> flat plane. See
+    # strands_robots.simulation.terrain. Only meaningful when ground_plane=True.
+    terrain: str | None = None
+    # Curriculum difficulty scaling the terrain's peak elevation (1.0 = full
+    # height); only meaningful when terrain is set. See
+    # strands_robots.simulation.terrain.terrain_elevation.
+    terrain_difficulty: float = 1.0
     status: SimStatus = SimStatus.IDLE
     sim_time: float = 0.0
     step_count: int = 0
@@ -180,3 +192,9 @@ class SimWorld:
     # Kept as a top-level field - requested by @yinsong1986 during review to
     # avoid monkey-patching when ``reset()`` creates a fresh ``SimWorld``.
     _checkpoints: dict[str, Any] = field(default_factory=dict)
+    # Monotonically-incremented generation counter bumped on every
+    # spec.recompile (scene_ops._recompile_preserving_state). Checkpoints
+    # stamp this value so load_state can detect a same-shape recompile
+    # (remove one free-jointed object, add another) that the nq/nv/na/nu
+    # counts alone cannot distinguish.
+    _recompile_generation: int = 0

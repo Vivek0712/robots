@@ -100,6 +100,11 @@ def _convert_joint_vector(
     because the SO-arm gripper uses ``MotorNormMode.RANGE_0_100`` (0..100), not
     degrees - see ``lerobot/robots/so_follower/so_follower.py``.
 
+    The arm-degrees direction assumes the checkpoint was recorded with the SO
+    driver's ``use_degrees=True`` (its default, but opt-out). With
+    ``use_degrees=False`` the arm is ``MotorNormMode.RANGE_M100_100`` (-100..100),
+    so this degree conversion must not be applied to such a checkpoint.
+
     LeRobot's ``MotorNormMode.DEGREES`` is **mid-point-centered**: the value a
     checkpoint trains on is the angular displacement from each motor's
     calibration mid-point, not the absolute joint angle (ground truth:
@@ -152,25 +157,121 @@ def _convert_joint_vector(
     return out
 
 
+# Hardware observation detection
+
+
+def _is_boolean_flag(value: object) -> bool:
+    """Whether ``value`` carries a boolean, in any of the flavours an observation uses.
+
+    A driver status flag is not a joint reading, and the exclusion has to cover
+    every spelling of "boolean" because none of them is caught by a check for
+    another one:
+
+    ==========================  ============================================
+    ``True``                    an ``int`` subclass, so a numeric check takes it
+    ``np.bool_(True)``          NOT a ``bool`` subclass, and NOT an
+                                ``np.integer`` - it reaches a duck-typed 0-d
+                                check instead (``ndim`` is 0, ``item`` exists)
+    ``np.array(True)``          an ``ndarray`` whose ``ndim`` is 0
+    ``torch.tensor(True)``      0-d with an ``item``, dtype ``torch.bool``
+    ==========================  ============================================
+
+    So the flag test is done once here, ahead of every accept branch, rather
+    than per branch: a branch added later cannot reopen the hole.
+
+    Dtype is matched by kind rather than identity so the check does not import
+    torch (this module stays light) and covers array libraries generally. An
+    unrecognised dtype spelling therefore reads as boolean if it says "bool",
+    which is the safe direction: a wrongly-rejected reading yields a SHORT key
+    list, and a short list refuses the hardware override (see
+    ``hardware_pos_keys`` callers) instead of binding a misaligned one.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return True
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return False
+    # numpy dtypes expose ``.kind`` ('b' for boolean); torch's do not, but every
+    # dtype spelling that means boolean says so in its string form.
+    return getattr(dtype, "kind", None) == "b" or "bool" in str(dtype).lower()
+
+
+def _is_joint_scalar(value: object) -> bool:
+    """Whether ``value`` is a single numeric joint reading.
+
+    Accepts python and numpy scalars plus 0-d arrays/tensors; rejects booleans
+    in every flavour (see :func:`_is_boolean_flag`) and anything with more than
+    one element.
+
+    The dtype coverage is the point: ``isinstance(np.float64(1.0), float)`` is
+    True but ``isinstance(np.float32(1.0), float)`` is False, so a predicate
+    written as "plain floats, and numpy only if that found nothing" answers
+    differently for a float32 observation than for a float64 one - and
+    differently again for an observation that mixes the two.
+    """
+    if _is_boolean_flag(value):
+        return False
+    if isinstance(value, (int, float, np.floating, np.integer)):
+        return True
+    if isinstance(value, np.ndarray):
+        return value.ndim == 0
+    # 0-d torch tensor, without importing torch here (this module stays light).
+    return getattr(value, "ndim", None) == 0 and hasattr(value, "item")
+
+
+def hardware_pos_keys(observation: dict[str, Any]) -> list[str]:
+    """Ordered ``'<motor>.pos'`` keys of ``observation`` carrying a joint reading.
+
+    The single source of truth for "does this observation come from real
+    hardware?", shared by the state side (:class:`PackStateProcessorStep`) and
+    the action side (``LerobotLocalPolicy._hardware_action_keys``).
+
+    Both sides bind their vectors positionally, so the returned order - the
+    observation's own insertion order, i.e. lerobot motor order - is part of the
+    contract.
+
+    Args:
+        observation: A raw robot/sim observation dict.
+
+    Returns:
+        The matching keys, in observation order.
+    """
+    return [
+        key
+        for key, value in observation.items()
+        if isinstance(key, str) and key.endswith(".pos") and _is_joint_scalar(value)
+    ]
+
+
 # Action diagnostics
 
 
-def diagnose_action_dim(n_action_values: int, n_action_keys: int, *, name: str = "") -> str | None:
+def diagnose_action_dim(
+    n_action_values: int, n_action_keys: int, *, name: str = "", pad_short: bool = False
+) -> str | None:
     """Return a warning message when a model action vector mis-matches the
     embodiment's declared actuator count, else ``None``.
 
     The local policy maps a model's action tensor onto robot actuators by index
     (``LerobotLocalPolicy._tensor_to_action_dicts``). When the model emits FEWER
     values than the embodiment declares actuator keys, the unmatched actuators
-    are zero-filled -- which silently freezes those joints and looks exactly like
-    "the policy runs but the robot does not move". When it emits MORE, the extra
-    trailing values are dropped. Either case is almost always an
-    embodiment/checkpoint mismatch the operator wants surfaced, not swallowed.
+    get no value from the model, and when it emits MORE the extra trailing values
+    are dropped. Either case is almost always an embodiment/checkpoint mismatch
+    the operator wants surfaced, not swallowed.
+
+    What happens to those unmatched actuators is the caller's choice, so the
+    message has to report the behaviour actually in effect: by default they are
+    omitted from the action dict and hold position, while
+    ``pad_short_actions=True`` sends them an explicit ``0.0``, which on an
+    absolute-position action space travels them to zero.
 
     Args:
         n_action_values: Length of the model's per-step action vector.
         n_action_keys: Number of declared actuator keys (``robot_state_keys``).
         name: Embodiment name for the message (optional).
+        pad_short: Whether the caller pads the unmatched actuators with ``0.0``
+            (see :func:`strands_robots.policies.base.align_action_values`).
+            Selects which consequence the message describes.
 
     Returns:
         A human-readable warning string, or ``None`` when the dims match.
@@ -180,11 +281,17 @@ def diagnose_action_dim(n_action_values: int, n_action_keys: int, *, name: str =
     label = f" '{name}'" if name else ""
     if n_action_values < n_action_keys:
         missing = n_action_keys - n_action_values
+        consequence = (
+            f"the {missing} unmatched actuator(s) are commanded to 0.0 "
+            f"(pad_short_actions=True), which on an absolute-position action space travels "
+            f"them to zero rather than holding them"
+            if pad_short
+            else f"the {missing} unmatched actuator(s) receive no command and hold their current position"
+        )
         return (
             f"Policy action dim {n_action_values} < embodiment{label} actuator count "
-            f"{n_action_keys}: the {missing} unmatched actuator(s) are zero-filled and will "
-            f"not move. Check the embodiment's action_keys order/count against the "
-            f"checkpoint's action dimension."
+            f"{n_action_keys}: {consequence}. Check the embodiment's action_keys "
+            f"order/count against the checkpoint's action dimension."
         )
     extra = n_action_values - n_action_keys
     return (
@@ -261,6 +368,27 @@ class ZeroActionMonitor:
 
 # Imported lazily so this module is importable without lerobot (e.g. for unit
 # testing EmbodimentMap loading/validation in a minimal env).
+# Warn-once dedup for state_keys absent from the observation (keyed by the
+# missing-key tuple, which is stable across the 50Hz control loop).
+_WARNED_MISSING_STATE_KEYS: set[tuple[str, ...]] = set()
+
+
+def _warn_missing_state_keys(missing: list[str]) -> None:
+    """Warn once that some declared ``state_keys`` were absent (zero-filled in place)."""
+    sig = tuple(missing)
+    if sig in _WARNED_MISSING_STATE_KEYS:
+        return
+    _WARNED_MISSING_STATE_KEYS.add(sig)
+    logger.warning(
+        "lerobot_local: state_key(s) %s absent from the observation; zero-filled IN "
+        "PLACE so the present joints keep their model index (the missing dims read 0). "
+        "The canonical trigger is a mimic/tendon gripper actuator (e.g. left/gripper) "
+        "whose sim observation exposes finger joints instead -- the arm proprioception "
+        "stays aligned while the gripper state reads 0.",
+        missing,
+    )
+
+
 def register_pack_state_step() -> type | None:
     """Define + register :class:`PackStateProcessorStep` against lerobot.
 
@@ -318,12 +446,16 @@ def register_pack_state_step() -> type | None:
         joint_mids: list[float] = field(default_factory=list)
 
         def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+            """Compose the declared scalar joint keys into ``observation.state`` (passthrough when already packed)."""
             if "observation.state" in observation:
                 return observation  # already packed -> passthrough
 
             vals: list[float] = []
+            missing: list[str] = []
+            present = 0
             for k in self.state_keys:
                 if k in observation:
+                    present += 1
                     v = observation[k]
                     if isinstance(v, np.ndarray):
                         if v.ndim == 0:
@@ -334,11 +466,47 @@ def register_pack_state_step() -> type | None:
                         vals.extend(float(x) for x in v)
                     else:
                         vals.append(float(v))
+                else:
+                    # Zero-fill the missing key IN PLACE so it holds its slot.
+                    # Skipping it (the previous behavior) collapsed the vector and
+                    # shifted every following joint out of its model index -- the
+                    # embodiment-path analog of the generic-path fix in
+                    # LerobotLocalPolicy._collect_state_values.
+                    vals.append(0.0)
+                    missing.append(k)
 
-            if not vals:
-                # No declared state keys present; leave obs alone so a clearer
-                # downstream error (or a state-less policy) can handle it.
+            if present == 0:
+                # None of the DECLARED state_keys are present. The canonical
+                # trigger is a SIM embodiment (e.g. so101: state_keys ['1'..'6'])
+                # driven from REAL hardware, whose observation carries
+                # '<motor>.pos' scalar keys instead (lerobot SOFollower). Rather
+                # than dead-end with "requires observation.state", fall back to
+                # the hardware '.pos' keys so ``embodiment="so101"`` works on the
+                # physical arm too - not only in sim.
+                #
+                # Hardware '.pos' values are ALREADY in the model's training
+                # units (so_follower MotorNormMode: arm DEGREES, gripper
+                # RANGE_0_100), so we pack them RAW and DO NOT apply the
+                # sim-radian -> model-degree conversion below (that would
+                # double-convert). Observation insertion order is lerobot motor
+                # order (shoulder_pan..gripper), which matches the positional
+                # sim state_keys, so a straight collection is index-aligned.
+                pos_keys = hardware_pos_keys(observation)
+                if len(pos_keys) >= len(self.state_keys) and self.state_keys:
+                    n = len(self.state_keys)
+                    hw_vals = [float(observation[k]) for k in pos_keys[:n]]
+                    target = self.expected_dim or len(hw_vals)
+                    hw_vals = reconcile_dim(hw_vals, target, self.dim_policy, label="observation.state")
+                    out = {k: v for k, v in observation.items() if k not in pos_keys[:n]}
+                    out["observation.state"] = torch.as_tensor(hw_vals, dtype=torch.float32)
+                    return out
+                # No declared state key AND no usable '.pos' fallback; leave obs
+                # alone so a clearer downstream error (or a state-less policy)
+                # can handle it, rather than emitting an all-zero state vector.
                 return observation
+
+            if missing:
+                _warn_missing_state_keys(missing)
 
             # Convert sim units (radians + gripper joint range) to the model's
             # training units (arm degrees, gripper 0..100) BEFORE packing, so the
@@ -369,6 +537,7 @@ def register_pack_state_step() -> type | None:
             return out
 
         def get_config(self) -> dict[str, Any]:
+            """Return the JSON-serializable config (``state_keys``, ``expected_dim``, ``dim_policy``) for checkpoint round-trip."""
             return {
                 "state_keys": list(self.state_keys),
                 "expected_dim": self.expected_dim,
@@ -376,6 +545,7 @@ def register_pack_state_step() -> type | None:
             }
 
         def transform_features(self, features):  # type: ignore[no-untyped-def]
+            """Return ``features`` unchanged: packing reshapes only the runtime obs, not the model's declared feature set."""
             # State vector composition doesn't change the model's declared
             # feature set (the normalizer already knows observation.state);
             # we only reshape the runtime obs. Pass features through.
@@ -410,13 +580,21 @@ class EmbodimentMap:
     dim_policy: str = "strict"
     # Unit conventions for state/action vectors. The MuJoCo sim expresses
     # revolute joints in RADIANS, but LeRobot SO-arm checkpoints (so100/so101,
-    # MolmoAct2 etc.) are trained on the driver's MotorNormMode: arm joints in
-    # DEGREES and the gripper in RANGE_0_100. "native" = no conversion (the
-    # default; real-hardware *_real maps already speak the driver units).
-    # "degrees" = arm columns are degrees + the gripper column is 0..100; the
-    # policy converts deg<->rad and 0..100<->the gripper joint range when packing
-    # state (model<-sim) and emitting actions (model->sim). See so_follower.py
-    # (MotorNormMode.DEGREES for the arm, RANGE_0_100 for the gripper).
+    # MolmoAct2 etc.) trained on data recorded with the driver's DEGREES mode
+    # speak the driver's MotorNormMode: arm joints in DEGREES and the gripper in
+    # RANGE_0_100. "native" = no conversion (the default; real-hardware *_real
+    # maps already speak the driver units). "degrees" = arm columns are degrees
+    # + the gripper column is 0..100; the policy converts deg<->rad and
+    # 0..100<->the gripper joint range when packing state (model<-sim) and
+    # emitting actions (model->sim). See so_follower.py.
+    #
+    # CAVEAT: the arm-in-DEGREES convention holds only for checkpoints recorded
+    # with the SO driver's use_degrees=True. That is the lerobot so_follower /
+    # so_leader DEFAULT (kept "for backward compatibility with previous
+    # policies/dataset"), but it is opt-out: with use_degrees=False the arm uses
+    # MotorNormMode.RANGE_M100_100 (-100..100), NOT degrees (so_follower.py:50
+    # -> RANGE_M100_100). state_units/action_units="degrees" would mis-convert a
+    # RANGE_M100_100-recorded checkpoint - leave those on "native".
     state_units: str = "native"
     action_units: str = "native"
     # Index of the gripper column in state_keys/action_keys (RANGE_0_100, not a

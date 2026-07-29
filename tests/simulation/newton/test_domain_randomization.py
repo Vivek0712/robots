@@ -18,14 +18,17 @@ The integration tests use the ``featherstone`` solver so they do not require
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import threading
 
 import numpy as np
 import pytest
 
+from strands_robots.simulation.base import randomization_range_error
 from strands_robots.simulation.newton.randomization import (
+    _OBS_NOISE_PARAMS,
+    _RANDOMIZE_PARAMS,
     DomainRandomizationMixin,
-    _validate_range,
 )
 
 _HAS_NEWTON = importlib.util.find_spec("newton") is not None and importlib.util.find_spec("warp") is not None
@@ -49,23 +52,70 @@ class _NoiseHost(DomainRandomizationMixin):
         self._obs_noise_rng = None
 
 
+class TestUnknownParamsRejected:
+    """Keywords the backend cannot honor are named, not swallowed.
+
+    ``randomize`` / ``set_obs_noise`` declare ``**kwargs`` for MuJoCo-signature
+    parity, which used to make a misspelled parameter a successful no-op. The
+    keys Newton genuinely reads out of that sink (``randomize_positions`` and
+    its ``position_noise`` companion) stay accepted so backend-agnostic code
+    still gets the explicit unsupported-axis error.
+    """
+
+    def test_randomize_rejects_misspelled_axis(self):
+        result = _NoiseHost().randomize(randomize_physic=True)
+
+        assert result["status"] == "error"
+        text = result["content"][0]["text"]
+        assert "randomize_physic" in text and "randomize_physics" in text
+
+    def test_randomize_keeps_the_unsupported_positions_message(self):
+        host = _NoiseHost()
+        host._world = object()  # non-None so the world guard passes
+        result = host.randomize(randomize_positions=True)
+
+        assert result["status"] == "error"
+        assert "not supported by the Newton backend" in result["content"][0]["text"]
+
+    def test_set_obs_noise_rejects_misspelled_std(self):
+        host = _NoiseHost()
+        result = host.set_obs_noise(joint_pos_stdev=0.05)
+
+        assert result["status"] == "error"
+        text = result["content"][0]["text"]
+        assert "joint_pos_stdev" in text and "joint_pos_std" in text
+        assert host._obs_noise is None
+
+    def test_accepted_names_cover_the_signatures(self):
+        for method, accepted, extra in (
+            (DomainRandomizationMixin.randomize, _RANDOMIZE_PARAMS, {"randomize_positions", "position_noise"}),
+            (DomainRandomizationMixin.set_obs_noise, _OBS_NOISE_PARAMS, set()),
+        ):
+            declared = {
+                name
+                for name, p in inspect.signature(method).parameters.items()
+                if name != "self" and p.kind is not inspect.Parameter.VAR_KEYWORD
+            }
+            assert set(accepted) == declared | extra
+
+
 class TestValidateRange:
     def test_accepts_ordered_non_negative_pair(self):
-        assert _validate_range("mass_range", (0.5, 2.0)) is None
+        assert randomization_range_error((0.5, 2.0), "mass_range") is None
 
     def test_rejects_inverted_bounds(self):
-        msg = _validate_range("mass_range", (2.0, 0.5))
+        msg = randomization_range_error((2.0, 0.5), "mass_range")
         assert msg is not None and "exceeds upper bound" in msg
 
     def test_rejects_negative_bound(self):
-        msg = _validate_range("friction_range", (-0.1, 1.0))
+        msg = randomization_range_error((-0.1, 1.0), "friction_range")
         assert msg is not None and "non-negative" in msg
 
     def test_rejects_non_numeric(self):
-        assert _validate_range("color_range", "nope") is not None
+        assert randomization_range_error("nope", "color_range") is not None
 
     def test_rejects_non_finite(self):
-        assert _validate_range("mass_range", (0.0, float("inf"))) is not None
+        assert randomization_range_error((0.0, float("inf")), "mass_range") is not None
 
 
 class TestSetObsNoiseValidation:

@@ -20,8 +20,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from .. import Policy
-from .embodiment import ZeroActionMonitor, diagnose_action_dim
+from .. import Policy, align_action_values
+from .embodiment import ZeroActionMonitor, diagnose_action_dim, hardware_pos_keys
 from .processor import ProcessorBridge
 from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_hub
 
@@ -82,6 +82,44 @@ def _merge_obs_rename(base: dict[str, str], override: dict[str, str | None] | No
         else:
             merged.pop(src, None)
     return merged
+
+
+_VELOCITY_SUFFIX = ".vel"
+
+
+def _drop_velocity_siblings(scalar_keys: list[str]) -> list[str]:
+    """Drop each ``<joint>.vel`` whose ``<joint>`` position companion is present.
+
+    Used only for the OBSERVATION-DERIVED state ordering (see
+    :meth:`LerobotLocalPolicy._resolve_state_order`), which is built from the
+    observation's own insertion order. The MuJoCo backend emits a velocity
+    sibling beside every joint position (``simulation/mujoco/rendering.py``:
+    ``obs[jnt_name] = qpos`` then ``obs[f"{jnt_name}.vel"] = qvel``), so that
+    order alternates ``[pos0, vel0, pos1, vel1, ...]``. Feeding it to a policy
+    trained on positions puts a velocity in every other slot of
+    ``observation.state`` and, once truncated to the model's state dim, drops
+    the trailing joints entirely - a wrong state vector with no error raised.
+    The producer documents ``<name>.vel`` as an ADDITIVE key that position-only
+    consumers are unaffected by; this restores that contract here.
+
+    A ``.vel`` key with NO position companion is KEPT, because some embodiments
+    legitimately declare velocity state and dropping it would corrupt those
+    instead: ``embodiments.json`` gives LeKiwi body-frame base velocities
+    ``x.vel`` / ``y.vel`` / ``theta.vel`` with no ``x`` / ``y`` / ``theta``
+    position key. Pairing is therefore decided per key, not by suffix alone.
+
+    Explicitly configured ``robot_state_keys`` are NOT filtered - an operator
+    naming ``elbow.vel`` is stating the model's input, and this only cleans up
+    an ordering inferred from whatever the observation happened to contain.
+
+    Args:
+        scalar_keys: Candidate state keys in observation insertion order.
+
+    Returns:
+        The same list, order preserved, minus the paired velocity siblings.
+    """
+    present = set(scalar_keys)
+    return [k for k in scalar_keys if not (k.endswith(_VELOCITY_SUFFIX) and k[: -len(_VELOCITY_SUFFIX)] in present)]
 
 
 # Fallback control rate used ONLY when RTC runs without the runtime having
@@ -226,6 +264,15 @@ class LerobotLocalPolicy(Policy):
             fallback) if any camera name cannot be matched to a declared
             policy image key by exact name and no ``camera_key_map`` covers
             it. Defaults to False (positional fallback).
+        pad_short_actions: When the model emits FEWER action values than the
+            robot declares actuator keys, command the unmatched actuators to
+            ``0.0`` instead of omitting them. Defaults to False: an omitted
+            actuator holds its position, whereas ``0.0`` is an absolute target
+            on a LeRobot ``<motor>.pos`` follower or a MuJoCo position
+            actuator, so padding TRAVELS those joints to zero. Enable only when
+            the consumer needs a fixed-width action dict and zero is a
+            meaningful target for every key it pads. Either way the dim
+            mismatch itself is reported once via ``diagnose_action_dim``.
     """
 
     def __init__(
@@ -249,6 +296,7 @@ class LerobotLocalPolicy(Policy):
         camera_key_map: dict[str, str] | None = None,
         obs_rename_override: dict[str, str | None] | None = None,
         strict_keys: bool = False,
+        pad_short_actions: bool = False,
         cache_model: bool = True,
         revision: str | None = None,
         **kwargs,
@@ -298,6 +346,11 @@ class LerobotLocalPolicy(Policy):
         # camera_key_map covers them). Defaults to False (positional fallback
         # with a warning), preserving zero-config ergonomics.
         self.strict_keys = strict_keys
+        # When the model emits fewer action values than the robot declares
+        # actuator keys, False (the default) omits the unmatched actuators so
+        # they hold position; True commands them 0.0, which on an absolute-
+        # position action space travels them to zero. See align_action_values.
+        self.pad_short_actions = bool(pad_short_actions)
         # Routing-degradation telemetry. The heuristic (non-declarative)
         # remap path can keep a run alive while silently producing
         # meaningless inputs - a camera routed to an arbitrary model image
@@ -406,6 +459,7 @@ class LerobotLocalPolicy(Policy):
 
     @property
     def provider_name(self) -> str:
+        """Registry key for this provider (``"lerobot_local"``)."""
         return "lerobot_local"
 
     @property
@@ -860,6 +914,8 @@ class LerobotLocalPolicy(Policy):
                 overrides=self.processor_overrides or {},
                 policy_type=self.policy_type,
                 policy_config=getattr(self._policy, "config", None),
+                revision=self.revision,
+                norm_tag=self._molmoact2_norm_tag,
             )
         except (FileNotFoundError, ValueError, ImportError) as exc:
             # Processor bridge is optional - models work without it via the raw
@@ -978,12 +1034,22 @@ class LerobotLocalPolicy(Policy):
             Many policies declare ``config.n_action_steps`` - the number of
             actions emitted per inference that the model was trained to replay
             open-loop before requerying observation (e.g. MolmoAct2 SO-100/101 =
-            30, ACT = 100, Diffusion = 32). The default ``actions_per_step=1`` is
+            30, ACT = 100). The default ``actions_per_step=1`` is
             a closed-loop convention that re-queries every step; for a chunk-
             trained model that is out of distribution and the shift compounds
             every chunk. When left at the default ``1`` we adopt
             ``n_action_steps`` so the chunk is consumed as trained. An explicit
             ``actions_per_step > 1`` from the caller is respected here.
+
+        Observation history (``config.n_obs_steps > 1``):
+            Diffusion (2) and VQBeT (5) consume a short observation history and
+            MUST run through ``select_action()`` (it maintains the obs-history
+            queue). Their ``predict_action_chunk()`` offline branch stacks a
+            single live frame as ``n_obs_steps=1`` and ``generate_actions()``
+            asserts, so the ``actions_per_step > 1`` regime crashes them. We keep
+            ``actions_per_step=1`` for these checkpoints; ``select_action()``
+            still replays the ``n_action_steps`` chunk from its internal queue,
+            so open-loop chunk replay is preserved - just correctly.
 
         Logged at INFO so the active regime is always visible.
         """
@@ -1015,6 +1081,29 @@ class LerobotLocalPolicy(Policy):
             return
         if self.actions_per_step != 1:
             return  # caller pinned an explicit horizon - never override it
+        # Observation-history policies (``n_obs_steps > 1``, e.g. Diffusion=2,
+        # VQBeT=5) MUST be driven per-step through ``select_action()``. That path
+        # maintains the required ``n_obs_steps`` observation queue AND still
+        # caches the model's ``n_action_steps`` chunk internally (re-querying the
+        # model only when the queue drains - the same open-loop chunk replay,
+        # done correctly). The ``actions_per_step > 1`` regime instead calls
+        # ``predict_action_chunk()`` on a SINGLE live observation frame; its
+        # offline branch stacks that lone frame as ``n_obs_steps=1``, so
+        # ``generate_actions()`` trips ``assert n_obs_steps == config.n_obs_steps``
+        # and crashes. Keep ``actions_per_step=1`` for these checkpoints so the
+        # per-step ``select_action()`` path is used.
+        n_obs_steps = getattr(config, "n_obs_steps", 1)
+        if isinstance(n_obs_steps, int) and n_obs_steps > 1:
+            logger.info(
+                "lerobot_local: %s consumes an observation history "
+                "(n_obs_steps=%d) - driving per-step via select_action() (which "
+                "keeps the obs-history queue and still replays the model's "
+                "n_action_steps chunk from its internal queue). Keeping "
+                "actions_per_step=1.",
+                type(self._policy).__name__,
+                n_obs_steps,
+            )
+            return
         n_action_steps = getattr(config, "n_action_steps", None)
         if isinstance(n_action_steps, int) and n_action_steps > 1:
             self.actions_per_step = n_action_steps
@@ -1367,17 +1456,16 @@ class LerobotLocalPolicy(Policy):
             logger.debug("RTC disabled for policy '%s'", type(self._policy).__name__)
             return
 
-        # Read RTC parameters from config, with user overrides
-        if rtc_config is not None:
-            if self._rtc_execution_horizon is None:
-                self._rtc_execution_horizon = getattr(rtc_config, "execution_horizon", 10)
-            if self._rtc_max_guidance_weight is None:
-                self._rtc_max_guidance_weight = getattr(rtc_config, "max_guidance_weight", 10.0)
-        else:
-            if self._rtc_execution_horizon is None:
-                self._rtc_execution_horizon = 10
-            if self._rtc_max_guidance_weight is None:
-                self._rtc_max_guidance_weight = 10.0
+        # Read RTC parameters from config, honoring user-provided overrides.
+        # Reaching this point guarantees rtc_config is not None: RTC is only
+        # enabled when a non-None rtc_config was found (see the auto-detect and
+        # explicit-enable branches above), so no rtc_config-is-None fallback is
+        # needed here. getattr still supplies the 10 / 10.0 defaults when the
+        # config object omits the attributes.
+        if self._rtc_execution_horizon is None:
+            self._rtc_execution_horizon = getattr(rtc_config, "execution_horizon", 10)
+        if self._rtc_max_guidance_weight is None:
+            self._rtc_max_guidance_weight = getattr(rtc_config, "max_guidance_weight", 10.0)
 
         logger.info(
             "RTC enabled for '%s': execution_horizon=%d, max_guidance_weight=%.1f",
@@ -1672,6 +1760,42 @@ class LerobotLocalPolicy(Policy):
 
     # Inference
 
+    def _hardware_action_keys(self, observation_dict: dict[str, Any]) -> list[str] | None:
+        """Actuator names to emit actions under when a SIM embodiment is driven from hardware.
+
+        lerobot ``SOFollower`` & friends key joint scalars as ``'<motor>.pos'``.
+        When a SIM embodiment (numeric / named sim joints) is fed a hardware
+        observation, the action tensor must still be emitted under those
+        ``'.pos'`` names, and WITHOUT the sim unit conversion, for
+        ``SOFollower.send_action`` to accept it.
+
+        Detection uses the same :func:`hardware_pos_keys` predicate as the state
+        side (``PackStateProcessorStep``). The two used to be written separately
+        and could disagree: this side ran a plain-``float`` pass and only tried a
+        numpy pass ``if not _pos:``, so a PARTIALLY matching first pass poisoned
+        the retry and left the override unset, while the state side - one
+        combined pass - succeeded on the same observation. The model was then fed
+        raw hardware degrees while its action was emitted with the sim
+        radian->degree conversion applied (~57x under-scaled), and nothing
+        warned, because the state side had succeeded.
+
+        Args:
+            observation_dict: The raw observation for this step.
+
+        Returns:
+            The hardware actuator names to bind the action vector to, or ``None``
+            when this is not a hardware observation (or the embodiment already
+            declares ``'.pos'`` action keys, making the override a no-op).
+        """
+        if self._embodiment is None or not self._embodiment.action_keys:
+            return None
+        if any(str(key).endswith(".pos") for key in self._embodiment.action_keys):
+            return None
+        pos_keys = hardware_pos_keys(observation_dict)
+        if len(pos_keys) < len(self._embodiment.action_keys):
+            return None
+        return pos_keys[: len(self._embodiment.action_keys)]
+
     async def get_actions(self, observation_dict: dict[str, Any], instruction: str, **kwargs) -> list[dict[str, Any]]:
         """Get actions from policy given observation and instruction.
 
@@ -1696,6 +1820,8 @@ class LerobotLocalPolicy(Policy):
         observation = dict(observation_dict)
         if instruction and "task" not in observation:
             observation["task"] = instruction
+
+        _hw_action_keys = self._hardware_action_keys(observation_dict)
 
         # When the processor bridge has a preprocessor, delegate normalization
         # and tokenization to it, then fix up any remaining raw arrays/tensors
@@ -1777,7 +1903,7 @@ class LerobotLocalPolicy(Policy):
         if self._processor_bridge and self._processor_bridge.has_postprocessor:
             action_tensor = self._processor_bridge.postprocess(action_tensor)
 
-        return self._tensor_to_action_dicts(action_tensor)
+        return self._tensor_to_action_dicts(action_tensor, hw_action_keys=_hw_action_keys)
 
     # Observation batch building
 
@@ -1940,20 +2066,30 @@ class LerobotLocalPolicy(Policy):
             fall back to the observation's own scalar keys so the state is
             populated rather than silently dropped.
 
+        Any ordering derived from the observation (both the fallback above and
+        the no-``robot_state_keys`` case) is position-only: a ``<joint>.vel``
+        sibling of a present ``<joint>`` is dropped by
+        :func:`_drop_velocity_siblings`, so a MuJoCo observation does not
+        interleave velocities into ``observation.state``. An unpaired ``.vel``
+        key (LeKiwi's base velocities) is kept, and an explicitly configured
+        ``robot_state_keys`` ordering is returned untouched.
+
         Args:
             observation_dict: Raw strands/sim observation for this step.
             scalar_keys: Non-image, non-``task`` scalar keys present in the
                 observation, used as the fallback ordering.
 
         Returns:
-            The ordered keys to pull scalar joint values from.
+            The ordered keys to pull scalar joint values from - the configured
+            ``robot_state_keys`` verbatim, or an observation-derived ordering
+            with paired velocity siblings removed.
 
         Raises:
             ValueError: When ``strict_keys`` is set and no configured key
                 matches the observation.
         """
         if not self.robot_state_keys:
-            return scalar_keys
+            return _drop_velocity_siblings(scalar_keys)
         if any(k in observation_dict for k in self.robot_state_keys):
             return self.robot_state_keys
         shown = self.robot_state_keys[:8]
@@ -1975,7 +2111,7 @@ class LerobotLocalPolicy(Policy):
         if not self._state_key_mismatch_warned:
             logger.warning(msg)
             self._state_key_mismatch_warned = True
-        return scalar_keys
+        return _drop_velocity_siblings(scalar_keys)
 
     def _collect_state_values(self, observation_dict: dict[str, Any], order: list[str]) -> list[float]:
         """Pull the joint-state vector from ``observation_dict`` in ``order``.
@@ -2571,7 +2707,9 @@ class LerobotLocalPolicy(Policy):
             return True
         return type(policy).__name__ == "MolmoAct2Policy"
 
-    def _tensor_to_action_dicts(self, action_tensor: torch.Tensor) -> list[dict[str, Any]]:
+    def _tensor_to_action_dicts(
+        self, action_tensor: torch.Tensor, hw_action_keys: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         """Convert action tensor to list of robot action dicts.
 
         Maps tensor values to robot_state_keys by index. Handles:
@@ -2623,7 +2761,9 @@ class LerobotLocalPolicy(Policy):
         emb_name = self._embodiment.name if self._embodiment is not None else ""
         n_values = len(actions_list[0]) if actions_list else 0
         if not self._action_dim_warned:
-            dim_msg = diagnose_action_dim(n_values, len(self.robot_state_keys), name=emb_name)
+            dim_msg = diagnose_action_dim(
+                n_values, len(self.robot_state_keys), name=emb_name, pad_short=self.pad_short_actions
+            )
             if dim_msg:
                 logger.warning("lerobot_local: %s", dim_msg)
                 self._action_dim_warned = True
@@ -2640,18 +2780,32 @@ class LerobotLocalPolicy(Policy):
         # arm freezes. EmbodimentMap.model_action_to_sim is a no-op when
         # action_units == "native" (the default / real-hardware path).
         emb = self._embodiment
-        convert = emb is not None and getattr(emb, "action_units", "native") != "native"
+        # HARDWARE OVERRIDE: when the caller detected real-hardware '.pos' obs
+        # keys (see get_actions), emit actions under those '.pos' names and SKIP
+        # the sim unit conversion. A SIM embodiment (e.g. so101, action_units=
+        # "degrees") would otherwise (a) key the action by numeric sim joints
+        # ('1'..'6') that the lerobot SOFollower.send_action does not accept, and
+        # (b) convert model DEGREES -> sim RADIANS, feeding ~0.003 rad to a
+        # hardware bus that expects degrees. Both are wrong on the physical arm.
+        # The '.pos' keys are already the model's native units, so pack raw.
+        if hw_action_keys:
+            out_keys = list(hw_action_keys)
+            convert = False
+        else:
+            out_keys = list(self.robot_state_keys)
+            convert = emb is not None and getattr(emb, "action_units", "native") != "native"
 
         result = []
         for action_values in actions_list:
-            vals = [
-                float(action_values[i]) if i < len(action_values) else 0.0 for i in range(len(self.robot_state_keys))
-            ]
+            # Align the model's vector with the actuator keys BEFORE any unit
+            # conversion, so a short vector converts only the columns the model
+            # actually produced (the embodiment's gripper column is positional).
+            vals, keys = align_action_values(action_values, out_keys, pad_short=self.pad_short_actions)
             # `convert` already implies `emb is not None`; the explicit guard lets
             # the type checker narrow `emb` from `EmbodimentMap | None` at the call.
             if convert and emb is not None:
                 vals = emb.model_action_to_sim(vals)
-            action_dict = {key: vals[index] for index, key in enumerate(self.robot_state_keys)}
+            action_dict = dict(zip(keys, vals, strict=True))
             result.append(action_dict)
 
         return result

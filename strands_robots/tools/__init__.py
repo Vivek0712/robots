@@ -14,6 +14,7 @@ import importlib as _importlib
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "download_assets": (".download_assets", "download_assets"),
     "gr00t_inference": (".gr00t_inference", "gr00t_inference"),
+    "harness_memory": (".harness_memory", "harness_memory"),
     "lerobot_calibrate": (".lerobot_calibrate", "lerobot_calibrate"),
     "lerobot_camera": (".lerobot_camera", "lerobot_camera"),
     "lerobot_teleoperate": (".lerobot_teleoperate", "lerobot_teleoperate"),
@@ -25,6 +26,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "train_policy": (".train_policy", "train_policy"),
     "use_lerobot": (".use_lerobot", "use_lerobot"),
     "use_ros": (".use_ros", "use_ros"),
+    "use_rosbridge": (".use_rosbridge", "use_rosbridge"),
     "use_rtps": (".use_rtps", "use_rtps"),
 }
 

@@ -135,16 +135,24 @@ class TestRobotFactory:
         assert sig.parameters["mode"].default == "sim"
 
     def test_isaac_backend_routes_to_factory_install_hint(self):
-        """A non-mujoco backend resolves through ``create_simulation`` rather
-        than a blanket ``NotImplementedError``. ``isaac`` ships in the
-        out-of-tree ``strands-robots-sim`` plugin, so when it is absent the
-        factory's actionable install hint surfaces (a ``ValueError`` listing
-        available backends + a ``pip install`` pointer), not a dead-end
-        "on the roadmap" message."""
-        with pytest.raises(ValueError, match="strands-robots-sim") as exc_info:
+        """``isaac`` is now a vendored built-in backend (#1145), resolved through
+        ``create_simulation`` like ``newton``. When Isaac Sim itself is not
+        installed (it ships out-of-band via Omniverse / Isaac Lab / the NGC
+        docker image, never via pip), constructing the sim succeeds but
+        ``create_world()`` surfaces the backend's own actionable install hint -
+        a ``RuntimeError`` naming Isaac Sim + its install paths - not a blanket
+        NotImplementedError or a dead-end "on the roadmap" message.
+
+        Skipped when Isaac Sim IS importable (a GPU box with Omniverse), where
+        world creation would actually proceed."""
+        from strands_robots.simulation.isaac.simulation import IsaacSimulation
+
+        ok, _ = IsaacSimulation.is_available()
+        if ok:
+            pytest.skip("Isaac Sim is installed; the not-available install-hint path is not exercised.")
+        with pytest.raises(RuntimeError, match="Isaac Sim") as exc_info:
             Robot("so100", mode="sim", backend="isaac")
         msg = str(exc_info.value)
-        assert "pip install" in msg
         # The misleading legacy framing must be gone.
         assert "not yet implemented" not in msg
         assert "roadmap" not in msg
@@ -193,11 +201,15 @@ class TestRobotFactory:
     def test_mjwarp_backend_gives_plugin_install_hint(self):
         """The GPU-parallel warp/MuJoCo path is the built-in ``newton`` backend;
         ``mjwarp`` is a name users reach for. ``Robot(backend="mjwarp")`` must
-        point them at the warp/newton plugin rather than dead-ending on an
-        unhelpful unknown-backend error with no remedy."""
-        with pytest.raises(ValueError, match="strands-robots-sim") as exc_info:
+        point them at the in-tree ``strands-robots[sim-newton]`` extra rather
+        than dead-ending on an unhelpful unknown-backend error with no remedy.
+        The hint must not reference the deprecated ``strands-robots-sim``
+        sibling package."""
+        with pytest.raises(ValueError, match=r"strands-robots\[sim-newton\]") as exc_info:
             Robot("so100", mode="sim", backend="mjwarp", num_envs=128)
-        assert "pip install" in str(exc_info.value)
+        msg = str(exc_info.value)
+        assert "pip install" in msg
+        assert "strands-robots-sim" not in msg
 
     def test_invalid_mode_raises(self):
         with pytest.raises(ValueError, match="Invalid mode"):
@@ -259,6 +271,115 @@ class TestRobotFactory:
 
         assert R is Robot
         assert callable(lr)
+
+
+class TestFactoryForwardsPosition:
+    """``Robot(position=...)`` reaches the backend exactly as the caller wrote it.
+
+    The factory is a thin wrapper over ``add_robot``, which validates a base
+    pose up front: a wrong-length, non-numeric or non-finite vector is refused
+    with an actionable message, an omitted pose spawns at the origin, and a
+    NumPy pose is accepted. Reading the parameter by truthiness in the factory
+    made the wrapper both less capable and less safe than the method it wraps -
+    an empty vector read as "omitted" so the origin was substituted for a caller
+    mistake ``add_robot`` refuses, and a NumPy pose raised a bare
+    ``ValueError: truth value of an array ... is ambiguous``.
+    """
+
+    MJCF = """<mujoco model="test_arm">
+      <worldbody>
+        <light pos="0 0 3"/>
+        <geom type="plane" size="1 1 0.1"/>
+        <body name="link0" pos="0 0 0.1">
+          <joint name="joint0" type="hinge" axis="0 0 1"/>
+          <geom type="capsule" size="0.02" fromto="0 0 0  0 0 0.2"/>
+        </body>
+      </worldbody>
+      <actuator><motor joint="joint0" ctrlrange="-1 1"/></actuator>
+    </mujoco>"""
+
+    @classmethod
+    def _model(cls, tmp_path):
+        """Write the minimal inline arm so no downloaded asset is needed."""
+        path = tmp_path / "test_arm.xml"
+        path.write_text(cls.MJCF)
+        return str(path)
+
+    def _spawned_position(self, tmp_path, **kwargs):
+        """Return the base position the factory actually gave the backend."""
+        sim = Robot("so100", mode="sim", urdf_path=self._model(tmp_path), mesh=False, **kwargs)
+        try:
+            return list(sim._world.robots["so100"].position)
+        finally:
+            sim.destroy()
+
+    def test_omitted_position_spawns_at_the_origin(self, tmp_path):
+        """The documented default survives: no position means the origin."""
+        pytest.importorskip("mujoco")
+        assert self._spawned_position(tmp_path) == [0.0, 0.0, 0.0]
+
+    def test_list_position_is_forwarded_unchanged(self, tmp_path):
+        pytest.importorskip("mujoco")
+        assert self._spawned_position(tmp_path, position=[0.4, 0.2, 0.1]) == [0.4, 0.2, 0.1]
+
+    def test_numpy_position_is_forwarded_unchanged(self, tmp_path):
+        """A pose computed with NumPy is what pose arithmetic produces, and
+        ``add_robot`` accepts it; the factory must not reject it."""
+        pytest.importorskip("mujoco")
+        np = pytest.importorskip("numpy")
+        assert self._spawned_position(tmp_path, position=np.array([0.4, 0.2, 0.1])) == [0.4, 0.2, 0.1]
+
+    def test_empty_position_is_refused_not_replaced_by_the_origin(self, tmp_path):
+        """An empty vector is a caller mistake, not a request for the default.
+
+        Substituting the origin would place the robot somewhere the caller never
+        asked for while reporting success.
+        """
+        pytest.importorskip("mujoco")
+        with pytest.raises(RuntimeError, match="3-element vector"):
+            Robot("so100", mode="sim", urdf_path=self._model(tmp_path), mesh=False, position=[])
+
+    def test_non_finite_position_is_refused(self, tmp_path):
+        """nan/inf would propagate through the whole physics state."""
+        pytest.importorskip("mujoco")
+        with pytest.raises(RuntimeError, match="finite numbers"):
+            Robot(
+                "so100",
+                mode="sim",
+                urdf_path=self._model(tmp_path),
+                mesh=False,
+                position=[float("nan"), 0.0, 0.0],
+            )
+
+    def test_factory_and_add_robot_agree_on_every_position(self, tmp_path):
+        """Parity: the wrapper accepts a pose if and only if the backend does.
+
+        Any value where the two verdicts differ is a pose the caller can only
+        express through one of the two entry points.
+        """
+        pytest.importorskip("mujoco")
+        np = pytest.importorskip("numpy")
+        from strands_robots import Simulation
+
+        model = self._model(tmp_path)
+        cases = [[], [0.5], [0.4, 0.2, 0.1], [float("inf"), 0.0, 0.0], np.array([0.4, 0.2, 0.1])]
+
+        for position in cases:
+            sim = Simulation(tool_name="parity", mesh=False)
+            try:
+                sim.create_world()
+                backend_accepts = sim.add_robot(name="so100", urdf_path=model, position=position)["status"] != "error"
+            finally:
+                sim.destroy()
+
+            try:
+                factory = Robot("so100", mode="sim", urdf_path=model, mesh=False, position=position)
+                factory.destroy()
+                factory_accepts = True
+            except RuntimeError:
+                factory_accepts = False
+
+            assert factory_accepts is backend_accepts, f"verdicts differ for position={position!r}"
 
 
 class TestRobotRealMode:
@@ -1079,7 +1200,8 @@ class TestRealModeConfigDiscovery:
 
         _ensure_lerobot_robots_registered()
         ConfigClass = RobotConfig.get_choice_class("so101_follower")
-        real_fields = {f.name for f in dataclasses.fields(ConfigClass)}
+        fields = list(dataclasses.fields(ConfigClass))
+        real_fields = {f.name for f in fields}
 
         # Import from production code -- single source of truth (no drift).
         forwardable_set = set(_FORWARDABLE_KWARGS)
@@ -1089,12 +1211,30 @@ class TestRealModeConfigDiscovery:
 
         target_field = sorted(dataclass_only_fields)[0]
 
+        # Satisfy every required (no-default) field so construction fails ONLY
+        # if the forwarding of ``target_field`` is broken -- never because of an
+        # unrelated required field. lerobot #4142 added optional PID-gain fields
+        # (position_p/i/d_coefficient) to SO-follower configs; when one of those
+        # sorts first as ``target_field`` the config still declares a required
+        # ``port``, so a fixed ``cameras``/``target_field`` kwarg pair alone left
+        # ``port`` unset and the construction raised a ValueError unrelated to
+        # the forwarding contract under test. Fill required fields dynamically so
+        # the test stays pinned on forwarding as lerobot evolves its dataclass.
+        required = {
+            f.name: "placeholder"
+            for f in fields
+            if f.default is dataclasses.MISSING
+            and f.default_factory is dataclasses.MISSING
+            and f.name not in {"cameras", "id"}
+        }
+        kwargs = {**required, target_field: "test_value"}
+
         hw = HwRobot.__new__(HwRobot)
         hw.tool_name_str = "test_forward"
-        # Pass the dataclass-only field -- should NOT raise ValueError
-        cfg = hw._create_minimal_config("so101_follower", cameras={}, **{target_field: "test_value"})
-        # The field should have been forwarded to the config
-        assert hasattr(cfg, target_field)
+        # Pass the dataclass-only field -- should NOT raise ValueError, and the
+        # value must round-trip verbatim (forwarded, not dropped).
+        cfg = hw._create_minimal_config("so101_follower", cameras={}, **kwargs)
+        assert getattr(cfg, target_field) == "test_value"
 
 
 class TestMinimalConfigContractBranches:
@@ -1270,18 +1410,31 @@ class TestHardwareConfigV040Followups:
             "the bare except Exception on plugin registration must be gone (#291)"
         )
 
-    def test_lerobot_extra_pins_torchcodec_on_aarch64(self):
-        """#378: the public [lerobot] extra must carry the aarch64 torchcodec
-        pin so a `pip install strands-robots[lerobot]` on Thor/Jetson gets a
-        working video decoder (not just the hatch dev env)."""
+    def test_lerobot_extra_provides_aarch64_video_decoder(self):
+        """#378: a `pip install strands-robots[lerobot]` on Thor/Jetson must get a
+        working aarch64 video decoder (torchcodec), not the removed
+        `torchvision.io.VideoReader`.
+
+        The [lerobot] extra used to carry an explicit aarch64 torchcodec pin
+        because lerobot 0.5.1's own marker excluded aarch64. lerobot 0.6 fixed
+        that upstream (its `torchcodec>=0.11,<0.12; aarch64` marker pulls the
+        torch-ABI-matched decoder), so the strands override was dropped and the
+        guarantee now rides on the `lerobot>=0.6.0` floor. This pins that floor
+        so a revert below 0.6 -- which would resurrect the missing-decoder bug
+        without the removed override -- fails here."""
         import tomllib
         from pathlib import Path
+
+        from packaging.requirements import Requirement
+        from packaging.version import Version
 
         root = Path(__file__).resolve().parents[1]
         data = tomllib.load(open(root / "pyproject.toml", "rb"))
         lerobot_extra = data["project"]["optional-dependencies"]["lerobot"]
-        assert any("torchcodec" in dep and "aarch64" in dep for dep in lerobot_extra), (
-            f"[lerobot] extra must pin torchcodec on linux+aarch64 (#378); got {lerobot_extra}"
+        lerobot_req = next(Requirement(d) for d in lerobot_extra if Requirement(d).name == "lerobot")
+        assert Version("0.6.0") in lerobot_req.specifier and Version("0.5.9") not in lerobot_req.specifier, (
+            f"[lerobot] extra must floor lerobot at >=0.6.0 so aarch64 gets torchcodec (#378); "
+            f"got {lerobot_req.specifier}"
         )
 
 

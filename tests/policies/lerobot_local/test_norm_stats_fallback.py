@@ -312,6 +312,17 @@ class TestProcessorBridgeFallback:
             pytest.skip("installed lerobot has no ProcessorMigrationError")
         assert migration_error in _missing_config_errors()
 
+    def test_missing_migration_error_falls_back_to_builtin_errors(self, monkeypatch):
+        # On an older lerobot that predates ProcessorMigrationError the set must
+        # degrade to the built-in (FileNotFoundError, ValueError) rather than
+        # raise ImportError while classifying a missing processor config.
+        from lerobot.processor import pipeline as lr_pipeline
+
+        from strands_robots.policies.lerobot_local.processor import _missing_config_errors
+
+        monkeypatch.delattr(lr_pipeline, "ProcessorMigrationError", raising=False)
+        assert _missing_config_errors() == (FileNotFoundError, ValueError)
+
 
 @_requires_lerobot_pipeline
 class TestUpstreamLerobotParity:
@@ -510,6 +521,54 @@ class TestBuildProcessorsGuards:
         assert ns.build_norm_stats_processors(payload, "t") == (None, None)
 
 
+class TestOptionalDepDegradation:
+    """``build_norm_stats_processors`` degrades to ``(None, None)`` -- never
+    raises -- when LeRobot's processor framework is unavailable.
+
+    The norm-stats fallback runs during policy load. LeRobot's processor
+    pipeline is an optional surface: an install that ships the pure-numpy
+    ``FeatureNormalizer`` math but not the ``ProcessorStep`` /
+    ``DataProcessorPipeline`` classes (older/partial lerobot) must still load
+    the policy and simply skip the pipeline wiring, rather than crashing the
+    whole ``ProcessorBridge.from_pretrained`` path. These lock that contract
+    at each import seam the builder crosses.
+    """
+
+    def test_make_step_classes_none_when_processor_framework_absent(self, monkeypatch):
+        # ``_make_step_classes`` imports its ProcessorStep bases lazily. When
+        # that import fails (framework absent) it returns None so the caller can
+        # degrade -- masking the submodule in sys.modules forces the ImportError.
+        import sys
+
+        monkeypatch.setitem(sys.modules, "lerobot.processor.pipeline", None)
+        assert ns._make_step_classes() is None
+
+    def test_build_degrades_when_step_classes_unavailable(self, monkeypatch):
+        # Valid, resolvable payload, but the ProcessorStep framework cannot be
+        # built: the builder must return the (None, None) pair, not raise.
+        monkeypatch.setattr(ns, "_make_step_classes", lambda: None)
+        assert ns.build_norm_stats_processors(_load_fixture()) == (None, None)
+
+    @_requires_lerobot_pipeline
+    def test_build_degrades_when_pipeline_class_unimportable(self, monkeypatch):
+        # The ProcessorStep bases resolve, but ``DataProcessorPipeline`` itself
+        # is missing from the installed lerobot: the deferred import inside the
+        # builder raises ImportError, which must fall through to (None, None).
+        import lerobot.processor.pipeline as pipeline_mod
+
+        monkeypatch.delattr(pipeline_mod, "DataProcessorPipeline", raising=False)
+        assert ns.build_norm_stats_processors(_load_fixture()) == (None, None)
+
+    def test_build_degrades_when_normalizer_fails_to_build(self, monkeypatch):
+        # Defensive contract at the normalizer seam: the stats dicts are present
+        # and well-formed, but ``FeatureNormalizer.from_stats`` yields None (an
+        # unusable normalizer). The builder must return the (None, None) pair
+        # rather than wire a None normalizer into a ProcessorStep -- guarding the
+        # degradation path if from_stats ever gains a dict-input None return.
+        monkeypatch.setattr(ns.FeatureNormalizer, "from_stats", staticmethod(lambda *a, **k: None))
+        assert ns.build_norm_stats_processors(_load_fixture()) == (None, None)
+
+
 class TestHubLoader:
     """load_norm_stats Hub path: config.json filename override + fetch."""
 
@@ -593,3 +652,33 @@ class TestProcessorStepEdgeCases:
         pre, _ = ns.build_norm_stats_processors(_load_fixture())
         obs = {"observation.images.top": "frame"}
         assert pre.steps[0].observation(obs) == obs
+
+
+class TestUnknownModeRaises:
+    """An unrecognized mode must raise, never silently pass values through.
+
+    Silent passthrough is the exact failure this module exists to prevent:
+    un-normalized state reaching the policy and un-unnormalized actions reaching
+    the motors. ``from_stats`` already rejects unknown modes; these guard the
+    public transform hot-path (a directly-constructed or future-mode normalizer)
+    so it fails loudly instead of degrading to identity.
+    """
+
+    def test_normalize_raises_on_unknown_mode(self):
+        fn = ns.FeatureNormalizer(mode="totally-bogus")
+        with pytest.raises(ValueError, match="unsupported mode"):
+            fn.normalize(np.array([1.0, 2.0], dtype=np.float32))
+
+    def test_unnormalize_raises_on_unknown_mode(self):
+        fn = ns.FeatureNormalizer(mode="totally-bogus")
+        with pytest.raises(ValueError, match="unsupported mode"):
+            fn.unnormalize(np.array([0.0, 0.5], dtype=np.float32))
+
+    def test_none_and_recognized_modes_still_transform(self):
+        # Regression fence: the raise must not leak into the five valid modes.
+        none_fn = ns.FeatureNormalizer.from_stats({"mean": [1.0]}, "none")
+        x = np.array([7.0], dtype=np.float32)
+        assert np.allclose(none_fn.normalize(x), x)
+        assert np.allclose(none_fn.unnormalize(x), x)
+        mm = ns.FeatureNormalizer.from_stats({"min": [0.0], "max": [10.0]}, "min_max")
+        assert np.allclose(mm.unnormalize(mm.normalize(np.array([5.0], dtype=np.float32))), [5.0], atol=1e-5)

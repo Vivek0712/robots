@@ -2,8 +2,11 @@
 
 import importlib
 import logging
+import math
+import numbers
 import os
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -186,22 +189,34 @@ def resolve_asset_path(relative_or_absolute: str | Path | None, default_name: st
 #
 
 
-def safe_join(base: Path, untrusted: str) -> Path:
+def safe_join(base: Path, untrusted: str, *, resolve_symlinks: bool = False) -> Path:
     """Join *base* with an untrusted relative path, rejecting traversal.
 
     Used to protect against ``../`` escapes in registry-sourced or
-    user-supplied path components before they reach the filesystem.
+    user-supplied path components before they reach the filesystem. Containment
+    is always verified lexically; set *resolve_symlinks* to additionally reject
+    symlinked components that escape *base* after resolution.
 
     Args:
         base: Trusted base directory.
         untrusted: Relative path component (may contain ``/`` but must not
             escape *base*).
+        resolve_symlinks: When ``True``, containment is re-verified after full
+            symlink resolution so a symlinked component that points outside
+            *base* (e.g. ``base/link -> /etc`` followed by ``link/passwd``) is
+            rejected. Enable this when *base* is an untrusted or externally
+            sourced tree - e.g. a freshly cloned repository - whose symlinks may
+            escape. Leave ``False`` (the default) for the managed asset cache,
+            whose robot directories are intentionally symlinked to installed
+            ``robot_descriptions`` packages that legitimately live outside the
+            cache; resolving those would wrongly reject them.
 
     Returns:
         Normalised absolute Path under *base*.
 
     Raises:
-        ValueError: If the resulting path would escape *base*.
+        ValueError: If the resulting path would escape *base* (lexically, or via
+            a symlink when *resolve_symlinks* is set).
 
     Example::
 
@@ -212,6 +227,17 @@ def safe_join(base: Path, untrusted: str) -> Path:
     base_norm = Path(os.path.normpath(base))
     if not (joined == base_norm or str(joined).startswith(str(base_norm) + os.sep)):
         raise ValueError(f"Path traversal blocked: {untrusted!r} escapes {base}")
+    if resolve_symlinks:
+        # Lexical normalisation cannot see through symlinks: a component such as
+        # ``link/passwd`` where ``base/link`` targets ``/etc`` stays lexically
+        # under *base* yet resolves outside it. ``resolve(strict=False)``
+        # resolves the existing prefix and appends the remainder lexically for
+        # not-yet-created files; resolving *base* too keeps a symlinked base
+        # prefix (e.g. /tmp on macOS) consistent on both sides.
+        base_resolved = base_norm.resolve()
+        joined_resolved = joined.resolve()
+        if not (joined_resolved == base_resolved or str(joined_resolved).startswith(str(base_resolved) + os.sep)):
+            raise ValueError(f"Path traversal blocked: {untrusted!r} escapes {base} via symlink")
     return joined
 
 
@@ -271,3 +297,276 @@ def process_rss_mb() -> float | None:
         return float(maxrss) / divisor
     except (ImportError, ValueError, OSError):
         return None
+
+
+def positive_finite_number_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable positive finite number.
+
+    Shared domain for every CONTINUOUS knob that names a rate or a span of
+    time - a control-loop frequency in Hz, a rollout or teleop ``duration`` in
+    seconds. Unlike :func:`positive_whole_number_error` a fractional value is
+    perfectly usable here (``2.5`` seconds, ``62.5`` Hz), so only the sign and
+    the finiteness are constrained. It lives here rather than beside one of its
+    callers because those callers sit in different layers
+    (:mod:`strands_robots.teleop_mixin` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them.
+
+    Only a positive finite value can be honored. Such a knob is always a
+    divisor (the loop period is ``1 / hz``) or a horizon (``duration *
+    frequency`` steps), so ``0`` makes the period undefined or the horizon
+    empty, a negative value inverts it, ``nan`` poisons every comparison it
+    reaches (``nan > 0`` and ``nan <= 0`` are both ``False``), and ``inf``
+    collapses the period to ``0`` - an unthrottled loop, not a fast one.
+    Accepts any real scalar (so a NumPy ``np.float32`` rate read from a config
+    array passes) and rejects ``bool`` explicitly - an ``int`` subclass whose
+    ``True`` would act as a silent ``1``.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            normally the public method name.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, numbers.Real)
+        # ``isfinite`` before the sign test: ``nan`` is never ``<= 0``, so
+        # ordering these the other way lets it through.
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        return f"{context}: {param} must be > 0, got {value!r}."
+    return None
+
+
+def finite_number_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable finite number of either sign.
+
+    Shared domain for a SIGNED physical quantity a command carries verbatim to a
+    robot - a linear or angular velocity component, an offset, a coordinate read
+    as a scalar. Both signs are legitimate (reverse is a negative linear
+    velocity, clockwise a negative yaw rate), so :func:`positive_finite_number_error`
+    cannot express this domain; only finiteness and numeric-ness are constrained.
+    It lives here rather than beside one of its callers because those callers sit
+    in different layers (:mod:`strands_robots.mesh` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them.
+
+    Only a finite value can be honored. ``nan``/``inf`` serialize into a wire
+    message as a valid IEEE-754 float64, so the transport accepts them and the
+    receiving controller integrates them into its state estimate - a silently
+    poisoned pose rather than a rejected command. A non-real value (a numeric
+    string, ``None``, a list) otherwise raises a bare ``TypeError`` from the
+    ``float()`` coercion, escaping the structured ``{"status": "error"}``
+    tool-result contract. Accepts any real scalar (so a NumPy ``np.float32``
+    velocity read from a policy action passes) and rejects ``bool`` explicitly -
+    an ``int`` subclass whose ``True`` would act as a silent ``1``.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            normally the public method name.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(float(value)):
+        return f"{context}: {param} must be a finite number, got {value!r}."
+    return None
+
+
+def positive_whole_number_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable positive whole number.
+
+    Shared domain for every media knob that counts frames or pixels - the
+    recorders' ``fps``, ``width``, ``height`` and in-memory frame cap, the
+    ``run_policy(video=...)`` dict fields, and the
+    :func:`~strands_robots.rendering.encode_clip` playback rate. It lives here
+    rather than beside one of its callers because those callers sit in different
+    layers (:mod:`strands_robots.rendering` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them. Only a positive whole number can be honored: ``0`` makes the capture loop's ``1 / fps``
+    period undefined, a negative rate is rejected by the ffmpeg writer, and a
+    zero/negative frame cap drops every frame. Accepts any real scalar with an
+    integral value (so a NumPy ``np.int64`` height or a ``30.0`` computed from a
+    config float passes) and rejects ``bool`` explicitly - an ``int`` subclass
+    whose ``True`` would act as a silent 1.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter (or dict key) it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            ``"video"`` for the :class:`VideoConfig` dict, the method name for a
+            keyword parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    message = f"{context}: {param} must be a positive whole number, got {value!r}."
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return message
+    numeric = float(value)
+    # ``isfinite`` first: ``int(nan)`` raises, and short-circuiting keeps it
+    # out of the integrality check below.
+    if not math.isfinite(numeric) or numeric != int(numeric) or numeric < 1:
+        return message
+    return None
+
+
+def positive_count_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable positive integer count.
+
+    Shared domain for the discrete knobs that count iterations of a control or
+    rollout loop - the simulation's ``n_episodes`` / ``max_steps`` /
+    ``control_substeps`` / ``action_horizon`` and the hardware control loop's
+    ``action_horizon``. It lives here rather than beside one of its callers
+    because those callers sit in different layers
+    (:mod:`strands_robots.hardware_robot` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them: the same count cannot be refused for a digital twin and
+    accepted for the arm it mirrors.
+
+    Distinct from :func:`positive_whole_number_error`, which accepts any real
+    scalar with an integral value so a ``30.0`` read from a config or an
+    ``np.int64`` probed from a camera can be honored. The counts guarded here are
+    consumed directly as ``range()`` bounds and slice indices, where an integral
+    float raises ``TypeError`` ("``'float' object cannot be interpreted as an
+    integer``") rather than being coerced, so only a true ``int`` can be honored.
+
+    ``bool`` is rejected explicitly. It is an ``int`` subclass, so a bare
+    ``value < 1`` test lets ``True`` through as a silent count of 1 while
+    rejecting ``False`` - a value the caller never meant either way.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter name it came from, used in the message. Callers that
+            accept a ``{robot_name: count}`` mapping pass a subscripted label
+            (``"action_horizon['alice']"``) so the message names the entry the
+            caller got wrong rather than the whole mapping.
+        context: Message prefix identifying the surface that received it - the
+            public method name, or the class name for a constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return f"{context}: {param} must be a positive integer, got {value!r}."
+    return None
+
+
+def finite_vector_error(method: str, param_name: str, vec: Any) -> str | None:
+    """Return an error message if any element of ``vec`` is not a finite number.
+
+    Guards the numeric vectors a scene-construction call bakes into the
+    compiled MJCF (``add_object`` color/size, ``add_camera`` position/target,
+    etc.) against the two classes the numeric-input campaign targets:
+
+    * A non-numeric or non-iterable element (e.g. ``["a", "b", "c"]`` or a
+      nested list) otherwise raises a bare ``TypeError``/``ValueError`` deep
+      inside MuJoCo's ``add_geom`` or a ``size <= 0`` comparison - escaping the
+      structured ``{"status": "error"}`` tool-result contract.
+    * A ``nan``/``inf`` component is baked verbatim into the geom/camera and
+      either poisons the physics state on the next ``mj_forward`` or aborts the
+      spec recompile with a cryptic "spec recompile refused", reporting a
+      success/garbage result instead of an actionable error.
+
+    A numpy real scalar per element is accepted (``np.float64`` and friends are
+    registered as ``numbers.Real``), matching the "accept NumPy scalar
+    components" behaviour of the other sim setters; a ``bool`` is refused
+    because ``float(True)`` would silently write ``1.0`` where a coordinate,
+    extent or colour channel belongs. Length is NOT checked here (size is shape-dependent, so
+    its count is checked against the shape afterwards); use
+    :func:`pose_vector_error` for a fixed length, or the rgba coercion in
+    :mod:`strands_robots.simulation.mujoco.physics` for a colour, whose count
+    the geom's rgba row defines. Returns ``None`` when every element is a finite
+    real number.
+    """
+    try:
+        iter(vec)
+    except TypeError:
+        return f"{method}: '{param_name}' must be a list/tuple of numbers, got {vec!r}"
+    for _elem in vec:
+        # ``numbers.Real`` accepts a numpy scalar (``np.float32`` / ``np.int64``
+        # are registered) and rejects a string, ``None`` or a nested list.
+        # ``bool`` is an ``int`` subclass, so it would otherwise pass as a
+        # silent ``1.0`` - a ``True`` coordinate placing a body 1 m out. The
+        # agent-tool router already refuses a bool component, so refusing it
+        # here keeps the direct API and the tool surface in step.
+        if isinstance(_elem, bool) or not isinstance(_elem, numbers.Real):
+            return f"{method}: '{param_name}' elements must be numbers, got {vec!r}"
+        if not math.isfinite(float(_elem)):
+            return f"{method}: '{param_name}' must contain finite numbers (no nan/inf), got {vec!r}"
+    return None
+
+
+def pose_vector_error(method: str, param_name: str, vec: Any, expected_len: int) -> str | None:
+    """Return an error message if ``vec`` is not ``expected_len`` finite numbers.
+
+    Fixed-length wrapper over :func:`finite_vector_error` for the pose
+    vectors written straight into ``data.qpos`` (``move_object`` /
+    ``add_object`` position+orientation, ``add_camera`` position+target). A
+    wrong-length vector otherwise raises a bare ``ValueError`` inside the numpy
+    assignment - escaping the structured ``{"status": "error"}`` tool-result
+    contract - and a ``nan``/``inf`` component is propagated through the whole
+    physics state by ``mj_forward``, reporting ``success`` while silently
+    poisoning the simulation. A numpy real scalar per element is accepted.
+
+    It lives here rather than beside one of its callers because those callers
+    sit in different layers: the scene-construction facade builds a pose before
+    the model is compiled, while the motion primitives take one against a live
+    model, and their accepted domain must not diverge - a pose either backend
+    entry point refuses must be refused by the other. Returns ``None`` when
+    ``vec`` is acceptable.
+    """
+    try:
+        length = len(vec)
+    except TypeError:
+        return f"{method}: '{param_name}' must be a list/tuple of {expected_len} numbers, got {vec!r}"
+    if length != expected_len:
+        return f"{method}: '{param_name}' must be a {expected_len}-element vector, got {length} ({vec!r})"
+    return finite_vector_error(method, param_name, vec)
+
+
+def coerce_pose_vector(
+    method: str, param_name: str, vec: Any, expected_len: int
+) -> tuple[list[float] | None, str | None]:
+    """Validate an optional pose vector and normalize it to plain floats.
+
+    Membership, not truthiness: a pose parameter is "supplied" when it is not
+    ``None``. Testing the vector itself (``if position:``, ``position or
+    <default>``) is wrong twice over. A NumPy array - the natural product of any
+    pose arithmetic, and what every docstring here advertises as accepted -
+    raises a bare ``ValueError: truth value of an array ... is ambiguous``
+    through the structured tool-result contract, and an empty vector reads as
+    "omitted", so the default is substituted (or the write skipped) while the
+    call reports success.
+
+    Normalizing to a ``list[float]`` keeps the accepted NumPy input from
+    outliving this boundary: the pose is stored on :class:`SimObject` /
+    :class:`SimRobot` (both annotated ``list[float]``), echoed in the status
+    text, and written into the spec, so a raw ``np.float64`` element would leak
+    ``np.float64(0.05)`` into agent-visible output.
+
+    Args:
+        method: Calling method name, used in error text.
+        param_name: Parameter name, used in error text.
+        vec: The caller's value, or ``None`` when the parameter was omitted.
+        expected_len: Component count the target buffer defines (3 for a
+            position, 4 for a wxyz quaternion).
+
+    Returns:
+        ``(None, None)`` when ``vec`` is ``None`` (omitted - the caller applies
+        its own default), ``(floats, None)`` for an acceptable vector, or
+        ``(None, error_message)`` for a wrong length, a non-numeric element or a
+        ``nan``/``inf`` component.
+    """
+    if vec is None:
+        return None, None
+    if (err := pose_vector_error(method, param_name, vec, expected_len)) is not None:
+        return None, err
+    return [float(v) for v in vec], None

@@ -100,6 +100,40 @@ class TestFromDictValidation:
         bench = DeclarativeBenchmark.from_dict({"name": "x", "default_robot": "anything", "supported_robots": []})
         assert bench.default_robot == "anything"
 
+    def test_accepts_instruction(self):
+        """A spec may declare a natural-language ``instruction`` and it is
+        surfaced on the compiled benchmark. Before this was supported the key
+        was rejected as an unknown top-level key, so a spec-authored benchmark
+        could not carry a task command for a language-conditioned policy."""
+        bench = DeclarativeBenchmark.from_dict(
+            {
+                "name": "x",
+                "default_robot": "so100",
+                "supported_robots": ["so100"],
+                "instruction": "walk forward at 1 m/s",
+            }
+        )
+        assert bench.instruction == "walk forward at 1 m/s"
+
+    def test_instruction_defaults_to_empty(self):
+        """A spec that omits ``instruction`` compiles to the empty-string
+        default (backward compatible with every pre-existing spec)."""
+        bench = DeclarativeBenchmark.from_dict({"name": "x", "default_robot": "so100", "supported_robots": ["so100"]})
+        assert bench.instruction == ""
+
+    def test_rejects_non_string_instruction(self):
+        """A non-string ``instruction`` is a clear error, not a silent coerce."""
+        with pytest.raises(ValueError) as exc:
+            DeclarativeBenchmark.from_dict(
+                {
+                    "name": "x",
+                    "default_robot": "so100",
+                    "supported_robots": ["so100"],
+                    "instruction": 123,
+                }
+            )
+        assert "instruction" in str(exc.value)
+
     def test_rejects_non_positive_max_steps(self):
         for bad in (-1, 0, "300", True):
             with pytest.raises(ValueError):
@@ -193,6 +227,26 @@ class TestPredicateCompilation:
             DeclarativeBenchmark.from_dict(self._base_spec(success={"all": [], "other": []}))
         assert "other" in str(exc.value)
 
+    def test_rejects_unknown_predicate_in_dense_reward(self):
+        """A typo'd predicate name in a ``dense_reward`` term surfaces the same
+        clear ``Unknown predicate ... Valid: [...]`` error as a success clause.
+
+        Success / failure clauses reject unknown names early via
+        ``predicate_kind`` kind-checking, but ``dense_reward`` terms compile
+        through a different path with no kind requirement and rely on
+        ``make_predicate`` to reject the name. This pins that a typo in a
+        reward-term predicate still fails loudly at compile time with a
+        discoverable list of valid predicates, rather than a cryptic
+        downstream crash at evaluation.
+        """
+        with pytest.raises(ValueError) as exc:
+            DeclarativeBenchmark.from_dict(
+                self._base_spec(dense_reward=[{"predicate": "totally_made_up", "value": 1.0}])
+            )
+        msg = str(exc.value)
+        assert "Unknown predicate" in msg
+        assert "totally_made_up" in msg
+
     def test_predicate_bad_kwargs_surface_compile_error(self):
         """Bad predicate kwargs (wrong types, missing required) surface as a
         compile-time error, not a runtime predicate crash."""
@@ -285,7 +339,12 @@ success:
         assert ".toml" in str(exc.value) or "extension" in str(exc.value)
 
     def test_spec_name_internal_overridden_by_registry_name(self, tmp_path):
-        """Registry name wins over any ``name`` declared inside the spec file."""
+        """Registry name wins over any ``name`` declared inside the spec file.
+
+        The override applies to the instance's ``.name`` too, not just the
+        registry key - the documented contract is that the registry name wins,
+        and ``DeclarativeBenchmark.name`` is what error/log messages report.
+        """
         p = tmp_path / "s.json"
         p.write_text(
             json.dumps(
@@ -296,10 +355,36 @@ success:
                 }
             )
         )
-        register_benchmark_from_file("external-name", str(p))
-        assert get_benchmark("external-name") is not None
+        bench = register_benchmark_from_file("external-name", str(p))
+        assert get_benchmark("external-name") is bench
         # The spec's internal name doesn't end up in the registry.
         assert get_benchmark("internal-name") is None
+        # The instance reports the registry name, not the stale spec-internal one.
+        assert bench.name == "external-name"
+
+    def test_same_spec_registered_under_multiple_names(self, tmp_path):
+        """The documented use case: one spec file, many registry names.
+
+        Each registration must yield an instance whose ``.name`` matches its own
+        registry key so the two are distinguishable - a spec that declares its
+        own ``name`` must not make every registration report that one name.
+        """
+        p = tmp_path / "s.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "name": "declared-in-spec",
+                    "default_robot": "so100",
+                    "supported_robots": ["so100"],
+                }
+            )
+        )
+        first = register_benchmark_from_file("task-a", str(p))
+        second = register_benchmark_from_file("task-b", str(p))
+        assert first.name == "task-a"
+        assert second.name == "task-b"
+        assert get_benchmark("task-a").name == "task-a"
+        assert get_benchmark("task-b").name == "task-b"
 
     def test_rejects_empty_name(self, tmp_path):
         p = tmp_path / "s.json"
