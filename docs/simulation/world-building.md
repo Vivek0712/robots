@@ -60,6 +60,43 @@ is an error that lists the model's available keyframes. `keyframe=None` (the
 default) keeps the zero-pose spawn. (MuJoCo backend; the Newton backend rejects
 `keyframe=` as not-yet-supported.)
 
+## Declared physics options
+
+A robot MJCF may declare the solver settings its contacts and actuators were
+tuned for. `add_robot` carries them onto the scene, because MuJoCo's `<option>`
+is model-global and does not survive the spec attach:
+
+```python
+sim.create_world()
+sim.add_robot(name="panda")          # model declares integrator="implicitfast"
+sim.mj_model.opt.integrator          # -> mjINT_IMPLICITFAST
+```
+
+This matters for manipulation. Under the default Euler integrator a Panda's
+position servos diverge enough that a top-down grasp pushes the object away and
+squeezes through it; `so100`, `so101`, `aloha`, `shadow_hand` and `robotiq_2f85`
+likewise declare `cone="elliptic" impratio="10"` so their grippers can hold load.
+
+Precedence, highest first:
+
+| Source | Wins for |
+| --- | --- |
+| `create_world(timestep=, gravity=)` | `timestep`, `gravity` - always |
+| Your own scene MJCF (`replace_scene_mjcf`) | any field it sets |
+| First robot attached that declares the field | everything else |
+
+A model-global field holds one value, so if a second robot declares a different
+value for a field already set, the existing value is kept and the discarded
+request is logged with the field, both values and the robot name. Add that robot
+first, or declare the value in your own scene MJCF, to make it win.
+
+Vector environment fields (`wind`, `magnetic`, contact overrides) and the flag
+bitfields describe the world rather than the robot and are never adopted.
+
+Adoption is committed only once the robot is actually in the scene, so an
+`add_robot` that reports an error leaves the world's solver settings exactly as
+they were - and leaves the field free for the next robot that declares it.
+
 ## Rough terrain
 
 By default `create_world()` lays down a flat ground plane. A locomotion
@@ -255,6 +292,36 @@ For natural surfaces prefer
 an **image texture**; the `checker` builtin reads as a literal checkerboard.
 Materials are currently supported by the MuJoCo backend; the Newton backend
 rejects a non-`None` `material` rather than silently ignoring it.
+
+## Surgical MJCF edits
+
+`patch_scene_mjcf(ops)` applies a list of structured ops to the live spec and
+recompiles once, preserving joint state for untouched joints. Each op accepts
+only the keys it reads:
+
+| Op | Keys |
+|----|------|
+| `add_body` | `parent` (default `"world"`), `name` (required), `pos`, `quat` |
+| `add_geom` | `body` (required), `type` (default `"box"`), `size`, `rgba`, `name`, `pos`, `quat` |
+| `add_site` | `body` (default `"world"`), `name` (required), `pos`, `size`, `rgba` |
+| `set_body_pos` | `name` (required), `pos` |
+| `set_body_quat` | `name` (required), `quat` |
+| `delete_body` | `name` (required) |
+
+Any other key is rejected. Every field above has a fallback default (`pos` the
+origin, `quat` identity, `type` `"box"`, `parent` the worldbody), so a key the op
+does not read is not inert - it would leave that default in place while the patch
+reports success:
+
+```python
+sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "position": [0.4, 0, 0.9]}])
+# status=error: set_body_pos: unknown op key(s): 'position' (did you mean 'pos'?).
+#               Accepted keys: name, op, pos.
+```
+
+The batch is atomic: if any op is rejected the world is rolled back to its
+pre-patch state, so a bad key never leaves a half-applied scene. Use
+`replace_scene_mjcf(xml)` for MJCF elements this vocabulary does not cover.
 
 ## Cameras
 

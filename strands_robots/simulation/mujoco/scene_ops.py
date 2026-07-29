@@ -27,7 +27,9 @@ the legacy API) so call sites in :mod:`simulation` don't need to change.
 
 from __future__ import annotations
 
+import difflib
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from strands_robots.simulation.models import SimCamera, SimObject, SimRobot, SimWorld
@@ -66,6 +68,43 @@ def _sync_cached_xml(world: SimWorld, spec: Any) -> None:
             world._backend_state["xml"] = spec.to_xml()
     except Exception as xml_err:
         logger.debug("spec.to_xml() failed; cached XML left stale: %s", xml_err)
+
+
+def _snapshot_spec(spec: Any, *, context: str) -> Any | None:
+    """Deep-copy ``spec`` so a refused mutation can be rolled back losslessly.
+
+    A spec mutation that is only validated by the recompile it precedes needs a
+    way back. Rebuilding the spec from the registered objects / cameras / robots
+    is not it: the live spec can carry mutations that exist ONLY on the spec and
+    are absent from that registry - weld equalities from ``attach_bodies``,
+    actuators from :func:`actuate_robot_in_scene`, bodies from
+    :func:`patch_scene_mjcf`, whole scenes from :func:`replace_scene_mjcf`. A
+    rebuild silently drops every one of them, which is why
+    :meth:`Simulation.remove_robot` refuses outright while an attachment is
+    live rather than rebuilding over it.
+
+    ``MjSpec.copy`` is used rather than a ``spec.to_xml()`` round-trip because
+    the round-trip is not faithful for a scene holding attached robots: the
+    emitted MJCF loses the asset search paths its mesh references were resolved
+    against and re-declares the attached model's keyframes, so the restored spec
+    no longer compiles ("Error opening file 'link2.stl'", "repeated name
+    'panda/home' in key") - a rollback that leaves the scene as broken as the
+    orphan it removed.
+
+    Args:
+        spec: live scene spec to snapshot.
+        context: short description of the caller, used in log messages.
+
+    Returns:
+        An independent copy of ``spec``, or ``None`` when the copy failed (the
+        reason is logged). A caller that cannot snapshot must refuse its
+        mutation rather than proceed with no way back.
+    """
+    try:
+        return spec.copy()
+    except (ValueError, RuntimeError) as e:
+        logger.error("%s: cannot snapshot the scene spec: %s", context, e)
+        return None
 
 
 def _recompile_preserving_state(world: SimWorld, spec: Any, *, raise_on_refusal: bool = False) -> bool:
@@ -337,10 +376,38 @@ def inject_robot_into_scene(
     Registers the robot's source joint names on ``robot.joint_names`` so
     downstream observation/policy code can resolve them via
     ``{robot.namespace}{joint_name}``.
+
+    ``spec.attach`` mutates the scene spec before the recompile that validates
+    the result, so a refused recompile - e.g. the robot model references a mesh
+    file that cannot be opened - leaves the robot's whole namespaced subtree in
+    the live spec. Every later scene mutation then recompiles that same broken
+    spec and fails too, so one unloadable robot bricked the world: subsequent
+    ``add_object`` / ``add_camera`` / ``add_robot`` calls all reported "spec
+    recompile refused" with nothing wrong with them, and each failed retry left
+    another orphan subtree behind. The attach is therefore rolled back out
+    before returning ``False``, mirroring :func:`inject_object_into_scene` and
+    :func:`inject_camera_into_scene`, so a refused robot costs exactly the add
+    that was refused.
+
+    The rollback reinstalls a snapshot taken before the attach
+    (:func:`_snapshot_spec`) rather than rebuilding the scene from ``world``: a
+    rebuild would drop the spec-only mutations the scene may already hold (weld
+    equalities, added actuators, agent-authored bodies), turning a correctly
+    refused add into corruption of a scene that was healthy before it. The
+    refused ``spec.recompile`` leaves ``world._model`` and ``_data`` untouched,
+    so putting the spec back is the whole rollback - no state restore, forward
+    pass or ID rediscovery is needed.
     """
     spec = _get_spec(world)
     if spec is None or world._model is None:
         logger.error("inject_robot: no spec or model in world")
+        return False
+
+    # Snapshot BEFORE mutating. Without a way back the add is refused here,
+    # while the scene is still exactly as it was found.
+    context = f"inject_robot {robot.name!r}"
+    backup_spec = _snapshot_spec(spec, context=context)
+    if backup_spec is None:
         return False
 
     try:
@@ -348,10 +415,22 @@ def inject_robot_into_scene(
             joint_names = SpecBuilder.attach_robot(spec, robot, robot_xml_path)
         robot.joint_names = joint_names
     except (ValueError, RuntimeError, OSError) as e:
+        # attach_robot can insert its worldbody frame before the call that
+        # raised. That leftover compiles, so it never broke the scene, but the
+        # snapshot is already in hand - restoring it costs nothing and puts
+        # every failure path on one rule: the spec is left as it was found.
         logger.error("Robot attach failed for '%s': %s", robot.name, e)
+        world._backend_state["spec"] = backup_spec
         return False
 
-    return _recompile_preserving_state(world, spec)
+    if _recompile_preserving_state(world, spec):
+        return True
+
+    # The attach landed in the spec but the model it produced was refused, so
+    # the robot's whole namespaced subtree is sitting in the live spec while the
+    # caller is about to report a failed add. Put the pre-attach spec back.
+    world._backend_state["spec"] = backup_spec
+    return False
 
 
 def inject_object_into_scene(world: SimWorld, obj: SimObject) -> bool:
@@ -836,11 +915,8 @@ def actuate_robot_in_scene(
     # Snapshot for atomic rollback (mirrors patch_scene_mjcf): the surgery
     # touches option/bodies/joints/actuators/geoms, too many objects to undo
     # piecewise.
-    try:
-        with filter_mujoco_attach_noise():
-            backup_xml = spec.to_xml()
-    except Exception as e:  # pragma: no cover - to_xml on a compiled spec is fine
-        logger.error("actuate_robot_in_scene: failed to snapshot spec: %s", e)
+    backup_spec = _snapshot_spec(spec, context="actuate_robot_in_scene")
+    if backup_spec is None:
         return False
 
     try:
@@ -885,13 +961,13 @@ def actuate_robot_in_scene(
             act.set_to_position(kp=float(kp), dampratio=1.0, inheritrange=jnt_range_defined)
     except (ValueError, RuntimeError, TypeError) as e:
         logger.error("actuate_robot_in_scene: spec surgery failed for '%s': %s", robot.name, e)
-        world._backend_state["spec"] = SpecBuilder.from_mjcf_string(backup_xml)
+        world._backend_state["spec"] = backup_spec
         return False
 
     if not _recompile_preserving_state(world, spec):
         # Restore the pre-surgery spec so the failed edit doesn't poison
         # later scene mutations.
-        world._backend_state["spec"] = SpecBuilder.from_mjcf_string(backup_xml)
+        world._backend_state["spec"] = backup_spec
         return False
     return True
 
@@ -933,17 +1009,61 @@ def replace_scene_mjcf(world: SimWorld, xml: str) -> bool:
 
 # Structured-op patching of the live spec (Stage 6, part 2 - GH #125)
 
-# Supported ops for patch_scene_mjcf. Kept narrow on purpose - adding unchecked
-# attribute setters would make the tool an arbitrary-code hole. Agents that
-# need exotic MJCF should go through replace_scene_mjcf with a full XML.
-_PATCH_OPS = {
-    "add_body",
-    "add_geom",
-    "add_site",
-    "set_body_pos",
-    "set_body_quat",
-    "delete_body",
+# Supported ops for patch_scene_mjcf, each mapped to the complete set of keys
+# that op reads. Kept narrow on purpose - adding unchecked attribute setters
+# would make the tool an arbitrary-code hole. Agents that need exotic MJCF
+# should go through replace_scene_mjcf with a full XML.
+#
+# This mapping is the single source of truth for the op vocabulary: it names
+# the supported ops AND, per op, every key that reaches MuJoCo. Any other key
+# is refused, because each field below is read with a fallback default - a
+# misspelled key would otherwise apply that default and report success, so
+# ``{"op": "set_body_pos", "name": "crate", "position": [...]}`` would move the
+# body to the origin rather than to the requested pose.
+_PATCH_OP_KEYS: dict[str, frozenset[str]] = {
+    "add_body": frozenset({"op", "parent", "name", "pos", "quat"}),
+    "add_geom": frozenset({"op", "body", "type", "size", "rgba", "name", "pos", "quat"}),
+    "add_site": frozenset({"op", "body", "name", "pos", "size", "rgba"}),
+    "set_body_pos": frozenset({"op", "name", "pos"}),
+    "set_body_quat": frozenset({"op", "name", "quat"}),
+    "delete_body": frozenset({"op", "name"}),
 }
+
+
+def _unknown_op_keys_error(kind: str, op: Mapping[str, Any]) -> str | None:
+    """Reject keys a patch op does not read, before its defaults are applied.
+
+    Every field of every op is read with a fallback default (``pos`` defaults
+    to the origin, ``quat`` to identity, ``type`` to ``"box"``, ``parent`` to
+    ``"world"``), so an unrecognised key is not an inert extra: the op runs
+    with that default and reports success. A misspelled ``pos`` silently moves
+    a body to the world origin, a misspelled ``parent`` re-parents it to the
+    worldbody, and a misspelled ``type`` compiles a box where a sphere was
+    asked for.
+
+    Args:
+        kind: The op name, already known to be in :data:`_PATCH_OP_KEYS`.
+        op: The caller-supplied op dict.
+
+    Returns:
+        An error message naming the unknown key(s), a close-match suggestion
+        where one exists, and the keys this op accepts - or ``None`` when
+        every key is honored.
+    """
+    accepted = _PATCH_OP_KEYS[kind]
+    unknown = [key for key in op if key not in accepted]
+    if not unknown:
+        return None
+    known = sorted(accepted)
+    # Suggest field names only. "op" selects the op and is already validated
+    # above, so it is never what a misspelled field meant - offering it turns a
+    # real MJCF attribute like "group" into a nonsense hint.
+    candidates = [key for key in known if key != "op"]
+    described = []
+    for key in sorted(unknown, key=str):
+        close = difflib.get_close_matches(str(key).lower(), candidates, n=1, cutoff=0.5)
+        described.append(f"{key!r}" + (f" (did you mean {close[0]!r}?)" if close else ""))
+    return f"{kind}: unknown op key(s): {', '.join(described)}. Accepted keys: {', '.join(known)}."
 
 
 def _find_body(spec: Any, name: str, new_bodies: dict[str, Any]) -> Any:
@@ -983,8 +1103,10 @@ def _apply_patch_op(spec: Any, op: dict[str, Any], new_bodies: dict[str, Any]) -
         raise ValueError(f"each op must be a dict, got {type(op).__name__}")
 
     kind = op.get("op")
-    if kind not in _PATCH_OPS:
-        raise ValueError(f"unknown op '{kind}'. Supported: {sorted(_PATCH_OPS)}")
+    if kind not in _PATCH_OP_KEYS:
+        raise ValueError(f"unknown op '{kind}'. Supported: {sorted(_PATCH_OP_KEYS)}")
+    if err := _unknown_op_keys_error(str(kind), op):
+        raise ValueError(err)
 
     if kind == "add_body":
         parent = op.get("parent", "world")
@@ -1089,6 +1211,10 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
         {"op": "set_body_pos", "name": "foo", "pos": [1,0,1]}
         {"op": "delete_body", "name": "foo"}
 
+    Each op accepts exactly the keys listed for it in :data:`_PATCH_OP_KEYS`;
+    anything else is rejected, because an unread key would leave the op running
+    on its fallback default (see :func:`_unknown_op_keys_error`).
+
     The list is applied atomically: if any op raises, the whole patch is
     rejected and the world is left in its original state. After all ops
     succeed, ``spec.recompile(model, data)`` is called once, so joint
@@ -1105,14 +1231,11 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
     if spec is None:
         raise RuntimeError("world has no spec; patch_scene_mjcf requires a compiled world")
 
-    # Apply ops on a *clone* of the spec so we can atomically reject on failure.
-    # MjSpec doesn't expose a cheap deep-copy, but round-tripping through XML
-    # is safe: it's the same canonical form used by the compiler.
-    try:
-        with filter_mujoco_attach_noise():
-            backup_xml = spec.to_xml()
-    except Exception as e:  # pragma: no cover - spec.to_xml on brand-new specs is fine
-        raise RuntimeError(f"failed to snapshot spec before patch: {e}") from e
+    # Snapshot the spec so a failed op can be atomically rejected: the batch is
+    # applied to the live spec and the snapshot put back if any op fails.
+    backup_spec = _snapshot_spec(spec, context="patch_scene_mjcf")
+    if backup_spec is None:
+        raise RuntimeError("failed to snapshot spec before patch (see logs)")
 
     applied = 0
     new_bodies: dict[str, Any] = {}
@@ -1121,15 +1244,7 @@ def patch_scene_mjcf(world: SimWorld, ops: list[dict[str, Any]]) -> int:
             _apply_patch_op(spec, op, new_bodies)
             applied += 1
     except Exception as err:
-        # Restore from backup.
-        try:
-            restored = SpecBuilder.from_mjcf_string(backup_xml)
-            world._backend_state["spec"] = restored
-        except Exception:
-            # If even the backup round-trip fails, the world is in a bad state
-            # and the caller should rebuild. Propagate the original error
-            # either way so the user sees what went wrong.
-            pass
+        world._backend_state["spec"] = backup_spec
         raise ValueError(f"patch op #{applied + 1} failed: {err}") from err
 
     # One recompile for the whole batch - preserves qpos/qvel for unchanged joints.

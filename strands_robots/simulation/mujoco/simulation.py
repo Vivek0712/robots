@@ -99,6 +99,11 @@ from strands_robots.simulation.mujoco.spec_builder import (
 from strands_robots.simulation.policy_runner import CooperativeStop
 from strands_robots.simulation.terrain import SUPPORTED_TERRAINS, validate_difficulty, validate_terrain
 from strands_robots.teleop_mixin import TeleopMixin
+from strands_robots.utils import (
+    coerce_pose_vector,
+    finite_vector_error,
+    pose_vector_error,
+)
 
 if TYPE_CHECKING:
     from strands_robots.policies import Policy
@@ -175,111 +180,10 @@ def _validated_mesh_handle(mesh: Any) -> Any:
     )
 
 
-def _validate_finite_vector(method: str, param_name: str, vec: Any) -> str | None:
-    """Return an error message if any element of ``vec`` is not a finite number.
-
-    Guards the numeric vectors a scene-construction call bakes into the
-    compiled MJCF (``add_object`` color/size, ``add_camera`` position/target,
-    etc.) against the two classes the numeric-input campaign targets:
-
-    * A non-numeric or non-iterable element (e.g. ``["a", "b", "c"]`` or a
-      nested list) otherwise raises a bare ``TypeError``/``ValueError`` deep
-      inside MuJoCo's ``add_geom`` or a ``size <= 0`` comparison - escaping the
-      structured ``{"status": "error"}`` tool-result contract.
-    * A ``nan``/``inf`` component is baked verbatim into the geom/camera and
-      either poisons the physics state on the next ``mj_forward`` or aborts the
-      spec recompile with a cryptic "spec recompile refused", reporting a
-      success/garbage result instead of an actionable error.
-
-    A numpy real scalar per element is accepted (``float(np.float64(...))``
-    succeeds), matching the "accept NumPy scalar components" behaviour of the
-    other sim setters. Length is NOT checked here (size is shape-dependent, so
-    its count is checked against the shape afterwards); use
-    :func:`_validate_pose_vector` for a fixed length, or the rgba coercion in
-    :mod:`strands_robots.simulation.mujoco.physics` for a colour, whose count
-    the geom's rgba row defines. Returns ``None`` when every element is a finite
-    real number.
-    """
-    try:
-        iter(vec)
-    except TypeError:
-        return f"{method}: '{param_name}' must be a list/tuple of numbers, got {vec!r}"
-    for _elem in vec:
-        try:
-            _f = float(_elem)
-        except (TypeError, ValueError):
-            return f"{method}: '{param_name}' elements must be numbers, got {vec!r}"
-        if not math.isfinite(_f):
-            return f"{method}: '{param_name}' must contain finite numbers (no nan/inf), got {vec!r}"
-    return None
-
-
-def _validate_pose_vector(method: str, param_name: str, vec: Any, expected_len: int) -> str | None:
-    """Return an error message if ``vec`` is not ``expected_len`` finite numbers.
-
-    Fixed-length wrapper over :func:`_validate_finite_vector` for the pose
-    vectors written straight into ``data.qpos`` (``move_object`` /
-    ``add_object`` position+orientation, ``add_camera`` position+target). A
-    wrong-length vector otherwise raises a bare ``ValueError`` inside the numpy
-    assignment - escaping the structured ``{"status": "error"}`` tool-result
-    contract - and a ``nan``/``inf`` component is propagated through the whole
-    physics state by ``mj_forward``, reporting ``success`` while silently
-    poisoning the simulation. A numpy real scalar per element is accepted.
-    Returns ``None`` when ``vec`` is acceptable.
-    """
-    try:
-        length = len(vec)
-    except TypeError:
-        return f"{method}: '{param_name}' must be a list/tuple of {expected_len} numbers, got {vec!r}"
-    if length != expected_len:
-        return f"{method}: '{param_name}' must be a {expected_len}-element vector, got {length} ({vec!r})"
-    return _validate_finite_vector(method, param_name, vec)
-
-
 # Actions consumed open-loop from each policy's chunk before it is re-queried,
 # when the caller gives no per-robot override. Single-sourced so the signature
 # default and the per-robot mapping fallback cannot drift apart.
 _DEFAULT_ACTION_HORIZON = 8
-
-
-def _coerce_pose_vector(
-    method: str, param_name: str, vec: Any, expected_len: int
-) -> tuple[list[float] | None, str | None]:
-    """Validate an optional pose vector and normalize it to plain floats.
-
-    Membership, not truthiness: a pose parameter is "supplied" when it is not
-    ``None``. Testing the vector itself (``if position:``, ``position or
-    <default>``) is wrong twice over. A NumPy array - the natural product of any
-    pose arithmetic, and what every docstring here advertises as accepted -
-    raises a bare ``ValueError: truth value of an array ... is ambiguous``
-    through the structured tool-result contract, and an empty vector reads as
-    "omitted", so the default is substituted (or the write skipped) while the
-    call reports success.
-
-    Normalizing to a ``list[float]`` keeps the accepted NumPy input from
-    outliving this boundary: the pose is stored on :class:`SimObject` /
-    :class:`SimRobot` (both annotated ``list[float]``), echoed in the status
-    text, and written into the spec, so a raw ``np.float64`` element would leak
-    ``np.float64(0.05)`` into agent-visible output.
-
-    Args:
-        method: Calling method name, used in error text.
-        param_name: Parameter name, used in error text.
-        vec: The caller's value, or ``None`` when the parameter was omitted.
-        expected_len: Component count the target buffer defines (3 for a
-            position, 4 for a wxyz quaternion).
-
-    Returns:
-        ``(None, None)`` when ``vec`` is ``None`` (omitted - the caller applies
-        its own default), ``(floats, None)`` for an acceptable vector, or
-        ``(None, error_message)`` for a wrong length, a non-numeric element or a
-        ``nan``/``inf`` component.
-    """
-    if vec is None:
-        return None, None
-    if (err := _validate_pose_vector(method, param_name, vec, expected_len)) is not None:
-        return None, err
-    return [float(v) for v in vec], None
 
 
 _TOOL_SPEC_PATH = Path(__file__).parent / "tool_spec.json"
@@ -842,6 +746,24 @@ class MuJoCoSimEngine(
             {"op": "set_body_quat", "name": "foo",     "quat": [1,0,0,0]}
             {"op": "delete_body",   "name": "foo"}
 
+        Each op accepts only the keys it reads, and every other key is
+        refused::
+
+            add_body       op, parent, name, pos, quat
+            add_geom       op, body, type, size, rgba, name, pos, quat
+            add_site       op, body, name, pos, size, rgba
+            set_body_pos   op, name, pos
+            set_body_quat  op, name, quat
+            delete_body    op, name
+
+        Rejecting the rest is not pedantry: every field has a fallback default
+        (``pos`` the origin, ``quat`` identity, ``type`` ``"box"``, ``parent``
+        the worldbody), so a misspelled key would apply that default and report
+        success - ``{"op": "set_body_pos", "name": "crate", "position": [...]}``
+        would move the body to the origin instead of to the requested pose. The
+        error names the op, the unrecognised key, a close match where one
+        exists, and the keys that op accepts.
+
         The whole batch is applied, then the spec is recompiled once. If any
         op fails, the batch is rejected and the world is rolled back to its
         pre-patch state (from an XML snapshot). Use this for fast iterative
@@ -1200,10 +1122,10 @@ class MuJoCoSimEngine(
         # element raises a bare MuJoCo `add_frame(): incompatible function
         # arguments` TypeError that escapes the structured-error contract. NumPy
         # scalar components are accepted.
-        position, e = _coerce_pose_vector("add_robot", "position", position, 3)
+        position, e = coerce_pose_vector("add_robot", "position", position, 3)
         if e is not None:
             return {"status": "error", "content": [{"text": e}]}
-        orientation, e = _coerce_pose_vector("add_robot", "orientation", orientation, 4)
+        orientation, e = coerce_pose_vector("add_robot", "orientation", orientation, 4)
         if e is not None:
             return {"status": "error", "content": [{"text": e}]}
 
@@ -1295,7 +1217,7 @@ class MuJoCoSimEngine(
             urdf_path=resolved_path,
             # ``is None`` means "omitted" -> the documented default. ``or`` would
             # additionally read a NumPy pose as ambiguous (a bare ValueError) and
-            # an empty vector as omitted; _coerce_pose_vector already rejected
+            # an empty vector as omitted; coerce_pose_vector already rejected
             # the latter and normalized the former to plain floats.
             position=[0.0, 0.0, 0.0] if position is None else position,
             orientation=[1.0, 0.0, 0.0, 0.0] if orientation is None else orientation,
@@ -2079,8 +2001,11 @@ class MuJoCoSimEngine(
         )
         base["methods"]["apply_force"] = (
             "(body_name: str, force=None, torque=None, point=None) -> dict  # "
-            "apply an external force/torque wrench to a body for the next step "
-            "(push-recovery / disturbance-rejection perturbation testing)"
+            "latch an external force/torque wrench on a body; MuJoCo re-applies "
+            "it on every subsequent step until the next apply_force for THAT "
+            "body, so several bodies can hold wrenches at once (push-recovery / "
+            "disturbance-rejection perturbation testing, wind, thrusters); "
+            "apply_force(body, force=[0,0,0]) stops one body, reset() stops all"
         )
 
         # Sim-state checkpoint + direct pose-setting surface. describe() teaches
@@ -2601,13 +2526,13 @@ class MuJoCoSimEngine(
         # non-numeric element (e.g. ["a", ...]) raises a bare TypeError inside
         # MuJoCo's add_geom or the size <= 0 comparison, escaping the
         # structured-error contract. NumPy scalar components are accepted.
-        position, e = _coerce_pose_vector("add_object", "position", position, 3)
+        position, e = coerce_pose_vector("add_object", "position", position, 3)
         if e is not None:
             return {"status": "error", "content": [{"text": e}]}
-        orientation, e = _coerce_pose_vector("add_object", "orientation", orientation, 4)
+        orientation, e = coerce_pose_vector("add_object", "orientation", orientation, 4)
         if e is not None:
             return {"status": "error", "content": [{"text": e}]}
-        if size is not None and (e := _validate_finite_vector("add_object", "size", size)) is not None:
+        if size is not None and (e := finite_vector_error("add_object", "size", size)) is not None:
             return {"status": "error", "content": [{"text": e}]}
 
         # 'color' targets the geom's 4-component rgba row, so its component
@@ -2678,7 +2603,7 @@ class MuJoCoSimEngine(
             shape=shape,
             # ``is None`` means "omitted" -> the documented default. ``or`` would
             # additionally read a NumPy pose as ambiguous (a bare ValueError) and
-            # an empty vector as omitted; _coerce_pose_vector already rejected
+            # an empty vector as omitted; coerce_pose_vector already rejected
             # the latter and normalized the former to plain floats.
             position=[0.0, 0.0, 0.0] if position is None else position,
             orientation=[1.0, 0.0, 0.0, 0.0] if orientation is None else orientation,
@@ -2821,10 +2746,10 @@ class MuJoCoSimEngine(
         # mj_forward silently poisons the whole physics state. Only validate a
         # component that is actually supplied (None leaves it unchanged; the
         # move logic below treats a falsy value as "no change").
-        position, perr = _coerce_pose_vector("move_object", "position", position, 3)
+        position, perr = coerce_pose_vector("move_object", "position", position, 3)
         if perr is not None:
             return {"status": "error", "content": [{"text": perr}]}
-        orientation, oerr = _coerce_pose_vector("move_object", "orientation", orientation, 4)
+        orientation, oerr = coerce_pose_vector("move_object", "orientation", orientation, 4)
         if oerr is not None:
             return {"status": "error", "content": [{"text": oerr}]}
 
@@ -2978,10 +2903,10 @@ class MuJoCoSimEngine(
         # ValueError on a NumPy pose (what the docstring above advertises as
         # accepted) and read an empty vector as "omitted", quietly placing the
         # camera at the default [1, 1, 1] under a success result.
-        position, _perr = _coerce_pose_vector("add_camera", "position", position, 3)
+        position, _perr = coerce_pose_vector("add_camera", "position", position, 3)
         if _perr is not None:
             return {"status": "error", "content": [{"text": _perr}]}
-        target, _terr = _coerce_pose_vector("add_camera", "target", target, 3)
+        target, _terr = coerce_pose_vector("add_camera", "target", target, 3)
         if _terr is not None:
             return {"status": "error", "content": [{"text": _terr}]}
         pos = [1.0, 1.0, 1.0] if position is None else position
@@ -2993,7 +2918,7 @@ class MuJoCoSimEngine(
             # TypeError there, and a nan/inf slips silently into the camera's
             # baked xyaxes (fwd /= flen divides by nan -> a degenerate camera
             # that renders garbage while reporting success). NumPy scalars ok.
-            if (e := _validate_pose_vector("add_camera", _lbl, _vec, 3)) is not None:
+            if (e := pose_vector_error("add_camera", _lbl, _vec, 3)) is not None:
                 return {"status": "error", "content": [{"text": e}]}
         # Degenerate orientation: position == target means no well-defined look direction.
         if all(abs(pos[i] - tgt[i]) < 1e-9 for i in range(3)):
@@ -4761,6 +4686,13 @@ class MuJoCoSimEngine(
     # Override in tests via ``cleanup(policy_stop_timeout=...)`` if needed.
     _DEFAULT_POLICY_STOP_TIMEOUT = 5.0
 
+    # Bounded wait for the world-handoff lock (seconds). A motion primitive
+    # holds ``self._lock`` only for one control tick (a few physics substeps,
+    # sub-millisecond), so this ceiling is generous; it exists so cleanup can
+    # never hang the host process on a wedged lock holder - the same tradeoff
+    # ``_DEFAULT_POLICY_STOP_TIMEOUT`` makes for a wedged policy worker.
+    _WORLD_HANDOFF_LOCK_TIMEOUT = 5.0
+
     def cleanup(self, policy_stop_timeout: float | None = None) -> None:
         """Release every resource owned by this Simulation instance.
 
@@ -4782,7 +4714,12 @@ class MuJoCoSimEngine(
              outside MuJoCo and a stale-pointer segfault is the lesser evil
              than hanging the host process on exit.
           4. Only AFTER workers have unwound do we null ``self._world``
-             and tear down renderers / the viewer / the executor.
+             and tear down renderers / the viewer / the executor. The
+             nulling itself happens under ``self._lock`` (bounded acquire):
+             an analytic motion primitive runs on its caller's thread rather
+             than through the executor, so the join in step 2 cannot cover
+             it and the lock is the only thing that keeps the handoff from
+             landing inside one of its control ticks.
 
         Args:
             policy_stop_timeout: Seconds to wait per active policy future.
@@ -4861,11 +4798,42 @@ class MuJoCoSimEngine(
                     )
             self._policy_threads.clear()
 
-        # Step 3: now it's safe to null the world. Any worker still alive
-        # at this point has already escaped MuJoCo (we've confirmed via
-        # fut.result()), so a nulled _model / _data is no longer racy.
-        if self._world:
-            self._world = None
+        # Step 3: hand the world off UNDER ``self._lock``.
+        #
+        # The join above covers every worker submitted to the executor, but a
+        # motion primitive (``move_to`` / ``set_gripper`` / ``rotate_wrist``)
+        # runs on its CALLER's thread: no Future awaits it, and the
+        # ``policy_running`` flag signalled in step 1 never applies to it
+        # (primitives refuse to start while a policy runs, so they never set
+        # it). ``self._lock`` is the only synchronisation such a primitive
+        # has - it takes the lock per control tick to re-check the world,
+        # step physics, then write back ``sim_time`` / ``step_count``.
+        # Nulling ``self._world`` outside the lock therefore lands INSIDE a
+        # tick, and the write-back raises ``AttributeError`` out of an API
+        # documented never to raise. Holding the lock makes the handoff
+        # atomic against a tick, so the primitive's next
+        # ``_primitive_abort_reason`` check reports the structured
+        # "world was destroyed ... aborting" error instead - the outcome that
+        # helper is written to produce. ``load_scene`` brackets its own world
+        # handoff the same way and for the same reason.
+        #
+        # The join must stay OUTSIDE the lock: a live policy worker takes the
+        # lock per step, so awaiting it while holding the lock deadlocks. The
+        # acquire is bounded for the same reason step 2 is bounded - cleanup
+        # must not hang the host process on a wedged lock holder.
+        handoff_locked = self._lock.acquire(timeout=self._WORLD_HANDOFF_LOCK_TIMEOUT)
+        if not handoff_locked:
+            logger.warning(
+                "cleanup: world-handoff lock still held after %.1fs; nulling the world anyway "
+                "(a concurrent control tick may raise).",
+                self._WORLD_HANDOFF_LOCK_TIMEOUT,
+            )
+        try:
+            if self._world:
+                self._world = None
+        finally:
+            if handoff_locked:
+                self._lock.release()
 
         self._close_viewer()
         # close main-thread renderers before dropping the TLS object.
