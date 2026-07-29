@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .. import Policy
+from .. import Policy, align_action_values
 from .embodiment import ZeroActionMonitor, diagnose_action_dim, hardware_pos_keys
 from .processor import ProcessorBridge
 from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_hub
@@ -82,6 +82,44 @@ def _merge_obs_rename(base: dict[str, str], override: dict[str, str | None] | No
         else:
             merged.pop(src, None)
     return merged
+
+
+_VELOCITY_SUFFIX = ".vel"
+
+
+def _drop_velocity_siblings(scalar_keys: list[str]) -> list[str]:
+    """Drop each ``<joint>.vel`` whose ``<joint>`` position companion is present.
+
+    Used only for the OBSERVATION-DERIVED state ordering (see
+    :meth:`LerobotLocalPolicy._resolve_state_order`), which is built from the
+    observation's own insertion order. The MuJoCo backend emits a velocity
+    sibling beside every joint position (``simulation/mujoco/rendering.py``:
+    ``obs[jnt_name] = qpos`` then ``obs[f"{jnt_name}.vel"] = qvel``), so that
+    order alternates ``[pos0, vel0, pos1, vel1, ...]``. Feeding it to a policy
+    trained on positions puts a velocity in every other slot of
+    ``observation.state`` and, once truncated to the model's state dim, drops
+    the trailing joints entirely - a wrong state vector with no error raised.
+    The producer documents ``<name>.vel`` as an ADDITIVE key that position-only
+    consumers are unaffected by; this restores that contract here.
+
+    A ``.vel`` key with NO position companion is KEPT, because some embodiments
+    legitimately declare velocity state and dropping it would corrupt those
+    instead: ``embodiments.json`` gives LeKiwi body-frame base velocities
+    ``x.vel`` / ``y.vel`` / ``theta.vel`` with no ``x`` / ``y`` / ``theta``
+    position key. Pairing is therefore decided per key, not by suffix alone.
+
+    Explicitly configured ``robot_state_keys`` are NOT filtered - an operator
+    naming ``elbow.vel`` is stating the model's input, and this only cleans up
+    an ordering inferred from whatever the observation happened to contain.
+
+    Args:
+        scalar_keys: Candidate state keys in observation insertion order.
+
+    Returns:
+        The same list, order preserved, minus the paired velocity siblings.
+    """
+    present = set(scalar_keys)
+    return [k for k in scalar_keys if not (k.endswith(_VELOCITY_SUFFIX) and k[: -len(_VELOCITY_SUFFIX)] in present)]
 
 
 # Fallback control rate used ONLY when RTC runs without the runtime having
@@ -226,6 +264,15 @@ class LerobotLocalPolicy(Policy):
             fallback) if any camera name cannot be matched to a declared
             policy image key by exact name and no ``camera_key_map`` covers
             it. Defaults to False (positional fallback).
+        pad_short_actions: When the model emits FEWER action values than the
+            robot declares actuator keys, command the unmatched actuators to
+            ``0.0`` instead of omitting them. Defaults to False: an omitted
+            actuator holds its position, whereas ``0.0`` is an absolute target
+            on a LeRobot ``<motor>.pos`` follower or a MuJoCo position
+            actuator, so padding TRAVELS those joints to zero. Enable only when
+            the consumer needs a fixed-width action dict and zero is a
+            meaningful target for every key it pads. Either way the dim
+            mismatch itself is reported once via ``diagnose_action_dim``.
     """
 
     def __init__(
@@ -249,6 +296,7 @@ class LerobotLocalPolicy(Policy):
         camera_key_map: dict[str, str] | None = None,
         obs_rename_override: dict[str, str | None] | None = None,
         strict_keys: bool = False,
+        pad_short_actions: bool = False,
         cache_model: bool = True,
         revision: str | None = None,
         **kwargs,
@@ -298,6 +346,11 @@ class LerobotLocalPolicy(Policy):
         # camera_key_map covers them). Defaults to False (positional fallback
         # with a warning), preserving zero-config ergonomics.
         self.strict_keys = strict_keys
+        # When the model emits fewer action values than the robot declares
+        # actuator keys, False (the default) omits the unmatched actuators so
+        # they hold position; True commands them 0.0, which on an absolute-
+        # position action space travels them to zero. See align_action_values.
+        self.pad_short_actions = bool(pad_short_actions)
         # Routing-degradation telemetry. The heuristic (non-declarative)
         # remap path can keep a run alive while silently producing
         # meaningless inputs - a camera routed to an arbitrary model image
@@ -2013,20 +2066,30 @@ class LerobotLocalPolicy(Policy):
             fall back to the observation's own scalar keys so the state is
             populated rather than silently dropped.
 
+        Any ordering derived from the observation (both the fallback above and
+        the no-``robot_state_keys`` case) is position-only: a ``<joint>.vel``
+        sibling of a present ``<joint>`` is dropped by
+        :func:`_drop_velocity_siblings`, so a MuJoCo observation does not
+        interleave velocities into ``observation.state``. An unpaired ``.vel``
+        key (LeKiwi's base velocities) is kept, and an explicitly configured
+        ``robot_state_keys`` ordering is returned untouched.
+
         Args:
             observation_dict: Raw strands/sim observation for this step.
             scalar_keys: Non-image, non-``task`` scalar keys present in the
                 observation, used as the fallback ordering.
 
         Returns:
-            The ordered keys to pull scalar joint values from.
+            The ordered keys to pull scalar joint values from - the configured
+            ``robot_state_keys`` verbatim, or an observation-derived ordering
+            with paired velocity siblings removed.
 
         Raises:
             ValueError: When ``strict_keys`` is set and no configured key
                 matches the observation.
         """
         if not self.robot_state_keys:
-            return scalar_keys
+            return _drop_velocity_siblings(scalar_keys)
         if any(k in observation_dict for k in self.robot_state_keys):
             return self.robot_state_keys
         shown = self.robot_state_keys[:8]
@@ -2048,7 +2111,7 @@ class LerobotLocalPolicy(Policy):
         if not self._state_key_mismatch_warned:
             logger.warning(msg)
             self._state_key_mismatch_warned = True
-        return scalar_keys
+        return _drop_velocity_siblings(scalar_keys)
 
     def _collect_state_values(self, observation_dict: dict[str, Any], order: list[str]) -> list[float]:
         """Pull the joint-state vector from ``observation_dict`` in ``order``.
@@ -2698,7 +2761,9 @@ class LerobotLocalPolicy(Policy):
         emb_name = self._embodiment.name if self._embodiment is not None else ""
         n_values = len(actions_list[0]) if actions_list else 0
         if not self._action_dim_warned:
-            dim_msg = diagnose_action_dim(n_values, len(self.robot_state_keys), name=emb_name)
+            dim_msg = diagnose_action_dim(
+                n_values, len(self.robot_state_keys), name=emb_name, pad_short=self.pad_short_actions
+            )
             if dim_msg:
                 logger.warning("lerobot_local: %s", dim_msg)
                 self._action_dim_warned = True
@@ -2732,12 +2797,15 @@ class LerobotLocalPolicy(Policy):
 
         result = []
         for action_values in actions_list:
-            vals = [float(action_values[i]) if i < len(action_values) else 0.0 for i in range(len(out_keys))]
+            # Align the model's vector with the actuator keys BEFORE any unit
+            # conversion, so a short vector converts only the columns the model
+            # actually produced (the embodiment's gripper column is positional).
+            vals, keys = align_action_values(action_values, out_keys, pad_short=self.pad_short_actions)
             # `convert` already implies `emb is not None`; the explicit guard lets
             # the type checker narrow `emb` from `EmbodimentMap | None` at the call.
             if convert and emb is not None:
                 vals = emb.model_action_to_sim(vals)
-            action_dict = {key: vals[index] for index, key in enumerate(out_keys)}
+            action_dict = dict(zip(keys, vals, strict=True))
             result.append(action_dict)
 
         return result
