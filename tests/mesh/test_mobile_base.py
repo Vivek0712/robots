@@ -73,6 +73,19 @@ def _robot(transport: _FakeTransport | None = None, **kwargs: Any) -> MobileBase
     return MobileBaseRobot("bot", "/cmd_vel", transport or _FakeTransport(), **kwargs)
 
 
+def _fake(robot: MobileBaseRobot) -> _FakeTransport:
+    """The recording transport behind ``robot``, narrowed from ``Transport``.
+
+    :attr:`MobileBaseRobot.transport` is typed as the protocol the base actually
+    depends on, and that protocol deliberately does not carry ``calls`` /
+    ``publishes`` - those exist only to let a test see what reached the wire.
+    Narrowing here keeps the recording surface out of the production protocol
+    instead of widening the protocol for the tests' benefit.
+    """
+    assert isinstance(robot.transport, _FakeTransport)
+    return robot.transport
+
+
 # -- construction -------------------------------------------------------------
 
 
@@ -105,8 +118,9 @@ def test_positive_finite_is_the_shared_domain_and_not_a_second_rulebook(value: A
 @pytest.mark.parametrize("field", ["max_linear", "max_angular", "max_duration", "publish_rate"])
 @pytest.mark.parametrize("value", [0, -1.0, float("nan"), float("inf")])
 def test_limits_must_be_positive_finite(field: str, value: float) -> None:
+    limits: dict[str, Any] = {field: value}
     with pytest.raises(ValueError, match=field):
-        _robot(**{field: value})
+        _robot(**limits)
 
 
 @pytest.mark.parametrize("node_name,cmd_vel_topic", [("bad name", "/cmd_vel"), ("bot", "/has;semicolon"), ("", "/c")])
@@ -120,7 +134,7 @@ def test_unset_limits_mean_unbounded_not_zero() -> None:
     robot = _robot()
     assert robot.max_linear is None and robot.max_angular is None and robot.max_duration is None
     robot.drive(linear=999.0, angular=-999.0)
-    assert robot.transport.publishes[0]["fields"] == {"linear": {"x": 999.0}, "angular": {"z": -999.0}}
+    assert _fake(robot).publishes[0]["fields"] == {"linear": {"x": 999.0}, "angular": {"z": -999.0}}
 
 
 def test_cmd_vel_type_defaults_to_the_transports_flavor() -> None:
@@ -177,10 +191,11 @@ def test_malformed_init_services_entry_refused(entry: dict[str, Any], match: str
 def test_drive_refuses_non_finite_velocity(axis: str, bad: float) -> None:
     """``nan`` passes silently through a min/max clamp - reject before clamping."""
     robot = _robot()
-    result = robot.drive(**{axis: bad})
+    command: dict[str, Any] = {axis: bad}
+    result = robot.drive(**command)
     assert result["status"] == "error"
     assert f"{axis} must be a finite number" in result["content"][0]["text"]
-    assert robot.transport.calls == []
+    assert _fake(robot).calls == []
 
 
 @pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf"), True, "2", [1.0]])
@@ -189,7 +204,7 @@ def test_drive_refuses_bad_duration(bad: Any) -> None:
     result = robot.drive(linear=1.0, duration=bad)
     assert result["status"] == "error"
     assert "duration" in result["content"][0]["text"]
-    assert robot.transport.calls == []
+    assert _fake(robot).calls == []
 
 
 @pytest.mark.parametrize("bad", [0, -1, 2.7, float("nan"), float("inf"), True, "3", None])
@@ -204,14 +219,14 @@ def test_drive_refuses_a_count_no_message_burst_expresses(bad: Any) -> None:
     result = robot.drive(linear=1.0, count=bad)
     assert result["status"] == "error"
     assert "count" in result["content"][0]["text"]
-    assert robot.transport.calls == []
+    assert _fake(robot).calls == []
 
 
 def test_drive_does_not_read_count_when_a_duration_supersedes_it() -> None:
     """``duration`` wins, so an unread ``count`` must not refuse a valid command."""
     robot = _robot(publish_rate=10.0)
     assert robot.drive(linear=1.0, duration=2.0, count=0)["status"] == "success"
-    assert robot.transport.publishes[0]["count"] == 20
+    assert _fake(robot).publishes[0]["count"] == 20
 
 
 @pytest.mark.parametrize("param", ["linear", "angular"])
@@ -223,8 +238,9 @@ def test_drive_accepts_a_numpy_scalar_velocity(param: str) -> None:
     """
     numpy = pytest.importorskip("numpy")
     robot = _robot()
-    assert robot.drive(**{param: numpy.float32(-0.25)})["status"] == "success"
-    assert robot.transport.publishes[0]["fields"]["linear" if param == "linear" else "angular"] == {
+    command: dict[str, Any] = {param: numpy.float32(-0.25)}
+    assert robot.drive(**command)["status"] == "success"
+    assert _fake(robot).publishes[0]["fields"]["linear" if param == "linear" else "angular"] == {
         "x" if param == "linear" else "z": pytest.approx(-0.25)
     }
 
@@ -234,19 +250,19 @@ def test_drive_refuses_overlong_duration_rather_than_truncating() -> None:
     result = robot.drive(linear=1.0, duration=6.0)
     assert result["status"] == "error"
     assert "exceeds max_duration" in result["content"][0]["text"]
-    assert robot.transport.calls == []
+    assert _fake(robot).calls == []
 
 
 def test_drive_clamps_both_axes_to_configured_limits() -> None:
     robot = _robot(max_linear=1.0, max_angular=0.5)
     robot.drive(linear=9.0, angular=-9.0)
-    assert robot.transport.publishes[0]["fields"] == {"linear": {"x": 1.0}, "angular": {"z": -0.5}}
+    assert _fake(robot).publishes[0]["fields"] == {"linear": {"x": 1.0}, "angular": {"z": -0.5}}
 
 
 def test_drive_duration_becomes_message_count_at_publish_rate() -> None:
     robot = _robot(publish_rate=10.0)
     robot.drive(linear=1.0, duration=1.5)
-    assert robot.transport.publishes[0]["count"] == 15
+    assert _fake(robot).publishes[0]["count"] == 15
 
 
 # -- drive: the enable handshake ----------------------------------------------
@@ -326,7 +342,7 @@ def test_enable_is_idempotent_once_successful() -> None:
 def test_timed_command_is_followed_by_a_single_zero_command() -> None:
     robot = _robot(publish_rate=10.0)
     robot.drive(linear=1.0, duration=1.0)
-    publishes = robot.transport.publishes
+    publishes = _fake(robot).publishes
     assert len(publishes) == 2
     assert publishes[0]["count"] == 10
     assert publishes[1]["fields"] == {"linear": {"x": 0.0}, "angular": {"z": 0.0}}
@@ -336,7 +352,7 @@ def test_timed_command_is_followed_by_a_single_zero_command() -> None:
 def test_multi_message_command_is_followed_by_a_zero_command() -> None:
     robot = _robot()
     robot.drive(linear=1.0, count=5)
-    assert len(robot.transport.publishes) == 2
+    assert len(_fake(robot).publishes) == 2
 
 
 def test_trailing_zero_is_sent_even_when_the_main_publish_raises() -> None:
@@ -352,7 +368,7 @@ def test_trailing_zero_is_sent_even_when_the_main_publish_raises() -> None:
     robot = _robot(_Exploding())
     with pytest.raises(RuntimeError, match="transport died"):
         robot.drive(linear=1.0, duration=1.0)
-    publishes = robot.transport.publishes
+    publishes = _fake(robot).publishes
     assert len(publishes) == 2
     assert publishes[1]["fields"] == {"linear": {"x": 0.0}, "angular": {"z": 0.0}}
 
@@ -361,19 +377,19 @@ def test_single_shot_command_latches_with_no_trailing_zero() -> None:
     """A bare drive() keeps a raw cmd_vel's latch semantics, as documented."""
     robot = _robot()
     robot.drive(linear=1.0)
-    assert len(robot.transport.publishes) == 1
+    assert len(_fake(robot).publishes) == 1
 
 
 def test_an_already_zero_command_gets_no_trailing_zero() -> None:
     robot = _robot()
     robot.drive(linear=0.0, angular=0.0, duration=1.0)
-    assert len(robot.transport.publishes) == 1
+    assert len(_fake(robot).publishes) == 1
 
 
 def test_trailing_zero_fires_on_a_clamped_but_nonzero_command() -> None:
     robot = _robot(max_linear=1.0, publish_rate=10.0)
     robot.drive(linear=50.0, duration=1.0)
-    publishes = robot.transport.publishes
+    publishes = _fake(robot).publishes
     assert publishes[0]["fields"]["linear"]["x"] == 1.0
     assert publishes[1]["fields"] == {"linear": {"x": 0.0}, "angular": {"z": 0.0}}
 
@@ -390,7 +406,7 @@ def test_cmd_fields_is_the_single_override_point_for_kinematics() -> None:
 
     robot = _ServoRobot("car", "/servo", _FakeTransport(), max_linear=2.0, publish_rate=10.0)
     robot.drive(linear=9.0, angular=0.25, duration=1.0)
-    publishes = robot.transport.publishes
+    publishes = _fake(robot).publishes
     # Clamping, duration->count and the trailing zero all still apply, and the
     # trailing zero is expressed in the subclass's own field vocabulary.
     assert publishes[0] == {
@@ -419,14 +435,14 @@ def test_pose_and_scan_report_absence_instead_of_echoing_nothing() -> None:
     for result, label in ((robot.get_pose(), "odom_topic"), (robot.get_scan(), "scan_topic")):
         assert result["status"] == "error"
         assert f"no {label} configured" in result["content"][0]["text"]
-    assert robot.transport.calls == []
+    assert _fake(robot).calls == []
 
 
 def test_pose_and_scan_echo_when_wired() -> None:
     robot = _robot(odom_topic="/odom", scan_topic="/scan", odom_type="nav_msgs/msg/Odometry")
     robot.get_pose(timeout=2.0)
     robot.get_scan()
-    echoes = [c for c in robot.transport.calls if c["action"] == "echo"]
+    echoes = [c for c in _fake(robot).calls if c["action"] == "echo"]
     assert echoes[0] == {
         "action": "echo",
         "topic": "/odom",
@@ -463,7 +479,7 @@ def test_drive_tool_forwards_to_the_instance() -> None:
     robot = _robot()
     drive_tool: Any = next(t for t in robot.tools if t.tool_name == "drive_bot")
     drive_tool(linear=1.0, angular=2.0)
-    assert robot.transport.publishes[0]["fields"] == {"linear": {"x": 1.0}, "angular": {"z": 2.0}}
+    assert _fake(robot).publishes[0]["fields"] == {"linear": {"x": 1.0}, "angular": {"z": 2.0}}
 
 
 # -- the same guarantees on the real shipped classes --------------------------
