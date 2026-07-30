@@ -3,12 +3,19 @@
 `RosBridgedRobot` and `RtpsRobot` were written by mirroring each other, so most
 of each class was the same code: name validation, the `drive`/`stop` contract,
 the `tools` property with suffix mangling, the `from_<preset>()` idiom. The
-duplication was not free. It is why `RosBridgedRobot` - the class most likely to
-be driving real ROS 2 hardware - shipped without the guards its newer siblings
-had: `drive(linear=float("nan"))` published NaN straight onto `cmd_vel` (a
-`min`/`max` clamp passes `nan` through silently), `drive(duration=float("inf"))`
-became an unbounded publish loop, and a timed command left the robot moving
-because nothing sent the trailing zero.
+duplication was not free, and its cost is a matter of record: the velocity and
+navigation-goal guards had to be written into both classes separately, once per
+transport, to close the same defect in each - `drive(linear=float("nan"))`
+publishing NaN onto `cmd_vel` (a `min`/`max` clamp passes `nan` through
+silently), `drive(duration=float("inf"))` becoming an unbounded publish loop.
+Every future mobile base would have paid that tax again, and the third one to
+be added would have been the first to be forgotten.
+
+Those guards now exist once. The base validates a drive request against the same
+shared numeric domain the rest of the package uses, rather than restating the
+rule, so a velocity clamp cannot start accepting a value that a control-loop
+frequency rejects. A regression test asserts the delegation itself, not just its
+current verdicts.
 
 `MobileBaseRobot` now owns the invariant half - validation, the drive contract
 and its safety semantics, the `init_services` enable handshake, `get_pose` /

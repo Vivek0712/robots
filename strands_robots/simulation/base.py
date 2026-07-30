@@ -232,6 +232,46 @@ def randomization_seed_error(value: Any, context: str) -> str | None:
     return None
 
 
+_NON_FINITE_ACTION_REASON = (
+    "A non-finite value is not clamped into the actuator's control range - the "
+    "integrator has no usable target for it. On MuJoCo the physics step is "
+    "discarded and every robot in the scene is reset to its initial pose, so no "
+    "robot follows the command and the reset is not scoped to the commanded "
+    "actuator or robot."
+)
+
+
+def _non_finite_action_error(label: str, value: Any) -> dict[str, Any] | None:
+    """Structured error when an already-coerced action value is not finite.
+
+    ``nan``/``inf`` are valid ``float`` objects, so a scalar-coercion check
+    admits them and they reach the actuator command unexamined. The sibling
+    state writers (``set_joint_positions`` / ``set_joint_velocities``) already
+    refuse a non-finite value; this is the same rule for the actuator-command
+    path, applied to both accepted action shapes so a mapping value and a vector
+    entry cannot diverge.
+
+    Args:
+        label: How to name the offending element in the message - the caller
+            supplies it because a mapping names a key while a vector names a
+            position and the actuator key it binds to.
+        value: The value, already confirmed to coerce to a scalar ``float`` by
+            the caller (so the coercion here cannot raise).
+
+    Returns:
+        A structured ``{"status": "error", ...}`` dict, or ``None`` when the
+        value is finite and therefore usable.
+    """
+    if math.isfinite(float(value)):
+        return None
+    return {
+        "status": "error",
+        "content": [
+            {"text": (f"send_action: {label} must be finite (no nan/inf), got {value!r}. {_NON_FINITE_ACTION_REASON}")}
+        ],
+    }
+
+
 class SimEngine(ABC):
     """Abstract base class for simulation engines.
 
@@ -385,7 +425,7 @@ class SimEngine(ABC):
         """
         known = self.list_robots()
         msg = f"Robot '{requested}' not found."
-        if known:
+        if known and isinstance(requested, str):
             matches = difflib.get_close_matches(requested, known, n=3, cutoff=0.4)
             if matches:
                 msg += " Did you mean: " + ", ".join(matches) + "?"
@@ -810,6 +850,22 @@ class SimEngine(ABC):
         error rather than raised as an unhandled ``TypeError`` deep in the
         actuator-application loop.
 
+        Every value must additionally be **finite**. ``nan``/``inf`` are valid
+        ``float`` objects, so the scalar-coercion check above admits them and they
+        reach the actuator command unexamined. A non-finite command is not clamped
+        into the actuator's range: MuJoCo finds the resulting non-finite ``qacc``,
+        discards the step and resets the world to its initial pose - on every
+        substep, and for *every* robot in the scene rather than only the commanded
+        one - while ``send_action`` still reports success, so a rollout recording
+        such a step writes a trajectory no robot followed. An ``inf`` is instead
+        clamped into ``ctrlrange``, i.e. silently rewritten into a full-travel
+        command. The sibling state writers (:meth:`set_joint_positions` /
+        :meth:`set_joint_velocities`) already refuse a non-finite value, so this
+        holds the actuator-command path to the same rule. The domain is finiteness
+        alone: a numeric string is an accepted spelling of a scalar here, and a
+        finite magnitude outside ``ctrlrange`` is a units question already
+        surfaced by the clamp warning.
+
         Args:
             action: A ``{name: value}`` mapping, or an ordered numeric vector
                 whose entries correspond to ``robot_action_keys(robot_name)``.
@@ -866,6 +922,8 @@ class SimEngine(ABC):
                             }
                         ],
                     }
+                if error := _non_finite_action_error(f"action value for key '{key}'", value):
+                    return None, error
                 normalized[key] = value
             return normalized, None
 
@@ -909,7 +967,12 @@ class SimEngine(ABC):
                     }
                 ],
             }
-        return {name: value for name, value in zip(action_keys, values)}, None
+        bound: dict[str, Any] = {}
+        for idx, (name, value) in enumerate(zip(action_keys, values)):
+            if error := _non_finite_action_error(f"action vector entry {idx} ('{name}')", value):
+                return None, error
+            bound[name] = value
+        return bound, None
 
     @abstractmethod
     def send_action(
@@ -1389,6 +1452,76 @@ class SimEngine(ABC):
             return {"status": "error", "content": [{"text": error}]}
         return None
 
+    def _validate_recording_rate(self, control_frequency: float, method: str) -> dict[str, Any] | None:
+        """Reject a rollout whose rate the active dataset recording cannot describe.
+
+        Instance method (not a ``@staticmethod`` like the other numeric guards)
+        because the value it compares against lives on the engine: the rate is
+        only knowable once a recording is open, which happens one call earlier
+        in ``start_recording``. Backends that cannot record inherit
+        :meth:`_is_recording` returning ``False`` and are unaffected, so this
+        one call site per rollout entry point covers every backend without each
+        needing its own copy.
+
+        Args:
+            control_frequency: Rate the rollout will capture frames at. Validate
+                it with :meth:`_validate_positive_frequency` first, so a
+                non-finite value is reported as the parameter error it is
+                rather than as a rate disagreement.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            A structured ``{"status": "error", ...}`` dict, or ``None`` when no
+            recording is active or the rates agree. See
+            :func:`~strands_robots.simulation.recording.dataset_rate_mismatch_reason`
+            for the contract and why a mismatch is refused rather than warned.
+        """
+        if not self._is_recording():
+            return None
+        from strands_robots.simulation.recording import dataset_rate_mismatch_error
+
+        return dataset_rate_mismatch_error(method, self._active_recorder(), control_frequency)
+
+    def _validate_recording_start_rate(self, fps: Any, method: str) -> dict[str, Any] | None:
+        """Reject opening a recording at a rate an in-flight rollout does not capture at.
+
+        The inverse ordering of :meth:`_validate_recording_rate`, and the same
+        disagreement: that guard runs when a rollout starts against an open
+        recording, this one when a recording is opened against a rollout that is
+        already running. ``start_policy`` makes the second ordering reachable by
+        design - it submits the rollout and returns while it continues - and the
+        two library defaults collide (``fps=30`` against
+        ``control_frequency=50.0``), so the plain sequence produced a 1.667x
+        mislabelled episode with every call reporting success.
+
+        Instance method for the same reason as :meth:`_validate_recording_rate`:
+        the value it compares against lives on the engine. Backends with no
+        asynchronous rollout inherit :meth:`_active_rollout_rates` returning an
+        empty mapping and are unaffected, so one call site per backend's
+        ``start_recording`` covers every backend without each needing its own
+        copy of the rule.
+
+        Args:
+            fps: Caller-supplied dataset frame rate. Validate it with
+                :func:`~strands_robots.simulation.recording.dataset_recording_option_error`
+                first, so a value no dataset can be written at is reported as
+                the parameter error it is rather than as a rate disagreement.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            A structured ``{"status": "error", ...}`` dict, or ``None`` when no
+            rollout is in flight or every one of them already captures at
+            ``fps``. See
+            :func:`~strands_robots.simulation.recording.rollout_rate_mismatch_reason`
+            for the contract and the measured consequence.
+        """
+        rates = self._active_rollout_rates()
+        if not rates:
+            return None
+        from strands_robots.simulation.recording import rollout_rate_mismatch_error
+
+        return rollout_rate_mismatch_error(method, fps, rates)
+
     @staticmethod
     def _validate_video_config(video: Any, method: str) -> dict[str, Any] | None:
         """Reject a ``video`` recording config the rollout cannot honor.
@@ -1686,6 +1819,11 @@ class SimEngine(ABC):
         if err := self._validate_action_horizon(action_horizon, "run_policy"):
             return err
         if err := self._validate_control_substeps(control_substeps, "run_policy"):
+            return err
+        # Both rates are known only here: the dataset rate was fixed by
+        # start_recording one call earlier. Checked before any policy is
+        # built so a rate disagreement costs no weight download and no frame.
+        if err := self._validate_recording_rate(control_frequency, "run_policy"):
             return err
 
         # Compile the stop_when early-return clause BEFORE any policy is
@@ -2124,6 +2262,23 @@ class SimEngine(ABC):
         """
         return False
 
+    def _active_rollout_rates(self) -> dict[str, float]:
+        """Capture rate in Hz of every rollout currently in flight, per robot.
+
+        Backends that can run a rollout asynchronously - returning to the caller
+        while it continues, as the MuJoCo ``start_policy`` does - override this
+        so :meth:`_validate_recording_start_rate` can compare a recording about
+        to be opened against what is already capturing frames. The base runs
+        every rollout to completion before returning, so no rollout can be in
+        flight when a caller reaches ``start_recording`` and the mapping is
+        empty.
+
+        Returns:
+            ``{robot_name: control_frequency}`` for live rollouts only; an empty
+            mapping when none is running.
+        """
+        return {}
+
     def _active_recorder(self) -> Any:
         """Return the active dataset recorder object, or ``None``.
 
@@ -2557,6 +2712,11 @@ class SimEngine(ABC):
             return err
         if err := self._validate_control_substeps(control_substeps, "eval_policy"):
             return err
+        # Both rates are known only here: the dataset rate was fixed by
+        # start_recording one call earlier. Checked before any policy is
+        # built so a rate disagreement costs no weight download and no frame.
+        if err := self._validate_recording_rate(control_frequency, "eval_policy"):
+            return err
         # Coerce to a plain Python float now the value is validated: a NumPy
         # scalar (accepted above via numbers.Real) flows into 1 / control_frequency
         # and time.sleep(...) downstream, and time.sleep rejects a numpy.float32
@@ -2740,6 +2900,11 @@ class SimEngine(ABC):
         if err := self._validate_positive_frequency(control_frequency, "evaluate_benchmark"):
             return err
         if err := self._validate_control_substeps(control_substeps, "evaluate_benchmark"):
+            return err
+        # Both rates are known only here: the dataset rate was fixed by
+        # start_recording one call earlier. Checked before any policy is
+        # built so a rate disagreement costs no weight download and no frame.
+        if err := self._validate_recording_rate(control_frequency, "evaluate_benchmark"):
             return err
         # Coerce to a plain Python float now the value is validated: a NumPy
         # scalar (accepted above via numbers.Real) flows into 1 / control_frequency

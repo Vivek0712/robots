@@ -23,6 +23,7 @@ import pytest
 
 from strands_robots.mesh import MobileBaseRobot, RosBridgedRobot, RtpsRobot
 from strands_robots.mesh._mobile_base import positive_finite
+from strands_robots.utils import positive_finite_number_error
 
 _OK: dict[str, Any] = {"status": "success", "content": [{"text": "ok"}]}
 _FAIL: dict[str, Any] = {"status": "error", "content": [{"text": "nope"}]}
@@ -78,8 +79,27 @@ def _robot(transport: _FakeTransport | None = None, **kwargs: Any) -> MobileBase
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "1.0", None, True])
 def test_positive_finite_refuses_non_positive_finite(value: Any) -> None:
     """``True`` is refused explicitly: it is a float-compatible 1 in disguise."""
-    with pytest.raises(ValueError, match="must be a positive finite number"):
+    with pytest.raises(ValueError, match="limit"):
         positive_finite("limit", value)
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "1.0", None, True, 2.5, 10])
+def test_positive_finite_is_the_shared_domain_and_not_a_second_rulebook(value: Any) -> None:
+    """The verdict is the shared guard's, verbatim - including the message.
+
+    A base that restated the rule would be free to drift from it: a velocity
+    clamp would start accepting a NumPy scalar or a ``True`` that a control-loop
+    frequency rejects, for no reason a reader could discover. Pinning the
+    delegation is what makes "every safety fix lands once" checkable rather than
+    aspirational.
+    """
+    expected = positive_finite_number_error(value, "limit", "ctx")
+    if expected is None:
+        assert positive_finite("limit", value, "ctx") == float(value)
+        return
+    with pytest.raises(ValueError) as excinfo:
+        positive_finite("limit", value, "ctx")
+    assert str(excinfo.value) == expected
 
 
 @pytest.mark.parametrize("field", ["max_linear", "max_angular", "max_duration", "publish_rate"])
@@ -163,13 +183,50 @@ def test_drive_refuses_non_finite_velocity(axis: str, bad: float) -> None:
     assert robot.transport.calls == []
 
 
-@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf"), True])
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf"), True, "2", [1.0]])
 def test_drive_refuses_bad_duration(bad: Any) -> None:
     robot = _robot()
     result = robot.drive(linear=1.0, duration=bad)
     assert result["status"] == "error"
-    assert "duration must be a positive finite number" in result["content"][0]["text"]
+    assert "duration" in result["content"][0]["text"]
     assert robot.transport.calls == []
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.7, float("nan"), float("inf"), True, "3", None])
+def test_drive_refuses_a_count_no_message_burst_expresses(bad: Any) -> None:
+    """``count`` is the horizon when no ``duration`` is given, so it is guarded.
+
+    Left unchecked, ``count=0`` reaches the transport, publishes nothing and
+    reports success - a drive the caller believes happened. A fractional count
+    has no burst that expresses it.
+    """
+    robot = _robot()
+    result = robot.drive(linear=1.0, count=bad)
+    assert result["status"] == "error"
+    assert "count" in result["content"][0]["text"]
+    assert robot.transport.calls == []
+
+
+def test_drive_does_not_read_count_when_a_duration_supersedes_it() -> None:
+    """``duration`` wins, so an unread ``count`` must not refuse a valid command."""
+    robot = _robot(publish_rate=10.0)
+    assert robot.drive(linear=1.0, duration=2.0, count=0)["status"] == "success"
+    assert robot.transport.publishes[0]["count"] == 20
+
+
+@pytest.mark.parametrize("param", ["linear", "angular"])
+def test_drive_accepts_a_numpy_scalar_velocity(param: str) -> None:
+    """A policy action element arrives as a NumPy scalar, not a Python float.
+
+    Refusing it would make the base reject the output of the very policies that
+    drive these robots, so the accepted domain is "any finite real scalar".
+    """
+    numpy = pytest.importorskip("numpy")
+    robot = _robot()
+    assert robot.drive(**{param: numpy.float32(-0.25)})["status"] == "success"
+    assert robot.transport.publishes[0]["fields"]["linear" if param == "linear" else "angular"] == {
+        "x" if param == "linear" else "z": pytest.approx(-0.25)
+    }
 
 
 def test_drive_refuses_overlong_duration_rather_than_truncating() -> None:

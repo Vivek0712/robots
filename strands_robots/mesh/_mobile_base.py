@@ -48,12 +48,17 @@ Safety semantics, stated once because they are now implemented once:
 
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Protocol, cast, runtime_checkable
 
 from strands import tool
 from strands.types.tools import AgentTool
+
+from strands_robots.utils import (
+    finite_number_error,
+    positive_finite_number_error,
+    positive_whole_number_error,
+)
 
 
 @runtime_checkable
@@ -107,14 +112,17 @@ class ActionCapable(Protocol):
         ...
 
 
-def positive_finite(label: str, value: Any) -> float:
+def positive_finite(label: str, value: Any, context: str = "MobileBaseRobot") -> float:
     """Return ``value`` as a float, raising ``ValueError`` unless positive finite.
 
-    ``bool`` is refused explicitly: ``True`` is a ``float``-compatible ``1`` and
-    would otherwise configure a limit of one silently.
+    Delegates the domain itself to :func:`~strands_robots.utils.positive_finite_number_error`,
+    the rule every other continuous knob in the codebase is measured against, so
+    a velocity clamp and a control-loop frequency cannot disagree about whether
+    ``True`` or a NumPy scalar is a usable number. This wrapper only converts
+    that shared verdict into the ``ValueError`` a constructor owes its caller.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{label} must be a positive finite number, got {value!r}")
+    if error := positive_finite_number_error(value, label, context):
+        raise ValueError(error)
     return float(value)
 
 
@@ -193,10 +201,11 @@ class MobileBaseRobot:
         self.cmd_vel_type = cmd_vel_type if cmd_vel_type is not None else transport.twist_type
         self.odom_type = odom_type
         self.scan_type = scan_type
-        self.max_linear = None if max_linear is None else positive_finite("max_linear", max_linear)
-        self.max_angular = None if max_angular is None else positive_finite("max_angular", max_angular)
-        self.max_duration = None if max_duration is None else positive_finite("max_duration", max_duration)
-        self.publish_rate = positive_finite("publish_rate", publish_rate)
+        context = type(self).__name__
+        self.max_linear = None if max_linear is None else positive_finite("max_linear", max_linear, context)
+        self.max_angular = None if max_angular is None else positive_finite("max_angular", max_angular, context)
+        self.max_duration = None if max_duration is None else positive_finite("max_duration", max_duration, context)
+        self.publish_rate = positive_finite("publish_rate", publish_rate, context)
         self.init_services = list(init_services or [])
         if self.init_services and not self.supports("service_call"):
             raise ValueError(
@@ -329,22 +338,31 @@ class MobileBaseRobot:
             contract; the order here is deliberate and pinned by tests -
             finite check, then ``duration``, then the handshake, then publish.
         """
-        for label, value in (("linear", linear), ("angular", angular)):
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-                return self._error(f"drive: {label} must be a finite number, got {value!r}")
-        if duration is not None:
-            if (
-                isinstance(duration, bool)
-                or not isinstance(duration, (int, float))
-                or not math.isfinite(duration)
-                or duration <= 0
-            ):
-                return self._error(f"drive: duration must be a positive finite number of seconds, got {duration!r}")
-            if self.max_duration is not None and duration > self.max_duration:
-                return self._error(
-                    f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
-                    "- issue shorter commands instead of one long hold"
-                )
+        # One domain rule per parameter, taken from the shared guards rather than
+        # restated here, so the accepted set cannot drift between this base and
+        # the rest of the codebase - and so the first refusable parameter is the
+        # one named, instead of a merged message the caller has to unpick.
+        request_error = (
+            finite_number_error(linear, "linear", "drive")
+            or finite_number_error(angular, "angular", "drive")
+            or (
+                positive_finite_number_error(duration, "duration", "drive")
+                if duration is not None
+                # ``duration`` supersedes ``count``, so ``count`` is the effective
+                # horizon only when no duration was given; refusing a ``count``
+                # this call never reads would reject a command that is valid.
+                # Left unchecked, ``count=0`` publishes nothing and reports
+                # success - a drive the caller believes happened.
+                else positive_whole_number_error(count, "count", "drive")
+            )
+        )
+        if request_error:
+            return self._error(request_error)
+        if duration is not None and self.max_duration is not None and duration > self.max_duration:
+            return self._error(
+                f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
+                "- issue shorter commands instead of one long hold"
+            )
         # Only after the request is known good may we touch the robot: an
         # invalid drive must not be what puts a vehicle into manual mode.
         if not self._enabled and self.init_services:

@@ -91,7 +91,75 @@ hatch run format            # ruff check --fix, ruff format
 4. All tests must pass, lint must be clean
 5. Open PR from your fork, address all review comments
 6. Track follow-up items as issues on the [project board](https://github.com/orgs/strands-labs/projects/2)
+
+   **Read the board with `PAT_TOKEN`, not the Actions `GITHUB_TOKEN`.** An
+   installation token that cannot see an organization project does not fail the
+   query - `issue.projectItems` comes back as an empty list, which is
+   indistinguishable from an issue nobody has tracked. The same one query, run
+   twice on #1762, #1768 and #1770:
+
+   | token | `issue.projectItems` |
+   |---|---|
+   | `GITHUB_TOKEN` | `[]` for all three |
+   | `PAT_TOKEN` | one item each; #1768 and #1770 already at `Done` |
+
+   Two things follow. First, adding an issue to the board is almost never the
+   missing step: all three items were created by `github-project-automation`
+   within three seconds of the issue itself, and the automation also moves them
+   to `Done` on close, so a merged fix needs no manual flip. What it cannot
+   infer is a status like `In review` while a PR is open - that is the part
+   worth setting by hand. Second, acting on the empty read looks harmless and
+   is not: `addProjectV2ItemById` is idempotent and returns the *existing*
+   item's id, so no duplicate ever appears and the false-empty read leaves no
+   trace - until a `Status` written on the strength of it silently overwrites a
+   value that was never read. Read a field before you set it, and treat an
+   empty project read as unknown rather than as absent.
 7. Squash merge into `main`
+8. **Verify a PR's state by reading it back - before and after you change it.**
+   Neither direction can be inferred:
+   - *Before.* Query `timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT])`
+     before closing or reopening. A lone `CLOSED_EVENT` is safe to re-apply; an
+     alternating run means something is undoing you, and a further flip only
+     lengthens it. #1667 - the retired `pr/consolidated-local-work` staging PR -
+     was closed and reopened **ten times in under fourteen hours**, each reopen 2-22
+     minutes after the preceding close, because independent contributors read
+     the same PR and reached opposite conclusions. Its extraction plan and
+     terminal state live in #1723; do not flip #1667 again.
+   - *After.* A `mergePullRequest` mutation can report `Pull Request is not
+     mergeable` on a merge that in fact landed - observed on #1756, where the
+     mutation returned that error and the squash was already on `main`. Confirm
+     with `state`/`merged`, or `git log origin/main`, before concluding a merge
+     failed and redoing the work.
+   And before merging, `reviewDecision: APPROVED` alone is not the gate: poll
+   `statusCheckRollup.state == SUCCESS` and `mergeStateStatus == CLEAN`
+   together, since `reviewDecision` flips before the checks finish.
+
+   Those three together are still not sufficient. They are all evaluated against
+   the base the branch was tested on, so none of them can see a **semantic**
+   conflict with a PR that landed on `main` after those checks ran. #1766 and
+   #1763 both edited `_recompile_preserving_state` for unrelated reasons: the
+   text merged with no conflict, #1763 stayed `MERGEABLE`/`CLEAN` with
+   `SUCCESS` checks after #1766 landed, and the squash still broke `main`,
+   because #1763 carried a *premise* test asserting the very defect #1766 had
+   just fixed. Neither PR's CI ever compiled the two together.
+
+   So when a second approved PR touches a file - especially a function - that a
+   just-merged PR also touched, do not merge on the green alone. Merge `main`
+   into the branch (or check out the merge locally) and run the affected tests
+   before issuing the mutation. A `CLEAN` status is a statement about text, not
+   about meaning. This is cheap: the check that would have caught the above was
+   one `pytest` invocation on two files.
+
+   Fixing forward beats reverting here - the two production changes were both
+   correct, and only an assertion and its justification were stale. Prefer a
+   narrow follow-up that re-pins the invalidated premise over reverting a
+   reviewed change. If a premise test is invalidated by a fix landing, replace it
+   rather than deleting it: the conclusion it supported usually still holds for a
+   different reason, and that reason is what the next reader needs.
+
+   The general rule behind all three: **a decision recorded only in a PR or
+   issue comment is not durable** - the next contributor will not read the same
+   comment. If a decision must survive, it belongs in this file.
 
 
 ## Registry conventions (strands_robots/registry/robots.json)

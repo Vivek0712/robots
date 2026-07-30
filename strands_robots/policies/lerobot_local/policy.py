@@ -20,12 +20,73 @@ from typing import Any
 import numpy as np
 import torch
 
-from .. import Policy, align_action_values
-from .embodiment import ZeroActionMonitor, diagnose_action_dim, hardware_pos_keys
+from ...utils import name_list_error
+from .. import Policy, align_action_values, chunk_count_error
+from .embodiment import ZeroActionMonitor, diagnose_action_dim, hardware_pos_keys, state_key_remedy
 from .processor import ProcessorBridge
 from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_hub
 
 logger = logging.getLogger(__name__)
+
+
+def _scalar_observation_keys(observation_dict: dict[str, Any]) -> list[str]:
+    """Observation keys that can carry a joint/state scalar, in observation order.
+
+    Excludes ``task`` (the instruction string) and any array with 2+ dimensions
+    (a camera frame). Both observation-to-batch paths derive their state-ordering
+    fallback from this, and the state-key diagnostics quote it back to the
+    caller, so all three must agree on what counts as a state key.
+
+    Args:
+        observation_dict: Raw strands/sim observation for this step.
+
+    Returns:
+        The candidate state keys, in the observation's own insertion order.
+    """
+    return [k for k, v in observation_dict.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)]
+
+
+def _state_key_cause(configured: list[str]) -> str:
+    """Name the likely cause of an all-missing ``robot_state_keys`` binding.
+
+    The diagnostic used to assert the generic-key cause unconditionally, which
+    holds only when the configured keys actually have that shape. A caller who
+    configured a NAMED set describing a different robot - the sim ``so101``
+    embodiment names ``'1'..'6'``, none of which a hardware observation's
+    ``'<motor>.pos'`` keys carry - was told their keys were auto-generated
+    ``joint_N`` placeholders they never configured, i.e. the diagnostic
+    mis-described the one mistake it exists to explain. Reading the configured
+    keys keeps the sentence true for either shape.
+
+    The placeholders are recognised by the exact shape the loader emits:
+    ``joint_0`` through ``joint_{n-1}``, consecutive and zero-based. A bare
+    ``joint_`` prefix is NOT enough to conclude a key was auto-generated - the
+    registry ships ``kinova_gen3``, whose real joint names are ``joint_1``
+    through ``joint_7`` (one-based), so a prefix test would tell a Kinova
+    operator that the arm's own joint names were placeholders it invented.
+    Matching the generator exactly keeps both callers' sentences true, and the
+    alternative sentence asserts nothing about genericity, so it holds for every
+    other set - named, one-based, reordered or mixed.
+
+    The loader records no flag when it fills the list in, so the shape is the
+    only signal available - and it is also the honest one, since a hand-written
+    ``joint_0..joint_N`` set carries exactly the ambiguity the generic sentence
+    describes.
+
+    Args:
+        configured: The ``robot_state_keys`` that matched nothing. Empty is
+            accepted (the caller's guard returns before then) and takes the
+            non-generic branch rather than vacuously claiming the shape.
+
+    Returns:
+        One sentence naming the cause, ending in a period.
+    """
+    if configured and configured == [f"{_GENERIC_STATE_KEY_PREFIX}{i}" for i in range(len(configured))]:
+        return (
+            "This usually means generic auto-generated keys (joint_0..joint_N) were "
+            "paired with a robot/sim that reports named joints."
+        )
+    return "The configured keys describe a different robot/sim than the one reporting this observation."
 
 
 def _declared_feature_is_image(name: str, feature: Any = None) -> bool:
@@ -82,6 +143,126 @@ def _merge_obs_rename(base: dict[str, str], override: dict[str, str | None] | No
         else:
             merged.pop(src, None)
     return merged
+
+
+# Prefix of the placeholder state keys the loader fills in when a checkpoint
+# declares a state/action dim but the caller named no joints: it emits the
+# consecutive zero-based run ``joint_0..joint_{n-1}``. The all-missing
+# diagnostic rebuilds that run to decide whether the generic-key explanation
+# applies, and the user-facing sentence quotes the shape, so the three must stay
+# in step. Real robots can also have joint_-prefixed names (the registry's
+# kinova_gen3 is joint_1..joint_7), which is why the run, not the prefix, is
+# what identifies a placeholder.
+_GENERIC_STATE_KEY_PREFIX = "joint_"
+
+_VELOCITY_SUFFIX = ".vel"
+
+
+def _undeclared_image_feature_error(
+    targets: list[str],
+    embodiment_name: str,
+    policy_config: dict[str, Any],
+) -> str | None:
+    """Report image features the embodiment feeds but ``image_keys`` withholds.
+
+    An explicit ``image_keys=`` is priority 1 in
+    :func:`~strands_robots.policies.lerobot_local.molmoact2.derive_image_keys`,
+    so it replaces the feature list that would otherwise be derived from the
+    embodiment's ``obs_rename`` targets. When the supplied list does not cover
+    those targets, the model is built declaring features the pipeline never
+    feeds, and ``EmbodimentMap.validate`` refuses the mismatch - but only after
+    the weight download, which is exactly what :meth:`LerobotLocalPolicy.preflight`
+    exists to get ahead of. Both inputs are in ``policy_config``, so the verdict
+    is available for free beforehand.
+
+    Scope: ``image_keys`` is honored only on the MolmoAct2 load path and is
+    documented as inert for every other policy type, so the check defers to
+    :func:`~strands_robots.policies.lerobot_local.molmoact2.is_molmoact2` rather
+    than refusing a list some other checkpoint would ignore. That predicate
+    short-circuits with no I/O when the caller declared ``policy_type``; in
+    auto-detect mode it reads ``config.json`` (cached, and returning ``None`` on
+    any failure), which the load path reads anyway.
+
+    Args:
+        targets: Image rename targets the embodiment feeds, as collected by
+            :meth:`LerobotLocalPolicy.preflight`.
+        embodiment_name: Resolved embodiment name, for the message.
+        policy_config: Provider kwargs (``image_keys``, ``policy_type``,
+            ``pretrained_name_or_path``, ``embodiment``, ...).
+
+    Returns:
+        The refusal message, or ``None`` when the configuration is consistent
+        (no explicit ``image_keys``, a non-MolmoAct2 checkpoint, or every target
+        declared).
+    """
+    image_keys = policy_config.get("image_keys")
+    if not image_keys:
+        # Not supplied: the feature list is derived FROM the embodiment, so the
+        # two sides cannot diverge.
+        return None
+
+    from . import molmoact2 as _molmoact2
+
+    if not _molmoact2.is_molmoact2(
+        policy_config.get("pretrained_name_or_path") or "", policy_config.get("policy_type")
+    ):
+        return None
+
+    # Forwarded verbatim rather than through list(): derive_image_keys owns the
+    # shape contract, and coercing here first would split a bare string into
+    # per-character names before it can be reported as one.
+    declared = _molmoact2.derive_image_keys(image_keys, policy_config.get("embodiment"))
+    undeclared = [t for t in targets if t not in set(declared)]
+    if not undeclared:
+        return None
+
+    return (
+        f"Embodiment {embodiment_name!r} feeds image feature(s) {undeclared}, but the explicit "
+        f"image_keys={list(declared)} does not declare them, so the model would be built without "
+        f"the inputs the embodiment routes and its configuration is refused after the weight "
+        f"download. Either:\n"
+        f"  (a) drop image_keys= so the features are derived from the embodiment "
+        f"(-> {list(targets)}), or\n"
+        f"  (b) pass image_keys={list(targets)!r} to declare what the embodiment feeds, or\n"
+        f"  (c) pass policy_config={{'obs_rename_override': {{'<your_camera_name>': "
+        f"{declared[0]!r}}}}} for EVERY key you declared, so each declared feature is a "
+        f"rename target."
+    )
+
+
+def _drop_velocity_siblings(scalar_keys: list[str]) -> list[str]:
+    """Drop each ``<joint>.vel`` whose ``<joint>`` position companion is present.
+
+    Used only for the OBSERVATION-DERIVED state ordering (see
+    :meth:`LerobotLocalPolicy._resolve_state_order`), which is built from the
+    observation's own insertion order. The MuJoCo backend emits a velocity
+    sibling beside every joint position (``simulation/mujoco/rendering.py``:
+    ``obs[jnt_name] = qpos`` then ``obs[f"{jnt_name}.vel"] = qvel``), so that
+    order alternates ``[pos0, vel0, pos1, vel1, ...]``. Feeding it to a policy
+    trained on positions puts a velocity in every other slot of
+    ``observation.state`` and, once truncated to the model's state dim, drops
+    the trailing joints entirely - a wrong state vector with no error raised.
+    The producer documents ``<name>.vel`` as an ADDITIVE key that position-only
+    consumers are unaffected by; this restores that contract here.
+
+    A ``.vel`` key with NO position companion is KEPT, because some embodiments
+    legitimately declare velocity state and dropping it would corrupt those
+    instead: ``embodiments.json`` gives LeKiwi body-frame base velocities
+    ``x.vel`` / ``y.vel`` / ``theta.vel`` with no ``x`` / ``y`` / ``theta``
+    position key. Pairing is therefore decided per key, not by suffix alone.
+
+    Explicitly configured ``robot_state_keys`` are NOT filtered - an operator
+    naming ``elbow.vel`` is stating the model's input, and this only cleans up
+    an ordering inferred from whatever the observation happened to contain.
+
+    Args:
+        scalar_keys: Candidate state keys in observation insertion order.
+
+    Returns:
+        The same list, order preserved, minus the paired velocity siblings.
+    """
+    present = set(scalar_keys)
+    return [k for k in scalar_keys if not (k.endswith(_VELOCITY_SUFFIX) and k[: -len(_VELOCITY_SUFFIX)] in present)]
 
 
 # Fallback control rate used ONLY when RTC runs without the runtime having
@@ -206,7 +387,11 @@ class LerobotLocalPolicy(Policy):
             call. Defaults to 1 (closed-loop). When left at the default,
             it is auto-set from the loaded model's ``config.n_action_steps``
             (the model's trained open-loop chunk size) if that exceeds 1;
-            pass an explicit value > 1 to override the auto-detection.
+            pass an explicit value > 1 to override the auto-detection. Must be
+            a positive ``int`` - it bounds a slice of the action chunk, and any
+            other value both suppresses that auto-detection (which only fires
+            at the default) and is floored to 1 when the horizon is read, so it
+            is refused here instead.
         use_processor: Whether to load the model's processor pipeline.
         processor_overrides: Dict of overrides for processor pipeline steps.
         tokenizer_max_length: Max token length for VLA language tokenization.
@@ -269,6 +454,16 @@ class LerobotLocalPolicy(Policy):
         self.revision = revision
         self.policy_type = policy_type
         self.requested_device = device
+        # Validated here, where the caller's value arrives and before any
+        # checkpoint is downloaded (``_load_model`` below): the read path
+        # (``execution_horizon``) floors it to 1, which for this provider
+        # ALSO silently forfeits the auto-adoption of the checkpoint's
+        # trained chunk length, since _auto_detect_actions_per_step reads
+        # any value other than the default 1 as a horizon the caller pinned
+        # deliberately. See ``chunk_count_error``.
+        error = chunk_count_error(actions_per_step, "actions_per_step", "lerobot_local")
+        if error:
+            raise ValueError(error)
         self.actions_per_step = actions_per_step
         self.use_processor = use_processor
         self.processor_overrides = processor_overrides
@@ -336,6 +531,11 @@ class LerobotLocalPolicy(Policy):
         # dedicated load path (see lerobot_local.molmoact2). These are inert
         # for every other policy type.
         self._molmoact2_norm_tag = norm_tag
+        # Refused here rather than at first use so a shape mistake is reported
+        # before the multi-minute weight download below, and before a bare
+        # string is read one feature per character.
+        if image_keys and (err := name_list_error(image_keys, "image_keys", "LerobotLocalPolicy")):
+            raise ValueError(err)
         self._molmoact2_image_keys = image_keys
         self._molmoact2_inference_action_mode = inference_action_mode
 
@@ -1199,10 +1399,23 @@ class LerobotLocalPolicy(Policy):
         ``obs_rename`` first, so an explicit override that maps a present camera
         onto the feature satisfies the check.
 
+        The converse is also checked: an explicit ``image_keys=`` replaces the
+        feature list that would be derived from those same rename targets (it is
+        priority 1 in ``derive_image_keys``), so a list that does not cover them
+        builds a model without the inputs the embodiment routes. That mismatch is
+        refused by ``EmbodimentMap.validate`` only after the weight download, and
+        both sides of it are already in ``policy_config`` here - see
+        :func:`_undeclared_image_feature_error`, which also explains why the check
+        applies to the MolmoAct2 load path only.
+
         No-op when no ``embodiment`` is configured (the policy then uses the
         legacy heuristic camera routing, which this hook cannot reason about),
         or when the embodiment name/spec cannot be resolved (``create_policy``
         surfaces that error authoritatively).
+
+        The parameter-shape guards below (``actions_per_step``, ``image_keys``)
+        run before that early-return, because both are honored whether or not an
+        embodiment is configured.
 
         Args:
             observation_keys: Runtime observation keys (joint + camera names).
@@ -1210,9 +1423,31 @@ class LerobotLocalPolicy(Policy):
                 ``obs_rename_override``, ...).
 
         Raises:
-            ValueError: When a model image feature has no satisfiable source
-                camera key in ``observation_keys``.
+            ValueError: When ``actions_per_step`` is not a positive whole number,
+                when ``image_keys`` is not a list of distinct non-blank names,
+                when a model image feature has no satisfiable source camera key
+                in ``observation_keys``, or when an explicit ``image_keys``
+                withholds a feature the embodiment feeds.
         """
+        # Checked before the embodiment early-return below, so a chunk count
+        # the consumer cannot execute is refused for every configuration rather
+        # than only for the ones that declare an embodiment. Running here (and
+        # not only in ``__init__``) is what turns it into a structured error
+        # from the rollout entry point instead of a raise, and refuses it before
+        # the weight download rather than after.
+        if "actions_per_step" in policy_config:
+            error = chunk_count_error(policy_config["actions_per_step"], "actions_per_step", "lerobot_local")
+            if error:
+                raise ValueError(error)
+
+        # Same reasoning for the image_keys shape: it is honored whether or not
+        # an embodiment is configured, so a shape mistake must be refused on
+        # both paths. Ordered after the chunk-count guard so the parameter error
+        # that landed first keeps its existing precedence.
+        supplied_image_keys = policy_config.get("image_keys")
+        if supplied_image_keys and (err := name_list_error(supplied_image_keys, "image_keys", "preflight")):
+            raise ValueError(err)
+
         spec = policy_config.get("embodiment")
         if spec is None:
             return
@@ -1235,6 +1470,13 @@ class LerobotLocalPolicy(Policy):
                 targets.setdefault(dst, []).append(src)
         if not targets:
             return
+
+        # A declared-feature contradiction is independent of the runtime camera
+        # names and no camera rename can resolve it, so it is reported before the
+        # source-availability check below.
+        undeclared_error = _undeclared_image_feature_error(sorted(targets), embodiment.name, policy_config)
+        if undeclared_error:
+            raise ValueError(undeclared_error)
 
         obs = set(observation_keys)
         unsatisfied = {dst: srcs for dst, srcs in targets.items() if not any(s in obs for s in srcs)}
@@ -2028,31 +2270,51 @@ class LerobotLocalPolicy(Policy):
             fall back to the observation's own scalar keys so the state is
             populated rather than silently dropped.
 
+        The cause that message names is read from the configured keys
+        (:func:`_state_key_cause`) rather than asserted, so a caller who
+        configured a NAMED set describing a different robot is not told their
+        keys were auto-generated placeholders they never configured. The remedy
+        is chosen from the observation (:func:`state_key_remedy`), so the two
+        halves of the message answer the two different questions the caller has.
+
+        Any ordering derived from the observation (both the fallback above and
+        the no-``robot_state_keys`` case) is position-only: a ``<joint>.vel``
+        sibling of a present ``<joint>`` is dropped by
+        :func:`_drop_velocity_siblings`, so a MuJoCo observation does not
+        interleave velocities into ``observation.state``. An unpaired ``.vel``
+        key (LeKiwi's base velocities) is kept, and an explicitly configured
+        ``robot_state_keys`` ordering is returned untouched.
+
         Args:
             observation_dict: Raw strands/sim observation for this step.
             scalar_keys: Non-image, non-``task`` scalar keys present in the
                 observation, used as the fallback ordering.
 
         Returns:
-            The ordered keys to pull scalar joint values from.
+            The ordered keys to pull scalar joint values from - the configured
+            ``robot_state_keys`` verbatim, or an observation-derived ordering
+            with paired velocity siblings removed.
 
         Raises:
             ValueError: When ``strict_keys`` is set and no configured key
                 matches the observation.
         """
         if not self.robot_state_keys:
-            return scalar_keys
+            return _drop_velocity_siblings(scalar_keys)
         if any(k in observation_dict for k in self.robot_state_keys):
             return self.robot_state_keys
         shown = self.robot_state_keys[:8]
         ellipsis = "..." if len(self.robot_state_keys) > 8 else ""
         msg = (
             f"None of the configured robot_state_keys {shown}{ellipsis} are present "
-            f"in the observation. Observed joint/state keys: {scalar_keys}. This "
-            "usually means generic auto-generated keys (joint_0..joint_N) were "
-            "paired with a robot/sim that reports named joints. Pass "
-            "embodiment='<name>' (e.g. embodiment='so101') or call "
-            "set_robot_state_keys([...]) with the robot's actual joint names."
+            f"in the observation. Observed joint/state keys: {scalar_keys}. "
+            # Cause read from the configured keys, so the sentence does not
+            # assert a key shape they do not have.
+            + _state_key_cause(self.robot_state_keys)
+            + " "
+            # Remedy chosen from the observation, so the advice cannot name an
+            # embodiment whose state_keys would land back on this same guard.
+            + state_key_remedy(scalar_keys)
         )
         if self.strict_keys:
             raise ValueError("strict_keys=True: " + msg)
@@ -2063,7 +2325,7 @@ class LerobotLocalPolicy(Policy):
         if not self._state_key_mismatch_warned:
             logger.warning(msg)
             self._state_key_mismatch_warned = True
-        return scalar_keys
+        return _drop_velocity_siblings(scalar_keys)
 
     def _collect_state_values(self, observation_dict: dict[str, Any], order: list[str]) -> list[float]:
         """Pull the joint-state vector from ``observation_dict`` in ``order``.
@@ -2126,8 +2388,10 @@ class LerobotLocalPolicy(Policy):
                 f"observation: {shown}{ellipsis}. Present joints keep their index and the "
                 "missing dims are zero-filled in place, but the sim/robot does not report "
                 "those joints - commonly a mimic/tendon gripper whose actuator name differs "
-                "from the observation's finger-joint names. Pass embodiment='<name>' or call "
-                "set_robot_state_keys([...]) with names the observation actually contains."
+                "from the observation's finger-joint names. "
+                # Same registry-checked remedy as the all-missing guard, so one
+                # rule serves both degradations.
+                + state_key_remedy(_scalar_observation_keys(observation_dict))
             )
             if self.strict_keys:
                 raise ValueError("strict_keys=True: " + msg)
@@ -2232,9 +2496,7 @@ class LerobotLocalPolicy(Policy):
             used_feats.add(feat)
 
         # 2) Collect scalar joint values into observation.state.
-        scalar_keys = [
-            k for k, v in observation_dict.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)
-        ]
+        scalar_keys = _scalar_observation_keys(observation_dict)
         # Resolve the joint-state ordering, raising/warning loudly when the
         # configured robot_state_keys cannot describe this observation (the
         # generic joint_0..N vs named-joint mismatch) instead of silently
@@ -2559,9 +2821,7 @@ class LerobotLocalPolicy(Policy):
         # raises (strict_keys) or warns + falls back to the observation's own
         # scalar keys, instead of silently dropping observation.state and
         # running the policy open-loop (see _resolve_state_order).
-        scalar_keys = [
-            k for k, v in observation_dict.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)
-        ]
+        scalar_keys = _scalar_observation_keys(observation_dict)
         order = self._resolve_state_order(observation_dict, scalar_keys)
 
         # Collect state values index-aligned with the resolved order. A key in

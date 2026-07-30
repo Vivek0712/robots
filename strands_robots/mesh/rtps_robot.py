@@ -93,6 +93,10 @@ class RtpsRobot(MobileBaseRobot):
         cmd_vel_type: Interface type for ``cmd_vel_topic`` (default
             ``geometry_msgs/msg/Twist``).
         publish_rate: Default rate (Hz) for multi-message :meth:`drive` calls.
+            Must be > 0 and finite: :meth:`drive` multiplies it by ``duration``
+            to size the message burst and ``use_rtps`` publishes at ``1 / rate``,
+            so a non-positive rate removes the pacing entirely rather than
+            slowing it. Raises ``ValueError`` at construction otherwise.
         max_linear: Optional linear-velocity clamp (m/s). Unset by default -
             an RTPS peer drives arbitrary third-party robots whose limits this
             class cannot know.

@@ -139,6 +139,19 @@ malformed names from reaching the ROS 2 client library. Backend and timeout
 failures are returned as structured `{"status": "error"}` results rather than
 raised exceptions.
 
+The numeric options an action consumes are checked in the same place, ahead of
+the backend probe, so a caller mistake reports identically whether or not a ROS 2
+distro is sourced and a refusal happens before a publisher joins the graph:
+
+| Option | Consumed by | Accepted values |
+|--------|-------------|-----------------|
+| `count` | `echo`, `publish` | a positive integer - it is a `range()` bound, so `0` sends nothing and `2.7` or `"3"` cannot be honored |
+| `rate` | `publish` | a positive finite number of Hz - the inter-message period is `1 / rate`, so `0`, a negative value, `nan` and `inf` all leave the burst unthrottled instead of paced |
+| `timeout` | `echo`, `service_call`, `action_send_goal` | a positive finite number of seconds - `0` and negatives wait for nothing, `inf` never expires |
+
+An option the requested action never reads is not second-guessed:
+`use_ros(action="status", count=-1)` still reports the backend.
+
 ## Sim bridge: publish a simulation on a ROS 2 domain
 
 The simulator can advertise its own live state on ROS 2. Construct any
@@ -298,13 +311,17 @@ agent("drive forward for two seconds, then tell me the pose")
 ```
 
 The bridge is intentionally thin: every method forwards to `use_ros`, so it
-inherits the same in-process rclpy backend and input validation. Construct it
-freely without a ROS 2 environment present - errors surface only when a method
-is actually called and `rclpy` is unavailable.
+inherits the same in-process rclpy backend and its topic/type validation. The
+parameters `use_ros` never sees are checked by the bridge itself - `drive`
+reports an error result without publishing when a velocity is not finite, a
+`duration` is not positive and finite, or a message `count` is not a positive
+whole number, and `publish_rate` is refused at construction. Construct it freely
+without a ROS 2 environment present - errors surface only when a method is
+actually called and `rclpy` is unavailable.
 
 | Method | ROS 2 action | Notes |
 |--------|--------------|-------|
-| `drive(linear, angular, duration=, count=)` | publish `Twist` to `cmd_vel_topic` | `duration` holds the command at `publish_rate` Hz |
+| `drive(linear, angular, duration=, count=)` | publish `Twist` to `cmd_vel_topic` | `duration` holds the command at `publish_rate` Hz; finite velocities, `duration > 0`, `count >= 1` - anything else is refused without publishing |
 | `stop()` | publish zero `Twist` | never gated on anything |
 | `get_pose()` | echo `odom_topic` | |
 | `get_scan()` | echo `scan_topic` | tool exposed only when a `scan_topic` is wired |
@@ -324,6 +341,13 @@ Everything below therefore holds identically for any transport:
 
 - Non-finite `linear` / `angular` / `duration` are refused. `nan` passes
   silently through a `min`/`max` clamp, so it has to be caught before clamping.
+  The accepted domain is the shared one used by every other numeric knob in the
+  package, so a velocity and a control-loop frequency agree on what a usable
+  number is - a NumPy scalar from a policy action is accepted, a `bool` is not.
+- `count` is the publish horizon when no `duration` is given, and must be a
+  positive whole number. `count=0` would otherwise publish nothing and report
+  success - a drive the caller believes happened. A `count` a call never reads
+  (because `duration` supersedes it) is not refused.
 - `duration` must be positive and finite, and within `max_duration` when the
   platform sets one. An over-long hold is refused, never silently truncated -
   and refused *before* any side effect, so an invalid request cannot be what

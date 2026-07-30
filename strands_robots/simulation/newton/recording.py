@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from strands_robots.simulation.models import registered
 from strands_robots.simulation.recording import (
     DatasetRecordingMixin,
     dataset_recording_option_error,
@@ -128,6 +129,13 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
         # probe so the same caller mistake reports the same way regardless of
         # which optional extras this install has.
         if error := dataset_recording_option_error("start_recording", fps):
+            return error
+
+        # Reject a rate a rollout already in flight is not capturing at. The
+        # rollout entry points cover the record-then-rollout ordering; this is
+        # the same disagreement with the calls the other way round, refused
+        # before any dataset is created so a refusal leaves nothing on disk.
+        if error := self._validate_recording_start_rate(fps, "start_recording"):
             return error
 
         _DatasetRecorder: Any = None
@@ -356,7 +364,7 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
         from strands_robots.simulation.policy_runner import _extract_frame_ndarray
 
         world = self._world
-        if world is None or robot_name not in world.robots:
+        if world is None or not registered(world.robots, robot_name):
             return None
 
         robot = world.robots[robot_name]

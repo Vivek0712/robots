@@ -5,7 +5,13 @@ A :class:`RosBridgedRobot` wraps a ROS 2 mobile base (or any robot exposing a
 its state with the same ``Agent(tools=[robot])`` pattern used for simulated and
 hardware robots. All ROS 2 I/O is forwarded through the
 :func:`strands_robots.tools.use_ros.use_ros` tool, so the bridge stays thin and
-inherits ``use_ros``'s in-process ``rclpy`` backend and input validation.
+inherits ``use_ros``'s in-process ``rclpy`` backend and its topic/type
+validation. The parameters ``use_ros`` never sees are validated here: a
+:meth:`RosBridgedRobot.drive` command whose velocity, hold duration or message
+count cannot be honored is refused without publishing anything, and a
+:meth:`RosBridgedRobot.navigate_to` goal whose pose cannot be honored is refused
+without sending anything - the goal coordinates travel inside the request body,
+which ``use_ros`` forwards verbatim.
 
 The drive contract, its safety semantics, and the ``tools`` property live in
 :class:`~strands_robots.mesh._mobile_base.MobileBaseRobot`; this module supplies
@@ -43,6 +49,9 @@ from strands.types.tools import AgentTool
 
 from strands_robots.mesh._mobile_base import ActionCapable, MobileBaseRobot
 from strands_robots.tools.use_ros import use_ros
+from strands_robots.utils import (
+    finite_number_error,
+)
 
 _TWIST_TYPE = "geometry_msgs/msg/Twist"
 _NAV_ACTION_TYPE = "nav2_msgs/action/NavigateToPose"
@@ -117,6 +126,10 @@ class RosBridgedRobot(MobileBaseRobot):
         scan_type: Interface type of ``scan_topic``. Optional - resolved from
             the live graph when omitted.
         publish_rate: Default rate (Hz) for multi-message :meth:`drive` calls.
+            Must be > 0 and finite: :meth:`drive` multiplies it by ``duration``
+            to size the message burst and ``use_ros`` publishes at ``1 / rate``,
+            so a non-positive rate removes the pacing entirely rather than
+            slowing it. Raises ``ValueError`` at construction otherwise.
         max_linear: Optional linear-velocity clamp (m/s). Unset by default: a
             generic ROS 2 base declares no speed limit to this bridge, and
             inventing one would silently cap an existing caller.
@@ -212,18 +225,44 @@ class RosBridgedRobot(MobileBaseRobot):
         cancels the goal so the robot does not keep navigating unattended.
 
         Args:
-            x: Goal position x in ``frame_id`` (meters).
-            y: Goal position y in ``frame_id`` (meters).
-            yaw: Goal heading in radians, encoded as a planar quaternion.
+            x: Goal position x in ``frame_id`` (meters). Must be a finite
+                number; both signs are valid.
+            y: Goal position y in ``frame_id`` (meters). Must be a finite
+                number; both signs are valid.
+            yaw: Goal heading in radians, encoded as a planar quaternion. Must
+                be a finite number; both signs are valid (negative turns the
+                other way).
             frame_id: Frame the goal pose is expressed in (default ``map``).
             timeout: End-to-end budget in seconds for the navigation goal.
+                Forwarded to ``use_ros``, which refuses a non-positive or
+                non-finite budget.
 
         Returns:
             The ``use_ros`` action result dict (goal status, result, feedback
-            samples), or an error result when no ``nav_action`` was configured.
+            samples), or an ``{"status": "error"}`` result when no
+            ``nav_action`` was configured or when a pose component cannot be
+            honored - in which case no goal is sent.
         """
         if not self.nav_action:
             return self._error("navigate_to: no nav_action configured for this robot")
+        # The goal pose is the part of this call ``use_ros`` never validates: it
+        # checks the action name and interface type, but the coordinates travel
+        # inside ``fields`` and are serialized into the request verbatim. A
+        # non-finite coordinate is a valid IEEE-754 float64 on the wire, so the
+        # goal is accepted and handed to a planner that cannot resolve it, and
+        # ``yaw`` additionally reaches ``math.sin``/``math.cos``, which raise a
+        # bare ``ValueError`` for an infinite angle - out of a method whose
+        # contract is a result dict, and out of the bound ``navigate_*`` tool.
+        # ``timeout`` does reach ``use_ros`` and is guarded there. This stays on
+        # the subclass because ``nav_action`` is a ROS 2 concept: no other
+        # transport has a goal-level navigation surface to guard.
+        pose_error = (
+            finite_number_error(x, "x", "navigate_to")
+            or finite_number_error(y, "y", "navigate_to")
+            or finite_number_error(yaw, "yaw", "navigate_to")
+        )
+        if pose_error:
+            return self._error(pose_error)
         half = 0.5 * float(yaw)
         fields = {
             "pose": {

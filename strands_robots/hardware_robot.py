@@ -204,6 +204,88 @@ def _build_camera_config(camera_name: str, config: Any) -> Any:
         ) from exc
 
 
+def _normalize_max_relative_target(value: Any, robot_type: str) -> float | dict[str, float] | None:
+    """Validate and normalize the ``max_relative_target`` servo safety clamp.
+
+    ``max_relative_target`` caps how far each commanded goal position may move
+    from the joint's present position. It is the only per-command travel limit
+    on the hardware path, so a value the driver cannot honor is a safety defect
+    rather than a cosmetic one - and lerobot's own consumer,
+    ``lerobot.robots.utils.ensure_safe_goal_position``, honors a narrower set of
+    values than the config dataclass accepts:
+
+    - a non-finite limit disables the clamp with no signal. ``min(diff, nan)``
+      and ``max(diff, -nan)`` both return ``diff`` unchanged, so the caller
+      believes travel is limited while every goal is applied in full.
+    - a negative limit inverts it. ``min(diff, -c)`` then ``max(..., c)``
+      resolves to ``present + c`` for any requested goal, turning the clamp
+      into a fixed-magnitude step generator that ignores the policy.
+    - a zero limit discards every commanded motion, so the rollout is a no-op
+      reported as success - the same outcome the rollout horizon guards refuse
+      for ``duration`` and ``control_substeps``.
+    - an ``int`` limit is refused outright at the first servo command, with a
+      bare ``TypeError(10)`` naming neither the parameter nor the reason: that
+      consumer dispatches on ``isinstance(value, float)``, while both the
+      dataclass field (annotated ``float | dict[str, float] | None``) and PEP
+      484's numeric tower accept an ``int``. So the one spelling a type checker
+      is happiest with is the one that cannot reach the motors.
+
+    Normalizing to ``float`` is therefore load-bearing, not cosmetic: it is what
+    lets a type-correct ``max_relative_target=10`` reach the bus at all.
+
+    Per-motor mapping values are held to the same domain. Their KEYS are not
+    checked here - the motor names are known only once the bus is connected, so
+    a mismatch is left to the driver's own ``keys must match`` refusal.
+
+    Args:
+        value: The caller-supplied limit: ``None`` to leave the clamp disabled,
+            a positive finite number, or a mapping of motor name to one.
+        robot_type: The lerobot robot type, named in the error so a fleet
+            reports which arm was misconfigured.
+
+    Returns:
+        ``None`` unchanged, or the limit with every magnitude coerced to
+        ``float``.
+
+    Raises:
+        ValueError: If the limit is not one the driver can honor.
+    """
+    param = "max_relative_target"
+    context = f"Robot(robot_type={robot_type!r})"
+    advice = (
+        f"{param} caps how far each commanded goal position may move from the present "
+        f"position, so only a finite positive limit can be honored. Omit it (or pass "
+        f"None) to leave the clamp disabled."
+    )
+
+    if value is None:
+        return None
+
+    if isinstance(value, Mapping):
+        if not value:
+            raise ValueError(
+                f"{context}: {param} must not be an empty mapping. A per-motor mapping has to name "
+                f"every motor the driver reads, so an empty one is refused at the first servo "
+                f"command. {advice}"
+            )
+        normalized: dict[str, float] = {}
+        for key, limit in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"{context}: {param} keys must be motor names (str), got "
+                    f"{type(key).__name__}: {key!r}. A non-name key can never match a motor, so "
+                    f"the mapping is refused at the first servo command."
+                )
+            if err := positive_finite_number_error(limit, f"{param}[{key!r}]", context):
+                raise ValueError(f"{err} {advice}")
+            normalized[key] = float(limit)
+        return normalized
+
+    if err := positive_finite_number_error(value, param, context):
+        raise ValueError(f"{err} {advice}")
+    return float(value)
+
+
 @functools.cache
 def _ensure_lerobot_robots_registered() -> None:
     """Import every robot driver subpackage so RobotConfig is populated.
@@ -442,6 +524,25 @@ class Robot(TeleopMixin, AgentTool):
         self._task_state = RobotTaskState()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{tool_name}_executor")
         self._shutdown_event = threading.Event()
+        # A stop request that arrived for the current task. An Event rather
+        # than a task-state field because ``stop_task`` is called from the
+        # agent-tool thread (and from the mesh dispatch) while the rollout runs
+        # on the executor thread, and because ``_task_state.status`` cannot
+        # carry the request: ``_execute_task_async`` writes ``RUNNING`` over
+        # whatever the status held once the bring-up finishes, so a stop
+        # recorded only as a status is lost.
+        self._stop_requested = threading.Event()
+        # Admission control for the motors bus. The arm has one command bus and
+        # this class already models one rollout at a time (a single-slot
+        # ``_task_state``, ``max_workers=1``), but ``_task_state.status`` cannot
+        # decide admission: ``_execute_task_async`` only reaches ``RUNNING``
+        # after ``_connect_robot`` and the policy build, so for the whole
+        # bring-up window a second task would read a non-running status. The
+        # claim is taken before that window opens and released when the rollout
+        # ends, and the lock makes the check-and-claim atomic so two callers
+        # racing at the same instant cannot both be admitted.
+        self._task_admission = threading.Lock()
+        self._task_claimed = False
 
         # Mesh attributes - populated by the Robot() factory after init.
         # Plain attributes (not properties) so test code can swap a fake mesh
@@ -840,6 +941,20 @@ class Robot(TeleopMixin, AgentTool):
         Each entry of ``cameras`` follows the same contract, resolved against
         the fields of lerobot's ``OpenCVCameraConfig`` -- see
         :func:`_build_camera_config`.
+
+        Forwarded values are otherwise passed through as given, because their
+        accepted domains are robot-specific. ``max_relative_target`` is the
+        exception: it is the per-command servo travel limit, and the driver
+        honors a narrower domain than the dataclass accepts, so it is validated
+        and normalized here -- see :func:`_normalize_max_relative_target`.
+
+        Raises:
+            ValueError: If a kwarg is unknown to both the cross-robot allowlist
+                and the resolved dataclass, if a ``cameras`` entry is malformed,
+                if ``max_relative_target`` is not a limit the driver can honor,
+                or if the resolved config class refuses the assembled values.
+            TypeError: If lerobot resolves ``robot_type`` to a non-dataclass
+                config class, which would make kwarg filtering unsafe.
         """
         # ``lerobot`` is already a hard dep at this point (``_initialize_robot``
         # imports it eagerly). Importing the camera + config modules here is
@@ -984,6 +1099,18 @@ class Robot(TeleopMixin, AgentTool):
                 f"(If this is a typo, fix it.)"
             )
 
+        # ``max_relative_target`` is the per-command servo travel limit, and the
+        # driver honors a narrower domain than this dataclass accepts - see
+        # ``_normalize_max_relative_target``. Validated after both forwarding
+        # loops and the kwarg-name gate, so it is checked exactly when it is the
+        # effective knob: a robot whose config does not declare the field never
+        # reads it, and refusing a value that robot would drop anyway would
+        # report an error for a parameter it has no opinion about.
+        if "max_relative_target" in config_data:
+            config_data["max_relative_target"] = _normalize_max_relative_target(
+                config_data["max_relative_target"], robot_type
+            )
+
         try:
             return ConfigClass(**config_data)
         except (TypeError, ValueError) as e:
@@ -1007,23 +1134,103 @@ class Robot(TeleopMixin, AgentTool):
 
         return create_policy(policy_provider, **policy_config)
 
-    def _rollback_half_open_connect(self) -> None:
-        """Close the half-open port a failed connect can leave behind.
+    def _close_open_devices(self) -> None:
+        """Close every device that is open, one at a time and best-effort.
 
-        lerobot's ``MotorsBus.connect()`` opens the serial port *before* the
-        motor handshake, so a failed handshake (e.g. an unpowered bus) leaves
-        ``is_connected`` True while fire-and-forget writes to the dead bus
-        keep "succeeding". Closing the port makes the next attempt retry the
-        connect and keep surfacing the failure. ``disable_torque=False``: the
-        handshake already failed, so the default disconnect's torque write
-        would only raise again (before ``closePort``) and leave the port open.
+        Two callers need exactly this, both for a device set that is only
+        *partly* open -- the state lerobot's own ``Robot.disconnect()`` cannot
+        recover, because it is gated on ``is_connected``
+        (``bus.is_connected and all(cam.is_connected ...)``):
+
+        - **A failed connect.** lerobot's ``MotorsBus.connect()`` opens the
+          serial port *before* the motor handshake, so a failed handshake
+          (e.g. an unpowered bus) leaves ``is_connected`` True while
+          fire-and-forget writes to the dead bus keep "succeeding". A robot's
+          ``connect()`` then opens its cameras one at a time
+          (``for cam in self.cameras.values(): cam.connect()``) with no
+          cleanup of its own, so a camera that fails to open leaves every
+          camera ahead of it in the set still streaming. Either leak makes the
+          *next* attempt unrecoverable rather than merely failing: the retry
+          raises ``DeviceAlreadyConnectedError`` on a device that is perfectly
+          healthy, which masks the device that actually failed.
+        - **Teardown.** ``cleanup()`` prefers the driver's own ``disconnect()``
+          while the robot is fully connected, and falls back here when it is
+          not -- or when that disconnect raised partway and abandoned the
+          devices behind it.
+
+        Each device is closed independently: one close that raises must
+        neither mask the caller's original error nor stop the remaining
+        devices from being closed, which is the failure mode lerobot's single
+        unguarded disconnect loop has.
         """
         bus = getattr(self.robot, "bus", None)
         try:
             if bus is not None and getattr(bus, "is_connected", False):
+                # disable_torque=False: this runs only where the driver's own
+                # disconnect is unavailable, would be refused, or has already
+                # raised, so a torque write here would most likely raise again
+                # -- before ``closePort``, leaving the port open, which is the
+                # one outcome this method exists to prevent.
                 bus.disconnect(disable_torque=False)
         except Exception:  # noqa: BLE001 - best-effort cleanup
-            logger.debug("%s post-connect-failure port close failed", self.tool_name_str)
+            logger.debug("%s port close failed", self.tool_name_str)
+
+        # lerobot builds ``cameras`` with ``make_cameras_from_configs``, whose
+        # contract is ``dict[str, Camera]``; anything else is not a camera set
+        # this rollback can walk.
+        cameras = getattr(self.robot, "cameras", None)
+        for name, camera in cameras.items() if isinstance(cameras, Mapping) else ():
+            try:
+                # A camera that failed to open already released its own
+                # resources in ``connect()``; disconnecting it again would
+                # raise ``DeviceNotConnectedError``.
+                if getattr(camera, "is_connected", False):
+                    camera.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort, and per camera so
+                # one stuck camera cannot keep the rest of the set open.
+                logger.debug(
+                    "%s camera %s close failed",
+                    self.tool_name_str,
+                    name,
+                )
+
+    def _disconnect_devices(self) -> None:
+        """Close the physical devices this robot holds: motors bus and cameras.
+
+        Every other teardown branch in ``cleanup()`` releases a resource the
+        *library* owns -- the teleop loop, the task executor, the mesh client,
+        the ROS bridge. The devices are the only resources that are physical,
+        and they were the only ones left open: a serial port is exclusive on
+        Linux and macOS, so a second process (or a re-constructed ``Robot`` in
+        this one) could not open the same ``/dev/tty*``, which made the
+        documented recovery for a wedged arm -- tear down and reconnect --
+        unavailable without exiting the process. Each camera also holds a
+        ``/dev/video*`` node and a read thread.
+
+        The driver's own ``disconnect()`` is preferred while it is callable,
+        because that is where a follower disables torque and releases the
+        gripper; closing the port underneath it skips both and leaves the arm
+        energised at its last commanded position.
+        """
+        disconnect = getattr(self.robot, "disconnect", None)
+        if callable(disconnect) and getattr(self.robot, "is_connected", False):
+            try:
+                disconnect()
+                return
+            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+                logger.warning(
+                    "%s: robot.disconnect() raised during cleanup: %s",
+                    self.tool_name_str,
+                    exc,
+                )
+
+        # Reached when the driver exposes no ``disconnect``, when it would
+        # refuse (lerobot gates it on ``is_connected``, false in every
+        # half-open state), or when it raised partway through its own single
+        # unguarded loop and so abandoned every device after the one that
+        # failed. Closing each device independently is what still gets the
+        # port and the surviving cameras shut.
+        self._close_open_devices()
 
     async def _connect_robot(self) -> tuple[bool, str]:
         """Connect to robot hardware with proper error handling.
@@ -1084,7 +1291,7 @@ class Robot(TeleopMixin, AgentTool):
             # Same rollback as the lazy teleop connect: without it a half-open
             # port makes the NEXT _connect_robot short-circuit on
             # "already connected" and report success against a dead bus.
-            self._rollback_half_open_connect()
+            self._close_open_devices()
             return False, error_msg
 
     async def _initialize_policy(self, policy: Policy) -> bool:
@@ -1107,6 +1314,28 @@ class Robot(TeleopMixin, AgentTool):
         except Exception as e:
             logger.error(f"Failed to initialize policy: {e}")
             return False
+
+    def _honor_stop_request(self) -> bool:
+        """Record a latched stop request as the task's terminal state.
+
+        Called at each point in ``_execute_task_async`` where the task is about
+        to move on to a stage that commands the arm. ``stop_task`` sets the
+        latch unconditionally, so this is the only thing that has to run for a
+        stop pressed at any point during bring-up to be honored.
+
+        Returns:
+            ``True`` when a stop was requested and the caller must abandon the
+            rollout, ``False`` when the task may proceed.
+        """
+        if not self._stop_requested.is_set():
+            return False
+        self._task_state.status = TaskStatus.STOPPED
+        logger.info(
+            "%s: task stopped during bring-up: '%s'",
+            self.tool_name_str,
+            self._task_state.instruction,
+        )
+        return True
 
     async def _execute_task_async(
         self,
@@ -1136,10 +1365,16 @@ class Robot(TeleopMixin, AgentTool):
         from .policies.base import resolve_chunk_length
 
         try:
-            # Update task state
+            # Update task state. The stop latch is cleared here so a stop
+            # pressed while the robot was idle does not pre-empt the next task,
+            # and ``duration`` is reset with it: a task stopped during bring-up
+            # never reaches the terminal block that writes it, and reporting the
+            # PREVIOUS task's elapsed time would misdescribe this one.
+            self._stop_requested.clear()
             self._task_state.status = TaskStatus.CONNECTING
             self._task_state.instruction = instruction
             self._task_state.start_time = time.time()
+            self._task_state.duration = 0.0
             self._task_state.step_count = 0
             self._task_state.error_message = ""
 
@@ -1148,6 +1383,13 @@ class Robot(TeleopMixin, AgentTool):
             if not connected:
                 self._task_state.status = TaskStatus.ERROR
                 self._task_state.error_message = connect_error or f"Failed to connect to {self.tool_name_str}"
+                return
+
+            # A stop pressed during the bring-up window above (a motors-bus
+            # handshake plus per-camera warmup - seconds on a real arm) is
+            # honored here, before the policy is even built, so the rollout is
+            # abandoned without commanding the arm.
+            if self._honor_stop_request():
                 return
 
             # Get policy instance: a caller-supplied pre-built object wins;
@@ -1200,6 +1442,12 @@ class Robot(TeleopMixin, AgentTool):
                     e,
                 )
 
+            # Building a server-backed policy is a second multi-second window
+            # (a network connect plus a handshake), so the latch is re-checked
+            # before the arm is commanded for the first time.
+            if self._honor_stop_request():
+                return
+
             self._task_state.status = TaskStatus.RUNNING
             start_time = time.time()
 
@@ -1207,6 +1455,7 @@ class Robot(TeleopMixin, AgentTool):
                 time.time() - start_time < duration
                 and (n_steps is None or self._task_state.step_count < n_steps)
                 and self._task_state.status == TaskStatus.RUNNING
+                and not self._stop_requested.is_set()
                 and not self._shutdown_event.is_set()
             ):
                 # Get observation from robot
@@ -1254,8 +1503,28 @@ class Robot(TeleopMixin, AgentTool):
             self._task_state.duration = elapsed
 
             if self._task_state.status == TaskStatus.RUNNING:
-                self._task_state.status = TaskStatus.COMPLETED
-                logger.info(f"Task completed: '{instruction}' in {elapsed:.1f}s ({self._task_state.step_count} steps)")
+                # A stop can land in the gap between the check above and the
+                # ``RUNNING`` write, which overwrites the ``STOPPED`` status
+                # ``stop_task`` recorded. The latch survives that write, so it
+                # is what decides here - otherwise an interrupted task reports
+                # itself completed.
+                #
+                # ``_shutdown_event`` is the other latch that ends the loop, and
+                # it needs the same treatment for a reason no entry-point guard
+                # can cover: ``cleanup()`` sets it and only then calls
+                # ``stop_task()``, gated on ``status == RUNNING``. A shutdown
+                # landing while this task is still in ``CONNECTING`` therefore
+                # sets no stop latch, and the rollout goes on to finish bring-up
+                # and exit the loop on its first evaluation - reported as
+                # ``completed`` with 0 steps.
+                if self._stop_requested.is_set() or self._shutdown_event.is_set():
+                    self._task_state.status = TaskStatus.STOPPED
+                    logger.info(f"Task stopped: '{instruction}' after {self._task_state.step_count} steps")
+                else:
+                    self._task_state.status = TaskStatus.COMPLETED
+                    logger.info(
+                        f"Task completed: '{instruction}' in {elapsed:.1f}s ({self._task_state.step_count} steps)"
+                    )
 
         except Exception as e:
             logger.error(f"Task execution failed: {e}")
@@ -1303,6 +1572,109 @@ class Robot(TeleopMixin, AgentTool):
             return {"status": "error", "content": [{"text": error}]}
         return None
 
+    def _shutdown_error(self, method: str) -> dict[str, Any] | None:
+        """Refuse a rollout on a robot whose ``cleanup()`` has already run.
+
+        ``_shutdown_event`` is one of the control loop's exit conditions
+        (``not self._shutdown_event.is_set()``), so once ``cleanup()`` has set
+        it the loop body can never execute. Nothing checked it on the way in,
+        though, so a task started afterwards ran the whole bring-up and then
+        fell out of the loop on its first evaluation - the same shape as the
+        unusable ``duration`` that :meth:`_duration_error` refuses, and it
+        reported the same false ``completed``.
+
+        Bring-up is not free of side effects, which is what makes this a
+        refusal rather than a cosmetic status fix. Measured on a two-device arm
+        after ``cleanup()``:
+
+        - ``_connect_robot()`` re-opens the motors bus and warms every camera,
+          and ``cleanup()`` does not disconnect the robot, so the re-opened
+          devices stay open for the life of the process. The executor is
+          already shut down, so no later ``cleanup()`` can close them either.
+        - ``Policy.reset()`` is called, clearing the per-episode state (action
+          chunk cache, sampler RNG, KV-cache) of a policy object the caller may
+          still be driving elsewhere - the documented
+          ``run_policy(policy_object=...)`` reuse pattern.
+        - The policy is never queried and the arm is never commanded, yet
+          ``run_policy`` and the agent-tool ``execute`` action both returned
+          ``status="success"`` with ``steps: 0``, indistinguishable from a
+          rollout that really ran.
+
+        ``start_task`` did not report success - it raised
+        ``RuntimeError("cannot schedule new futures after shutdown")`` from the
+        executor submit, naming an executor internal rather than the robot. The
+        guard makes all three entry points refuse in the same tool shape, per
+        this module's contract that an action handler returns an error dict
+        instead of raising.
+
+        Args:
+            method: Public entry point name, used to prefix the message.
+
+        Returns:
+            A tool-shaped error naming the shut-down robot, or ``None`` when
+            the robot can still accept a rollout.
+        """
+        if not self._shutdown_event.is_set():
+            return None
+        return {
+            "status": "error",
+            "content": [
+                {
+                    "text": f"{method}: {self.tool_name_str} has been shut down - cleanup() has already run, "
+                    f"so the control loop cannot execute a single step. Construct a new robot to drive "
+                    f"the arm again."
+                }
+            ],
+        }
+
+    def _claim_task(self, instruction: str) -> dict[str, Any] | None:
+        """Claim the motors bus for one rollout, or refuse a concurrent one.
+
+        Admission has to be decided here rather than from
+        ``_task_state.status``: that status only becomes ``RUNNING`` once
+        ``_execute_task_async`` has finished connecting and building the
+        policy, so a status-based check admits every caller that arrives during
+        bring-up - a motors-bus handshake plus per-camera warmup, seconds on a
+        real arm. Two admitted rollouts then interleave ``send_action`` writes
+        on one half-duplex bus, and because they share the single
+        ``_task_state`` slot they also overwrite each other's step count and
+        terminal status, so both report success while only one of them was
+        actually driving the arm.
+
+        The claimed instruction is recorded on the task state immediately, so a
+        refusal names the rollout that actually holds the bus instead of
+        whichever task ran last.
+
+        Args:
+            instruction: Instruction of the rollout being admitted, used for
+                the refusal text shown to a second caller.
+
+        Returns:
+            ``None`` when the caller now owns the bus and must eventually call
+            :meth:`_release_task`, or a tool-shaped error naming the rollout
+            already in flight.
+        """
+        with self._task_admission:
+            if self._task_claimed:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": f"Task already running: {self._task_state.instruction}\n"
+                            f"{self.tool_name_str} drives one rollout at a time - the arm has a single "
+                            f"command bus. Wait for it to finish or call action='stop' first."
+                        }
+                    ],
+                }
+            self._task_claimed = True
+            self._task_state.instruction = instruction
+        return None
+
+    def _release_task(self) -> None:
+        """Release the motors-bus claim taken by :meth:`_claim_task`."""
+        with self._task_admission:
+            self._task_claimed = False
+
     def _execute_task_sync(
         self,
         instruction: str,
@@ -1313,14 +1685,78 @@ class Robot(TeleopMixin, AgentTool):
         policy_object: Policy | None = None,
         n_steps: int | None = None,
     ) -> dict[str, Any]:
-        """Execute task synchronously in thread - no new event loop."""
-        # Validated here as well as at the public methods below: this is the
-        # chokepoint the agent-tool "execute" action and the mesh "execute"
-        # dispatch reach directly, so a peer-supplied budget is refused before
-        # the arm is commanded rather than after.
+        """Execute task synchronously in thread - no new event loop.
+
+        This is the chokepoint the agent-tool ``execute`` action and the mesh
+        ``execute`` dispatch reach directly, so it both validates the
+        peer-supplied budget and claims the motors bus before the arm is
+        commanded.
+        """
+        # Validated here as well as at the public methods below: a peer-supplied
+        # budget is refused before the arm is commanded rather than after. The
+        # check is stateless, so it runs before the claim - a rejected budget
+        # must not take the bus away from a rollout that could still start.
+        if err := self._shutdown_error("execute_task"):
+            return err
         if err := self._duration_error(duration, "execute_task"):
             return err
+        if err := self._claim_task(instruction):
+            return err
 
+        return self._drive_claimed_task(
+            instruction,
+            policy_port,
+            policy_host,
+            policy_provider,
+            duration,
+            policy_object=policy_object,
+            n_steps=n_steps,
+        )
+
+    def _drive_claimed_task(
+        self,
+        instruction: str,
+        policy_port: int | None = None,
+        policy_host: str = "localhost",
+        policy_provider: str = "groot",
+        duration: float = 30.0,
+        policy_object: Policy | None = None,
+        n_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Run the control loop for an already-admitted task and report it.
+
+        The caller must already hold the claim from :meth:`_claim_task`; this
+        method always releases it, including when the rollout raises, so a
+        failed task never leaves the robot permanently refusing new ones. The
+        claim is taken by the callers rather than here because ``start_task``
+        returns before its executor job begins: it has to be able to refuse a
+        second caller synchronously instead of reporting a task as started and
+        only then turning that caller away on the background thread.
+        """
+        try:
+            return self._run_control_loop(
+                instruction,
+                policy_port,
+                policy_host,
+                policy_provider,
+                duration,
+                policy_object=policy_object,
+                n_steps=n_steps,
+            )
+        finally:
+            self._release_task()
+
+    def _run_control_loop(
+        self,
+        instruction: str,
+        policy_port: int | None = None,
+        policy_host: str = "localhost",
+        policy_provider: str = "groot",
+        duration: float = 30.0,
+        policy_object: Policy | None = None,
+        n_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Drive the rollout on its own event loop and report the outcome."""
         # Import here to avoid conflicts
         import asyncio
 
@@ -1392,25 +1828,43 @@ class Robot(TeleopMixin, AgentTool):
 
         Returns:
             Tool-shaped result confirming the task started, or an error naming
-            the offending parameter.
+            the offending parameter. A second task is refused while another
+            rollout is in flight - including during its connect/policy-build
+            bring-up - because the arm has a single command bus. A robot that
+            ``cleanup`` / ``stop`` has shut down is refused permanently: the
+            executor and bridges are gone, so a rollout started now would
+            command the arm zero times.
         """
         # Before the submit: the work happens on a background thread, so a
         # budget checked inside it would still report "Task started" to the
         # caller for a task that commands nothing (or never ends).
+        # Checked before the budget and before the claim: once ``cleanup()`` has
+        # run, the executor submit below raises ``RuntimeError`` from inside
+        # concurrent.futures, which names an executor internal rather than the
+        # robot. Refusing here reports it in the same tool shape as the other
+        # two entry points.
+        if err := self._shutdown_error("start_task"):
+            return err
         if err := self._duration_error(duration, "start_task"):
             return err
 
-        # Check if task is already running
-        if self._task_state.status == TaskStatus.RUNNING:
-            return {
-                "status": "error",
-                "content": [{"text": f"Task already running: {self._task_state.instruction}"}],
-            }
+        # Claim the bus here, not on the executor thread: this method returns
+        # before its job begins, so a claim taken inside the job would report
+        # "Task started" to a second caller and only then turn it away, with
+        # nobody left to tell.
+        if err := self._claim_task(instruction):
+            return err
 
-        # Start task in background
-        self._task_state.task_future = self._executor.submit(
-            self._execute_task_sync, instruction, policy_port, policy_host, policy_provider, duration
-        )
+        # Start task in background. The claim is released by
+        # ``_drive_claimed_task`` when the rollout ends; if the submit itself
+        # fails (a shut-down executor) nothing would ever run to release it.
+        try:
+            self._task_state.task_future = self._executor.submit(
+                self._drive_claimed_task, instruction, policy_port, policy_host, policy_provider, duration
+            )
+        except BaseException:
+            self._release_task()
+            raise
 
         return {
             "status": "success",
@@ -1447,6 +1901,19 @@ class Robot(TeleopMixin, AgentTool):
         thread. For the server-backed provider path (and for fire-and-forget
         execution) use ``start_task``.
 
+        Exclusive: the arm has a single command bus, so this is refused while
+        another rollout is in flight - including while that rollout is still
+        connecting or building its policy, before it reports ``RUNNING``.
+        Two rollouts admitted at once would interleave ``send_action`` writes
+        on one half-duplex bus and share the single task-state slot.
+
+        Terminal after shutdown: ``cleanup`` / ``stop`` release the task
+        executor, the mesh and the ROS bridges and cannot be undone, so a
+        rollout requested afterwards is refused rather than admitted to command
+        the arm zero times. A rollout already running when the shutdown lands is
+        reported ``STOPPED`` - a shutdown truncates a task exactly as
+        ``stop_task`` does, so its step count is a partial one.
+
         Args:
             policy_object: A constructed ``Policy`` instance. The object's
                 own device / embodiment / chunking configuration is honored;
@@ -1469,22 +1936,22 @@ class Robot(TeleopMixin, AgentTool):
         Returns:
             Tool-shaped result: a text summary plus a ``{"json": ...}`` block
             carrying ``status`` / ``steps`` / ``duration_s`` / ``instruction``
-            / ``policy`` (and ``error`` when one occurred).
+            / ``policy`` (and ``error`` when one occurred), or an error naming
+            the rollout already in flight.
         """
         if policy_object is None:
             return {
                 "status": "error",
                 "content": [{"text": "policy_object is required (for the provider+port path use start_task)"}],
             }
-        if self._task_state.status == TaskStatus.RUNNING:
-            return {
-                "status": "error",
-                "content": [{"text": f"Task already running: {self._task_state.instruction}"}],
-            }
+        if err := self._shutdown_error("run_policy"):
+            return err
         if err := self._duration_error(duration, "run_policy"):
             return err
+        if err := self._claim_task(instruction):
+            return err
 
-        self._execute_task_sync(instruction, duration=duration, policy_object=policy_object, n_steps=n_steps)
+        self._drive_claimed_task(instruction, duration=duration, policy_object=policy_object, n_steps=n_steps)
 
         succeeded = self._task_state.status == TaskStatus.COMPLETED
         summary = (
@@ -1535,13 +2002,48 @@ class Robot(TeleopMixin, AgentTool):
         }
 
     def stop_task(self) -> dict[str, Any]:
-        """Stop currently running task."""
+        """Stop the current task, including one that is still connecting.
 
-        if self._task_state.status != TaskStatus.RUNNING:
+        This is the interrupt an operator (or the fleet ``{"action": "stop"}``
+        dispatch, via ``mesh/core.py``) reaches for, so it has to hold for a
+        task in ANY stage that can still command the arm - not only the one
+        stage whose status happens to be ``RUNNING``.
+
+        ``_execute_task_async`` sits in ``CONNECTING`` for the whole hardware
+        bring-up: a motors-bus handshake plus ``warmup_s`` per camera, seconds
+        on a real arm and longer on a multi-camera rig, followed by the policy
+        build. A stop pressed in that window used to be answered with
+        ``status="success"`` and ``"No task running to stop"``, and the arm then
+        moved anyway once the bring-up finished - the operator was told the
+        interrupt was handled while the rollout it was meant to cancel was
+        still pending.
+
+        A status write cannot express the request on its own, because
+        ``_execute_task_async`` writes ``RUNNING`` once bring-up completes and
+        that overwrites any ``STOPPED`` recorded before it. So the request is
+        latched in an event that is set here FIRST, before the status is even
+        read, and cleared only when a new task starts. The rollout honors the
+        latch at each stage boundary and in its loop condition.
+
+        Returns:
+            A tool-shaped result confirming the stop, or - for a robot that is
+            genuinely idle or already in a terminal state - reporting that
+            there was nothing to stop. Both are ``status="success"``: asking an
+            idle robot to stop is satisfied, not an error.
+        """
+        # Latched before the status is read: a stop that lands in the gap
+        # between the rollout's last stage check and its ``RUNNING`` write must
+        # not be lost, and the latch is the only record that survives it.
+        self._stop_requested.set()
+
+        stoppable = (TaskStatus.RUNNING, TaskStatus.CONNECTING)
+        if self._task_state.status not in stoppable:
             return {
                 "status": "success",
                 "content": [{"text": f"No task running to stop (current: {self._task_state.status.value})"}],
             }
+
+        was_connecting = self._task_state.status == TaskStatus.CONNECTING
 
         # Signal task to stop
         self._task_state.status = TaskStatus.STOPPED
@@ -1552,11 +2054,12 @@ class Robot(TeleopMixin, AgentTool):
 
         logger.info(f"Task stopped: {self._task_state.instruction}")
 
+        stage = " (during connect)" if was_connecting else ""
         return {
             "status": "success",
             "content": [
                 {
-                    "text": f"Task stopped: '{self._task_state.instruction}'\n"
+                    "text": f"Task stopped{stage}: '{self._task_state.instruction}'\n"
                     f"Duration: {self._task_state.duration:.1f}s\n"
                     f"Steps completed: {self._task_state.step_count}"
                 }
@@ -1725,7 +2228,18 @@ class Robot(TeleopMixin, AgentTool):
             )
 
     def cleanup(self) -> None:
-        """Cleanup resources and stop any running tasks."""
+        """Cleanup resources and stop any running tasks.
+
+        Terminal: this latches a shutdown, releases the task executor, tears
+        down the mesh and ROS bridges, and disconnects the robot -- the motors
+        bus and every camera -- so no device node stays held. There is no
+        ``restart``, so
+        ``run_policy`` / ``start_task`` / the ``execute`` action refuse
+        permanently afterwards rather than admit a rollout that would command
+        the arm zero times, and a rollout still in flight when this runs is
+        reported ``STOPPED`` rather than ``COMPLETED``. Construct a new
+        ``Robot`` to run another task.
+        """
         try:
             # Signal shutdown
             self._shutdown_event.set()
@@ -1767,6 +2281,14 @@ class Robot(TeleopMixin, AgentTool):
 
             # Tear down the ROS 2 telemetry bridge if one was created.
             self._shutdown_ros_bridge()
+
+            # Close the devices last, once every source of commands is down.
+            # ``send_action`` re-opens the robot lazily on a command that finds
+            # it disconnected, so a port closed before the teleop loop, the
+            # task executor, the mesh and the ROS bridge have stopped can be
+            # re-opened behind this teardown -- and would then stay open for
+            # the life of the process, since nothing runs after ``cleanup()``.
+            self._disconnect_devices()
 
             logger.info(f"{self.tool_name_str} cleanup completed")
 
@@ -1856,7 +2378,7 @@ class Robot(TeleopMixin, AgentTool):
                 try:
                     self.robot.connect(False)
                 except Exception:
-                    self._rollback_half_open_connect()
+                    self._close_open_devices()
                     raise
             self.robot.send_action(action)
             return {"status": "success", "content": [{"text": "ok"}]}
@@ -1868,18 +2390,33 @@ class Robot(TeleopMixin, AgentTool):
             }
 
     async def stop(self) -> None:
-        """Stop robot and disconnect."""
+        """Stop the robot and release everything it holds.
+
+        Terminal, exactly as :meth:`cleanup` is -- this is the async spelling
+        of it, and it delegates every step rather than performing any itself.
+
+        The disconnect in particular belongs to that cleanup rather than ahead
+        of it. lerobot gates ``Robot.disconnect()`` on ``is_connected``
+        (``bus.is_connected and all(cam.is_connected ...)``) and raises
+        ``DeviceNotConnectedError`` when it is false, so disconnecting here
+        first meant that stopping a robot which was never connected -- or one
+        left half-open by a failed bring-up -- raised before :meth:`cleanup`
+        was reached. Every terminal guarantee was then silently skipped: no
+        shutdown latch, a task executor still accepting work, and any device a
+        half-open connect had opened still held, with no entry point left that
+        would close it.
+
+        Ordering matters as much as reachability. :meth:`cleanup` closes the
+        devices *last*, once the teleop loop, the task executor, the mesh and
+        the ROS bridge are all down, because :meth:`send_action` re-opens the
+        robot lazily on a command that finds it disconnected. Disconnecting
+        here put that close ahead of every one of those command sources.
+
+        Runs off the event loop: :meth:`cleanup` joins the task executor and
+        closes a serial port, both of which block.
+        """
         try:
-            # Stop any running task first
-            if self._task_state.status == TaskStatus.RUNNING:
-                self.stop_task()
-
-            # Disconnect robot hardware
-            if hasattr(self.robot, "disconnect"):
-                await asyncio.to_thread(self.robot.disconnect)
-
-            # Cleanup resources
-            self.cleanup()
+            await asyncio.to_thread(self.cleanup)
 
             logger.info(f"{self.tool_name_str} stopped and disconnected")
 
