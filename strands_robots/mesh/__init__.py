@@ -34,6 +34,7 @@ from strands_robots.mesh.core import (
 )
 from strands_robots.mesh.input import InputPublisher, InputReceiver
 from strands_robots.mesh.ros_bridge import RosBridgedRobot
+from strands_robots.mesh.rosbridge_robot import RosbridgeRobot
 from strands_robots.mesh.rtps_robot import RtpsRobot
 from strands_robots.mesh.session import (
     clear_peers,
@@ -54,6 +55,7 @@ __all__ = [
     "InputPublisher",
     "InputReceiver",
     "RosBridgedRobot",
+    "RosbridgeRobot",
     "RtpsRobot",
     # Factory & registry
     "init_mesh",

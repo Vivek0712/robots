@@ -17,7 +17,8 @@ Exposes the deep MuJoCo C API through clean Python methods:
 
 import logging
 import math
-from typing import TYPE_CHECKING, Any
+import numbers
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -25,10 +26,12 @@ from strands_robots.simulation.mujoco.backend import (
     _NO_WORLD_MSG,
     _ensure_mujoco,
     filter_mujoco_attach_noise,
+    mj_name_to_id,
 )
 from strands_robots.simulation.mujoco.scene_ops import (
     persist_body_mass,
     persist_geom_properties,
+    refresh_body_inertial_from_geometry,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +213,118 @@ def _coerce_finite_joint_map(
             }
         out[jnt_name] = f
     return out, None
+
+
+# A ray batch is a sequence of 3-component direction vectors. Spelling it out in
+# one place keeps the batch-shape rejection and the tool_spec description in
+# agreement about what a castable batch looks like.
+_RAY_BATCH_HINT = "Pass one [dx, dy, dz] direction per ray, e.g. [[0, 0, -1], [1, 0, 0]]."
+
+
+def _coerce_ray_batch(directions: Any, method: str) -> tuple[list[Any] | None, dict[str, Any] | None]:
+    """Materialize a ray batch, refusing a value that names no castable ray.
+
+    Guards the batch parameter itself, before the per-ray direction checks. A
+    ``str`` is iterable, so ``directions="abc"`` would otherwise be read as three
+    rays - one per character - and a non-iterable raises ``TypeError`` past the
+    structured-error tool contract. An empty batch requests no ray at all, so
+    there is no cast whose result could be reported.
+
+    Args:
+        directions: The caller-supplied batch.
+        method: Calling method name, used in error text.
+
+    Returns:
+        ``(rays, None)`` with the batch materialized as a list, or
+        ``(None, error_dict)`` when it holds no castable ray.
+    """
+    if isinstance(directions, (str, bytes, bytearray)):
+        return None, {
+            "status": "error",
+            "content": [
+                {
+                    "text": (
+                        f"{method}: 'directions' must be a sequence of direction vectors, "
+                        f"not {type(directions).__name__} - iterating one casts a ray per "
+                        f"character. {_RAY_BATCH_HINT}"
+                    )
+                }
+            ],
+        }
+    try:
+        rays = list(directions)
+    except TypeError:
+        return None, {
+            "status": "error",
+            "content": [
+                {
+                    "text": (
+                        f"{method}: 'directions' must be a sequence of direction vectors, "
+                        f"got {directions!r}. {_RAY_BATCH_HINT}"
+                    )
+                }
+            ],
+        }
+    if not rays:
+        return None, {
+            "status": "error",
+            "content": [
+                {
+                    "text": (
+                        f"{method}: 'directions' must hold at least one direction - "
+                        f"an empty batch casts no ray. {_RAY_BATCH_HINT}"
+                    )
+                }
+            ],
+        }
+    return rays, None
+
+
+def _coerce_excluded_body(value: Any, method: str, nbody: int) -> tuple[int | None, dict[str, Any] | None]:
+    """Coerce ``exclude_body`` to a body id ``mj_ray`` can honor.
+
+    ``mj_ray`` takes the exclusion as a C ``int`` and skips the geoms whose body
+    id equals it, so only ``-1`` (the documented "exclude nothing") or an id the
+    compiled model actually defines can be honored. A float / str / nan value
+    raises ``TypeError`` out of the pybind11 signature - past the structured-error
+    tool contract - and an id outside ``[0, nbody)`` matches no body, so the cast
+    silently includes the geoms the caller asked to skip and can report a hit on
+    the caller's own robot as an obstacle.
+
+    Accepts any real scalar with an integral value (a NumPy ``np.int64`` body id
+    read back from ``list_bodies`` passes) and rejects ``bool`` explicitly - an
+    ``int`` subclass whose ``True`` would silently exclude body 1.
+
+    Args:
+        value: The caller-supplied exclusion.
+        method: Calling method name, used in error text.
+        nbody: Body count of the compiled model (``model.nbody``).
+
+    Returns:
+        ``(body_id, None)`` on success, or ``(None, error_dict)``.
+    """
+    error = {
+        "status": "error",
+        "content": [
+            {
+                "text": (
+                    f"{method}: 'exclude_body' must be -1 (exclude nothing) or a body id "
+                    f"in [0, {nbody}), got {value!r}. Read an id from list_bodies()."
+                )
+            }
+        ],
+    }
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None, error
+    numeric = float(value)
+    # ``isfinite`` first: ``int(nan)`` raises, and short-circuiting keeps it out
+    # of the integrality check below.
+    if not math.isfinite(numeric) or numeric != int(numeric):
+        return None, error
+    body_id = int(numeric)
+    if body_id < -1 or body_id >= nbody:
+        return None, error
+    return body_id, None
 
 
 def _full_mass_matrix(mj: Any, model: Any, data: Any) -> np.ndarray:
@@ -708,18 +823,21 @@ class PhysicsMixin:
         which is non-deterministic - this is a deliberate
         "unambiguous or explicit" contract.
         """
-        import mujoco as _mj
 
         assert self._world is not None and self._world._model is not None
         model = self._world._model
-        mid = _mj.mj_name2id(model, obj_type, name)
+        mid = mj_name_to_id(model, obj_type, name)
         if mid >= 0:
             return int(mid)
+        if not isinstance(name, str):
+            # mj_name_to_id already refused it; the namespace retry below
+            # would only reach `in` / `+` on a value that supports neither.
+            return -1
         if "/" in name:  # already namespaced, no point retrying
             return -1
         for robot in self._world.robots.values():
             if robot.namespace:
-                mid = _mj.mj_name2id(model, obj_type, robot.namespace + name)
+                mid = mj_name_to_id(model, obj_type, robot.namespace + name)
                 if mid >= 0:
                     return int(mid)
         return -1
@@ -754,7 +872,7 @@ class PhysicsMixin:
             "Joint": (_mj.mjtObj.mjOBJ_JOINT, model.njnt),
         }[kind]
         known = [nm for i in range(int(count)) if (nm := _mj.mj_id2name(model, obj_type, i)) and nm != "world"]
-        if known:
+        if known and isinstance(requested, str):
             import difflib
 
             matches = difflib.get_close_matches(requested, known, n=3, cutoff=0.4)
@@ -792,7 +910,11 @@ class PhysicsMixin:
         Args:
             origin: [x, y, z] ray start point in world frame.
             direction: [dx, dy, dz] ray direction (auto-normalized).
-            exclude_body: Body ID to exclude from intersection (-1 = none).
+            exclude_body: Body ID whose geoms the ray passes through (``-1`` =
+                exclude nothing). Any other value must be a body id the compiled
+                model defines - an id outside ``[0, model.nbody)`` matches no
+                body, so the geoms the caller asked to skip would be included
+                and could be reported as the obstacle.
             include_static: Whether to include static geoms.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
@@ -832,6 +954,13 @@ class PhysicsMixin:
         mj = _ensure_mujoco()
         model, data = self._world._model, self._world._data
 
+        # ``exclude_body`` reaches mj_ray as a C int. A non-integral value raises
+        # TypeError out of the pybind11 signature (past the tool contract) and an
+        # out-of-range id matches no body, so the exclusion silently does nothing.
+        exclusion, err = _coerce_excluded_body(exclude_body, "raycast", int(model.nbody))
+        if err is not None:
+            return err
+
         pnt = np.array(origin_f, dtype=np.float64)
         vec = np.array(direction_f, dtype=np.float64)
         # Normalize direction
@@ -861,7 +990,7 @@ class PhysicsMixin:
                 vec,
                 None,  # geom group filter (None = all)
                 1 if include_static else 0,
-                exclude_body,
+                exclusion,
                 geomid,
             )
             hit = dist >= 0
@@ -1653,10 +1782,15 @@ class PhysicsMixin:
         to whatever the scene was compiled with - after this call had already
         reported the new one.
 
-        A resize is the one property with a further consequence at recompile time:
-        the model write resizes the geom without re-deriving the owning body's
-        inertia, whereas the recompile integrates the inertia from the persisted
-        shape - the physically consistent value for the new extents.
+        A resize also changes what the owning body's geometry weighs and how it is
+        balanced, so the body's mass, center of mass and inertia tensor - all
+        integrated from its geoms at compile time, and never recomputed by a step -
+        are re-derived from the resized shape. They are read from a compile of the
+        persisted spec, so they equal the values the next scene recompile produces
+        and the resize means the same thing whether or not anything follows it. A
+        body that declares its own ``<inertial>`` takes nothing from geometry and is
+        left alone. The cost is one spec compile per resize; the live model is not
+        swapped, so entity ids and joint state are preserved.
 
         Every vector must carry the exact number of components its target
         defines, because there is no meaningful value to invent for a component
@@ -1789,6 +1923,9 @@ class PhysicsMixin:
             # geom silently reverts after this call reported the new value.
             # Record it in the spec first, so a scene that cannot carry the
             # change is refused before either representation is touched.
+            # Kept so a refresh that cannot be honored restores the spec to the
+            # size the model is still compiled with, leaving the two in step.
+            prior_size = None if size is None else model.geom_size[gid, : len(size)].tolist()
             if reason := persist_geom_properties(self._world, gid, color=color, friction=friction, size=size):
                 return {"status": "error", "content": [{"text": f"set_geom_properties: {reason}"}]}
 
@@ -1803,6 +1940,17 @@ class PhysicsMixin:
                 changes.append(f"friction → {friction}")
 
             if size is not None:
+                # A resize changes the shape the owning body's inertial row was
+                # integrated from. Re-derive that row from the spec, which now
+                # carries the new size, BEFORE touching the model: a scene whose
+                # resized geometry cannot be compiled is refused with both
+                # representations restored rather than left describing different
+                # shapes. The reported result is then the one the next recompile
+                # reproduces, so the resize does not depend on what follows it.
+                if reason := refresh_body_inertial_from_geometry(self._world, gid):
+                    persist_geom_properties(self._world, gid, size=prior_size)
+                    return {"status": "error", "content": [{"text": f"set_geom_properties: {reason}"}]}
+
                 # Validated as exactly the component count this geom's type
                 # defines; the unused tail of the 3-wide row stays as compiled.
                 model.geom_size[gid, : len(size)] = size
@@ -1897,15 +2045,37 @@ class PhysicsMixin:
         are refreshed once (``mj_kinematics``) and the whole batch is cast under
         the sim lock, so every ray samples one consistent, current snapshot of
         the scene (see ``raycast``).
-        Returns array of distances and hit geoms.
+
+        The batch is all-or-nothing: every direction is validated before any ray
+        is cast, and a direction that cannot be cast (wrong component count,
+        non-numeric, nan/inf, zero-length) refuses the whole call, naming every
+        offending index. Casting the rest and reporting ``distance: None`` for
+        the rejected ones - the previous behavior - makes a ray that was never
+        cast indistinguishable from a ray that found nothing, i.e. free space,
+        which is the dangerous reading for the clearance and obstacle checks this
+        method exists to serve. It matches ``raycast``, which refuses the same
+        directions outright, so a caller does not get two contracts for one
+        malformed vector.
+
+        Args:
+            origin: [x, y, z] ray start point in world frame.
+            directions: One [dx, dy, dz] direction per ray, each auto-normalized.
+                Must be a non-empty sequence of 3-component vectors (a bare
+                string is refused rather than read as one ray per character).
+            exclude_body: Body ID whose geoms every ray passes through (``-1`` =
+                exclude nothing); see :meth:`raycast`.
+
+        Returns:
+            Standard status dict. On success the ``{"json": ...}`` block carries
+            ``rays`` - one ``{"distance", "geom_id"}`` entry per direction, in
+            order, with ``distance`` ``None`` for a genuine miss - plus ``hits``.
+            On rejection it carries ``invalid_directions``, one
+            ``{"index", "error"}`` entry per direction that cannot be cast.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
 
-        mj = _ensure_mujoco()
-        model, data = self._world._model, self._world._data
-
-        # validate origin shape; per-ray zero-direction guard (avoid mj_ray abort)
+        # validate origin shape
         try:
             if len(origin) != 3:
                 return {
@@ -1921,6 +2091,56 @@ class PhysicsMixin:
         if err is not None:
             return err
 
+        rays, batch_err = _coerce_ray_batch(directions, "multi_raycast")
+        if rays is None:
+            return cast("dict[str, Any]", batch_err)
+
+        mj = _ensure_mujoco()
+        model, data = self._world._model, self._world._data
+
+        exclusion, err = _coerce_excluded_body(exclude_body, "multi_raycast", int(model.nbody))
+        if err is not None:
+            return err
+
+        # Validate and normalize EVERY direction before casting anything, so a
+        # batch that cannot be cast in full is refused rather than half-cast. The
+        # loop collects all offending indices instead of returning on the first,
+        # so one round-trip is enough to fix a whole malformed fan.
+        vectors: list[np.ndarray] = []
+        invalid: list[dict[str, Any]] = []
+        for idx, d in enumerate(rays):
+            param = f"directions[{idx}]"
+            floats, d_err = _coerce_finite_vector(d, param, "multi_raycast", accepted_lengths=(3,), layout="dx, dy, dz")
+            if d_err is not None:
+                invalid.append({"index": idx, "error": d_err["content"][0]["text"]})
+                continue
+            vec = np.array(floats, dtype=np.float64)
+            norm = float(np.linalg.norm(vec))
+            if norm < 1e-10:
+                invalid.append(
+                    {
+                        "index": idx,
+                        "error": (f"multi_raycast: '{param}' is zero-length - supply a non-zero direction."),
+                    }
+                )
+                continue
+            vectors.append(vec / norm)
+
+        if invalid:
+            detail = "; ".join(f"[{entry['index']}] {entry['error']}" for entry in invalid)
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"multi_raycast: {len(invalid)} of {len(rays)} direction(s) cannot be "
+                            f"cast, so no ray was cast (a rejected ray is not a miss): {detail}"
+                        )
+                    },
+                    {"json": {"invalid_directions": invalid}},
+                ],
+            }
+
         pnt = np.array(origin_f, dtype=np.float64)
         results: list[dict[str, Any]] = []
 
@@ -1929,38 +2149,9 @@ class PhysicsMixin:
         # all rays sample one consistent snapshot of the scene.
         with self._lock:
             mj.mj_kinematics(model, data)
-            for idx, d in enumerate(directions):
-                try:
-                    if len(d) != 3:
-                        results.append(
-                            {
-                                "distance": None,
-                                "geom_id": None,
-                                "error": f"ray[{idx}]: direction must have 3 elements, got {len(d)}",
-                            }
-                        )
-                        continue
-                except TypeError:
-                    results.append(
-                        {
-                            "distance": None,
-                            "geom_id": None,
-                            "error": f"ray[{idx}]: direction must be a list of 3 numbers",
-                        }
-                    )
-                    continue
-                d_floats, d_err = _coerce_finite_vector(d, "direction", f"ray[{idx}]")
-                if d_err is not None:
-                    results.append({"distance": None, "geom_id": None, "error": d_err["content"][0]["text"]})
-                    continue
-                vec = np.array(d_floats, dtype=np.float64)
-                norm = np.linalg.norm(vec)
-                if norm < 1e-10:
-                    results.append({"distance": None, "geom_id": None, "error": f"ray[{idx}]: zero-length direction"})
-                    continue
-                vec /= norm
+            for vec in vectors:
                 geomid = np.array([-1], dtype=np.int32)
-                dist = mj.mj_ray(model, data, pnt, vec, None, 1, exclude_body, geomid)
+                dist = mj.mj_ray(model, data, pnt, vec, None, 1, exclusion, geomid)
                 results.append(
                     {
                         "distance": float(dist) if dist >= 0 else None,
@@ -1972,8 +2163,8 @@ class PhysicsMixin:
         return {
             "status": "success",
             "content": [
-                {"text": f"Multi-ray: {hit_count}/{len(directions)} hits from {origin}"},
-                {"json": {"rays": results}},
+                {"text": f"Multi-ray: {hit_count}/{len(results)} hits from {origin}"},
+                {"json": {"rays": results, "hits": hit_count}},
             ],
         }
 
@@ -2001,7 +2192,7 @@ class PhysicsMixin:
             mj.mj_camlight(model, data)
 
             if body_name is not None:
-                bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name)
+                bid = mj_name_to_id(model, mj.mjtObj.mjOBJ_BODY, body_name)
                 if bid < 0:
                     return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Body", body_name)}]}
                 body_payload = {

@@ -11,11 +11,13 @@ if TYPE_CHECKING:
 
     from strands_robots.rendering import CameraParams
 
+from strands_robots.simulation.models import registry_entry
 from strands_robots.simulation.mujoco.backend import (
     _NO_WORLD_MSG,
     _can_render,
     _ensure_mujoco,
     capture_stderr_fd,
+    mj_name_to_id,
 )
 from strands_robots.simulation.safe_output import (
     atomic_write_bytes,
@@ -124,6 +126,14 @@ def _cameras_recording_option_error(
     capture thread, ``max_frames_per_camera=0`` made ``len(buffer) >= cap`` true
     for every frame, and a non-positive ``width``/``height`` failed every render
     call - all reported as success by both ``start`` and ``stop``.
+
+    The accepted domain admits any real scalar with an integral value, so
+    passing this guard is a promise the value *can* be honored, not that it is
+    already in the form its consumer needs. Callers must therefore normalize
+    the pixel counts to plain ``int`` before handing them to ``render``, which
+    requires a true ``int``: accepting ``640.0`` here and forwarding it
+    verbatim reproduced the very empty-recording-reported-as-success failure
+    this guard exists to prevent.
 
     Args:
         method: Public method name, used to prefix the error message.
@@ -338,9 +348,9 @@ class RenderingMixin:
         mj = _ensure_mujoco()
         for jnt_name in robot.joint_names:
             lookup = pfx + jnt_name if pfx else jnt_name
-            jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
+            jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
             if jnt_id < 0 and pfx:
-                jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
+                jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
             if jnt_id < 0:
                 continue
             body = int(model.jnt_bodyid[jnt_id])
@@ -367,9 +377,9 @@ class RenderingMixin:
         pfx = robot.namespace or ""
         for jnt_name in robot.joint_names:
             lookup = pfx + jnt_name if pfx else jnt_name
-            jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
+            jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
             if jnt_id < 0 and pfx:
-                jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
+                jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
             if jnt_id >= 0 and model.jnt_type[jnt_id] == mj.mjtJoint.mjJNT_FREE:
                 return int(jnt_id)
         return self._robot_base_free_joint(model, robot, pfx)
@@ -396,9 +406,9 @@ class RenderingMixin:
         for jnt_name in robot.joint_names:
             # Try namespaced name first (multi-robot), fall back to raw.
             lookup = pfx + jnt_name if pfx else jnt_name
-            jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
+            jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
             if jnt_id < 0 and pfx:
-                jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
+                jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
             if jnt_id >= 0:
                 # A FREE joint (6-DoF floating base) has no single hinge/slide
                 # position: its qpos is [xyz(3) + quat(4)] and qvel is
@@ -466,8 +476,8 @@ class RenderingMixin:
         for cname in cameras_to_render:
             if not cname:
                 continue
-            cam_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_CAMERA, cname)
-            cam_info = self._world.cameras.get(cname)
+            cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, cname)
+            cam_info = registry_entry(self._world.cameras, cname)
             h = cam_info.height if cam_info else self.default_height
             w = cam_info.width if cam_info else self.default_width
             try:
@@ -526,7 +536,7 @@ class RenderingMixin:
         mj = _ensure_mujoco()
         assert self._world is not None  # callers must check
         model, data = self._world._model, self._world._data
-        robot = self._world.robots.get(robot_name)
+        robot = registry_entry(self._world.robots, robot_name)
         pfx = robot.namespace if robot else ""
 
         # Action-controller fast path: adapter-installed transform
@@ -627,10 +637,10 @@ class RenderingMixin:
         def _lookup(obj_type: Any, name: str) -> int:
             """Try namespaced lookup first, fall back to raw."""
             if pfx:
-                i = mj.mj_name2id(model, obj_type, pfx + name)
+                i = mj_name_to_id(model, obj_type, pfx + name)
                 if i >= 0:
                     return i
-            return int(mj.mj_name2id(model, obj_type, name))
+            return int(mj_name_to_id(model, obj_type, name))
 
         unresolved: list[str] = []
         for key, value in action_dict.items():
@@ -943,7 +953,11 @@ class RenderingMixin:
         # with get_observation, which already keys off the per-camera config.
         # The free camera ("default"/"free") and model-only cameras that have no
         # SimCamera entry fall back to the engine default.
-        cam_cfg = self._world.cameras.get(camera_name) if camera_name not in (None, "", "default", "free") else None
+        cam_cfg = (
+            registry_entry(self._world.cameras, camera_name)
+            if camera_name not in (None, "", "default", "free")
+            else None
+        )
         w = (cam_cfg.width if cam_cfg is not None else self.default_width) if width is None else width
         h = (cam_cfg.height if cam_cfg is not None else self.default_height) if height is None else height
         if err := self._validate_render_dims(w, h):
@@ -972,7 +986,7 @@ class RenderingMixin:
                 cam_id = -1
                 label = "free (default)"
             else:
-                cam_id = mj.mj_name2id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = mj_name_to_id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
                 if cam_id < 0:
                     return {
                         "status": "error",
@@ -1080,7 +1094,11 @@ class RenderingMixin:
         # frame render() produces for the same camera (and with get_observation).
         # The free camera and model-only cameras with no SimCamera entry fall
         # back to the engine default.
-        cam_cfg = self._world.cameras.get(camera_name) if camera_name not in (None, "", "default", "free") else None
+        cam_cfg = (
+            registry_entry(self._world.cameras, camera_name)
+            if camera_name not in (None, "", "default", "free")
+            else None
+        )
         w = (cam_cfg.width if cam_cfg is not None else self.default_width) if width is None else width
         h = (cam_cfg.height if cam_cfg is not None else self.default_height) if height is None else height
         if err := self._validate_render_dims(w, h):
@@ -1092,7 +1110,7 @@ class RenderingMixin:
                 cam_id = -1
                 label = "free (default)"
             else:
-                cam_id = mj.mj_name2id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = mj_name_to_id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
                 if cam_id < 0:
                     return {
                         "status": "error",
@@ -1277,7 +1295,11 @@ class RenderingMixin:
             raise RuntimeError(_NO_WORLD_MSG)
 
         mj = _ensure_mujoco()
-        cam_cfg = self._world.cameras.get(camera_name) if camera_name not in (None, "", "default", "free") else None
+        cam_cfg = (
+            registry_entry(self._world.cameras, camera_name)
+            if camera_name not in (None, "", "default", "free")
+            else None
+        )
         w = (cam_cfg.width if cam_cfg is not None else self.default_width) if width is None else width
         h = (cam_cfg.height if cam_cfg is not None else self.default_height) if height is None else height
         if err := self._validate_render_dims(w, h):
@@ -1295,7 +1317,7 @@ class RenderingMixin:
             if camera_name in (None, "", "default", "free"):
                 cam_id = -1
             else:
-                cam_id = mj.mj_name2id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = mj_name_to_id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
                 if cam_id < 0:
                     raise KeyError(f"Camera '{camera_name}' not found. Available: {self._list_camera_names()}")
 
@@ -1390,7 +1412,7 @@ class RenderingMixin:
         # The free camera is not a model camera: it has no name to resolve and
         # no SimCamera entry, so its resolution and default size differ.
         free_camera = camera_name in (None, "", "default", "free")
-        cam_cfg = None if free_camera else self._world.cameras.get(camera_name)
+        cam_cfg = None if free_camera else registry_entry(self._world.cameras, camera_name)
 
         w = (cam_cfg.width if cam_cfg is not None else self.default_width) if width is None else width
         h = (cam_cfg.height if cam_cfg is not None else self.default_height) if height is None else height
@@ -1412,7 +1434,7 @@ class RenderingMixin:
                 K_explicit = None
             else:
                 R, t, fovy_deg = self._named_camera_pose(mj, model, self._world._data, camera_name)
-                cam_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
                 K_explicit = self._explicit_intrinsics_K(_np, model, cam_id, w, h)
 
         if K_explicit is not None:
@@ -1514,7 +1536,7 @@ class RenderingMixin:
         Raises:
             KeyError: no camera of that name exists in the model.
         """
-        cam_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+        cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
         if cam_id < 0:
             raise KeyError(f"Camera '{camera_name}' not found. Available: {self._list_camera_names()}")
         mj.mj_forward(model, data)
@@ -1610,7 +1632,22 @@ class RenderingMixin:
         return ["default", *[n for n in named if n != "default"]]
 
     def get_contacts(self) -> dict[str, Any]:
-        """Return the list of active geom-geom contacts at the current step.
+        """Return the geom-geom pairs MuJoCo detected at the current step.
+
+        ``mjData.contact`` holds every pair inside the *detection* range,
+        which is the pair's ``margin`` plus its ``gap``. MuJoCo hands only
+        the pairs inside ``margin`` to the constraint solver; a pair between
+        the two thresholds is a proximity report that carries no force at
+        all. Each record therefore reports ``active`` - the solver's own
+        decision, taken from ``mjContact.exclude`` - so a caller asking "are
+        these two touching?" can tell a touch from a near miss. Without it
+        every consumer answered on geometry alone, which reports contact for
+        bodies that are visibly apart whenever an asset declares a ``gap``.
+
+        Proximity reports are still listed: they are what a clearance query
+        wants, and suppressing them would hide the detection set from
+        callers who need it. Use :meth:`get_contact_forces` for the magnitude
+        of the load a touching pair carries.
 
         We run ``mj_forward`` first so the contact list reflects the
         current qpos/qvel even immediately after ``reset`` or ``add_robot``
@@ -1635,6 +1672,11 @@ class RenderingMixin:
                     "geom2": int(data.contact[i].geom2),
                     "dist": float(data.contact[i].dist),
                     "pos": data.contact[i].pos.tolist(),
+                    # ``exclude == 0`` is MuJoCo's own decision to hand the
+                    # pair to the constraint solver, i.e. the pair is close
+                    # enough to push back. Anything else is in the gap and
+                    # carries no force.
+                    "active": int(data.contact[i].exclude) == 0,
                 }
                 for i in range(ncon)
             ]
@@ -1658,12 +1700,16 @@ class RenderingMixin:
         for c in contact_snapshot:
             g1 = _resolve_geom(c["geom1"])
             g2 = _resolve_geom(c["geom2"])
-            contacts.append({"geom1": g1, "geom2": g2, "dist": c["dist"], "pos": c["pos"]})
+            contacts.append({"geom1": g1, "geom2": g2, "dist": c["dist"], "pos": c["pos"], "active": c["active"]})
 
-        text = f"{len(contacts)} contacts" if contacts else "No contacts."
         if contacts:
+            n_active = sum(1 for c in contacts if c["active"])
+            text = f"{len(contacts)} contacts ({n_active} touching)"
             for c in contacts[:10]:
-                text += f"\n  - {c['geom1']} <-> {c['geom2']} (d={c['dist']:.4f})"
+                touch = "" if c["active"] else ", proximity only - no force"
+                text += f"\n  - {c['geom1']} <-> {c['geom2']} (d={c['dist']:.4f}{touch})"
+        else:
+            text = "No contacts."
 
         return {
             "status": "success",
@@ -1827,7 +1873,8 @@ class RenderingMixin:
                 ``status="success"`` return.
             width/height: per-frame size. ``None`` uses the camera's configured
                 resolution (else the renderer default); an explicit value must
-                be a positive whole number.
+                be a positive whole number, and an integral ``float`` or
+                ``np.int64`` is normalized to ``int`` rather than refused.
             name: filename tag (auto if None). Validated as a single path
                 component - separators / traversal / metacharacters rejected.
             max_frames_per_camera: safety cap on in-memory buffers. Must be a
@@ -1849,6 +1896,20 @@ class RenderingMixin:
             "start_cameras_recording", fps, width, height, max_frames_per_camera
         ):
             return error
+
+        # The guard above accepts any real scalar with an integral value, so a
+        # ``640.0`` read from a config float and an ``np.int64`` probed from a
+        # camera are both usable pixel counts - honor that by normalizing them
+        # to plain ``int`` here. The capture loop hands these straight to
+        # ``render``, whose ``_validate_render_dims`` requires a true ``int``,
+        # so without this every frame was refused and the recording wrote no
+        # MP4 at all while both ``start`` and ``stop`` reported success. This is
+        # the same normalization every other pixel-count surface in the library
+        # already performs (``VideoConfig.from_dict``, ``HybridCompositor``,
+        # ``mjpeg_frames``). ``None`` keeps its "use the camera's own
+        # resolution" meaning and is passed through untouched.
+        width = None if width is None else int(width)
+        height = None if height is None else int(height)
 
         if getattr(self, "_cams_rec_state", None) and self._cams_rec_state.get("running"):
             cur = self._cams_rec_state["name"]
@@ -2280,6 +2341,20 @@ class RenderingMixin:
             "start_cameras_recording_synchronous", fps, width, height, max_frames_per_camera
         ):
             return error
+
+        # The guard above accepts any real scalar with an integral value, so a
+        # ``640.0`` read from a config float and an ``np.int64`` probed from a
+        # camera are both usable pixel counts - honor that by normalizing them
+        # to plain ``int`` here. The capture loop hands these straight to
+        # ``render``, whose ``_validate_render_dims`` requires a true ``int``,
+        # so without this every frame was refused and the recording wrote no
+        # MP4 at all while both ``start`` and ``stop`` reported success. This is
+        # the same normalization every other pixel-count surface in the library
+        # already performs (``VideoConfig.from_dict``, ``HybridCompositor``,
+        # ``mjpeg_frames``). ``None`` keeps its "use the camera's own
+        # resolution" meaning and is passed through untouched.
+        width = None if width is None else int(width)
+        height = None if height is None else int(height)
 
         if getattr(self, "_cams_rec_state", None) and self._cams_rec_state.get("running"):
             cur = self._cams_rec_state["name"]

@@ -29,7 +29,7 @@ For walkthroughs see [Simulation overview](../simulation/overview.md).
 | `replace_scene_mjcf(xml)` | Swap entire world XML |
 | `patch_scene_mjcf(ops)` | Incremental patches, no full recompile |
 | `raycast(origin, direction, ...)` | Single ray–mesh intersection |
-| `multi_raycast(rays, ...)` | Batch ray–mesh intersections |
+| `multi_raycast(origin, directions, ...)` | Batch ray–mesh intersections from one origin; all-or-nothing, a direction it cannot cast refuses the batch |
 
 ## Robots
 
@@ -96,13 +96,13 @@ Newton backend, so a rollout rig can be enumerated instead of guessed.
 | `step` | `n_steps=1` (max 100 000/call) |
 | `set_gravity` | `gravity=[x,y,z]` or a scalar z-component |
 | `set_timestep` | `timestep` |
-| `get_contacts` / `get_contact_forces` | - |
+| `get_contacts` / `get_contact_forces` | - . `get_contacts` lists every geom pair inside the detection range (`margin` + `gap`) and marks each one `active` - MuJoCo hands only the pairs inside `margin` to the solver, so a pair between the two thresholds is a proximity report carrying no force. Contact predicates count only `active` pairs; `get_contact_forces` gives the load a touching pair carries |
 | `apply_force` | `body_name`, `force`, `torque`, `point` - latched on that body and re-applied every step until the next `apply_force` for it, so several bodies can hold wrenches at once (`force=[0,0,0]` stops one, `reset()` stops all) |
 | `get_jacobian` | `body_name` *or* `site_name` *or* `geom_name` |
 | `get_mass_matrix` | - |
 | `inverse_dynamics` | - (compensation torques to hold the current `qpos`/`qvel`) |
 | `forward_kinematics` | `body_name` (optional) |
-| `save_state` / `load_state` | snapshot/restore full physics |
+| `save_state` / `load_state` | `name` - snapshot/restore full physics. A checkpoint is valid only for the model it was taken against: any scene mutation that swaps the compiled model (`add_object`, `add_robot`, `add_camera`, `remove_camera`, `remove_robot`, `patch_scene_mjcf`, `replace_scene_mjcf`) invalidates it, and `load_state` then returns a structured error instead of writing a state vector whose indices now mean something else. Save a fresh checkpoint after mutating the scene |
 | `set_joint_positions` | `positions` (dict or ordered list), `robot_name` (optional) - write `qpos` directly + run FK (teleport / set an initial pose, bypassing actuators) |
 | `set_joint_velocities` | `velocities` (dict or ordered list), `robot_name` (optional) - write `qvel` directly (set an initial dynamic state) |
 | `get_energy` | - |

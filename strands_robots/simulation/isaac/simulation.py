@@ -36,7 +36,12 @@ import numpy as np
 from strands_robots.simulation.base import SimEngine
 from strands_robots.simulation.isaac.config import IsaacConfig
 from strands_robots.simulation.isaac.recording import IsaacRecordingMixin
-from strands_robots.utils import positive_whole_number_error
+from strands_robots.utils import (
+    camera_fov_error,
+    coerce_pose_vector,
+    positive_count_error,
+    positive_whole_number_error,
+)
 
 if TYPE_CHECKING:
     from strands_robots.rendering import CameraParams
@@ -96,6 +101,75 @@ def _env_float(name: str, default: float) -> float:
         return v if v > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _to_float_list(value: Any, n: int) -> list[float] | None:
+    """Coerce a torch tensor / numpy array / sequence to ``n`` floats.
+
+    Isaac core APIs return numpy arrays on the CPU pipeline and torch
+    tensors on the GPU pipeline; ``get_observation`` handles the same
+    duality with a ``hasattr(x, "cpu")`` probe, mirrored here. Returns
+    ``None`` on any shape / dtype mismatch so callers can treat the
+    read as failed rather than propagate a partial vector.
+    """
+    try:
+        if hasattr(value, "cpu"):
+            value = value.cpu().numpy()
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    if arr.shape[0] < n or not np.all(np.isfinite(arr[:n])):
+        return None
+    return [float(x) for x in arr[:n]]
+
+
+def _rotmat_to_quat_wxyz(rotmat: np.ndarray | list[list[float]]) -> list[float]:
+    """Row-major 3x3 rotation matrix -> unit quaternion, MuJoCo order (wxyz).
+
+    Shepperd's method (branch on the largest diagonal term) for numerical
+    stability near 180-degree rotations. The result is normalized and
+    sign-canonicalized to ``w >= 0`` (quaternion double-cover: ``q`` and
+    ``-q`` encode the same rotation, so the canonical sign is safe for
+    every consumer and keeps repeated reads deterministic).
+    """
+    m = np.asarray(rotmat, dtype=np.float64)
+    t = float(np.trace(m))
+    if t > 0.0:
+        s = float(np.sqrt(t + 1.0)) * 2.0
+        w, x, y, z = 0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] >= m[1, 1] and m[0, 0] >= m[2, 2]:
+        s = float(np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])) * 2.0
+        w, x, y, z = (m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] >= m[2, 2]:
+        s = float(np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])) * 2.0
+        w, x, y, z = (m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s
+    else:
+        s = float(np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])) * 2.0
+        w, x, y, z = (m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    norm = float(np.linalg.norm(q)) or 1.0
+    q = q / norm
+    if q[0] < 0.0:
+        q = -q
+    return [float(v) for v in q]
+
+
+# ``get_body_state`` submits its USD read to the main-thread pump when called
+# from a worker thread; the read itself is trivial, so a stuck wait means the
+# pump died -- fail with a TimeoutError instead of hanging the caller forever.
+_BODY_STATE_MAIN_THREAD_TIMEOUT_S = 30.0
+
+
+def _body_state_envelope(body_name: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a body-state payload in the MuJoCo-compatible success envelope."""
+    pos = state["position"]
+    quat = state["quaternion"]
+    text = (
+        f"Body '{body_name}' ({state.get('source', 'body')} at {state.get('prim_path', '?')}):\n"
+        f"  pos: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]\n"
+        f"  quat: [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]"
+    )
+    return {"status": "success", "content": [{"text": text}, {"json": state}]}
 
 
 class SimulationAppLaunchConfig(TypedDict, total=False):
@@ -1858,14 +1932,33 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
     @staticmethod
     def _stop_timeline_for_deferred_physics() -> None:
-        """Stop the Isaac timeline so the physics-tensor view is cleared.
+        """Stop the Isaac timeline AND invalidate the physics-tensor view.
 
         After this returns the physics-tensor view is torn down, so
         ``RigidPrim.__init__`` skips its eager ``_on_physics_ready``
         velocity query and a freshly constructed ``Dynamic*`` prim
-        initialises only on the next ``world.reset()``. Best-effort: a
-        missing ``omni.timeline`` (partial Isaac install) is logged and
-        ignored.
+        initialises only on the next ``world.reset()``.
+
+        ``timeline.stop()`` alone is NOT sufficient on Isaac Sim 6.0.x
+        (verified on the pip ``isaacsim`` 6.0.0.1 and 6.0.1.0 wheels):
+        the view invalidation that upstream documents as happening
+        "automatically when the timeline is stopped" rides an event
+        subscription, and ``SimulationManager.get_physics_sim_view()``
+        is still non-``None`` when ``stop()`` returns - so the eager
+        velocity query in ``RigidPrim.__init__`` still fires and raises
+        the bare ``Exception("Failed to get rigid body velocities from
+        backend")`` this guard exists to prevent (#159 lineage). Upstream
+        provides :meth:`SimulationManager.invalidate_physics` as the
+        documented manual-invalidation entry point ("not intended to be
+        called directly unless a manual invalidation is desired/required"
+        - deferring a not-yet-viewed prim's physics init is exactly that
+        case), and it tears the view down synchronously. Call both: stop
+        the timeline (scene-build ordering, matches Isaac's own "build
+        rigid bodies, then reset once" flow) then invalidate the view.
+
+        Best-effort: a missing ``omni.timeline`` /
+        ``isaacsim.core.simulation_manager`` (partial Isaac install, older
+        Isaac without the manager API) is logged and ignored.
         """
         try:
             import omni.timeline  # type: ignore[import-not-found]
@@ -1873,6 +1966,21 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             omni.timeline.get_timeline_interface().stop()
         except (ImportError, AttributeError, RuntimeError) as e:
             logger.warning("Could not stop timeline to defer physics init: %s", e)
+        try:
+            from isaacsim.core.simulation_manager import (  # type: ignore[import-not-found]
+                SimulationManager,
+            )
+
+            if SimulationManager.get_physics_sim_view() is not None:
+                SimulationManager.invalidate_physics()
+                logger.info(
+                    "Invalidated live physics-tensor view after timeline stop "
+                    "(stop() alone leaves the view armed on Isaac Sim 6.0.x, "
+                    "so RigidPrim.__init__ would still run its eager velocity "
+                    "query on a prim outside the view)."
+                )
+        except (ImportError, AttributeError, RuntimeError) as e:
+            logger.warning("Could not invalidate physics-tensor view: %s", e)
 
     def _create_shape_prim(
         self,
@@ -2049,10 +2157,39 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
             # Clear any objects realized by a prior load_scene so per-episode
             # reloads are idempotent (no duplicate prims / no "already exists").
+            removed_any = False
             for prior_name in list(self._scene_objects):
                 if prior_name in self._objects:
                     self.remove_object(prior_name)
+                    removed_any = True
                 self._scene_objects.discard(prior_name)
+
+            # Deleting prims leaves PhysX's simulation view STALE but
+            # non-None: the very next ``DynamicCuboid`` construction takes
+            # ``RigidPrim.__init__``'s eager ``_on_physics_ready`` path
+            # (gated on ``SimulationManager.get_physics_sim_view() is not
+            # None``) and its velocity read against the torn-down view
+            # raises the bare ``Exception("Failed to get rigid body
+            # velocities from backend")`` -- episode 2+ of every Isaac
+            # LIBERO eval crashed here (#1802). The #159 timeline-stop
+            # guard does not cover this: ``SimulationManager``'s STOP
+            # callback is a pop-subscription that only fires on an app
+            # update tick, which never happens between ``timeline.stop()``
+            # and the prim constructor. ``invalidate_physics()`` is the
+            # public, SYNCHRONOUS form of exactly that callback (its
+            # docstring sanctions manual invalidation); with the view
+            # gone, every subsequent add takes the deferred-init path and
+            # the end-of-load ``world.step`` below rebuilds one fresh
+            # view for the new scene.
+            if removed_any:
+                try:
+                    from isaacsim.core.simulation_manager import (  # type: ignore[import-not-found]
+                        SimulationManager,
+                    )
+
+                    SimulationManager.invalidate_physics()
+                except (ImportError, RuntimeError, ValueError, AttributeError, TypeError) as e:
+                    logger.warning("load_scene: invalidating the physics view after removals failed: %s", e)
 
             realized: list[str] = []
             skipped: list[dict[str, Any]] = []
@@ -2084,6 +2221,67 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             )
             if skipped:
                 summary += f" ({len(skipped)} skipped)"
+
+            # Re-initialize physics views (#1802). Realizing new prims on a
+            # stage that has ALREADY STEPPED invalidates PhysX's simulation
+            # view (``_construct_shape_prim`` also stops the timeline per
+            # dynamic prim, #159; the removals above invalidate it
+            # explicitly): the per-robot ``SingleArticulation`` handles are
+            # left holding the torn-down view, and ``get_joint_positions``
+            # returns nothing but the "Physics Simulation View is not
+            # created yet" warning. On the LIBERO eval that surfaced as an
+            # observation with NO joint keys -> no ``state.gripper`` -> the
+            # GR00T server rejecting every call.
+            #
+            # The rebuild is ``SimulationManager.initialize_physics()``
+            # (the public warmup that creates the tensor-API simulation
+            # view; a no-op when the view is already live) + per-robot
+            # ``articulation.initialize`` against the fresh view --
+            # deliberately NOT ``world.reset()``: a full reset re-applies
+            # every registered prim's default state on ``post_reset``,
+            # which was measured (2026-07-31, Isaac 6.0 / L4) to
+            # destabilize the already-posed articulation into a PhysX
+            # "Illegal BroadPhaseUpdateData - non-finite bounds" explosion
+            # within ~2 s of stepping. Best-effort per robot: a robot
+            # without a handle (Phase-1 stub) is skipped, a failed re-init
+            # is logged loudly because joint observations WILL be empty
+            # afterwards.
+            if realized:
+                try:
+                    import omni.kit.app  # type: ignore[import-not-found]
+                    from isaacsim.core.simulation_manager import (  # type: ignore[import-not-found]
+                        SimulationManager,
+                    )
+
+                    # Flush the timeline-STOP events queued by the
+                    # per-dynamic-prim ``timeline.stop()`` calls (#159)
+                    # BEFORE rebuilding. Those events are dispatched on the
+                    # next app update, and their handlers null every
+                    # ``RigidPrim`` / ``Articulation`` physics handle -- a
+                    # rebuild done first would be silently undone by the
+                    # first rendered step of the episode (observed as
+                    # "Physics Simulation View is not created yet" on every
+                    # subsequent joint read / action apply of the eval).
+                    omni.kit.app.get_app().update()
+                    SimulationManager.initialize_physics()
+                except (ImportError, RuntimeError, ValueError, AttributeError, TypeError) as e:
+                    logger.warning(
+                        "load_scene: rebuilding the physics view after realizing scene objects failed: %s", e
+                    )
+                for robot in self._robots.values():
+                    if robot.articulation is None:
+                        continue
+                    try:
+                        robot.articulation.initialize(getattr(self._world, "physics_sim_view", None))
+                    except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+                        logger.warning(
+                            "load_scene: re-initializing articulation for robot %r after scene "
+                            "realization failed (%s); joint observations for this robot will be "
+                            "EMPTY until the handle is re-initialized.",
+                            robot.name,
+                            e,
+                        )
+
             logger.info("IsaacSimulation.load_scene: %s", summary)
             return {
                 "status": "success",
@@ -2626,8 +2824,21 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if not self._world_created:
                 return None, None, {"error": "No world created."}
 
-            w = width or self._config.camera_width
-            h = height or self._config.camera_height
+            # Same shared pixel floor ``add_camera`` applies, so the
+            # config-time and call-time domains agree. These sized the
+            # blank-frame fallbacks below with no validation at all: a negative
+            # width reached ``np.zeros`` as ``ValueError: negative dimensions
+            # are not allowed`` and a fractional or non-numeric one as
+            # ``TypeError: 'float' object cannot be interpreted as an
+            # integer``, both escaping this method's ``(rgb, depth, meta)``
+            # contract. ``None`` still means "take the config default";
+            # membership decides that, not truthiness.
+            for param, value in (("width", width), ("height", height)):
+                if value is not None and (dim_err := positive_count_error(value, param, "render")) is not None:
+                    return None, None, {"error": dim_err}
+
+            w = self._config.camera_width if width is None else width
+            h = self._config.camera_height if height is None else height
 
             if self._config.render_mode == "headless":
                 # Return blank frames in headless mode. Most CI flows
@@ -2796,6 +3007,13 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if cam.handle is None:
                 raise RuntimeError(f"Camera '{camera_name}' has no live RTX handle; re-add it via add_camera().")
             for arg_name, arg, native in (("width", width, cam.width), ("height", height, cam.height)):
+                # Shared pixel floor first: the comparison below coerces
+                # with ``int(arg)``, which raises an uninformative
+                # ``ValueError`` for a non-numeric value instead of naming
+                # the parameter that was wrong.
+                if arg is not None:
+                    if (dim_err := positive_count_error(arg, arg_name, "get_frame")) is not None:
+                        raise ValueError(dim_err)
                 if arg is not None and int(arg) != int(native):
                     raise ValueError(
                         f"Isaac cameras render at the resolution fixed at add_camera time; "
@@ -2827,14 +3045,15 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         Args:
             camera_name: a camera previously added via ``add_camera``.
             width: must be ``None`` or the camera's native render width (the
-                handle's intrinsics are only valid at native resolution).
+                handle's intrinsics are only valid at native resolution), and
+                a positive integer when supplied.
             height: same contract as ``width``.
 
         Raises:
             RuntimeError: no world, or the camera has no live RTX handle.
             KeyError: unknown camera name.
-            ValueError: ``width``/``height`` differ from the native render
-                resolution.
+            ValueError: ``width``/``height`` is not a positive integer, or
+                differs from the native render resolution.
         """
         from strands_robots.rendering import CameraParams
 
@@ -2850,6 +3069,13 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     "read off a registration-only camera. Re-add it via add_camera()."
                 )
             for arg_name, arg, native in (("width", width, cam.width), ("height", height, cam.height)):
+                # Shared pixel floor first: the comparison below coerces
+                # with ``int(arg)``, which raises an uninformative
+                # ``ValueError`` for a non-numeric value instead of naming
+                # the parameter that was wrong.
+                if arg is not None:
+                    if (dim_err := positive_count_error(arg, arg_name, "get_camera_params")) is not None:
+                        raise ValueError(dim_err)
                 if arg is not None and int(arg) != int(native):
                     raise ValueError(
                         f"Isaac camera intrinsics are only valid at the native render resolution; "
@@ -2906,11 +3132,50 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         """
         if self._world is None:
             return False
+
+        # A stopped timeline never feeds the RTX render products, so a
+        # warm-up loop below it would step the physics scene while every
+        # render() probe keeps returning the malformed-buffer error - the
+        # exact state load_scene leaves behind after its deferred-physics
+        # window (the #159 guard stops the timeline before constructing
+        # Dynamic* prims, and ``world.step`` does not resume play). Resume
+        # inside the loop, every iteration: timeline stop/play commands
+        # land asynchronously on a kit update tick, so ``is_playing()`` can
+        # report stale ``True`` right after a queued ``stop()`` and a
+        # single pre-loop resume can be undone when that queued stop lands
+        # mid-warm-up. Re-asserting play() before each step converges even
+        # when a stop event is still in flight. Best-effort, same failure
+        # tolerance as the step loop.
+        def _ensure_timeline_playing() -> None:
+            try:
+                import omni.timeline  # type: ignore[import-not-found]
+
+                timeline = omni.timeline.get_timeline_interface()
+                if not timeline.is_playing():
+                    timeline.play()
+                    logger.debug(
+                        "Camera %r warm-up: resumed stopped timeline so the RTX render product can accumulate frames",
+                        name,
+                    )
+            except (ImportError, AttributeError, RuntimeError) as e:
+                logger.debug("Camera %r warm-up: could not query/resume timeline: %s", name, e)
+
         for i in range(max(1, n_steps)):
             try:
+                _ensure_timeline_playing()
                 self._world.step(render=True)
                 self._sim_time += self._config.physics_dt
                 self._step_count += 1
+                # ``world.step(render=True)`` reliably refreshes only the
+                # PRIMARY render product; a camera added after the first
+                # (e.g. the LIBERO adapter's ``wrist_image``, installed at
+                # episode start next to the pre-existing ``image``) never
+                # accumulates a frame from stepping alone and the warm-up
+                # loop ran to exhaustion (#1802). Flush the secondary
+                # products the same way ``get_observation`` does before
+                # checking for a frame.
+                if len(self._cameras) > 1:
+                    self._refresh_all_render_products()
                 if self.render(camera_name=name).get("status") == "success":
                     logger.debug("Camera %r warmed up after %d step(s)", name, i + 1)
                     return True
@@ -2970,14 +3235,44 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             If ``None``, the camera keeps its constructed orientation
             (identity).
         width : int, optional
-            Image width in pixels. Defaults to ``IsaacConfig.camera_width``.
+            Image width in pixels; a positive integer. ``None`` (omitted)
+            takes ``IsaacConfig.camera_width``.
         height : int, optional
-            Image height in pixels. Defaults to ``IsaacConfig.camera_height``.
+            Image height in pixels; a positive integer. ``None`` (omitted)
+            takes ``IsaacConfig.camera_height``.
         fov : float
             Horizontal field of view in degrees. Default 60.0. Mapped
             onto ``Camera.set_focal_length`` using the standard pinhole
             relation ``focal_length = horizontal_aperture / (2 * tan(fov/2))``
             with the USD-default 24 mm horizontal aperture.
+
+        Validation
+        ----------
+        ``position`` and ``target`` must each be 3 finite numbers (a list,
+        tuple or NumPy array; NumPy scalar elements accepted, ``bool``
+        refused), and must not be identical - a camera whose eye is its own
+        look-at point has no look direction. Omit a vector to take its
+        default; an empty vector is a wrong-length request and is rejected
+        rather than silently placing the camera at the default pose. ``fov``
+        must be a finite angle in the open interval ``(0, 180)`` degrees, and
+        ``width`` / ``height`` must each be a positive integer (omit one to take
+        the ``IsaacConfig`` default - ``0`` is a request for an impossible
+        resolution, not an omission). These are the same bounds the MuJoCo and
+        Newton backends' ``add_camera`` enforces, on the shared
+        :func:`~strands_robots.utils.coerce_pose_vector` /
+        :func:`~strands_robots.utils.camera_fov_error` /
+        :func:`~strands_robots.utils.positive_count_error` domains, so a camera
+        configuration one backend refuses is refused by all three. Invalid
+        values are rejected here, before the stage is touched, rather than
+        deferring an uncaught exception (non-numeric ``fov``, ``fov=0``) or a
+        silently degenerate camera (a ``nan`` in the USD pose or in the derived
+        focal length) to the first render.
+
+        A non-positive ``width`` is especially costly here because the DLSS
+        upscale below multiplies it back out: ``scale = _MIN_RENDER_PX / w`` for
+        ``w = -4`` gave a native render size of ``640 x -76800``, and every
+        later render of that camera then failed on the negative dimension - one
+        bad configuration call disabled the camera for the rest of the session.
 
         Returns
         -------
@@ -2992,16 +3287,72 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
 
+            # Validate the pose and the field of view on the shared domains the
+            # MuJoCo and Newton backends' ``add_camera`` already applies, before
+            # anything touches the stage. ``coerce_pose_vector``'s contract is
+            # that a pose either backend entry point refuses must be refused by
+            # the other, and this was the entry point that refused nothing: the
+            # ``list(position)`` below copied the caller's vector element-wise
+            # without reading it, so a ``nan``/``inf`` component, a non-numeric
+            # element, a ``bool`` (the coordinate 1.0) and a wrong-length vector
+            # all reached ``_create_camera_prim`` under ``status="success"``, and
+            # a NumPy pose leaked ``np.float64`` into the status text and the
+            # json payload. ``float(fov)`` accepted ``nan``/``inf``/``0``/
+            # ``>= 180`` and raised a bare ``ValueError`` on a non-numeric value
+            # - from outside the try block below, so it escaped the structured
+            # ``{"status": "error"}`` contract entirely. Coercion is validation
+            # only when the coercion rejects; these did not.
+            position, pos_err = coerce_pose_vector("add_camera", "position", position, 3)
+            if pos_err is not None:
+                return {"status": "error", "content": [{"text": pos_err}]}
+            target, tgt_err = coerce_pose_vector("add_camera", "target", target, 3)
+            if tgt_err is not None:
+                return {"status": "error", "content": [{"text": tgt_err}]}
+            pos = [2.0, 2.0, 2.0] if position is None else position
+            tgt = target
+            if tgt is not None and all(abs(pos[i] - tgt[i]) < 1e-9 for i in range(3)):
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": f"add_camera: 'position' and 'target' are identical ({pos}); camera has no look direction."
+                        }
+                    ],
+                }
+            # An fov outside (0, 180) is not merely mis-framed here: the pinhole
+            # relation ``focal_length = horizontal_aperture / (2 * tan(fov / 2))``
+            # in :meth:`_create_camera_prim` raises ``ZeroDivisionError`` for
+            # ``0`` - which is NOT in the except tuple below, so it propagates
+            # out of this method - and yields a ``nan`` focal length for a
+            # ``nan`` fov and 7.3e-16 mm for ``180``, both of which
+            # ``set_focal_length`` accepts, giving a camera that renders nothing
+            # usable under a success result.
+            if (fov_err := camera_fov_error("add_camera", "fov", fov)) is not None:
+                return {"status": "error", "content": [{"text": fov_err}]}
+            # Pixel dimensions on the shared floor
+            # (:func:`~strands_robots.utils.positive_count_error`) the MuJoCo
+            # backend's ``_validate_render_dims`` already applies, so a
+            # resolution one backend refuses is refused by all of them. The
+            # ``int(width or ...)`` this replaces validated nothing and read a
+            # falsy value as *omitted*: ``width=0`` silently substituted the
+            # config default and reported it as the resolution, so the caller
+            # was told a size it never asked for. A negative was stored
+            # verbatim, a fractional or ``bool`` value was truncated, and a
+            # non-numeric / ``nan`` / ``inf`` value raised ``ValueError`` /
+            # ``OverflowError`` from ``int()`` - outside the try block below, so
+            # it escaped the structured ``{"status": "error"}`` contract.
+            for param, value in (("width", width), ("height", height)):
+                if value is not None and (dim_err := positive_count_error(value, param, "add_camera")) is not None:
+                    return {"status": "error", "content": [{"text": dim_err}]}
+
             if name in self._cameras:
                 return {
                     "status": "error",
                     "content": [{"text": f"Camera '{name}' already exists."}],
                 }
 
-            w = int(width or self._config.camera_width)
-            h = int(height or self._config.camera_height)
-            pos = list(position) if position is not None else [2.0, 2.0, 2.0]
-            tgt = list(target) if target is not None else None
+            w = self._config.camera_width if width is None else width
+            h = self._config.camera_height if height is None else height
             fov_deg = float(fov)
 
             # RTX cameras: render at a higher NATIVE resolution if the
@@ -4295,6 +4646,211 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             return [float(x) for x in pos]
         except (RuntimeError, ValueError, AttributeError, TypeError):
             return None
+
+    def get_body_state(self, body_name: str) -> dict[str, Any]:
+        """World pose of a scene object or robot link, MuJoCo-envelope-compatible.
+
+        Implements the same duck-typed contract as
+        :meth:`strands_robots.simulation.mujoco.physics.PhysicsMixin.get_body_state`,
+        which is the read primitive under BOTH consumers this backend was
+        missing (#1802):
+
+        * the predicate DSL (:mod:`strands_robots.simulation.predicates`
+          ``_body_position`` / ``_body_quaternion``, so ``body_above_z`` /
+          ``body_on`` / ``distance_less_than`` / ... evaluate on Isaac), and
+        * :meth:`LiberoAdapter._read_eef_pose`'s body-state fallback, which
+          injects the ``state.x/y/z/roll/pitch/yaw`` keys the ``libero_panda``
+          GR00T data-config requires.
+
+        Name resolution, in order (namespace-aware, mirroring MuJoCo's
+        "unambiguous or explicit" contract):
+
+        1. **Object registry** -- an ``add_object`` / ``load_scene`` object
+           whose name matches ``body_name`` verbatim (this is how LIBERO
+           scene bodies such as ``porcelain_mug_1_main`` resolve).
+        2. **Absolute prim path** -- a ``body_name`` starting with ``/`` is
+           looked up on the stage directly.
+        3. **Namespaced robot link** -- ``"<robot>/<link>"`` searches the
+           named robot's prim subtree for an Xformable prim named
+           ``<link>`` (e.g. ``"robot/panda_hand"``).
+        4. **Bare robot link** -- searched across every robot's subtree;
+           first match wins, so multi-robot scenes with colliding link
+           names MUST use the namespaced form.
+
+        Returns:
+            ``{"status": "success", "content": [{"text": ...}, {"json":
+            {"position": [x, y, z], "quaternion": [w, x, y, z],
+            "rotation_matrix": 3x3, ...}}]}`` on success. ``linear_velocity``
+            / ``angular_velocity`` are included only when the resolved
+            object's handle exposes them (rigid-prim objects do; USD-walked
+            robot links do not -- keys are OMITTED rather than zero-filled,
+            per the no-silent-defaults rule). ``mass`` / ``center_of_mass``
+            from the MuJoCo contract are likewise not reported on Isaac.
+            Unknown bodies and a missing world return
+            ``{"status": "error", "content": [{"text": ...}]}``.
+
+        Concurrency: safe to call from any thread. Off the main thread with
+        the pump running, the USD read is submitted via :meth:`run_on_main`
+        (Kit's stage may only be queried from the thread that owns
+        ``SimulationApp``).
+        """
+        if not isinstance(body_name, str) or not body_name.strip():
+            return {
+                "status": "error",
+                "content": [{"text": "get_body_state: body_name must be a non-empty string."}],
+            }
+        if not self._world_created:
+            return {"status": "error", "content": [{"text": "No world created. Call create_world() first."}]}
+
+        if self._on_main_thread() or not self._pump_running:
+            return self._get_body_state_impl(body_name)
+        return self.run_on_main(
+            lambda: self._get_body_state_impl(body_name),
+            timeout=_BODY_STATE_MAIN_THREAD_TIMEOUT_S,
+        )
+
+    def _get_body_state_impl(self, body_name: str) -> dict[str, Any]:
+        """Resolve + read ``body_name``; runs on the main thread (or pump-less)."""
+        obj = self._objects.get(body_name)
+        if obj is not None and obj.handle is not None:
+            state = self._object_body_state(obj)
+            if state is not None:
+                return _body_state_envelope(body_name, state)
+
+        state = self._prim_body_state(body_name)
+        if state is not None:
+            return _body_state_envelope(body_name, state)
+
+        objects = sorted(self._objects)
+        shown = ", ".join(objects[:20]) + (", ..." if len(objects) > 20 else "")
+        msg = (
+            f"Body '{body_name}' not found on the Isaac stage. "
+            f"Known objects: [{shown}]. Robots: {sorted(self._robots)} -- address robot links as "
+            f"'<robot>/<link>' (e.g. 'robot/panda_hand') or pass an absolute prim path ('/World/...')."
+        )
+        return {"status": "error", "content": [{"text": msg}]}
+
+    def _object_body_state(self, obj: _ObjectState) -> dict[str, Any] | None:
+        """Pose (+ best-effort velocities) of a registered object's rigid prim."""
+        try:
+            pos, quat = obj.handle.get_world_pose()
+        except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+            logger.debug("get_body_state: get_world_pose failed for object %r: %s", obj.name, e)
+            return None
+        position = _to_float_list(pos, 3)
+        quaternion = _to_float_list(quat, 4)  # Isaac core convention is scalar-first (wxyz), same as MuJoCo
+        if position is None or quaternion is None:
+            logger.debug("get_body_state: object %r returned an unusable pose (%r, %r)", obj.name, pos, quat)
+            return None
+        state: dict[str, Any] = {
+            "position": position,
+            "quaternion": quaternion,
+            "rotation_matrix": _quat_wxyz_to_rotmat(np.asarray(quaternion)).tolist(),
+            "source": "object",
+            "prim_path": obj.prim_path,
+        }
+        for key, getter in (("linear_velocity", "get_linear_velocity"), ("angular_velocity", "get_angular_velocity")):
+            fn = getattr(obj.handle, getter, None)
+            if fn is None:
+                continue
+            try:
+                vel = _to_float_list(fn(), 3)
+            except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+                logger.debug("get_body_state: %s failed for object %r: %s", getter, obj.name, e)
+                continue
+            if vel is not None:
+                state[key] = vel
+        return state
+
+    def _prim_body_state(self, body_name: str) -> dict[str, Any] | None:
+        """Pose of a robot-link / absolute-path prim, read off the USD stage.
+
+        Same stage-walk + axis-normalization approach as
+        :meth:`gripper_frame_pose` (handles authored scale), generalized from
+        that method's name-heuristic gripper search to exact-name link
+        resolution. Returns ``None`` when the prim cannot be resolved.
+        """
+        try:
+            import omni.usd  # type: ignore[import-not-found]
+            from pxr import (  # type: ignore[import-not-found]
+                Gf,
+                Sdf,
+                Usd,
+                UsdGeom,
+            )
+        except ImportError as e:
+            logger.debug("get_body_state: USD runtime not importable: %s", e)
+            return None
+        try:
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return None
+
+            prim = None
+            if body_name.startswith("/"):
+                p = stage.GetPrimAtPath(body_name)
+                if p and p.IsValid() and p.IsA(UsdGeom.Xformable):
+                    prim = p
+            elif "/" in body_name:
+                robot_name, _, link_name = body_name.partition("/")
+                r = self._robots.get(robot_name)
+                if r is not None and link_name:
+                    prim = self._find_robot_link_prim(stage, r, link_name, Sdf, Usd, UsdGeom)
+            else:
+                for r in self._robots.values():
+                    prim = self._find_robot_link_prim(stage, r, body_name, Sdf, Usd, UsdGeom)
+                    if prim is not None:
+                        break
+            if prim is None:
+                return None
+
+            xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            t = xf.ExtractTranslation()
+
+            def _axis(vx: float, vy: float, vz: float) -> list[float]:
+                d = xf.TransformDir(Gf.Vec3d(vx, vy, vz))
+                n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) ** 0.5 or 1.0
+                return [d[0] / n, d[1] / n, d[2] / n]
+
+            ax, ay, az = _axis(1.0, 0.0, 0.0), _axis(0.0, 1.0, 0.0), _axis(0.0, 0.0, 1.0)
+            # Columns are the prim frame's local axes in world coords
+            # (``world = R @ local``), matching MuJoCo's ``data.xmat``.
+            rotmat = [
+                [ax[0], ay[0], az[0]],
+                [ax[1], ay[1], az[1]],
+                [ax[2], ay[2], az[2]],
+            ]
+            return {
+                "position": [float(t[0]), float(t[1]), float(t[2])],
+                "quaternion": _rotmat_to_quat_wxyz(rotmat),
+                "rotation_matrix": rotmat,
+                "source": "prim",
+                "prim_path": str(prim.GetPath()),
+            }
+        except (RuntimeError, ValueError, AttributeError, TypeError):
+            logger.debug("get_body_state: USD read failed for %r", body_name, exc_info=True)
+            return None
+
+    @staticmethod
+    def _find_robot_link_prim(stage: Any, r: _RobotState, link_name: str, Sdf: Any, Usd: Any, UsdGeom: Any) -> Any:  # noqa: N803 - pxr module objects passed by caller
+        """Exact-name Xformable prim under a robot's top-level subtree, or ``None``.
+
+        Walks up from ``r.actual_prim_path`` to the top-level robot prim
+        (the importer may have relocated the robot -- see
+        :meth:`gripper_frame_pose`) and searches the whole subtree for a
+        prim named ``link_name``.
+        """
+        sdf_path = Sdf.Path(r.actual_prim_path)
+        top = sdf_path
+        while top.GetParentPath() != Sdf.Path.absoluteRootPath and top.GetParentPath() != Sdf.Path.emptyPath:
+            top = top.GetParentPath()
+        root = stage.GetPrimAtPath(top)
+        if not root or not root.IsValid():
+            return None
+        for p in Usd.PrimRange(root):
+            if p.GetName() == link_name and p.IsA(UsdGeom.Xformable):
+                return p
+        return None
 
     def gripper_frame_pos(self, robot_name: str | None = None) -> list[float] | None:
         """World position of the robot's gripper / tool link (translation only)."""

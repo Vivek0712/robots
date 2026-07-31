@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 # signature as a *string* annotation; ``from __future__ import
 # annotations`` (already in effect) makes that a no-op at runtime.
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
-from strands_robots.utils import positive_finite_number_error
+from strands_robots.utils import positive_count_error, positive_finite_number_error
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,46 @@ def randomization_seed_error(value: Any, context: str) -> str | None:
     return None
 
 
+_NON_FINITE_ACTION_REASON = (
+    "A non-finite value is not clamped into the actuator's control range - the "
+    "integrator has no usable target for it. On MuJoCo the physics step is "
+    "discarded and every robot in the scene is reset to its initial pose, so no "
+    "robot follows the command and the reset is not scoped to the commanded "
+    "actuator or robot."
+)
+
+
+def _non_finite_action_error(label: str, value: Any) -> dict[str, Any] | None:
+    """Structured error when an already-coerced action value is not finite.
+
+    ``nan``/``inf`` are valid ``float`` objects, so a scalar-coercion check
+    admits them and they reach the actuator command unexamined. The sibling
+    state writers (``set_joint_positions`` / ``set_joint_velocities``) already
+    refuse a non-finite value; this is the same rule for the actuator-command
+    path, applied to both accepted action shapes so a mapping value and a vector
+    entry cannot diverge.
+
+    Args:
+        label: How to name the offending element in the message - the caller
+            supplies it because a mapping names a key while a vector names a
+            position and the actuator key it binds to.
+        value: The value, already confirmed to coerce to a scalar ``float`` by
+            the caller (so the coercion here cannot raise).
+
+    Returns:
+        A structured ``{"status": "error", ...}`` dict, or ``None`` when the
+        value is finite and therefore usable.
+    """
+    if math.isfinite(float(value)):
+        return None
+    return {
+        "status": "error",
+        "content": [
+            {"text": (f"send_action: {label} must be finite (no nan/inf), got {value!r}. {_NON_FINITE_ACTION_REASON}")}
+        ],
+    }
+
+
 class SimEngine(ABC):
     """Abstract base class for simulation engines.
 
@@ -385,7 +425,7 @@ class SimEngine(ABC):
         """
         known = self.list_robots()
         msg = f"Robot '{requested}' not found."
-        if known:
+        if known and isinstance(requested, str):
             matches = difflib.get_close_matches(requested, known, n=3, cutoff=0.4)
             if matches:
                 msg += " Did you mean: " + ", ".join(matches) + "?"
@@ -810,6 +850,22 @@ class SimEngine(ABC):
         error rather than raised as an unhandled ``TypeError`` deep in the
         actuator-application loop.
 
+        Every value must additionally be **finite**. ``nan``/``inf`` are valid
+        ``float`` objects, so the scalar-coercion check above admits them and they
+        reach the actuator command unexamined. A non-finite command is not clamped
+        into the actuator's range: MuJoCo finds the resulting non-finite ``qacc``,
+        discards the step and resets the world to its initial pose - on every
+        substep, and for *every* robot in the scene rather than only the commanded
+        one - while ``send_action`` still reports success, so a rollout recording
+        such a step writes a trajectory no robot followed. An ``inf`` is instead
+        clamped into ``ctrlrange``, i.e. silently rewritten into a full-travel
+        command. The sibling state writers (:meth:`set_joint_positions` /
+        :meth:`set_joint_velocities`) already refuse a non-finite value, so this
+        holds the actuator-command path to the same rule. The domain is finiteness
+        alone: a numeric string is an accepted spelling of a scalar here, and a
+        finite magnitude outside ``ctrlrange`` is a units question already
+        surfaced by the clamp warning.
+
         Args:
             action: A ``{name: value}`` mapping, or an ordered numeric vector
                 whose entries correspond to ``robot_action_keys(robot_name)``.
@@ -866,6 +922,8 @@ class SimEngine(ABC):
                             }
                         ],
                     }
+                if error := _non_finite_action_error(f"action value for key '{key}'", value):
+                    return None, error
                 normalized[key] = value
             return normalized, None
 
@@ -909,7 +967,12 @@ class SimEngine(ABC):
                     }
                 ],
             }
-        return {name: value for name, value in zip(action_keys, values)}, None
+        bound: dict[str, Any] = {}
+        for idx, (name, value) in enumerate(zip(action_keys, values)):
+            if error := _non_finite_action_error(f"action vector entry {idx} ('{name}')", value):
+                return None, error
+            bound[name] = value
+        return bound, None
 
     @abstractmethod
     def send_action(
@@ -1033,8 +1096,14 @@ class SimEngine(ABC):
         and would otherwise be silently clamped to 1 by
         :func:`~strands_robots.policies.base.resolve_chunk_length`, hiding the
         caller's mistake behind a rollout that does not run the requested
-        horizon. Returns a structured ``{"status": "error", ...}`` dict to
-        surface, or ``None`` when the value is valid.
+        horizon. ``True`` is rejected for the same reason: it would act as a
+        silent horizon of 1. Returns a structured ``{"status": "error", ...}``
+        dict to surface, or ``None`` when the value is valid.
+
+        The domain is delegated to :meth:`_validate_positive_int`, which the
+        hardware control loop's ``action_horizon`` guard shares through
+        :func:`~strands_robots.utils.positive_count_error`, so a horizon refused
+        for a simulated rollout cannot be accepted for the real arm.
 
         Args:
             action_horizon: The caller-supplied value to validate.
@@ -1047,12 +1116,7 @@ class SimEngine(ABC):
         Returns:
             An error dict naming the offending parameter, or ``None``.
         """
-        if not isinstance(action_horizon, int) or action_horizon < 1:
-            return {
-                "status": "error",
-                "content": [{"text": f"{method}: {param} must be a positive integer, got {action_horizon!r}."}],
-            }
-        return None
+        return SimEngine._validate_positive_int(action_horizon, param, method)
 
     @staticmethod
     def _validate_per_robot_mapping(
@@ -1101,14 +1165,26 @@ class SimEngine(ABC):
         """Reject a non-positive-integer count at the public API.
 
         Shared guard for the rollout count knobs that must be ``>= 1`` -
-        ``n_episodes`` (how many reset->rollout episodes to run) and
-        ``max_steps`` (the per-episode step cap). A zero/negative/non-int
-        value would otherwise flow into the rollout loop and produce a
-        degenerate result that still reports ``status="success"``: an eval
-        over zero episodes, or episodes of zero length, that fabricate a 0%
-        success rate (``Episodes: -2 | Success: 0/-2``) instead of surfacing
-        the caller's mistake. Returns a structured ``{"status": "error", ...}``
-        dict to surface, or ``None`` when the value is valid.
+        ``n_episodes`` (how many reset->rollout episodes to run), ``max_steps``
+        (the per-episode step cap), ``control_substeps`` and
+        ``action_horizon``. A zero/negative/non-int value would otherwise flow
+        into the rollout loop and produce a degenerate result that still reports
+        ``status="success"``: an eval over zero episodes, or episodes of zero
+        length, that fabricate a 0% success rate (``Episodes: -2 | Success:
+        0/-2``) instead of surfacing the caller's mistake. Returns a structured
+        ``{"status": "error", ...}`` dict to surface, or ``None`` when the value
+        is valid.
+
+        Thin binding of the shared count domain
+        (:func:`~strands_robots.utils.positive_count_error`) to this class's
+        tool-error envelope. The domain lives in :mod:`strands_robots.utils`
+        because the hardware control loop's ``action_horizon`` must enforce the
+        identical rule and :mod:`strands_robots.hardware_robot` cannot import
+        :mod:`strands_robots.simulation`; sharing one implementation is what
+        stops the same count being refused for a digital twin and accepted for
+        the arm it mirrors. ``bool`` is part of that shared domain rather than
+        each caller's business: a bare ``value < 1`` test lets ``True`` through
+        as a silent count of 1 while rejecting ``False``.
 
         Args:
             value: The caller-supplied value to validate.
@@ -1118,11 +1194,8 @@ class SimEngine(ABC):
         Returns:
             An error dict naming the offending parameter, or ``None``.
         """
-        if not isinstance(value, int) or value < 1:
-            return {
-                "status": "error",
-                "content": [{"text": f"{method}: {name} must be a positive integer, got {value!r}."}],
-            }
+        if error := positive_count_error(value, name, method):
+            return {"status": "error", "content": [{"text": error}]}
         return None
 
     @staticmethod
@@ -1140,13 +1213,13 @@ class SimEngine(ABC):
         exists to avoid - the arm integrates ~2 ms of a 20 ms control period, so
         the rollout reports ``status="success"`` while the policy looks like a
         no-op. A float (``2.7``) was silently truncated, ``True`` acted as a
-        silent 1 substep (``bool`` is an ``int`` subclass, so it is rejected
-        explicitly as in :meth:`_validate_positive_frequency`), and ``nan`` /
-        ``inf`` reached ``int()`` deep inside the runner and surfaced as a bare
+        silent 1 substep (``bool`` is an ``int`` subclass), and ``nan`` / ``inf``
+        reached ``int()`` deep inside the runner and surfaced as a bare
         ``ValueError``/``OverflowError`` instead of the structured tool-error
         dict the public API contracts.
 
-        The positive-integer domain itself is delegated to
+        The positive-integer domain itself - including the ``bool`` rejection,
+        which this guard used to repeat locally - is delegated to
         :meth:`_validate_positive_int` so this guard and the rollout count knobs
         cannot drift apart.
 
@@ -1160,13 +1233,6 @@ class SimEngine(ABC):
         """
         if control_substeps is None:
             return None
-        if isinstance(control_substeps, bool):
-            return {
-                "status": "error",
-                "content": [
-                    {"text": f"{method}: control_substeps must be a positive integer, got {control_substeps!r}."}
-                ],
-            }
         return SimEngine._validate_positive_int(control_substeps, "control_substeps", method)
 
     @staticmethod
@@ -1385,6 +1451,76 @@ class SimEngine(ABC):
         if error:
             return {"status": "error", "content": [{"text": error}]}
         return None
+
+    def _validate_recording_rate(self, control_frequency: float, method: str) -> dict[str, Any] | None:
+        """Reject a rollout whose rate the active dataset recording cannot describe.
+
+        Instance method (not a ``@staticmethod`` like the other numeric guards)
+        because the value it compares against lives on the engine: the rate is
+        only knowable once a recording is open, which happens one call earlier
+        in ``start_recording``. Backends that cannot record inherit
+        :meth:`_is_recording` returning ``False`` and are unaffected, so this
+        one call site per rollout entry point covers every backend without each
+        needing its own copy.
+
+        Args:
+            control_frequency: Rate the rollout will capture frames at. Validate
+                it with :meth:`_validate_positive_frequency` first, so a
+                non-finite value is reported as the parameter error it is
+                rather than as a rate disagreement.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            A structured ``{"status": "error", ...}`` dict, or ``None`` when no
+            recording is active or the rates agree. See
+            :func:`~strands_robots.simulation.recording.dataset_rate_mismatch_reason`
+            for the contract and why a mismatch is refused rather than warned.
+        """
+        if not self._is_recording():
+            return None
+        from strands_robots.simulation.recording import dataset_rate_mismatch_error
+
+        return dataset_rate_mismatch_error(method, self._active_recorder(), control_frequency)
+
+    def _validate_recording_start_rate(self, fps: Any, method: str) -> dict[str, Any] | None:
+        """Reject opening a recording at a rate an in-flight rollout does not capture at.
+
+        The inverse ordering of :meth:`_validate_recording_rate`, and the same
+        disagreement: that guard runs when a rollout starts against an open
+        recording, this one when a recording is opened against a rollout that is
+        already running. ``start_policy`` makes the second ordering reachable by
+        design - it submits the rollout and returns while it continues - and the
+        two library defaults collide (``fps=30`` against
+        ``control_frequency=50.0``), so the plain sequence produced a 1.667x
+        mislabelled episode with every call reporting success.
+
+        Instance method for the same reason as :meth:`_validate_recording_rate`:
+        the value it compares against lives on the engine. Backends with no
+        asynchronous rollout inherit :meth:`_active_rollout_rates` returning an
+        empty mapping and are unaffected, so one call site per backend's
+        ``start_recording`` covers every backend without each needing its own
+        copy of the rule.
+
+        Args:
+            fps: Caller-supplied dataset frame rate. Validate it with
+                :func:`~strands_robots.simulation.recording.dataset_recording_option_error`
+                first, so a value no dataset can be written at is reported as
+                the parameter error it is rather than as a rate disagreement.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            A structured ``{"status": "error", ...}`` dict, or ``None`` when no
+            rollout is in flight or every one of them already captures at
+            ``fps``. See
+            :func:`~strands_robots.simulation.recording.rollout_rate_mismatch_reason`
+            for the contract and the measured consequence.
+        """
+        rates = self._active_rollout_rates()
+        if not rates:
+            return None
+        from strands_robots.simulation.recording import rollout_rate_mismatch_error
+
+        return rollout_rate_mismatch_error(method, fps, rates)
 
     @staticmethod
     def _validate_video_config(video: Any, method: str) -> dict[str, Any] | None:
@@ -1626,24 +1762,91 @@ class SimEngine(ABC):
                 why the rollout ended via ``stopped_reason``.
 
         Returns:
-            Standard status dict with an agent-consumable ``{"json": {...}}``
-            content block alongside the human-readable ``text``. The json block
-            carries the rollout facts as typed fields (``n_steps``,
-            ``steps_used``, ``elapsed_s``, ``stopped_early``,
-            ``stopped_reason`` (``"predicate"`` | ``"budget"`` |
-            ``"cancelled"``; ``"error"`` on error results - so an agent
-            deciding whether to retry knows WHY the rollout ended),
-            ``action_errors``, ``video_path``,
-            ``video_frames``, ``positional_fallback_used``,
-            ``generic_state_keys_used``, ``missing_state_keys_used``, ...) so callers can self-correct
-            programmatically without parsing the text. The two routing-
-            degradation flags are True when the driving policy could not bind
-            the observation to the model's inputs by name and silently fell
-            back (a camera routed to a model image slot positionally, or
-            ``observation.state`` composed from the observation's own scalar
-            keys because none of ``robot_state_keys`` matched). A True flag on
-            an otherwise ``success`` run is the signature of the robot moving
-            on meaningless inputs. Mirrors :meth:`eval_policy`.
+            The standard agent-tool envelope
+            ``{"status": "success"|"error", "content": [{"text": ...},
+            {"json": {...}}]}``. The ``json`` block is the machine-readable
+            rollout report; ``text`` carries the same facts for humans.
+
+            Read the json block by SCANNING ``content`` for the first block
+            with a ``"json"`` key, never by a fixed index::
+
+                report = next(b["json"] for b in result["content"] if "json" in b)
+
+            An early caller-error return (a rejected ``duration``, an unknown
+            robot) carries a ``text`` block ONLY, so a hardcoded
+            ``content[1]`` raises ``IndexError`` on exactly the results a
+            caller most needs to read.
+
+            IMPORTANT - ``status`` is not the rollout verdict. It reports
+            whether the CALL was accepted and the loop ran; it does not say the
+            robot did anything useful. A rollout that drove only a SUBSET of
+            the robot's actuators is deliberately ``success`` (it is
+            operational), so ``status`` alone cannot see it: a policy driving 1
+            of a Panda's 8 actuators returns ``status="success"`` with
+            ``action_errors=0`` and ``partial_action_failure_rate=0.875``. Gate
+            on ``partial_action_failure_rate`` and the binding-degradation
+            flags below to decide whether a rollout is worth anything. A TOTAL
+            failure - no emitted key resolving to any actuator - is reported as
+            ``status="error"``.
+
+            Fields in the json block:
+
+            Identity: ``robot_name``, ``policy`` (the driving policy's class
+            name), ``instruction``.
+
+            Horizon: ``n_steps`` (control steps executed), ``steps_used``
+            (alias of ``n_steps`` under the retry-loop name), ``elapsed_s``,
+            ``sim_time_s`` (when the backend reports sim time),
+            ``stopped_early``, ``stopped_reason`` (``"predicate"`` - the
+            ``stop_when`` condition fired; ``"budget"`` - the step/duration
+            horizon was exhausted; ``"cancelled"`` - a cooperative stop, e.g.
+            ``stop_policy``; ``"error"`` on error results - so an agent
+            deciding whether to retry knows WHY the rollout ended).
+
+            Action health: ``action_errors`` (steps where at least one emitted
+            key did not resolve), ``action_resolution_rate`` (an
+            ``{actuator_name: fraction_of_steps_driven}`` map, so a joint stuck
+            at ``0.0`` names the actuator the policy never drove) and
+            ``partial_action_failure_rate`` (the mean fraction of the robot's
+            DOF never driven; ``0.0`` == every actuator moved every step,
+            ``~0.83`` == only 1 of 6 actuators ever moved).
+
+            Video: ``video_path`` (``None`` when no MP4 was written) and
+            ``video_frames``.
+
+            Episodes: ``n_episodes_requested``, ``n_episodes_completed``,
+            ``episodes_saved`` and ``dataset_episode_indices`` (the dataset
+            episode indices this call flushed, empty without a recording).
+
+            Policy binding: ``positional_fallback_used``,
+            ``generic_state_keys_used`` and ``missing_state_keys_used``. True
+            means the driving policy could not bind the observation to the
+            model's inputs by name and silently fell back (a camera routed to a
+            model image slot positionally, or ``observation.state`` composed
+            from the observation's own scalar keys because none of
+            ``robot_state_keys`` matched). A True flag on an otherwise
+            ``success`` run is the signature of a robot moving on meaningless
+            inputs.
+
+            Policy load: ``policy_load_time_s``, ``policy_load_cache_hit``
+            (``False`` on episode 2+ of a loop is a smell that the caller
+            rebuilt the policy instead of reusing ``policy_object=``) and
+            ``policy_resident_rss_mb``.
+
+            Async-RTC telemetry, so latency masking is provable from the
+            payload instead of from logs: ``rtc_async_enabled``,
+            ``rtc_chunks_acquired``, ``rtc_prefetch_hits``,
+            ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms`` and
+            ``rtc_max_inference_ms``.
+
+            Fail-fast: if EVERY action step in the opening probe window drives
+            zero actuators - none of the policy's emitted keys resolve to any of
+            the robot's actuators - the rollout can never move the robot, so it
+            returns ``status="error"`` at the probe boundary instead of running
+            the full episode (and every remaining model inference call +
+            recording write). The error enumerates the unresolved keys and the
+            robot's valid actuator names. A PARTIAL failure runs to completion,
+            surfaced via ``partial_action_failure_rate``.
         """
         from strands_robots.policies import create_policy
 
@@ -1683,6 +1886,11 @@ class SimEngine(ABC):
         if err := self._validate_action_horizon(action_horizon, "run_policy"):
             return err
         if err := self._validate_control_substeps(control_substeps, "run_policy"):
+            return err
+        # Both rates are known only here: the dataset rate was fixed by
+        # start_recording one call earlier. Checked before any policy is
+        # built so a rate disagreement costs no weight download and no frame.
+        if err := self._validate_recording_rate(control_frequency, "run_policy"):
             return err
 
         # Compile the stop_when early-return clause BEFORE any policy is
@@ -2121,6 +2329,23 @@ class SimEngine(ABC):
         """
         return False
 
+    def _active_rollout_rates(self) -> dict[str, float]:
+        """Capture rate in Hz of every rollout currently in flight, per robot.
+
+        Backends that can run a rollout asynchronously - returning to the caller
+        while it continues, as the MuJoCo ``start_policy`` does - override this
+        so :meth:`_validate_recording_start_rate` can compare a recording about
+        to be opened against what is already capturing frames. The base runs
+        every rollout to completion before returning, so no rollout can be in
+        flight when a caller reaches ``start_recording`` and the mapping is
+        empty.
+
+        Returns:
+            ``{robot_name: control_frequency}`` for live rollouts only; an empty
+            mapping when none is running.
+        """
+        return {}
+
     def _active_recorder(self) -> Any:
         """Return the active dataset recorder object, or ``None``.
 
@@ -2524,6 +2749,49 @@ class SimEngine(ABC):
         ``eval_ep1.mp4``, ...) so episodes never overwrite each other, and the
         written files are returned in the result json ``video_paths``. Recording
         is unsupported on the benchmark (``evaluate_benchmark``) path.
+
+        Returns:
+            The standard agent-tool envelope
+            ``{"status": "success"|"error", "content": [{"text": ...},
+            {"json": {...}}]}``, read the same way as :meth:`run_policy`'s -
+            by scanning ``content`` for the first block with a ``"json"`` key,
+            never by a fixed index (an early caller-error return carries a
+            ``text`` block only).
+
+            ``status`` reports whether the evaluation RAN, not whether the
+            policy succeeded: an evaluation in which every episode failed is
+            still ``status="success"`` with ``success_rate=0.0``. Read
+            ``success_measured`` first - it is ``False`` when no
+            ``success_fn`` / benchmark spec was supplied, in which case
+            ``success_rate`` is ``0.0`` for every policy regardless of what it
+            did and measures nothing.
+
+            Fields in the json block:
+
+            Outcome: ``success_rate``, ``n_success``, ``success_measured``,
+            ``episodes_completed``, ``episodes`` (the per-episode records) and
+            ``avg_steps``.
+
+            Horizon: ``n_episodes``, ``max_steps`` (the values the evaluation
+            ran with) and ``stopped_early``.
+
+            Video: ``video_paths`` (one MP4 per episode, empty when no
+            recording was requested).
+
+            Policy binding: ``positional_fallback_used``,
+            ``generic_state_keys_used`` and ``missing_state_keys_used`` - True
+            means the policy silently fell back to positional camera routing or
+            to observation-derived state keys, so the robot moved on
+            meaningless inputs and the success rate measures nothing about the
+            policy. See :meth:`run_policy` for the full contract.
+
+            Policy load: ``policy_load_time_s``, ``policy_load_cache_hit`` and
+            ``policy_resident_rss_mb``.
+
+            Async-RTC telemetry: ``rtc_async_enabled``,
+            ``rtc_chunks_acquired``, ``rtc_prefetch_hits``,
+            ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms`` and
+            ``rtc_max_inference_ms``.
         """
         robots = self.list_robots()
         if not robots:
@@ -2553,6 +2821,11 @@ class SimEngine(ABC):
         if err := self._validate_positive_frequency(control_frequency, "eval_policy"):
             return err
         if err := self._validate_control_substeps(control_substeps, "eval_policy"):
+            return err
+        # Both rates are known only here: the dataset rate was fixed by
+        # start_recording one call earlier. Checked before any policy is
+        # built so a rate disagreement costs no weight download and no frame.
+        if err := self._validate_recording_rate(control_frequency, "eval_policy"):
             return err
         # Coerce to a plain Python float now the value is validated: a NumPy
         # scalar (accepted above via numbers.Real) flows into 1 / control_frequency
@@ -2737,6 +3010,11 @@ class SimEngine(ABC):
         if err := self._validate_positive_frequency(control_frequency, "evaluate_benchmark"):
             return err
         if err := self._validate_control_substeps(control_substeps, "evaluate_benchmark"):
+            return err
+        # Both rates are known only here: the dataset rate was fixed by
+        # start_recording one call earlier. Checked before any policy is
+        # built so a rate disagreement costs no weight download and no frame.
+        if err := self._validate_recording_rate(control_frequency, "evaluate_benchmark"):
             return err
         # Coerce to a plain Python float now the value is validated: a NumPy
         # scalar (accepted above via numbers.Real) flows into 1 / control_frequency
@@ -2971,7 +3249,23 @@ class SimEngine(ABC):
         raise NotImplementedError("set_obs_noise not implemented by this backend")
 
     def get_contacts(self) -> dict[str, Any]:
-        """Get contact information. Override per backend."""
+        """Get contact information. Override per backend.
+
+        Returns:
+            The agent-tool envelope -- ``{"status": ..., "content": [...]}`` --
+            whose ``json`` content block carries ``contacts``, a list of
+            per-contact records. The payload lives in that block, not on the
+            envelope itself, so a caller reading ``result["contacts"]``
+            directly always misses. The predicate DSL's ``contact_*``
+            factories (see
+            :mod:`strands_robots.simulation.predicates`) are the supported
+            readers; ``success_fn="contact"`` on
+            :meth:`~strands_robots.simulation.policy_runner.PolicyRunner.evaluate`
+            shares them.
+
+        Raises:
+            NotImplementedError: Backends that expose no contact list.
+        """
         raise NotImplementedError("get_contacts not implemented by this backend")
 
     # Raw-frame render APIs (programmatic, not tool-envelope). Optional per

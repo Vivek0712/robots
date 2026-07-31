@@ -24,7 +24,12 @@ non-VLA reference implementation.
 import asyncio
 import concurrent.futures
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
+
+import numpy as np
+
+from strands_robots.utils import positive_count_error
 
 
 class Policy(ABC):
@@ -373,6 +378,57 @@ class ChunkedPolicy(Protocol):
     supports_rtc: bool
 
 
+def align_action_values(
+    values: Sequence[float] | np.ndarray,
+    action_keys: Sequence[str],
+    *,
+    pad_short: bool = False,
+) -> tuple[list[float], list[str]]:
+    """Pair a model's ordered action vector with the actuator keys it drives.
+
+    Every provider maps a policy's flat action vector onto actuator names BY
+    INDEX, and the two lengths are not guaranteed to agree: a checkpoint trained
+    for a 6-DOF arm can be pointed at a 7-actuator robot, or an embodiment can
+    declare a gripper the checkpoint never learned. This centralizes the single
+    rule for that mismatch so providers cannot drift.
+
+    * **More values than keys** - the trailing values are dropped. There is no
+      actuator to receive them.
+    * **Fewer values than keys** (the default) - only the leading keys the model
+      actually produced a value for are returned. The unmatched actuators are
+      left out of the action dict entirely, so they receive no command and hold
+      their current position.
+    * **Fewer values than keys with ``pad_short=True``** - the unmatched keys are
+      returned carrying ``0.0``. That is a COMMAND, not an omission: where the
+      action space is absolute position - a LeRobot ``<motor>.pos`` follower, a
+      MuJoCo position actuator - ``0.0`` means "travel to zero", so those
+      actuators MOVE, at whatever rate the servo will do it. Opt in only when
+      the consumer needs a fixed-width action dict and zero is a meaningful
+      target for every key it pads.
+
+    Args:
+        values: The model's per-step action vector. Any sized, indexable
+            numeric sequence - a list or a 1-D array, as the two providers hand
+            over a NumPy row; entries are coerced with ``float``.
+        action_keys: Ordered actuator keys the vector maps onto, index 0 first.
+        pad_short: Emit ``0.0`` for keys past the end of ``values`` instead of
+            omitting them. See the note above before enabling this.
+
+    Returns:
+        ``(values, keys)``, equal length and aligned 1:1 by index - ready to zip
+        into an action dict after any unit conversion has been applied to the
+        values.
+    """
+    keys = list(action_keys)
+    aligned = [float(values[index]) for index in range(min(len(values), len(keys)))]
+    if len(aligned) < len(keys):
+        if pad_short:
+            aligned.extend(0.0 for _ in range(len(keys) - len(aligned)))
+        else:
+            keys = keys[: len(aligned)]
+    return aligned, keys
+
+
 def resolve_chunk_length(policy: "Policy", action_horizon: int) -> int:
     """Effective number of actions to consume from one ``get_actions`` chunk.
 
@@ -429,3 +485,48 @@ def resolve_chunk_length(policy: "Policy", action_horizon: int) -> int:
         # RTC owns the interval; action_horizon cannot override it.
         return horizon_int
     return max(int(action_horizon), 1, horizon_int)
+
+
+def chunk_count_error(value: object, param: str, provider: str) -> str | None:
+    """Error text when a per-inference chunk count is not one a policy can execute.
+
+    Shared domain for the counts that describe one inference chunk - how many
+    actions a provider emits (``actions_per_chunk``), how many of them a
+    consumer executes before re-querying (``actions_per_step``), and the
+    Real-Time Chunking override of that re-query interval
+    (``rtc_execution_horizon``, which replaces ``actions_per_step`` whenever RTC
+    is active). All are consumed as slice bounds over the action chunk, so only
+    a true positive ``int`` can be honored; :func:`~strands_robots.utils.positive_count_error`
+    supplies that domain (and rejects ``bool``, which as an ``int`` subclass
+    would otherwise pass as a silent count of one).
+
+    It lives here rather than beside one of its callers because the providers
+    that accept these counts sit in sibling packages
+    (:mod:`strands_robots.policies.lerobot_local` and
+    :mod:`strands_robots.policies.lerobot_async`) and the accepted domain must
+    not diverge between them: the same chunk count cannot be refused by a local
+    checkpoint and accepted by the server serving it.
+
+    Why the count has to be checked where it arrives, rather than where it is
+    read: :attr:`Policy.execution_horizon` resolves the re-query interval
+    through ``max(1, int(...))``, which turns a count no consumer can execute
+    into ``1``. That floor is the right default for a duck-typed chunk source
+    that never passed through a provider constructor, but as a guard it is
+    silently destructive - and specifically so for a provider that treats the
+    default count as a request to adopt the checkpoint's own trained chunk
+    length, because a rejected-then-floored value has already suppressed that
+    adoption and cannot be distinguished from a deliberate single-step request.
+
+    Args:
+        value: The caller-supplied count.
+        param: The parameter name it came from, used in the message.
+        provider: Provider name, used as the message prefix.
+
+    Returns:
+        An error message naming the parameter and the remedy, or ``None`` when
+        the count is usable.
+    """
+    error = positive_count_error(value, param, provider)
+    if error:
+        return f"{error} Omit it to use the provider default."
+    return None

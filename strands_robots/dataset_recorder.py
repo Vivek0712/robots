@@ -21,14 +21,18 @@ Usage:
     recorder.push_to_hub()
 """
 
+import importlib.util
 import json
 import logging
 import re
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from strands_robots.utils import lerobot_version
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +225,12 @@ def sync_dataset_to_bucket(
             text=True,
         )
         blob = (cp.stderr + cp.stdout).lower()
-        if cp.returncode != 0 and "exist" not in blob:
+        # An already-created bucket is the normal case for a daily re-sync, so it
+        # must not fail the sync. The hub reports it as "You already created this
+        # bucket repo" with a 409, which does not contain "exists" - match the
+        # status code and both phrasings rather than one substring.
+        already_exists = "exist" in blob or "409" in blob or "already created" in blob
+        if cp.returncode != 0 and not already_exists:
             return {
                 "status": "error",
                 "message": f"bucket create failed: {cp.stderr.strip()}",
@@ -320,22 +329,133 @@ def _huggingface_hub_version_error() -> str | None:
 _HAS_LEROBOT_DATASET: list[bool] = []
 
 
-def has_lerobot_dataset() -> bool:
-    """Return True if lerobot's ``LeRobotDataset`` can be imported.
+#: The packages ``lerobot[dataset]`` installs and that
+#: ``lerobot.datasets.lerobot_dataset`` imports at module scope. Named in the
+#: install hint so a single command fixes every one of them at once; the
+#: authoritative set is lerobot's own extra, so this is a hint for a human, not
+#: a second source of truth strands-robots probes against.
+_LEROBOT_DATASET_PACKAGES = "datasets, pandas, pyarrow, av, torchcodec"
+
+#: The module strands-robots imports to record a LeRobotDataset. Named in the
+#: drift diagnosis so a caller can check it against their lerobot directly.
+_LEROBOT_DATASET_MODULE = "lerobot.datasets.lerobot_dataset"
+
+
+def _lerobot_installed() -> bool:
+    """Whether the ``lerobot`` package itself is present.
+
+    Uses a spec lookup rather than an import so it has no side effects and does
+    not pay lerobot's import cost just to answer a question about an error
+    message.
+    """
+    if "lerobot" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("lerobot") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _describe_lerobot_import_failure(exc: BaseException) -> str:
+    """Turn an import failure into the diagnosis a caller can act on.
+
+    Four unrelated failures reach here and they need four different
+    instructions, so the message has to say which one happened:
+
+    * lerobot itself is absent -- installing the extra is the fix;
+    * lerobot is present but a package its dataset stack needs is not
+      (``datasets``, ``pandas``, ``pyarrow``, ``av``, ...). Plain ``pip install
+      lerobot`` does not pull those in, so "install lerobot" is not a usable
+      instruction here: the package it names is already installed;
+    * lerobot is present but does not provide what strands-robots imports -- an
+      out-of-range or from-source lerobot that moved or renamed the module;
+    * the import failed without any module being missing (``ValueError`` /
+      ``RuntimeError``, typically a pandas built against a different numpy).
+      Nothing is absent, so no install fixes it.
+
+    Only a non-``ImportError`` may claim that nothing is missing: an
+    ``ImportError`` whose ``name`` is unset still reports a failed import, and
+    telling that caller to reconcile binary versions would send them after a
+    conflict they may not have.
+
+    Args:
+        exc: The exception raised while importing ``LeRobotDataset``.
+
+    Returns:
+        An actionable diagnosis naming the cause and the install that fixes it.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+
+    if not _lerobot_installed():
+        return (
+            f"lerobot is not installed ({detail}). Install lerobot >= 0.6.0 with: pip install 'strands-robots[lerobot]'"
+        )
+
+    version = lerobot_version()
+
+    if not isinstance(exc, ImportError):
+        return (
+            f"lerobot {version} is installed and no module is missing, but importing its dataset "
+            f"stack failed ({detail}). That is a conflict between installed packages -- commonly a "
+            f"pandas built against a different numpy -- so no install of lerobot or its extra fixes "
+            f"it; reconcile the conflicting packages instead."
+        )
+
+    missing = getattr(exc, "name", None) or ""
+    if missing and missing.split(".")[0] != "lerobot":
+        return (
+            f"lerobot {version} is installed, but {missing!r}, which its dataset stack needs, is "
+            f"not ({detail}). Install that whole set with: pip install 'lerobot[dataset]' "
+            f"-- {_LEROBOT_DATASET_PACKAGES}. Installing lerobot without that extra does not pull "
+            f"them in, so reinstalling lerobot alone will not fix this."
+        )
+
+    return (
+        f"lerobot {version} is installed, but it does not provide "
+        f"{_LEROBOT_DATASET_MODULE} ({detail}). strands-robots supports "
+        f"lerobot >= 0.6.0,<0.7.0; an out-of-range or from-source lerobot can move or rename "
+        f"that module. Install a supported one with: pip install 'strands-robots[lerobot]'"
+    )
+
+
+def lerobot_dataset_import_error() -> str | None:
+    """Return None if lerobot's ``LeRobotDataset`` imports, else why it does not.
+
+    This is the probe :func:`has_lerobot_dataset` answers yes/no from, and the
+    one a caller should use when it has to tell a human what to do: the reason
+    is what distinguishes "install the lerobot extra" from the cases that
+    instruction cannot fix.
 
     A successful probe is cached; a failed probe is intentionally re-attempted
     on the next call so a transient import failure does not permanently disable
     recording for the process.
+
+    Returns:
+        ``None`` when ``LeRobotDataset`` is importable, otherwise a
+        ready-to-display diagnosis naming the cause and the install that fixes
+        it (see :func:`_describe_lerobot_import_failure`).
     """
     if _HAS_LEROBOT_DATASET:
-        return True
+        return None
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: F401
     except (ImportError, ValueError, RuntimeError) as exc:
-        logger.debug("lerobot not available: %s", exc)
-        return False
+        reason = _describe_lerobot_import_failure(exc)
+        logger.debug("lerobot dataset stack unavailable: %s", reason)
+        return reason
     _HAS_LEROBOT_DATASET.append(True)
-    return True
+    return None
+
+
+def has_lerobot_dataset() -> bool:
+    """Return True if lerobot's ``LeRobotDataset`` can be imported.
+
+    A thin predicate over :func:`lerobot_dataset_import_error` so the two cannot
+    disagree about whether recording is available. Callers that must explain the
+    unavailability to a human should use that function instead: a bare False
+    cannot say which of several unrelated causes applied.
+    """
+    return lerobot_dataset_import_error() is None
 
 
 def _get_lerobot_dataset_class():
@@ -463,6 +583,84 @@ def _prepare_create_target(dataset_dir: Path, *, overwrite: bool) -> None:
         "(no meta/ directory), and is not empty. Refusing to overwrite unrelated "
         "files. Pass overwrite=True to replace it, or choose a new/empty root=."
     )
+
+
+def unrecordable_action_columns_error(
+    action: Mapping[str, Any],
+    declared: Sequence[str],
+    required: Sequence[str] | None,
+) -> str | None:
+    """Reject a frame whose action omits a declared column the caller requires.
+
+    A LeRobot action column must hold the command that was issued at that step.
+    When the dataset schema declares a column the frame's action dict does not
+    carry, there is no such command, and every candidate placeholder is wrong:
+
+    * ``0.0`` is itself a command wherever the action space is absolute
+      position - a LeRobot ``<motor>.pos`` follower, a MuJoCo position actuator
+      - so the joint TRAVELS to zero at servo speed on replay rather than
+      staying where the un-commanded joint actually stayed.
+    * A joint's measured position is in different units from a normalized or
+      tendon-driven actuator's command, so substituting it moves those
+      actuators too.
+    * The command standing on the actuator cannot be read back, because the
+      action-to-``ctrl`` mapping is deliberately not injective (a normalized
+      open/close fraction and a raw tendon-unit command can share one ``ctrl``).
+
+    So the frame is refused instead of persisted, which keeps the recorded
+    action columns equal to what the policy issued and keeps ``replay_episode``
+    a faithful round trip.
+
+    ``required`` scopes the check to the columns the caller knows must come from
+    this frame - typically the action keys of the robot being driven. Columns
+    outside it (in a shared scene, the robots this rollout does not drive) are
+    not this frame's to supply and are left alone.
+
+    Args:
+        action: The frame's action dict, keyed as the dataset schema spells it.
+        declared: Action column names declared by the dataset schema.
+        required: Column names this frame must supply, or ``None`` to skip the
+            check entirely (the historical behaviour).
+
+    Returns:
+        An actionable message naming the missing columns, or ``None`` when every
+        required column is present.
+    """
+    if required is None:
+        return None
+    declared_set = set(declared)
+    missing = [key for key in required if key in declared_set and key not in action]
+    if not missing:
+        return None
+    return (
+        f"Recorded action column(s) {missing} have no value in this frame's action, so the "
+        "recording would persist a command that was never issued. No placeholder is correct: "
+        "0.0 is a 'travel to zero' command for an absolute-position actuator, a joint's measured "
+        "position is in different units from a normalized or tendon actuator's command, and the "
+        "command standing on the actuator cannot be read back (the action-to-ctrl mapping is not "
+        "injective). Record with a policy that produces a value for every declared action column "
+        "- an action vector narrower than the actuator list is reported by diagnose_action_dim - "
+        "or record a schema covering only the actuators it drives."
+    )
+
+
+class RecordingFrameError(RuntimeError):
+    """A frame the dataset recorder could not write, in fail-fast mode.
+
+    Raised by :meth:`DatasetRecorder.add_frame` when the underlying
+    ``LeRobotDataset`` write fails and the recorder was constructed with
+    ``strict=True`` (the default). The frame is already gone at that point, so
+    the episode on disk is shorter than the rollout that produced it and every
+    surviving frame is re-timestamped from the declared ``fps`` - the caller has
+    to be told.
+
+    A distinct type, rather than the underlying error, so a rollout driver can
+    tell a lost recording frame apart from a failure in a caller's telemetry
+    hook. The drivers deliberately tolerate a few consecutive telemetry
+    failures; granting that tolerance to a lost recording frame truncates the
+    dataset while the rollout still reports success. The originating error is
+    chained and its text preserved.
+    """
 
 
 class DatasetRecorder:
@@ -889,6 +1087,7 @@ class DatasetRecorder:
         action: dict[str, Any],
         task: str | None = None,
         camera_keys: list[str] | None = None,
+        required_action_keys: Sequence[str] | None = None,
     ) -> None:
         """Add a single control-loop frame to the dataset.
 
@@ -900,6 +1099,21 @@ class DatasetRecorder:
             action: Action dict (joint_name → float)
             task: Task description (uses default if None)
             camera_keys: Which keys in observation are camera images
+            required_action_keys: Action column names this frame must
+                supply a value for - typically the action keys of the robot
+                being driven. A declared column in this set that ``action``
+                omits raises ``ValueError`` rather than being written as a
+                fabricated command; see
+                :func:`unrecordable_action_columns_error`. ``None`` skips
+                the check.
+
+        Raises:
+            ValueError: A column in ``required_action_keys`` is declared by
+                the dataset schema but absent from ``action``.
+            RecordingFrameError: The dataset write failed and this recorder is
+                ``strict`` (the default). With ``strict=False`` the frame is
+                counted in ``dropped_frame_count`` and a warning is logged
+                instead.
         """
         if self._closed:
             return
@@ -952,15 +1166,26 @@ class DatasetRecorder:
                 frame["observation.state"] = np.array(state_vals, dtype=np.float32)
 
         # Action → flattened vector
-        # Use feature schema ordering for actions too.
+        # Use feature schema ordering for actions too. Resolved before the
+        # `if action:` guard so a frame carrying NO action for a column the
+        # caller requires is refused rather than silently skipped. The sorted()
+        # fallback still only runs for a non-empty action, so an observation-only
+        # frame cannot cache an empty key list for the rest of the episode.
+        if self._cached_action_keys is None:
+            feat = self.dataset.features.get("action", {})
+            action_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
+            if action_names:
+                self._cached_action_keys = list(action_names)
+            elif action:
+                self._cached_action_keys = sorted(action.keys())
+
+        gap = unrecordable_action_columns_error(action, self._cached_action_keys or [], required_action_keys)
+        if gap is not None:
+            raise ValueError(gap)
+
         if action:
             action_vals = []
-            if self._cached_action_keys is None:
-                feat = self.dataset.features.get("action", {})
-                action_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
-                self._cached_action_keys = action_names if action_names else sorted(action.keys())
-
-            for k in self._cached_action_keys:
+            for k in self._cached_action_keys or []:
                 v = action.get(k)
                 if v is None:
                     action_vals.append(0.0)
@@ -1049,7 +1274,16 @@ class DatasetRecorder:
             self.episode_frame_count += 1
         except Exception as e:
             if self.strict:
-                raise  # Fail-fast per AGENTS.md convention #5
+                # Fail-fast per AGENTS.md convention #5. Raised as
+                # RecordingFrameError so a rollout driver does not absorb it
+                # into the tolerance it grants a caller's telemetry hook - the
+                # frame is lost, so silently continuing writes a short episode
+                # and reports success. The original error is chained.
+                raise RecordingFrameError(
+                    f"dataset add_frame failed after {self.frame_count} frame(s) written; "
+                    f"the recording is incomplete from this frame on "
+                    f"(strict=True, so it is not dropped silently): {e}"
+                ) from e
             self.dropped_frame_count += 1
             n = self.dropped_frame_count
             # Log at 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, then every 1000

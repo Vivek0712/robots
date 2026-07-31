@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from strands_robots.simulation.models import registered
 from strands_robots.simulation.recording import (
     DatasetRecordingMixin,
     dataset_recording_option_error,
@@ -56,6 +57,10 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
 
         def render(self, camera_name: str = ..., width: int | None = ..., height: int | None = ...) -> dict[str, Any]:
             """Type-only stub for the engine-provided render method."""
+
+        def robot_action_keys(self, robot_name: str) -> list[str]:
+            """Type-only stub for the engine-provided action-key accessor."""
+            return []
 
     def start_recording(
         self,
@@ -126,25 +131,38 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
         if error := dataset_recording_option_error("start_recording", fps):
             return error
 
+        # Reject a rate a rollout already in flight is not capturing at. The
+        # rollout entry points cover the record-then-rollout ordering; this is
+        # the same disagreement with the calls the other way round, refused
+        # before any dataset is created so a refusal leaves nothing on disk.
+        if error := self._validate_recording_start_rate(fps, "start_recording"):
+            return error
+
         _DatasetRecorder: Any = None
-        _has_lerobot = False
+        unavailable: str | None = None
         try:
             from strands_robots.dataset_recorder import DatasetRecorder as _DatasetRecorder
-            from strands_robots.dataset_recorder import has_lerobot_dataset as _check_lerobot
+            from strands_robots.dataset_recorder import lerobot_dataset_import_error
 
-            _has_lerobot = _check_lerobot()
-        except ImportError:
-            # lerobot extra not installed; handled by the _has_lerobot guard below.
-            pass
+            unavailable = lerobot_dataset_import_error()
+        except ImportError as exc:
+            # strands_robots.dataset_recorder itself did not import (a partial or
+            # drifted install); report that rather than blaming the lerobot extra.
+            unavailable = f"strands_robots.dataset_recorder is unavailable ({exc})."
+        if unavailable is None and _DatasetRecorder is None:
+            unavailable = "strands_robots.dataset_recorder did not provide DatasetRecorder."
 
-        if not _has_lerobot or _DatasetRecorder is None:
+        if unavailable is not None:
             return {
                 "status": "error",
                 "content": [
                     {
                         "text": (
-                            "start_recording produces a LeRobotDataset (parquet + video) and "
-                            "requires the lerobot extra: pip install 'strands-robots[lerobot]'.\n"
+                            "start_recording produces a LeRobotDataset (parquet + video), which "
+                            "needs lerobot's dataset stack:\n"
+                            "\n"
+                            f"  {unavailable}\n"
+                            "\n"
                             "For plain MP4 video, pass video={'path': ...} to run_policy instead."
                         )
                     }
@@ -352,7 +370,7 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
         from strands_robots.simulation.policy_runner import _extract_frame_ndarray
 
         world = self._world
-        if world is None or robot_name not in world.robots:
+        if world is None or not registered(world.robots, robot_name):
             return None
 
         robot = world.robots[robot_name]
@@ -360,6 +378,29 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
         robot.policy_instruction = instruction
         robot.policy_steps = 0
         multi_robot = len(world.robots) > 1
+
+        # Action columns this rollout is responsible for: the driven robot's own
+        # actuators. A declared column the policy never produced cannot be written
+        # as a placeholder without persisting a command nobody issued, so
+        # ``add_frame`` refuses it.
+        #
+        # Resolved on the first recorded frame and cached, rather than up front:
+        # ``robot_action_keys`` is explicitly best-effort for the runner's
+        # fail-fast probe (a backend quirk or a mid-rollout teardown may make it
+        # raise, and that must not mask the primary "robot has not moved" signal),
+        # so the hook must not call it for a rollout that is not recording. Where a
+        # recording IS attached the keys are load-bearing - without them the frame
+        # cannot be checked - so a raise there correctly fails the recording.
+        action_key_cache: dict[bool, list[str]] = {}
+
+        def _required_action_keys(prefixed: bool) -> list[str]:
+            """Action columns this frame owes the recorder, resolved once."""
+            cached = action_key_cache.get(prefixed)
+            if cached is None:
+                keys = self.robot_action_keys(robot_name)
+                cached = [f"{robot_name}__{key}" for key in keys] if prefixed else list(keys)
+                action_key_cache[prefixed] = cached
+            return cached
 
         def _hook(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
             robot.policy_steps = step + 1
@@ -381,8 +422,18 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
 
                 obs = {(k if isinstance(v, np.ndarray) else f"{robot_name}__{k}"): v for k, v in obs.items()}
                 act = {f"{robot_name}__{k}": v for k, v in action.items()}
-                rec.add_frame(observation=obs, action=act, task=instruction)
+                rec.add_frame(
+                    observation=obs,
+                    action=act,
+                    task=instruction,
+                    required_action_keys=_required_action_keys(True),
+                )
             else:
-                rec.add_frame(observation=obs, action=action, task=instruction)
+                rec.add_frame(
+                    observation=obs,
+                    action=action,
+                    task=instruction,
+                    required_action_keys=_required_action_keys(False),
+                )
 
         return _hook

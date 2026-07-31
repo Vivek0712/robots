@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from strands_robots._async_utils import _resolve_coroutine
+from strands_robots.dataset_recorder import RecordingFrameError
 from strands_robots.policies.base import resolve_chunk_length
 from strands_robots.utils import positive_whole_number_error, process_rss_mb, require_optional
 
@@ -503,6 +504,14 @@ class _RolloutVideoWriter:
 # episode with zero frames written and silently corrupt the dataset. After this
 # many *consecutive* failures, the runner raises and fails the episode loudly.
 #
+# The counter resets on every success, so this bounds an ALWAYS-failing hook and
+# nothing else: a hook failing every other step never reaches the limit. That is
+# the right trade for caller telemetry, which is why
+# :class:`~strands_robots.dataset_recorder.RecordingFrameError` is excluded from
+# the tolerance entirely - a lost dataset frame is data loss, not telemetry, and
+# tolerating it writes a short, re-timestamped episode under a successful
+# rollout.
+#
 # Overridable via the ``max_onframe_failures`` kwarg on ``PolicyRunner.run``.
 # See GH #117.
 _MAX_CONSECUTIVE_ONFRAME_FAILURES = 5
@@ -812,6 +821,53 @@ class PolicyRunner:
             return max(1, round((1.0 / control_frequency) / dt))
         return 1
 
+    def _reject_recording_rate_mismatch(self, control_frequency: float, method: str) -> None:
+        """Refuse a rollout the engine's open dataset recording cannot describe.
+
+        The dataset recorder is driven once per control step with no
+        decimation, and LeRobot timestamps each frame positionally from the
+        rate ``start_recording(fps=...)`` wrote into the metadata. A rollout
+        capturing at a different ``control_frequency`` therefore cannot be
+        labelled correctly, only mislabelled - the episode declares a
+        duration it was not captured over, which is the control period a
+        policy trains on and the budget ``replay_episode`` replays it at.
+
+        The engine's rollout entry points already refuse this before a frame
+        is written. ``run`` and ``evaluate`` are also driven directly, with
+        the engine's guard off the path, so the check is repeated here for
+        the same reason :meth:`_control_substeps` raises for a bad
+        ``control_substeps``: this layer owes a direct caller its own
+        guarantee. A backend that cannot record has no ``_is_recording``, and
+        a duck-typed test double may have neither hook, so both are probed
+        rather than assumed.
+
+        Args:
+            control_frequency: Rate this rollout captures frames at.
+            method: Public method name, used to prefix the message.
+
+        Raises:
+            ValueError: If a recording is open at a rate other than
+                ``control_frequency``. Raised rather than returned as an error
+                dict so it cannot be absorbed, and reported before any frame
+                is written so the caller loses nothing.
+        """
+        is_recording = getattr(self.sim, "_is_recording", None)
+        if not callable(is_recording) or not is_recording():
+            return
+        active_recorder = getattr(self.sim, "_active_recorder", None)
+        if not callable(active_recorder):
+            return
+        recorder = active_recorder()
+        if recorder is None:
+            return
+        # Imported here, like the engine's own call site, so the recording
+        # module stays out of this module's import graph.
+        from strands_robots.simulation.recording import dataset_rate_mismatch_reason
+
+        reason = dataset_rate_mismatch_reason(method, recorder, control_frequency)
+        if reason is not None:
+            raise ValueError(reason)
+
     # ------------------------------------------------------------------
     # Recorder per-episode boundary (issue #708)
     # ------------------------------------------------------------------
@@ -1049,6 +1105,8 @@ class PolicyRunner:
         # seed is given, reseed the client RNGs once and forward it to the policy
         # (mirrors the per-episode reseed in evaluate()). Default None leaves RNG
         # state untouched, preserving historical behaviour.
+        # Refuse before any frame reaches the engine's open recording.
+        self._reject_recording_rate_mismatch(control_frequency, "PolicyRunner.run")
         if seed is not None:
             set_eval_seed(seed)
             try:
@@ -1258,6 +1316,14 @@ class PolicyRunner:
                         consecutive_onframe_failures = 0
                     except CooperativeStop:
                         # Backend (e.g. MuJoCo) signalled a graceful stop.
+                        raise
+                    except RecordingFrameError:
+                        # A frame the dataset recorder could not write is data
+                        # loss, not telemetry: the episode on disk is already
+                        # shorter than this rollout. Never counted against the
+                        # telemetry tolerance below, which resets on every
+                        # success and so would let an intermittent recorder
+                        # failure truncate the dataset without ever tripping.
                         raise
                     except Exception as e:
                         # on_frame is user-provided telemetry - never fatal
@@ -2132,6 +2198,8 @@ class PolicyRunner:
             metrics are computed over ``episodes_completed`` (which may be less
             than the requested ``n_episodes``).
         """
+        # Refuse before any frame reaches the engine's open recording.
+        self._reject_recording_rate_mismatch(control_frequency, "PolicyRunner.evaluate")
         if spec is not None and success_fn is not None:
             return {
                 "status": "error",
@@ -2274,6 +2342,11 @@ class PolicyRunner:
                     # Documented graceful early-stop (the same signal run()
                     # honors). Propagate to the episode loop; never swallow
                     # it as a best-effort telemetry failure.
+                    raise
+                except RecordingFrameError:
+                    # Data loss, not telemetry - see the note on the tolerance
+                    # constant. Propagate so the caller learns the episode is
+                    # incomplete instead of reading a successful eval.
                     raise
                 except Exception as e:  # noqa: BLE001 - hook is best-effort telemetry
                     logger.warning("on_frame hook failed at global_step=%d: %s", global_step, e)
@@ -2699,6 +2772,10 @@ class PolicyRunner:
                                     # Documented graceful early-stop; propagate
                                     # to the episode loop instead of swallowing.
                                     raise
+                                except RecordingFrameError:
+                                    # Data loss, not telemetry - see the note on
+                                    # the tolerance constant.
+                                    raise
                                 except Exception as e:  # noqa: BLE001 - hook is best-effort
                                     logger.warning(
                                         "on_frame hook failed at global_step=%d (ep=%d, ep_step=%d): %s",
@@ -2890,25 +2967,26 @@ class PolicyRunner:
             return success_fn
         if success_fn == "contact":
             sim = self.sim
+            # Share the DSL's reader instead of keeping a second one. The
+            # inline copy this replaces indexed the engine result as if it
+            # were the payload, so it never saw a real backend's envelope and
+            # scored every episode a failure - while still working against a
+            # test double that returns the bare mapping.
+            #
+            # Imported inside the method, not at module level: base.py imports
+            # this module at import time and predicates.py imports base under
+            # TYPE_CHECKING, so a module-level edge from here to predicates
+            # closes a loop that CodeQL's py/unsafe-cyclic-import walks - it
+            # does not honour the guard (see the #191 note on base.py's import
+            # of this module). No runtime cycle exists either way, and base.py
+            # reaches into predicates the same way from
+            # ``_stop_when_unresolved_error``.
+            from strands_robots.simulation.predicates import make_predicate
+
+            contact_any = make_predicate("contact_any")
 
             def _contact_check(_obs: dict[str, Any]) -> bool:
-                get_contacts = getattr(sim, "get_contacts", None)
-                if get_contacts is None:
-                    return False
-                try:
-                    result = get_contacts()
-                except NotImplementedError:
-                    return False
-                except Exception:
-                    return False
-                # Accept either {"contacts": [...]} or {"n_contacts": int}
-                if isinstance(result, dict):
-                    if result.get("n_contacts", 0) > 0:
-                        return True
-                    contacts = result.get("contacts")
-                    if isinstance(contacts, list) and contacts:
-                        return True
-                return False
+                return bool(contact_any(sim))
 
             return _contact_check
         raise ValueError(f"Unknown success_fn string: {success_fn!r}")

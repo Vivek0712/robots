@@ -11,7 +11,8 @@ resume-schema guard.
 import logging
 from typing import TYPE_CHECKING, Any
 
-from strands_robots.simulation.mujoco.backend import _NO_WORLD_MSG, _ensure_mujoco
+from strands_robots.simulation.models import registry_entry
+from strands_robots.simulation.mujoco.backend import _NO_WORLD_MSG, _ensure_mujoco, mj_name_to_id
 from strands_robots.simulation.recording import (
     DatasetRecordingMixin,
     dataset_recording_option_error,
@@ -82,9 +83,14 @@ class RecordingMixin(DatasetRecordingMixin):
             fps: Dataset frame rate recorded in the LeRobot metadata. Must be a
                 positive whole number - a fractional or non-numeric rate cannot
                 be written and is rejected up front rather than aborting the
-                rollout behind a ``status="success"`` return. Set it to the
-                ``run_policy`` ``control_frequency`` so recorded timestamps
-                match the cadence frames were captured at. When an existing
+                rollout behind a ``status="success"`` return. It must EQUAL the
+                rollout's ``control_frequency``: the recorder captures one frame
+                per control step and never decimates, so a differing rate cannot
+                be honored, only mislabelled. The disagreement is refused
+                before any frame is written whichever call comes first: by every
+                rollout entry point when a rollout starts against an open
+                recording, and here when a recording is opened against a rollout
+                already in flight. When an existing
                 dataset is RESUMED (``overwrite=False``), it must equal that
                 dataset's on-disk rate: a resumed dataset keeps the rate it was
                 created at, so a differing request is refused with the on-disk
@@ -134,28 +140,40 @@ class RecordingMixin(DatasetRecordingMixin):
         if error := dataset_recording_option_error("start_recording", fps):
             return error
 
+        # Reject a rate a rollout already in flight is not capturing at. The
+        # rollout entry points cover the record-then-rollout ordering; this is
+        # the same disagreement with the calls the other way round, refused
+        # before any dataset is created so a refusal leaves nothing on disk.
+        if error := self._validate_recording_start_rate(fps, "start_recording"):
+            return error
+
         _DatasetRecorder: Any = None
-        _has_lerobot = False
+        unavailable: str | None = None
         try:
             from strands_robots.dataset_recorder import DatasetRecorder as _DatasetRecorder
-            from strands_robots.dataset_recorder import has_lerobot_dataset as _check_lerobot
+            from strands_robots.dataset_recorder import lerobot_dataset_import_error
 
-            _has_lerobot = _check_lerobot()
-        except ImportError:
-            pass
+            unavailable = lerobot_dataset_import_error()
+        except ImportError as exc:
+            # strands_robots.dataset_recorder itself did not import (a partial or
+            # drifted install); report that rather than blaming the lerobot extra.
+            unavailable = f"strands_robots.dataset_recorder is unavailable ({exc})."
+        if unavailable is None and _DatasetRecorder is None:
+            unavailable = "strands_robots.dataset_recorder did not provide DatasetRecorder."
 
-        if not _has_lerobot or _DatasetRecorder is None:
+        if unavailable is not None:
             return {
                 "status": "error",
                 "content": [
                     {
                         "text": (
-                            "start_recording produces a LeRobotDataset (parquet + video) and "
-                            "requires the lerobot extra. For plain MP4 video under the "
-                            "[sim-mujoco] extra alone, use start_cameras_recording instead.\n"
+                            "start_recording produces a LeRobotDataset (parquet + video), which "
+                            "needs lerobot's dataset stack:\n"
                             "\n"
-                            "  - Dataset + policy training data:  pip install 'strands-robots[lerobot]'\n"
-                            "  - Plain MP4 only:                  start_cameras_recording(cameras=..., output_dir=...)"
+                            f"  {unavailable}\n"
+                            "\n"
+                            "For plain MP4 video under the [sim-mujoco] extra alone, use "
+                            "start_cameras_recording(cameras=..., output_dir=...) instead."
                         )
                     }
                 ],
@@ -216,9 +234,9 @@ class RecordingMixin(DatasetRecordingMixin):
                 pfx = robot.namespace or ""
                 scalar_joint_names: list[str] = []
                 for jn in robot.joint_names:
-                    jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, (pfx + jn) if pfx else jn)
+                    jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, (pfx + jn) if pfx else jn)
                     if jid < 0 and pfx:
-                        jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, jn)
+                        jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jn)
                     if jid >= 0 and model.jnt_type[jid] == mj.mjtJoint.mjJNT_FREE:
                         continue
                     scalar_joint_names.append(jn)
@@ -277,7 +295,9 @@ class RecordingMixin(DatasetRecordingMixin):
                 safe_name = cam_name.replace("/", "__")
                 raw_to_safe[cam_name] = safe_name
                 camera_keys.append(safe_name)
-                cam_info = self._world.cameras.get(cam_name) or self._world.cameras.get(safe_name)
+                cam_info = registry_entry(self._world.cameras, cam_name) or registry_entry(
+                    self._world.cameras, safe_name
+                )
                 if cam_info is not None:
                     camera_dims[safe_name] = (int(cam_info.height), int(cam_info.width))
                 else:

@@ -5,6 +5,7 @@ import logging
 import math
 import numbers
 import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,33 @@ def require_optionals(
         parts.append(f"  pip install 'strands-robots[{extra}]'")
     parts.append(f"  pip install {' '.join(missing)}")
     raise ImportError("\n".join(parts)) from None
+
+
+def lerobot_version() -> str:
+    """Return the installed lerobot version, or ``"unknown"`` if undeterminable.
+
+    Best-effort and never raises: it exists for error messages, where naming the
+    installed version is what distinguishes "lerobot is missing" from "lerobot
+    is present but something it needs is not". Lives here rather than beside one
+    of its callers because those callers sit in different modules
+    (:mod:`strands_robots.dataset_recorder` and
+    :mod:`strands_robots.streaming_dataset`) and must not report the version
+    differently.
+
+    ``except ImportError`` is deliberately the whole handler. ``version`` signals
+    an unresolvable distribution with ``PackageNotFoundError``, which subclasses
+    ``ModuleNotFoundError`` and so already *is* an ``ImportError``. Naming it in
+    the handler as well would bind it as a local that the ``import`` above may
+    never reach, and evaluating the handler would then raise
+    ``UnboundLocalError`` out of a function documented never to raise - on
+    precisely the failure the second name looked like it was covering.
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("lerobot")
+    except ImportError:
+        return "unknown"
 
 
 #
@@ -343,6 +371,43 @@ def positive_finite_number_error(value: Any, param: str, context: str) -> str | 
     return None
 
 
+def finite_number_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable finite number of either sign.
+
+    Shared domain for a SIGNED physical quantity a command carries verbatim to a
+    robot - a linear or angular velocity component, an offset, a coordinate read
+    as a scalar. Both signs are legitimate (reverse is a negative linear
+    velocity, clockwise a negative yaw rate), so :func:`positive_finite_number_error`
+    cannot express this domain; only finiteness and numeric-ness are constrained.
+    It lives here rather than beside one of its callers because those callers sit
+    in different layers (:mod:`strands_robots.mesh` must not depend on
+    :mod:`strands_robots.simulation`), and the accepted domain must not diverge
+    between them.
+
+    Only a finite value can be honored. ``nan``/``inf`` serialize into a wire
+    message as a valid IEEE-754 float64, so the transport accepts them and the
+    receiving controller integrates them into its state estimate - a silently
+    poisoned pose rather than a rejected command. A non-real value (a numeric
+    string, ``None``, a list) otherwise raises a bare ``TypeError`` from the
+    ``float()`` coercion, escaping the structured ``{"status": "error"}``
+    tool-result contract. Accepts any real scalar (so a NumPy ``np.float32``
+    velocity read from a policy action passes) and rejects ``bool`` explicitly -
+    an ``int`` subclass whose ``True`` would act as a silent ``1``.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            normally the public method name.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(float(value)):
+        return f"{context}: {param} must be a finite number, got {value!r}."
+    return None
+
+
 def positive_whole_number_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable positive whole number.
 
@@ -378,6 +443,144 @@ def positive_whole_number_error(value: Any, param: str, context: str) -> str | N
     # out of the integrality check below.
     if not math.isfinite(numeric) or numeric != int(numeric) or numeric < 1:
         return message
+    return None
+
+
+def positive_count_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable positive integer count.
+
+    Shared domain for two families of discrete quantity:
+
+    * The knobs that count iterations of a control or rollout loop - the
+      simulation's ``n_episodes`` / ``max_steps`` / ``control_substeps`` /
+      ``action_horizon`` and the hardware control loop's ``action_horizon``.
+    * A camera's pixel dimensions - the ``width`` / ``height`` of
+      ``add_camera`` and of the render family (``render``, ``get_frame``,
+      ``get_camera_params``) on every simulation backend. A backend may add
+      an upper bound of its own on top of this floor (MuJoCo caps at the
+      offscreen framebuffer size; the ray-traced backends have no such
+      buffer), but the floor itself must not differ between them: the same
+      camera configuration cannot be refused on one backend and accepted on
+      another.
+
+    It lives here rather than beside one of its callers because those callers
+    sit in different layers (:mod:`strands_robots.hardware_robot` must not
+    depend on :mod:`strands_robots.simulation`), and the accepted domain must
+    not diverge between them: the same count cannot be refused for a digital
+    twin and accepted for the arm it mirrors.
+
+    Distinct from :func:`positive_whole_number_error`, which accepts any real
+    scalar with an integral value so a ``30.0`` read from a config or an
+    ``np.int64`` probed from a camera can be honored. The values guarded here
+    are consumed directly as ``range()`` bounds, slice indices, or an array /
+    framebuffer dimension, where an integral float raises ``TypeError``
+    ("``'float' object cannot be interpreted as an integer``") rather than being
+    coerced, so only a true ``int`` can be honored.
+
+    ``bool`` is rejected explicitly. It is an ``int`` subclass, so a bare
+    ``value < 1`` test lets ``True`` through as a silent count of 1 while
+    rejecting ``False`` - a value the caller never meant either way.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter name it came from, used in the message. Callers that
+            accept a ``{robot_name: count}`` mapping pass a subscripted label
+            (``"action_horizon['alice']"``) so the message names the entry the
+            caller got wrong rather than the whole mapping.
+        context: Message prefix identifying the surface that received it - the
+            public method name, or the class name for a constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return f"{context}: {param} must be a positive integer, got {value!r}."
+    return None
+
+
+def name_list_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable list of distinct key names.
+
+    Shared domain for the parameters that carry an ordered list of KEY NAMES
+    into a policy: the LeRobot ``image_keys`` (model VISUAL feature keys to
+    declare on the config) and the VERA ``image_keys`` (observation camera keys
+    to width-concat into one frame). The two name different vocabularies, but
+    the shape contract is identical - several distinct non-blank names, in the
+    order the caller wants them - and both consumers reach the same failure when
+    it is not met, so the rule lives here rather than beside either of them.
+
+    The mistake this exists for is a single name passed as a bare string.
+    ``str`` is iterable, so ``list("wrist")`` yields ``['w', 'r', 'i', 's', 't']``
+    - five names the caller never wrote, one per character. Nothing downstream
+    can tell that apart from a deliberate five-entry list, so it is accepted and
+    the consequence surfaces far from the call: a model built declaring
+    per-character features, or a ``KeyError: 'w'`` raised mid-rollout when the
+    frame for a one-letter camera is looked up.
+
+    A ``Mapping`` is refused for the same reason in the other direction: it is
+    iterable over its keys, so its values would be silently discarded.
+
+    A repeated name is refused because it cannot be honored as written - the
+    LeRobot side builds a feature dict, where a duplicate collapses and declares
+    fewer features than asked for, and the VERA side concatenates one panel per
+    entry, where a duplicate doubles the width of the frame the model sees.
+
+    Only a :class:`~collections.abc.Sequence` is accepted, which excludes
+    one-shot iterators. That matters on the LeRobot path, where the value is
+    read twice - once by the pre-flight check and again at load - so a generator
+    exhausted by the first read would present as empty to the second.
+
+    Callers gate this check on a truthy value, because in both consumers a falsy
+    ``image_keys`` (``None``, or an empty list) already means "not supplied" and
+    the list is derived instead. So an empty sequence is not rejected here, and
+    ``None`` is the caller's to skip rather than this function's to accept - a
+    surface where an absent value IS an error keeps that verdict its own.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter name it came from, used in the message.
+        context: Message prefix identifying the surface that received it - the
+            public method name, or the class name for a constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, str | bytes):
+        shown = value.decode(errors="replace") if isinstance(value, bytes) else value
+        return (
+            f"{context}: {param} must be a list of names, not a single string, got {value!r}. "
+            f"A string is iterable per character, so this would be read as "
+            f"{[c for c in shown][:6]}{' ...' if len(shown) > 6 else ''} "
+            f"({len(shown)} name(s)). Wrap it in a list: [{shown!r}]."
+        )
+    if isinstance(value, Mapping):
+        return (
+            f"{context}: {param} must be a list of names, not a mapping, got {value!r}. "
+            f"A mapping is iterable over its keys, so its values would be discarded - "
+            f"pass the names as a list: {list(value)!r}."
+        )
+    if not isinstance(value, Sequence):
+        return (
+            f"{context}: {param} must be a list of names, got {type(value).__name__} "
+            f"({value!r}). Pass a list or tuple; a one-shot iterator cannot be used "
+            f"because the value is read more than once."
+        )
+    for i, entry in enumerate(value):
+        if not isinstance(entry, str):
+            return f"{context}: {param}[{i}] must be a name (str), got {type(entry).__name__} ({entry!r})."
+        if not entry.strip():
+            return f"{context}: {param}[{i}] must be a non-blank name, got {entry!r}."
+    seen: set[str] = set()
+    repeated: set[str] = set()
+    for entry in value:
+        if entry in seen:
+            repeated.add(entry)
+        seen.add(entry)
+    if repeated:
+        return (
+            f"{context}: {param} must not repeat a name, got {list(value)!r} "
+            f"({sorted(repeated)!r} appears more than once)."
+        )
     return None
 
 
@@ -492,3 +695,179 @@ def coerce_pose_vector(
     if (err := pose_vector_error(method, param_name, vec, expected_len)) is not None:
         return None, err
     return [float(v) for v in vec], None
+
+
+def camera_fov_error(method: str, param_name: str, value: Any) -> str | None:
+    """Return an error message if ``value`` is not a usable camera field of view.
+
+    A camera's vertical field of view must be a finite angle in the open
+    interval ``(0, 180)`` degrees. This lives here, beside
+    :func:`pose_vector_error`, for the same reason that one does: the MuJoCo and
+    Newton backends both expose ``add_camera(fov=...)`` and their accepted
+    domain must not diverge - an fov either backend refuses must be refused by
+    the other, and a second copy of the interval would drift from the first.
+
+    Outside that interval a camera is not merely mis-posed but unusable, and
+    each backend fails differently and late rather than at config time:
+
+    * MuJoCo bakes the value into the MJCF ``fovy`` attribute, so the spec
+      recompile aborts inside ``inject_camera_into_scene`` with a cryptic "spec
+      recompile refused".
+    * Newton stores it and derives the pinhole intrinsics
+      ``0.5 * height / tan(radians(fov) / 2)`` at render time, which is ``nan``
+      for a ``nan`` fov and raises ``ZeroDivisionError`` for ``0``.
+
+    A NumPy real scalar is accepted (``np.float32(58.0)`` read out of a config
+    array is a legitimate fov); a ``bool`` is refused because ``float(True)``
+    would silently mean a 1-degree lens. Returns ``None`` when ``value`` is a
+    usable field of view.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(float(value)):
+        return f"{method}: '{param_name}' must be a finite number in degrees, got {value!r}."
+    if not (0.0 < float(value) < 180.0):
+        return f"{method}: '{param_name}' must be in the open interval (0, 180) degrees, got {value}."
+    return None
+
+
+def entity_name_error(method: str, param_name: str, name: Any) -> str | None:
+    """Return an error message if ``name`` cannot address the entity it names.
+
+    The creation-site counterpart to the total lookups in
+    :mod:`strands_robots.simulation.models`. A lookup asks whether a name
+    addresses something, so a name that cannot be a registry key is honestly
+    "absent"; a creation site *claims* a name, so the same value has to be
+    refused instead - an entity registered under a name that nothing can
+    resolve is unreachable through the very API that created it.
+
+    It lives here, beside :func:`camera_fov_error`, for the same reason that one
+    does: ``add_object`` / ``add_camera`` / ``add_robot`` exist on more than one
+    backend and their accepted domain must not diverge - a name one backend
+    refuses must be refused by the others, and a second copy of the rule would
+    drift from the first.
+
+    Three values are refused, each because it produces an entity that some part
+    of this API cannot address (measured on MuJoCo 3.11.0, one ``create_world``
+    then ``add_object``):
+
+    * **Not a ``str``.** ``add_object(7, ...)`` registered the key ``7`` and
+      only then raised ``TypeError`` out of MuJoCo's ``add_body``, leaving the
+      world holding an entry for a body that does not exist; a name that is not
+      hashable at all (``["x"]``) raised out of the duplicate-name test.
+      ``add_robot(7, ...)`` did compile, under the int registry key ``7`` -
+      which the tool surface, where every name arrives as a JSON string, can
+      never address. A falsy non-``str`` was worse than either: ``add_robot(0)``
+      silently derived the label ``"arm"`` from the model and reported success
+      under a name the caller never asked for.
+    * **The empty string.** ``""`` is MuJoCo's own sentinel for an unnamed
+      entity, so ``mj_name2id(model, BODY, "")`` returns ``-1``:
+      ``add_object("")`` succeeded and ``get_body_state(body_name="")`` then
+      reported ``Body '' not found``. For a camera it also collides with a
+      routing token - ``render(camera_name="")`` selects the free camera - so a
+      camera created as ``""`` can never be rendered from.
+    * **A ``str`` containing a NUL.** The compiled model compares names only up
+      to the first NUL, so ``add_object("a\\x00b")`` registered ``'a\\x00b'``
+      while the body compiled as ``'a'``, and ``mj_name2id(..., "a\\x00b")``
+      returned the id of ``'a'``. Two names, one entity, each layer believing a
+      different one. Through ``add_robot`` the NUL took the namespace separator
+      with it: the bodies compiled as ``'abase'`` / ``'alink'`` rather than
+      under the ``'a\\x00b/'`` prefix ``list_bodies`` looks for.
+
+    Nothing else is refused. In particular this is NOT the MJCF-interpolation
+    allowlist (``^[a-zA-Z0-9_-]+$``): a namespaced body label (``so101/gripper``)
+    and a dotted or unicode object name are all addressable, and narrowing the
+    domain to an allowlist is a separate decision from refusing a name that
+    demonstrably cannot address its entity.
+
+    A ``str`` subclass is accepted - it is a string by every operation here and
+    by the registry. Callers with a documented "derive the name" input (the
+    MuJoCo ``add_robot(name=None)`` / ``add_robot(name="")`` short form) must
+    check for that input before calling this, since ``""`` is refused here.
+
+    Args:
+        method: Calling method name, used in error text.
+        param_name: Parameter name, used in error text.
+        name: The caller's value.
+
+    Returns:
+        ``None`` when ``name`` can address the entity it creates, otherwise the
+        error message to report through the structured tool-result dict.
+    """
+    if not isinstance(name, str):
+        return (
+            f"{method}: '{param_name}' must be a non-empty string, got {name!r} "
+            f"({type(name).__name__}); an entity is addressed by name and every "
+            "agent-tool call carries that name as a string."
+        )
+    if not name:
+        return (
+            f"{method}: '{param_name}' must be a non-empty string, got ''; an empty "
+            "name is the backend's own sentinel for an unnamed entity, so the entity "
+            "created under it could not be addressed afterwards."
+        )
+    if "\x00" in name:
+        return (
+            f"{method}: '{param_name}' must not contain a NUL character, got {name!r}; "
+            "the compiled model reads a name only up to the first NUL, so the registry "
+            "and the model would disagree about the entity's name."
+        )
+    return None
+
+
+def validation_split_fraction(val_episodes: int, total_episodes: int) -> float:
+    """``dataset.eval_split`` that holds out exactly ``val_episodes`` episodes.
+
+    lerobot builds its held-out validation set by taking
+    ``ceil(n_episodes * eval_split)`` episodes from each task's tail, so every
+    fraction in ``((N - 1) / total, N / total]`` holds out exactly ``N``. This
+    returns the MIDPOINT of that interval rather than its ``N / total`` upper
+    bound, because the bound is not float-safe: ``25 * (7 / 25)`` evaluates to
+    ``7.000000000000001``, whose ceiling is 8 - one episode more than the caller
+    asked to reserve. The midpoint leaves half an episode of slack on either
+    side, so the requested count survives the round trip at every dataset size.
+
+    Args:
+        val_episodes: Number of episodes to hold out. Must be positive and
+            smaller than ``total_episodes``; callers validate that themselves so
+            they can name their own parameter in the error.
+        total_episodes: Episode count of the dataset being split.
+
+    Returns:
+        The fraction to pass as lerobot's ``--dataset.eval_split``.
+    """
+    return (val_episodes - 0.5) / total_episodes
+
+
+def validation_split_error(val_episodes: int, total_tasks: Any, context: str) -> str | None:
+    """Error text when a global episode COUNT cannot be honored as a split.
+
+    lerobot expresses a validation split as one ``eval_split`` FRACTION and
+    applies ``ceil(n_episodes * eval_split)`` to each task independently, so a
+    single fraction reproduces a global episode count only on a single-task
+    dataset. With ``T > 1`` tasks the ceiling is taken ``T`` times and the total
+    held out is generally not the requested ``N`` - reserving 1 episode of a
+    two-task dataset would hold out 2. Rather than quietly reserve a different
+    number of episodes than asked, callers refuse and point at the fraction,
+    which addresses the per-task behaviour directly.
+
+    A ``total_tasks`` of 0 or ``None`` means the dataset does not record a task
+    count (lerobot's own field defaults to 0), which is treated as single-task.
+
+    Args:
+        val_episodes: The requested held-out episode count, for the message.
+        total_tasks: ``total_tasks`` from the dataset's ``meta/info.json``.
+        context: Caller label the message is prefixed with.
+
+    Returns:
+        The error text, or None when the count can be honored exactly.
+    """
+    if not isinstance(total_tasks, int) or isinstance(total_tasks, bool) or total_tasks <= 1:
+        return None
+    return (
+        f"{context}: val_episodes={val_episodes} cannot be reserved exactly on a "
+        f"dataset with {total_tasks} tasks. A validation split is a per-task "
+        "fraction in lerobot (it holds out ceil(episodes_in_task * eval_split) "
+        "from every task), so a single global count is not expressible: the "
+        "ceiling would be applied once per task. Pass the fraction directly, "
+        "e.g. extra_flags={'dataset.eval_split': 0.1, 'eval_steps': 1000}, and "
+        "the split will hold out a tenth of each task."
+    )

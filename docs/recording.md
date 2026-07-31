@@ -8,7 +8,7 @@ description: DatasetRecorder - LeRobot v3 dataset writer used by both Simulation
 from strands_robots import Robot
 
 sim = Robot("so100")
-sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=30)
+sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=50)
 sim.run_policy(robot_name="so100", instruction="pick up the cube",
                policy_provider="mock", duration=10.0)
 sim.stop_recording()
@@ -16,6 +16,64 @@ sim.stop_recording()
 ```
 
 `start_recording` requires `[lerobot]`. Without it, use `start_cameras_recording` for plain MP4.
+
+## `fps` must equal the rollout's `control_frequency`
+
+The recorder captures **one frame per control step and never decimates**, so the
+rate frames arrive at is the rollout's `control_frequency` - and LeRobot derives
+every timestamp from the dataset's declared `fps` positionally
+(`timestamp = frame_index / fps`). A differing `fps` therefore cannot be
+honored, only mislabelled, so it is refused:
+
+```python
+sim.start_recording(repo_id="user/my_dataset", task="t", fps=30)
+sim.run_policy(robot_name="so100", policy_provider="mock")   # default 50.0 Hz
+# -> "run_policy: the active recording declares 30 fps but this rollout captures
+#     at control_frequency=50 Hz. [...] a 1.667x distortion of the episode
+#     duration [...] Align the two rates: pass control_frequency=30 to
+#     run_policy(), or record at the rollout's rate"
+```
+
+The refusal lands before any frame is written, so nothing is lost - pass either
+rate. It matters beyond the label: that per-frame interval is the control period
+a policy trains on, and `replay_episode` derives its per-frame physics budget
+from the dataset rate, so a mislabelled episode also replays at the wrong speed.
+To record at a lower rate than you control at, run the rollout at that rate -
+there is no decimating recorder.
+
+`PolicyRunner` is drivable directly, and the engine's check is not on that path,
+so `PolicyRunner.run` / `PolicyRunner.evaluate` apply the same rule themselves.
+They raise `ValueError` rather than returning an error dict, because a direct
+caller has no tool envelope to read:
+
+```python
+runner = PolicyRunner(sim)
+runner.run("so100", policy, control_frequency=50.0, on_frame=hook)
+# -> ValueError: PolicyRunner.run: the active recording declares 30 fps but this
+#    rollout captures at control_frequency=50 Hz. [...] pass control_frequency=30
+#    to PolicyRunner.run()
+```
+
+The rule holds whichever call comes first. `start_policy` returns while its
+rollout keeps running, so a recording can be opened against a rollout already in
+flight - and on the defaults (`fps=30` against `control_frequency=50.0`) that
+recorded a 1.667x mislabelled episode with every call reporting success.
+`start_recording` refuses the same disagreement, before creating the dataset:
+
+```python
+sim.start_policy(robot_name="so100", policy_provider="mock")   # default 50.0 Hz
+sim.start_recording(repo_id="user/my_dataset", task="t", fps=30)
+# -> "start_recording: this recording would declare 30 fps but a rollout is
+#     already running ('so100' at 50 Hz). [...] Align the two rates: record at
+#     the rollout's rate (start_recording(fps=50)), or restart the rollout at the
+#     recording's rate (stop_policy(robot_name='so100'), then
+#     start_policy(..., control_frequency=30))"
+```
+
+Rollouts running at *different* rates are refused outright, even when `fps`
+matches one of them: their frames interleave into one episode whose single
+declared rate cannot describe both, so there is no `fps` to pass instead. Stop
+all but one, or restart them at a common `control_frequency`.
 
 ## Selecting which cameras to record
 
@@ -33,7 +91,7 @@ sim.add_camera(name="camera1", ...)
 sim.add_camera(name="camera2", ...)
 sim.add_camera(name="camera3", ...)
 sim.start_recording(
-    repo_id="user/my_dataset", task="pick up the cube", fps=30,
+    repo_id="user/my_dataset", task="pick up the cube", fps=50,
     cameras=["camera1", "camera2", "camera3"],   # drops the implicit 'default'
 )
 ```
@@ -142,7 +200,7 @@ flushes a dataset episode boundary after each, and resets the sim between
 episodes for you:
 
 ```python
-sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=30)
+sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=50)
 sim.run_policy(robot_name="so100", instruction="pick up the cube",
                policy_provider="mock", n_steps=60, n_episodes=20)
 sim.stop_recording()
@@ -162,7 +220,7 @@ randomization, conditional logic between episodes), drive the loop yourself and
 call `save_episode()` after each rollout to flush it as its own episode:
 
 ```python
-sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=30)
+sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=50)
 for _ in range(20):
     sim.reset()
     sim.run_policy(robot_name="so100", instruction="pick up the cube",
@@ -184,7 +242,7 @@ episode per rollout - the explicit `save_episode()` is optional when you reset
 between rollouts:
 
 ```python
-sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=30)
+sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=50)
 for _ in range(20):
     sim.run_policy(robot_name="so100", instruction="pick up the cube",
                    policy_provider="mock", n_steps=60)
@@ -382,6 +440,30 @@ recorder = DatasetRecorder.create(
 
 Use `resume()` (not `create(overwrite=True)`) when you want to **append**
 episodes to the existing dataset instead of replacing it.
+
+### A frame the recorder cannot write fails the rollout
+
+`DatasetRecorder` is fail-fast by default (`strict=True`): if the underlying
+`LeRobotDataset` write fails, it raises
+`strands_robots.dataset_recorder.RecordingFrameError` instead of continuing. When
+the recorder is driven by `run_policy`, that ends the rollout with
+`status="error"` naming the frame the recording stopped being complete at:
+
+```
+Policy failed: dataset add_frame failed after 7 frame(s) written; the recording
+is incomplete from this frame on (strict=True, so it is not dropped silently):
+<the underlying error>
+```
+
+Continuing past a lost frame is not a smaller failure. Timestamps are derived
+positionally from the declared `fps`, so the surviving frames are re-stamped into
+a shorter span than they were captured over - a rollout that loses every other
+frame at 50 Hz produces an episode labelled at 2x speed, with no gap to detect.
+
+Construct the recorder with `strict=False` to trade that for best-effort
+recording: a failed write is counted in `dropped_frame_count`, warned about at
+`WARNING` (on the 1st, 2nd, 4th, 8th ... failure so a 50 Hz loop cannot flood the
+log), and the rollout continues.
 
 ## Instance methods
 

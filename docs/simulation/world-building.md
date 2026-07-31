@@ -52,13 +52,32 @@ sim.add_robot(name="panda", data_config="panda", keyframe="home")  # or keyframe
 ```
 
 The pose is applied to the robot's joints by name and is restored by `reset()`,
-so a keyframe spawn is sticky across episodes. It also survives later
-`add_robot` calls, so incrementally building a multi-robot scene keeps every
-already-spawned arm at its home pose rather than collapsing it to zero. An
+so a keyframe spawn is sticky across episodes. An
 unknown keyframe name/index
 is an error that lists the model's available keyframes. `keyframe=None` (the
 default) keeps the zero-pose spawn. (MuJoCo backend; the Newton backend rejects
 `keyframe=` as not-yet-supported.)
+
+### Adding a robot does not disturb the scene it joins
+
+Only the robot being added is placed at a defined configuration - its keyframe,
+or the zero pose. Everything already in the world is left exactly as it was: an
+arm keeps the pose it is in (whether that is its keyframe pose or wherever a
+policy or `send_action` has driven it) *and* the actuator setpoints holding it
+there, objects stay where they settled or were carried to, latched `apply_force`
+wrenches persist, and the clock keeps counting.
+
+So a scene can be composed in any order, and a robot can be added mid-session
+without invalidating what has already happened in it:
+
+```python
+sim.run_policy(robot_name="panda", ...)   # arm ends up somewhere useful
+sim.add_robot(name="helper", data_config="so101", position=[0.0, -0.6, 0.0])
+# 'panda' is still where the rollout left it; 'helper' starts at its zero pose
+```
+
+To return the *whole* world to its initial state - every robot, every object and
+the clock - call `reset()`, which is what that method is for.
 
 ## Declared physics options
 
@@ -319,8 +338,21 @@ sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "position": [0.4, 
 #               Accepted keys: name, op, pos.
 ```
 
+Every numeric field an op writes - `pos`, `quat`, `size`, `rgba` - must hold
+finite numbers, the same domain `add_object` / `add_camera` / `move_object` apply.
+MuJoCo bakes a `nan`/`inf` component into the model without complaint, so an
+unchecked one reports success and only surfaces later as a poisoned physics
+state:
+
+```python
+sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "pos": [float("nan"), 0, 0.3]}])
+# status=error: set_body_pos: 'pos' must contain finite numbers (no nan/inf),
+#               got [nan, 0, 0.3]
+```
+
 The batch is atomic: if any op is rejected the world is rolled back to its
-pre-patch state, so a bad key never leaves a half-applied scene. Use
+pre-patch state, so a bad key or a non-finite component never leaves a
+half-applied scene. Use
 `replace_scene_mjcf(xml)` for MJCF elements this vocabulary does not cover.
 
 ## Cameras
@@ -337,6 +369,12 @@ sim.add_camera(name="wrist", parent_body=mount,
 ```
 
 `list_bodies()` (no `robot_name`) lists every body in the world; with `robot_name` it scopes to that robot and also returns `gripper_body`, the best-guess end-effector mount.
+
+A mounted camera survives `remove_robot`, which rebuilds the whole scene: it is
+re-mounted on its body once every surviving robot is re-attached, keeping its
+local pose and its tracking. Removing the robot the camera is mounted ON leaves
+it with no mount point, so that camera is dropped (with a warning naming it)
+rather than blocking the removal.
 
 ## Multi-robot policies
 
