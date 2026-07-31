@@ -34,6 +34,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -52,6 +53,7 @@ from strands_robots.benchmarks.libero.bddl_parser import (
     parse_bddl_file,
 )
 from strands_robots.simulation.benchmark import BenchmarkProtocol, StepInfo
+from strands_robots.simulation.isaac.delta_eef import IsaacDeltaEEFController
 from strands_robots.simulation.models import SimCamera, SimRobot
 from strands_robots.utils import get_base_dir, require_optional
 
@@ -59,6 +61,17 @@ if TYPE_CHECKING:
     from strands_robots.simulation.base import SimEngine
 
 logger = logging.getLogger(__name__)
+
+# #1812 - LIBERO-on-Isaac Franka joint/link names. The Isaac eval path
+# (``examples/libero/run_isaac.py``) loads Isaac Sim's bundled Franka USD,
+# whose articulation DOFs are named ``panda_joint1..7`` (arm) plus
+# ``panda_finger_joint1/2`` (0..0.04 m prismatic fingers), with the
+# end-effector link ``panda_hand``. LIBERO is a Franka-only benchmark, so
+# these are constants rather than constructor knobs; a robot that lacks
+# them is a setup error surfaced through ``_ControllerInstallError``.
+_ISAAC_FRANKA_ARM_JOINTS: tuple[str, ...] = tuple(f"panda_joint{i}" for i in range(1, 8))
+_ISAAC_FRANKA_GRIPPER_JOINTS: tuple[str, ...] = ("panda_finger_joint1", "panda_finger_joint2")
+_ISAAC_FRANKA_EEF_LINK = "panda_hand"
 
 
 class LiberoAdapter(BenchmarkProtocol):
@@ -145,8 +158,11 @@ class LiberoAdapter(BenchmarkProtocol):
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str | None = None,
         eef_state_site_name: str | None = None,
+        eef_pos_offset: list[float] | None = None,
+        eef_quat_offset: list[float] | None = None,
         gripper_joint_name: str | None = None,
         state_gripper_joint_names: list[str] | None = None,
+        state_gripper_signs: list[float] | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -220,6 +236,28 @@ class LiberoAdapter(BenchmarkProtocol):
                 deltas. The site is preferred; the body is used as a
                 fallback when the site doesn't exist (non-RoboSuite
                 scenes).
+            eef_pos_offset: Optional ``[x, y, z]`` offset (metres),
+                expressed in the EEF *body's local frame*, added to the
+                position read via the ``get_body_state`` fallback path.
+                Backends without the RoboSuite grip site (e.g. Isaac,
+                whose Franka USD has no ``gripper0_grip_site``) can only
+                report the wrist-body pose, which sits ~9.7 cm behind
+                the gripper tip that ``state.x/y/z`` was trained on
+                (#168). This offset translates the body read to the
+                site-equivalent point: ``pos + R(body_quat) @ offset``.
+                ``None`` (default) applies no offset. Never applied to
+                the direct MuJoCo site read (that source IS the site).
+            eef_quat_offset: Optional ``[w, x, y, z]`` unit quaternion,
+                right-multiplied onto the orientation read via the
+                ``get_body_state`` fallback path (a constant local-frame
+                correction: ``quat = body_quat * offset``). Use when the
+                backend's EEF body frame differs from RoboSuite's
+                ``robot0_right_hand`` frame by a fixed rotation (the
+                frames are rigidly attached to the same physical link,
+                so the correction is configuration-independent). ``None``
+                (default) applies no correction. The position offset is
+                applied using the RAW body orientation, before this
+                correction.
             gripper_joint_name: Joint name whose ``qpos`` is read for the
                 LIBERO ``state.gripper`` key. ``None`` (default) triggers
                 auto-resolution from the scene at episode start using
@@ -231,6 +269,17 @@ class LiberoAdapter(BenchmarkProtocol):
                 is ``"finger_joint1"``. The Menagerie Panda's two-finger
                 MJCF equality constraint mirrors the value to the second
                 finger, so reading just one is sufficient.
+            state_gripper_signs: Optional 2-element sign/scale vector
+                multiplied elementwise onto the ``state.gripper``
+                2-vector, whatever source produced it. RoboSuite's
+                training data records the two Panda finger qpos with
+                OPPOSITE signs (``finger_joint1`` in ``[0, +0.04]``,
+                ``finger_joint2`` in ``[-0.04, 0]``); backends whose
+                gripper model drives both fingers positive (e.g. the
+                Isaac Franka USD, whose ``panda_finger_joint2`` follows
+                the URDF ``[0, 0.04]`` mimic convention) must pass
+                ``[1.0, -1.0]`` to restore the trained sign convention.
+                ``None`` (default) leaves values as read.
             inject_eef_state: When ``True`` (default), the adapter's
                 :meth:`augment_observation` injects ``x`` / ``y`` / ``z``
                 / ``roll`` / ``pitch`` / ``yaw`` / ``gripper`` keys
@@ -354,7 +403,7 @@ class LiberoAdapter(BenchmarkProtocol):
                 action. ``PolicyRunner._evaluate_with_spec`` catches the
                 exception from ``on_episode_start`` and returns a
                 structured ``{"status": "error", ...}`` dict, so a broken
-                *setup* (e.g. the ``numba`` / ``coverage>=7`` import clash,
+                *setup* (e.g. the ``numba`` / ``coverage`` import clash,
                 missing robosuite, missing site/actuator IDs) is no longer
                 indistinguishable from a bad *policy* scoring
                 ``success_rate=0`` on a green run (#522). Set to ``False``
@@ -439,7 +488,26 @@ class LiberoAdapter(BenchmarkProtocol):
         self._user_state_gripper_joint_names: list[str] | None = (
             [str(n) for n in state_gripper_joint_names] if state_gripper_joint_names is not None else None
         )
+        # #1802 - EEF source corrections for backends without the RoboSuite
+        # grip site (Isaac). Validated eagerly: a malformed offset silently
+        # feeding GR00T garbage state is exactly the failure class #168
+        # spent 30 rounds bisecting.
+        self._eef_pos_offset: list[float] | None = _validated_float_vector(eef_pos_offset, 3, "eef_pos_offset")
+        self._eef_quat_offset: list[float] | None = _validated_float_vector(eef_quat_offset, 4, "eef_quat_offset")
+        if self._eef_quat_offset is not None:
+            norm = float(np.linalg.norm(self._eef_quat_offset))
+            if not (0.99 < norm < 1.01):
+                raise ValueError(f"eef_quat_offset must be a unit quaternion (wxyz); got norm={norm:.4f}")
+        self._state_gripper_signs: list[float] | None = _validated_float_vector(
+            state_gripper_signs, 2, "state_gripper_signs"
+        )
         self._inject_eef_state = bool(inject_eef_state)
+        # #1802 - loud-error latch for augment_observation: when EEF state
+        # injection is enabled but produces no state keys, the failure used
+        # to surface only as the GR00T server's cryptic "State key 'state.x'
+        # must be in observation" rejection. Log ERROR once per adapter
+        # instead (once: augment_observation runs per control step).
+        self._eef_state_missing_logged = False
         self._auto_generate_scene = bool(auto_generate_scene)
         self._scene_cache_dir = scene_cache_dir
         # Default camera-name alias map matches RoboSuite/LIBERO's two
@@ -507,6 +575,13 @@ class LiberoAdapter(BenchmarkProtocol):
         # clears the tag.
         self._strict_action_controller = bool(strict_action_controller)
         self._action_controller_error: str | None = None
+        # #1812 - name of the robot an Isaac-side delta-EEF action
+        # controller was installed for (via
+        # ``IsaacSimulation.install_action_controller``), or ``None`` when
+        # the MuJoCo OSC path (or no path) is active. Used by the
+        # post-install settle step in :meth:`on_episode_start`, which
+        # otherwise only fires for the MuJoCo ``backend_state`` seam.
+        self._isaac_action_controller_robot: str | None = None
 
         # #168 - diagnostic logging gate for the STATE side
         # of the policy interface. Set ``STRANDS_LIBERO_STATE_LOG=1`` to
@@ -555,8 +630,11 @@ class LiberoAdapter(BenchmarkProtocol):
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str | None = None,
         eef_state_site_name: str | None = None,
+        eef_pos_offset: list[float] | None = None,
+        eef_quat_offset: list[float] | None = None,
         gripper_joint_name: str | None = None,
         state_gripper_joint_names: list[str] | None = None,
+        state_gripper_signs: list[float] | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -584,8 +662,11 @@ class LiberoAdapter(BenchmarkProtocol):
             cameras=cameras,
             eef_body_name=eef_body_name,
             eef_state_site_name=eef_state_site_name,
+            eef_pos_offset=eef_pos_offset,
+            eef_quat_offset=eef_quat_offset,
             gripper_joint_name=gripper_joint_name,
             state_gripper_joint_names=state_gripper_joint_names,
+            state_gripper_signs=state_gripper_signs,
             inject_eef_state=inject_eef_state,
             auto_generate_scene=auto_generate_scene,
             scene_cache_dir=scene_cache_dir,
@@ -611,8 +692,11 @@ class LiberoAdapter(BenchmarkProtocol):
         cameras: dict[str, dict[str, Any]] | None = None,
         eef_body_name: str | None = None,
         eef_state_site_name: str | None = None,
+        eef_pos_offset: list[float] | None = None,
+        eef_quat_offset: list[float] | None = None,
         gripper_joint_name: str | None = None,
         state_gripper_joint_names: list[str] | None = None,
+        state_gripper_signs: list[float] | None = None,
         inject_eef_state: bool = True,
         auto_generate_scene: bool = True,
         scene_cache_dir: str | None = None,
@@ -635,8 +719,11 @@ class LiberoAdapter(BenchmarkProtocol):
             cameras=cameras,
             eef_body_name=eef_body_name,
             eef_state_site_name=eef_state_site_name,
+            eef_pos_offset=eef_pos_offset,
+            eef_quat_offset=eef_quat_offset,
             gripper_joint_name=gripper_joint_name,
             state_gripper_joint_names=state_gripper_joint_names,
+            state_gripper_signs=state_gripper_signs,
             inject_eef_state=inject_eef_state,
             auto_generate_scene=auto_generate_scene,
             scene_cache_dir=scene_cache_dir,
@@ -980,20 +1067,23 @@ class LiberoAdapter(BenchmarkProtocol):
         # settle to avoid raising - the eval will still run, just at
         # the un-settled init pose.
         if scene_was_loaded:
-            world = getattr(sim, "_world", None)
-            if world is not None:
-                backend_state = getattr(world, "_backend_state", None)
-                if isinstance(backend_state, dict) and "action_controller" in backend_state:
-                    send_action = getattr(sim, "send_action", None)
-                    if callable(send_action):
-                        try:
-                            send_action({})
-                        except Exception as e:  # noqa: BLE001 - never abort eval on settle failure
-                            logger.warning(
-                                "LiberoAdapter.on_episode_start: settle send_action({}) raised %s; "
-                                "first observation will be at raw init_state instead of init_state+1step",
-                                e,
-                            )
+            controller_installed = self._isaac_action_controller_robot is not None
+            if not controller_installed:
+                world = getattr(sim, "_world", None)
+                if world is not None:
+                    backend_state = getattr(world, "_backend_state", None)
+                    controller_installed = isinstance(backend_state, dict) and "action_controller" in backend_state
+            if controller_installed:
+                send_action = getattr(sim, "send_action", None)
+                if callable(send_action):
+                    try:
+                        send_action({})
+                    except Exception as e:  # noqa: BLE001 - never abort eval on settle failure
+                        logger.warning(
+                            "LiberoAdapter.on_episode_start: settle send_action({}) raised %s; "
+                            "first observation will be at raw init_state instead of init_state+1step",
+                            e,
+                        )
 
         # #168 - reset per-episode state-log counter so each
         # episode emits its own first N STATE_LOG lines (matches the
@@ -1521,12 +1611,18 @@ class LiberoAdapter(BenchmarkProtocol):
         # deltas across rounds 23-32 of #168.
         #
         # Read both finger qpos directly from ``data.qpos[jnt_qposadr]``
-        # using the canonical RoboSuite joint names. Falls back to the
-        # legacy single-joint duplicate-packing for non-RoboSuite
-        # scenes that don't ship two named finger joints.
+        # using the canonical RoboSuite joint names. On backends without
+        # a direct MuJoCo model (Isaac), fall back to reading both
+        # configured finger joints from the observation dict itself
+        # (#1802), then to the legacy single-joint duplicate-packing for
+        # scenes that don't ship two named finger joints. Whatever source
+        # produced the 2-vector, ``state_gripper_signs`` restores the
+        # RoboSuite sign convention when configured.
         gripper_qpos = self._read_gripper_qpos(sim)
+        if gripper_qpos is None:
+            gripper_qpos = self._read_gripper_qpos_from_obs(obs)
         if gripper_qpos is not None:
-            merged.setdefault("gripper", gripper_qpos)
+            merged.setdefault("gripper", self._apply_gripper_signs(gripper_qpos))
         else:
             # Legacy fallback - read one joint from obs and duplicate
             # (preserves pre-#168 behaviour for non-RoboSuite
@@ -1540,7 +1636,7 @@ class LiberoAdapter(BenchmarkProtocol):
                         gripper_value = val
                         break
             if isinstance(gripper_value, (int, float)) and not isinstance(gripper_value, bool):
-                merged.setdefault("gripper", [float(gripper_value), float(gripper_value)])
+                merged.setdefault("gripper", self._apply_gripper_signs([float(gripper_value), float(gripper_value)]))
             else:
                 logger.debug(
                     "LiberoAdapter: gripper joints %s not found via direct mujoco lookup, "
@@ -1588,6 +1684,37 @@ class LiberoAdapter(BenchmarkProtocol):
             cam_value = merged.get(cam_key)
             if isinstance(cam_value, np.ndarray) and cam_value.ndim >= 2:
                 merged[cam_key] = np.ascontiguousarray(cam_value[::-1, :])
+
+        # #1802 - loud, actionable failure when injection was requested
+        # but produced nothing. Before this check the only symptom was
+        # the GR00T server's per-call rejection ("State key 'state.x'
+        # must be in observation") after a silent DEBUG skip here -
+        # useless for diagnosing WHICH source failed. Logged once per
+        # adapter (augment_observation runs every control step).
+        if self._inject_eef_state and not self._eef_state_missing_logged:
+            missing = [k for k in ("x", "y", "z", "roll", "pitch", "yaw", "gripper") if k not in merged]
+            if missing:
+                self._eef_state_missing_logged = True
+                has_body_state = getattr(sim, "get_body_state", None) is not None
+                logger.error(
+                    "LiberoAdapter.augment_observation: could not inject EEF state key(s) %s "
+                    "(sim=%s, get_body_state=%s, eef_state_site_name=%r, eef_body_name=%r, "
+                    "gripper_joint_name=%r, state_gripper_joint_names=%s). A policy data-config "
+                    "that requires 'state.*' keys (e.g. libero_panda) will reject every "
+                    "observation with \"State key 'state.x' must be in observation\". Fix: pass "
+                    "eef_body_name= / gripper joint names that resolve on this backend (for the "
+                    "bundled Isaac Franka: eef_body_name='panda_hand', state_gripper_joint_names="
+                    "['panda_finger_joint1', 'panda_finger_joint2']), or set "
+                    "inject_eef_state=False if the backend supplies these keys natively. "
+                    "This error is logged once per adapter.",
+                    missing,
+                    type(sim).__name__,
+                    "available" if has_body_state else "NOT IMPLEMENTED",
+                    self.eef_state_site_name,
+                    self._eef_body_name,
+                    self._gripper_joint_name,
+                    self.state_gripper_joint_names,
+                )
 
         # #168 - emit one structured STATE_LOG line per
         # ``augment_observation`` call when STRANDS_LIBERO_STATE_LOG=1.
@@ -1733,6 +1860,25 @@ class LiberoAdapter(BenchmarkProtocol):
                 logger.debug("LiberoAdapter: get_body_state(%r) raised: %s", self._eef_body_name, e)
                 state_result = None
             fallback_pos, fallback_quat = _extract_pose(state_result)
+            # #1802 - site-equivalent corrections for backends whose only
+            # EEF source is the wrist body (Isaac has no RoboSuite grip
+            # site). The position offset is expressed in the body's local
+            # frame and therefore rotated by the RAW body orientation -
+            # before the quaternion correction, which realigns the frame
+            # to RoboSuite's ``robot0_right_hand`` convention afterwards.
+            if self._eef_pos_offset is not None and fallback_pos is not None:
+                if fallback_quat is not None:
+                    delta = _quat_wxyz_rotate_vec(fallback_quat, self._eef_pos_offset)
+                    fallback_pos = [p + d for p, d in zip(fallback_pos, delta)]
+                else:
+                    logger.debug(
+                        "LiberoAdapter: eef_pos_offset configured but get_body_state(%r) "
+                        "reported no orientation; cannot express the body-frame offset - "
+                        "using the uncorrected position",
+                        self._eef_body_name,
+                    )
+            if self._eef_quat_offset is not None and fallback_quat is not None:
+                fallback_quat = _quat_wxyz_multiply(fallback_quat, self._eef_quat_offset)
         else:
             logger.debug("LiberoAdapter: sim has no get_body_state(); skipping EEF state injection")
 
@@ -1813,6 +1959,56 @@ class LiberoAdapter(BenchmarkProtocol):
                 )
                 return None
         return finger_qposes
+
+    def _read_gripper_qpos_from_obs(self, obs: dict[str, Any]) -> list[float] | None:
+        """Read both finger qpos from the observation dict itself (#1802).
+
+        Backends without a direct MuJoCo model (Isaac) still key their
+        observations by joint name, so the two joints named by
+        :attr:`state_gripper_joint_names` can be read straight from
+        ``obs``. Tries the bare key first, then the ``.../<name>``
+        namespaced-suffix convention (same convention as the legacy
+        single-joint fallback).
+
+        Returns the 2-element ``[finger1.qpos, finger2.qpos]`` vector, or
+        ``None`` if ANY configured joint is missing / non-numeric - whole
+        vector or nothing, same contract as :meth:`_read_gripper_qpos`.
+        """
+        joint_names = self.state_gripper_joint_names
+        if not joint_names:
+            return None
+        values: list[float] = []
+        for jname in joint_names:
+            value = obs.get(jname)
+            if value is None:
+                for key, val in obs.items():
+                    if isinstance(key, str) and key.endswith("/" + jname):
+                        value = val
+                        break
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return None
+            values.append(float(value))
+        return values
+
+    def _apply_gripper_signs(self, gripper_qpos: list[float]) -> list[float]:
+        """Apply the configured ``state_gripper_signs`` to a gripper 2-vector.
+
+        No-op (returns the input unchanged) when signs weren't configured
+        or the vector length doesn't match - a mismatch means the caller
+        produced a shape this adapter wasn't configured for, and mangling
+        a partial application would be worse than leaving it as read.
+        """
+        if self._state_gripper_signs is None:
+            return gripper_qpos
+        if len(gripper_qpos) != len(self._state_gripper_signs):
+            logger.warning(
+                "LiberoAdapter: state_gripper_signs has %d elements but the gripper "
+                "vector has %d; leaving state.gripper unsigned",
+                len(self._state_gripper_signs),
+                len(gripper_qpos),
+            )
+            return gripper_qpos
+        return [v * s for v, s in zip(gripper_qpos, self._state_gripper_signs)]
 
     def is_success(self, sim: SimEngine) -> bool:
         """Check whether the LIBERO task goal is satisfied.
@@ -2362,7 +2558,7 @@ class LiberoAdapter(BenchmarkProtocol):
           the result) before falling through to the no-op name-lookup
           path - the pre-#522 best-effort behaviour.
         * Dependency-clash failures (``ImportError`` / ``AttributeError``
-          from the import chain - e.g. the ``numba`` / ``coverage>=7``
+          from the import chain - e.g. the ``numba`` / ``coverage``
           incompatibility) are ALWAYS re-raised with a remediation hint,
           regardless of the flag, because they are fixable
           environment-level breakage, not a legitimate "no controller
@@ -2377,8 +2573,10 @@ class LiberoAdapter(BenchmarkProtocol):
         ``prewarm`` or another ``on_episode_start`` cycle.
         """
         # Clear any prior-episode failure tag - a re-install that now
-        # succeeds must not leave a stale error around.
+        # succeeds must not leave a stale error around. Same for the
+        # Isaac-path marker: it is re-set below if that path installs.
         self._action_controller_error = None
+        self._isaac_action_controller_robot = None
         try:
             controller = _LiberoOSCController.from_sim(
                 sim,
@@ -2389,7 +2587,7 @@ class LiberoAdapter(BenchmarkProtocol):
         except (ImportError, AttributeError) as e:
             # Defense-in-depth: an import/attribute error escaped from_sim's
             # own classification (it normally wraps these). Treat the known
-            # numba/coverage>=7 clash as fatal (surface it, #522); anything
+            # numba/coverage clash as fatal (surface it, #522); anything
             # else degrades like a missing optional dep.
             if _is_numba_coverage_clash(e):
                 remediation = self._action_controller_remediation(e)
@@ -2405,13 +2603,34 @@ class LiberoAdapter(BenchmarkProtocol):
             logger.warning("LiberoAdapter._install_action_controller: %s", msg)
             return
         except _ControllerDependencyMissing as e:
-            # An optional dep (mujoco / robosuite) is genuinely absent.
-            # This is environmental, not a fixable setup bug, so degrade
-            # gracefully even in strict mode: requiring robosuite as a
-            # hard dep would break installs without the optional extras.
+            # The MuJoCo OSC path is unavailable - either an optional dep
+            # (mujoco / robosuite) is genuinely absent or the engine has no
+            # compiled MuJoCo model (e.g. the Isaac backend). Before
+            # degrading to the no-op name-lookup path, try the Isaac-side
+            # delta-EEF differential-IK controller (#1812); the duck-typed
+            # probe returns False on engines that expose no Isaac action
+            # seam, so non-Isaac environments keep the pre-existing
+            # warn-and-degrade behaviour.
+            try:
+                if self._try_install_isaac_action_controller(sim):
+                    return
+            except _ControllerInstallError as isaac_err:
+                msg = f"{isaac_err}. GR00T actions would no-op without the Isaac delta-EEF action controller."
+                self._action_controller_error = msg
+                if self._strict_action_controller:
+                    logger.error("LiberoAdapter._install_action_controller: %s", msg)
+                    raise _ControllerInstallError(msg) from isaac_err
+                logger.warning(
+                    "LiberoAdapter._install_action_controller: %s "
+                    "Running in non-strict mode: GR00T actions will no-op until this is resolved "
+                    "(set strict_action_controller=True to surface this as an eval error).",
+                    msg,
+                )
+                return
             msg = (
-                f"{e}. GR00T actions will no-op: the OSC controller's optional "
-                "dependencies (robosuite + mujoco) are not available in this environment."
+                f"{e}. GR00T actions will no-op: neither the MuJoCo OSC controller's "
+                "optional dependencies (robosuite + mujoco) nor an Isaac-side action "
+                "path are available in this environment."
             )
             self._action_controller_error = msg
             logger.warning("LiberoAdapter._install_action_controller: %s", msg)
@@ -2462,23 +2681,132 @@ class LiberoAdapter(BenchmarkProtocol):
             len(controller.gripper_actuator_ids),
         )
 
+    def _try_install_isaac_action_controller(self, sim: SimEngine) -> bool:
+        """Install the Isaac delta-EEF differential-IK action controller.
+
+        Isaac counterpart of the robosuite ``OSC_POSE`` install (#1812): the
+        Isaac backend has no compiled MuJoCo model, so GR00T's task-space
+        delta-EEF action keys resolve to no joint and every action lands in
+        ``send_action``'s ``unresolved_keys`` - a 946-second video of a
+        perfectly still Franka. This builds an
+        :class:`~strands_robots.simulation.isaac.delta_eef.IsaacDeltaEEFController`
+        over the engine's public seams (``get_jacobian`` /
+        ``get_observation`` / ``install_action_controller``) so
+        ``send_action`` converts each delta into joint position targets.
+
+        Duck-typed engine probe, mirroring how the MuJoCo path probes
+        ``sim._world._model``: an engine that lacks any of the required
+        callables is simply not an Isaac engine and gets ``False`` back (the
+        caller then keeps the pre-existing warn-and-degrade behaviour).
+
+        Returns:
+            ``True`` when the controller was installed, ``False`` when the
+            engine exposes no Isaac action seam.
+
+        Raises:
+            _ControllerInstallError: The engine IS an Isaac engine but the
+                setup is broken - zero or multiple robots, missing Franka
+                joints, unreadable Jacobian, or a rejected install. These are
+                fixable setup bugs, so the caller applies the same
+                strict/non-strict policy as the MuJoCo path.
+        """
+        # Typed ``Any``: SimEngine's base surface declares none of these
+        # backend-specific seams, so ``getattr`` would otherwise narrow the
+        # results to ``None`` and mypy would reject the calls below.
+        install: Any = getattr(sim, "install_action_controller", None)
+        get_jacobian: Any = getattr(sim, "get_jacobian", None)
+        list_robots: Any = getattr(sim, "list_robots", None)
+        robot_joint_names: Any = getattr(sim, "robot_joint_names", None)
+        get_observation: Any = getattr(sim, "get_observation", None)
+        if not all(callable(f) for f in (install, get_jacobian, list_robots, robot_joint_names, get_observation)):
+            return False
+
+        robots = list(list_robots())
+        if len(robots) != 1:
+            raise _ControllerInstallError(
+                f"Isaac delta-EEF controller needs exactly one robot to bind to, found {robots!r}"
+            )
+        robot_name = robots[0]
+        joint_names = list(robot_joint_names(robot_name))
+        required = list(_ISAAC_FRANKA_ARM_JOINTS) + list(_ISAAC_FRANKA_GRIPPER_JOINTS)
+        missing = [j for j in required if j not in joint_names]
+        if missing:
+            raise _ControllerInstallError(
+                f"Isaac robot '{robot_name}' lacks the LIBERO Franka joints {missing}; "
+                f"articulation DOFs present: {joint_names}"
+            )
+
+        arm_joints = list(_ISAAC_FRANKA_ARM_JOINTS)
+        arm_indices = [joint_names.index(j) for j in arm_joints]
+
+        def jacobian_fn() -> np.ndarray:
+            result = get_jacobian(body_name=_ISAAC_FRANKA_EEF_LINK, robot_name=robot_name)
+            if result.get("status") != "success":
+                raise RuntimeError(result["content"][0]["text"])
+            payload = result["content"][1]["json"]
+            jac = np.asarray(payload["jacp"] + payload["jacr"], dtype=np.float64)
+            return jac[:, arm_indices]
+
+        def joint_positions_fn() -> np.ndarray:
+            obs = get_observation(robot_name, skip_images=True)
+            try:
+                return np.array([float(obs[j]) for j in arm_joints], dtype=np.float64)
+            except KeyError as missing_joint:
+                raise RuntimeError(
+                    f"Observation for robot '{robot_name}' is missing arm joint {missing_joint}; "
+                    f"observation keys: {sorted(obs)}"
+                ) from missing_joint
+
+        # Probe the Jacobian once at install time so a broken kinematics
+        # read surfaces as a loud install error at episode start (where the
+        # strict/non-strict policy applies) instead of as one error
+        # envelope per action mid-eval. The physics tensor view exists by
+        # now: the runner's warm-up and the scene load have stepped the
+        # world.
+        try:
+            probe = jacobian_fn()
+        except RuntimeError as e:
+            raise _ControllerInstallError(
+                f"Isaac delta-EEF controller cannot read the '{_ISAAC_FRANKA_EEF_LINK}' Jacobian: {e}"
+            ) from e
+        if probe.shape != (6, len(arm_joints)):
+            raise _ControllerInstallError(
+                f"Isaac Jacobian probe returned shape {probe.shape}; expected (6, {len(arm_joints)})"
+            )
+
+        controller = IsaacDeltaEEFController(
+            arm_joint_names=arm_joints,
+            gripper_joint_names=list(_ISAAC_FRANKA_GRIPPER_JOINTS),
+            joint_positions_fn=joint_positions_fn,
+            jacobian_fn=jacobian_fn,
+        )
+        result = install(robot_name, controller)
+        if result.get("status") != "success":
+            raise _ControllerInstallError(
+                f"IsaacSimulation.install_action_controller refused the controller: {result['content'][0]['text']}"
+            )
+        controller.reset()
+        self._isaac_action_controller_robot = robot_name
+        logger.info(
+            "LiberoAdapter: installed Isaac delta-EEF action controller for robot '%s' "
+            "(eef_link=%r, arm_joints=%d, gripper_joints=%d)",
+            robot_name,
+            _ISAAC_FRANKA_EEF_LINK,
+            len(arm_joints),
+            len(_ISAAC_FRANKA_GRIPPER_JOINTS),
+        )
+        return True
+
     @staticmethod
     def _action_controller_remediation(error: BaseException) -> str:
         """Build a remediation hint for a dependency-clash install failure.
 
-        Detects the known ``numba`` / ``coverage>=7`` incompatibility
+        Detects the known ``numba`` / ``coverage`` incompatibility
         (#522) via :func:`_is_numba_coverage_clash` and surfaces a targeted
         fix; falls back to a generic hint for other failures.
         """
         if _is_numba_coverage_clash(error):
-            return (
-                "This is the known numba/coverage>=7 incompatibility: numba's "
-                "coverage_support module subclasses coverage.types.Tracer, which "
-                "coverage>=7 removed. Remediation: uninstall the conflicting "
-                "coverage from the eval environment ('pip uninstall coverage'), or "
-                "pin coverage<7, or upgrade numba to a release that no longer "
-                "imports coverage.types.Tracer."
-            )
+            return _numba_coverage_clash_remedy()
         return (
             "Ensure the OSC controller dependencies (robosuite and its "
             "transitive imports) are importable in this environment."
@@ -2635,6 +2963,16 @@ class LiberoAdapter(BenchmarkProtocol):
         cameras_attr = getattr(world, "cameras", None) if world is not None else None
         if isinstance(cameras_attr, dict):
             names.update(cameras_attr.keys())
+
+        # Isaac registry-side (#1802): IsaacSimulation tracks cameras on
+        # ``sim._cameras`` (its ``_world`` is the Isaac ``World`` handle,
+        # which has no ``cameras`` dict). Without this check the install
+        # step re-attempts ``add_camera`` for the pre-added ``image`` /
+        # ``wrist_image`` every episode and logs a duplicate-name WARNING
+        # per camera per episode.
+        sim_cameras_attr = getattr(sim, "_cameras", None)
+        if isinstance(sim_cameras_attr, dict):
+            names.update(sim_cameras_attr.keys())
 
         # Model-side: cameras declared in a loaded scene MJCF.
         model = getattr(world, "_model", None) if world is not None else None
@@ -3221,6 +3559,48 @@ def _extract_pose(state: dict[str, Any] | None) -> tuple[list[float] | None, lis
     return (pos, quat)
 
 
+def _validated_float_vector(value: Any, n: int, param: str) -> list[float] | None:
+    """Validate an optional length-``n`` float vector constructor argument.
+
+    Returns ``None`` untouched; otherwise a fresh ``list[float]`` of exactly
+    ``n`` finite elements. Raises :class:`ValueError` on any shape / dtype
+    problem - state-side config errors must fail at construction, not feed
+    the policy silently-wrong observations (#168's failure class).
+    """
+    if value is None:
+        return None
+    try:
+        vec = [float(c) for c in value]
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{param} must be a sequence of {n} numbers; got {value!r}") from e
+    if len(vec) != n or not all(math.isfinite(c) for c in vec):
+        raise ValueError(f"{param} must be {n} finite numbers; got {value!r}")
+    return vec
+
+
+def _quat_wxyz_multiply(a: list[float], b: list[float]) -> list[float]:
+    """Hamilton product ``a * b`` of two wxyz quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return [
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ]
+
+
+def _quat_wxyz_rotate_vec(quat_wxyz: list[float], vec: list[float]) -> list[float]:
+    """Rotate ``vec`` by the (normalized) wxyz quaternion: ``R(q) @ vec``."""
+    q = np.asarray(quat_wxyz, dtype=np.float64)
+    norm = float(np.linalg.norm(q)) or 1.0
+    w, x, y, z = q / norm
+    u = np.array([x, y, z], dtype=np.float64)
+    v = np.asarray(vec, dtype=np.float64)
+    rotated = v + 2.0 * np.cross(u, np.cross(u, v) + w * v)
+    return [float(c) for c in rotated]
+
+
 def _fmt_state_value(value: Any) -> str:
     """Format a state value for ``STATE_LOG`` output (#168).
 
@@ -3578,7 +3958,7 @@ class _ControllerInstallError(RuntimeError):
     """Raised inside :meth:`_LiberoOSCController.from_sim` when the
     LIBERO action controller can't be built but the prerequisites ARE
     present (missing site / actuator IDs, wrong arm-joint count, a
-    broken-but-installed import such as the numba/coverage>=7 clash,
+    broken-but-installed import such as the numba/coverage clash,
     etc.). With ``strict_action_controller=True`` (the default),
     :meth:`LiberoAdapter._install_action_controller` re-raises this so
     ``PolicyRunner`` returns a structured eval error instead of silently
@@ -3598,14 +3978,59 @@ class _ControllerDependencyMissing(_ControllerInstallError):
     extras."""
 
 
+#: Oldest ``coverage`` release that provides ``coverage.types.Tracer`` - the
+#: symbol ``numba.misc.coverage_support`` subclasses unconditionally. The name
+#: was renamed INTO existence at this release: coverage 7.4.0-7.6.0 call the
+#: same protocol ``TracerCore``, 7.0-7.3 call it ``TTracer``, and 6.x and older
+#: ship no ``coverage/types.py`` at all. The numba clash is therefore a
+#: coverage-too-OLD condition, so every remedy must raise ``coverage`` rather
+#: than pin it down.
+_COVERAGE_TRACER_MIN_VERSION = "7.6.1"
+
+
+def _numba_coverage_clash_remedy() -> str:
+    """Return the remediation text for the ``numba`` / ``coverage`` clash (#522).
+
+    Single source of truth, so every raise site that classifies the clash
+    hands the caller the same fix. The version boundary it names is
+    :data:`_COVERAGE_TRACER_MIN_VERSION`.
+    """
+    return (
+        "This is the known numba/coverage import clash: numba's coverage_support "
+        "module subclasses coverage.types.Tracer with no version guard, and "
+        f"coverage provides that symbol only from {_COVERAGE_TRACER_MIN_VERSION} "
+        f"onward. Remediation: raise coverage (pip install "
+        f"'coverage>={_COVERAGE_TRACER_MIN_VERSION}'), or remove coverage from the "
+        "eval environment entirely ('pip uninstall coverage'), which numba's "
+        "ImportError guard tolerates. Pinning coverage DOWN does not fix it - older "
+        "releases have no coverage.types.Tracer either - and an environment held at "
+        "an older coverage (some GPU-sim wheels pin coverage==7.4.4) is the usual "
+        "cause."
+    )
+
+
 def _is_numba_coverage_clash(error: BaseException) -> bool:
-    """Recognise the ``numba`` / ``coverage>=7`` import incompatibility (#522).
+    """Recognise the ``numba`` / ``coverage`` import incompatibility (#522).
 
     ``numba/misc/coverage_support.py`` defines
-    ``class NumbaTracer(coverage.types.Tracer)``, but ``coverage>=7``
-    removed ``coverage.types.Tracer`` - so importing ``numba`` (pulled in
-    transitively by robosuite's OSC controller path) raises
-    ``AttributeError: module 'coverage.types' has no attribute 'Tracer'``.
+    ``class NumbaTracer(coverage.types.Tracer)`` with no version guard - its
+    only guard is ``except ImportError`` around ``import coverage`` - while
+    ``coverage`` provides ``coverage.types.Tracer`` only from
+    :data:`_COVERAGE_TRACER_MIN_VERSION` onward. Importing ``numba`` (pulled in
+    transitively by robosuite's OSC controller path) against an older
+    ``coverage`` therefore fails in one of two shapes:
+
+    * ``module 'coverage.types' has no attribute 'Tracer'`` - coverage
+      7.0-7.6.0, where ``coverage/types.py`` exists but names the protocol
+      ``TTracer`` (7.0-7.3) or ``TracerCore`` (7.4.0-7.6.0).
+    * ``module 'coverage' has no attribute 'types'`` - coverage 6.x and older,
+      which ship no ``coverage/types.py`` at all.
+
+    Both shapes are the same clash with the same fix, so both are recognised.
+    The second one is what a caller lands in after pinning ``coverage`` *down*;
+    not recognising it would downgrade the strict install error into the silent
+    "GR00T actions will no-op" degrade that #522 exists to prevent.
+
     Walk the exception chain so the signature is still recognised when the
     AttributeError is wrapped by a later ImportError.
     """
@@ -3615,6 +4040,8 @@ def _is_numba_coverage_clash(error: BaseException) -> bool:
         seen.add(id(cur))
         text = str(cur)
         if "coverage.types" in text and "Tracer" in text:
+            return True
+        if "coverage" in text and "has no attribute 'types'" in text:
             return True
         cur = cur.__cause__ or cur.__context__
     return False
@@ -3784,7 +4211,7 @@ class _LiberoOSCController:
         the sim has no compiled MuJoCo model - the caller degrades
         gracefully. Raises the base :class:`_ControllerInstallError` for a
         fixable setup failure (missing site / actuator IDs, wrong arm-joint
-        count, or the known numba/coverage>=7 clash) - in strict mode the
+        count, or the known numba/coverage clash) - in strict mode the
         caller re-raises so ``PolicyRunner`` returns a structured eval
         error instead of silently dropping every GR00T action (#522).
         """
@@ -3796,7 +4223,7 @@ class _LiberoOSCController:
         # caller degrades gracefully; that is an environmental / optional-
         # dep condition, not a fixable setup bug. An import that fails for
         # ANOTHER reason while the module IS importable-but-broken (e.g.
-        # the numba/coverage>=7 ``AttributeError`` clash) raises the base
+        # the numba/coverage ``AttributeError`` clash) raises the base
         # ``_ControllerInstallError`` so the caller can surface it (#522).
         try:
             import mujoco as _mj
@@ -3804,7 +4231,9 @@ class _LiberoOSCController:
             raise _ControllerDependencyMissing(f"mujoco not available: {e}") from e
         except ImportError as e:
             if _is_numba_coverage_clash(e):
-                raise _ControllerInstallError(f"mujoco import hit the numba/coverage clash: {e}") from e
+                raise _ControllerInstallError(
+                    f"mujoco import hit the numba/coverage clash: {e} {_numba_coverage_clash_remedy()}"
+                ) from e
             raise _ControllerDependencyMissing(f"mujoco import failed (treated as unavailable): {e}") from e
         try:
             from robosuite.controllers import (  # type: ignore[import-not-found]
@@ -3814,7 +4243,7 @@ class _LiberoOSCController:
             from robosuite.utils.binding_utils import MjSim  # type: ignore[import-not-found]
         except (ImportError, AttributeError) as e:
             # The robosuite OSC import chain failed. Two cases:
-            #   1. The known numba/coverage>=7 clash (#522) - a FIXABLE
+            #   1. The known numba/coverage clash (#522) - a FIXABLE
             #      environment problem - surface it strictly so the eval
             #      returns an error instead of scoring success_rate=0 with
             #      every action dropped.
@@ -3824,7 +4253,9 @@ class _LiberoOSCController:
             #      as a hard dependency would break installs without the
             #      optional extras.
             if _is_numba_coverage_clash(e):
-                raise _ControllerInstallError(f"robosuite OSC import hit the numba/coverage clash: {e}") from e
+                raise _ControllerInstallError(
+                    f"robosuite OSC import hit the numba/coverage clash: {e} {_numba_coverage_clash_remedy()}"
+                ) from e
             raise _ControllerDependencyMissing(
                 f"robosuite OSC controller imports unavailable: {type(e).__name__}: {e}"
             ) from e
