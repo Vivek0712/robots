@@ -44,6 +44,11 @@ from strands.types.tools import AgentTool
 
 from strands_robots.mesh.ros_bridge import _check_topic
 from strands_robots.tools.use_ros import use_ros
+from strands_robots.utils import (
+    finite_number_error,
+    positive_finite_number_error,
+    positive_whole_number_error,
+)
 
 _SERVO_TYPE = "deepracer_interfaces_pkg/msg/ServoCtrlMsg"
 
@@ -146,8 +151,8 @@ class AckermannRosRobot:
             ("max_duration", max_duration),
             ("publish_rate", publish_rate),
         ):
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{label} must be a positive finite number, got {value!r}")
+            if limit_err := positive_finite_number_error(value, label, type(self).__name__):
+                raise ValueError(limit_err)
         self.wheelbase_m = float(wheelbase_m)
         self.max_speed = float(max_speed)
         self.max_steering_rad = float(max_steering_rad)
@@ -247,17 +252,29 @@ class AckermannRosRobot:
         ``duration``, ``count=1``) latches like a raw servo command until
         :meth:`stop`.
         """
-        for label, value in (("linear", linear), ("angular", angular)):
-            if not math.isfinite(value):
-                return self._error(f"drive: {label} must be a finite number, got {value!r}")
-        if duration is not None:
-            if not math.isfinite(duration) or duration <= 0:
-                return self._error(f"drive: duration must be a positive finite number of seconds, got {duration!r}")
-            if duration > self.max_duration:
-                return self._error(
-                    f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
-                    "- issue shorter commands instead of one long hold"
-                )
+        # A servo command is the one call on this bridge that physically moves
+        # the car, so every knob it carries is checked before anything reaches
+        # the wire, through the same shared domains the sibling bridges use.
+        cmd_err = (
+            finite_number_error(linear, "linear", "drive")
+            or finite_number_error(angular, "angular", "drive")
+            or (
+                positive_finite_number_error(duration, "duration", "drive")
+                if duration is not None
+                # ``duration`` supersedes ``count``, so ``count`` is only the
+                # effective horizon when no duration was given.
+                else positive_whole_number_error(count, "count", "drive")
+            )
+        )
+        if cmd_err:
+            return self._error(cmd_err)
+        # Ordered after the finiteness guard on purpose: every comparison
+        # against ``nan`` is false, so a ceiling test cannot stand in for one.
+        if duration is not None and duration > self.max_duration:
+            return self._error(
+                f"drive: duration {duration}s exceeds max_duration {self.max_duration}s "
+                "- issue shorter commands instead of one long hold"
+            )
         if not self._enabled and self.init_services:
             enabled = self.enable()
             if enabled.get("status") != "success":

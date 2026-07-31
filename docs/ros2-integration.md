@@ -179,6 +179,9 @@ drive cannot leave the car with a live throttle. A bare single-shot `drive()`
 (no `duration`) latches like any raw servo command until `stop()`. Commands
 are clamped to `max_speed`; holds longer
 than `max_duration` are rejected loudly rather than silently truncated. The
+`linear`/`angular`/`duration`/`count` values themselves are checked against the
+same shared domains the differential-drive bridges use, so an unusable value is
+refused with identical text on every transport. The
 stock platform publishes no odometry, so there is deliberately no
 `get_pose`. See `examples/ros2/deepracer_agent.py`.
 
