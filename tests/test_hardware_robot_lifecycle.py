@@ -100,6 +100,9 @@ def _make_robot(fake: _FakeLeRobot | None = None, control_frequency: float = 100
     hw._task_state = RobotTaskState()
     hw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test_arm_executor")
     hw._shutdown_event = threading.Event()
+    hw._stop_requested = threading.Event()
+    hw._task_admission = threading.Lock()
+    hw._task_claimed = False
     hw.mesh = None
     hw.peer_id = None
     hw.robot = fake if fake is not None else _FakeLeRobot()
@@ -174,9 +177,16 @@ class TestStopTask:
 
 class TestStartTask:
     def test_start_when_already_running_returns_error(self):
+        """A second start is refused while a rollout owns the motors bus.
+
+        The in-flight rollout is represented by taking the real admission
+        claim rather than by writing ``RUNNING`` onto the task state: the
+        status only reaches ``RUNNING`` after connect and the policy build, so
+        it is not what decides admission (see
+        ``tests/test_hardware_one_rollout_per_bus.py``).
+        """
         hw = _make_robot()
-        hw._task_state.status = TaskStatus.RUNNING
-        hw._task_state.instruction = "busy"
+        assert hw._claim_task("busy") is None
         result = hw.start_task("new task", policy_port=5555)
         assert result["status"] == "error"
         assert "already running" in result["content"][0]["text"].lower()
@@ -188,18 +198,22 @@ class TestStartTask:
 
         captured = {}
 
-        def _fake_sync(instruction, port, host, provider, duration):
+        def _fake_loop(instruction, port, host, provider, duration, **_kw):
             captured["instruction"] = instruction
             hw._task_state.status = TaskStatus.COMPLETED
             return {"status": "success", "content": [{"text": "done"}]}
 
-        hw._execute_task_sync = _fake_sync  # type: ignore[assignment]
+        # Stubs the control loop rather than the callable start_task submits, so
+        # the submitted wrapper still releases the motors-bus claim it was
+        # started under.
+        hw._run_control_loop = _fake_loop  # type: ignore[assignment]
         result = hw.start_task("grab", policy_port=5555, duration=1.0)
         assert result["status"] == "success"
         assert "grab" in result["content"][0]["text"]
         # Wait for the background future to run.
         hw._task_state.task_future.result(timeout=5)
         assert captured["instruction"] == "grab"
+        assert hw._task_claimed is False
         hw.cleanup()
 
 
@@ -430,13 +444,17 @@ class TestRunPolicyObject:
         hw.cleanup()
 
     def test_rejects_concurrent_task(self):
+        """A rollout is refused while another one owns the motors bus.
+
+        As above, the in-flight rollout is represented by the real admission
+        claim; ``_task_state.status`` is not the admission predicate.
+        """
         hw = _make_robot()
-        hw._task_state.status = TaskStatus.RUNNING
-        hw._task_state.instruction = "busy"
+        assert hw._claim_task("busy") is None
         result = hw.run_policy(policy_object=_StubPolicy(), instruction="pick", n_steps=1)
         assert result["status"] == "error"
         assert "already running" in result["content"][0]["text"].lower()
-        hw._task_state.status = TaskStatus.IDLE
+        hw._release_task()
         hw.cleanup()
 
     def test_connect_failure_reports_error_payload(self):
@@ -627,6 +645,45 @@ class TestStreamDispatch:
         assert captured["instruction"] == "go"
         hw.cleanup()
 
+    def test_stream_never_raises_past_dispatch_on_handler_error(self):
+        # Tool contract: a handler blowing up must surface as a structured
+        # {"status": "error"} event, never propagate out of the async
+        # generator (which the agent runtime cannot recover from).
+        hw = _make_robot()
+
+        def _boom():
+            raise RuntimeError("kaboom")
+
+        hw.get_task_status = _boom  # type: ignore[assignment]
+        events = _drain(hw.stream({"toolUseId": "t6", "input": {"action": "status"}}, {}))
+        result = events[-1].tool_result
+        assert result["status"] == "error"
+        assert "kaboom" in result["content"][0]["text"]
+        hw.cleanup()
+
+
+class TestCleanupFailSoft:
+    def test_cleanup_continues_when_stop_teleoperate_raises(self):
+        # A teleop teardown failure must not abort the rest of cleanup: the
+        # mesh (and every later teardown step) still has to run so the process
+        # does not leak a live transport when teleop happens to be flaky.
+        hw = _make_robot()
+        hw._teleop_running = True
+
+        def _raise_teleop():
+            raise RuntimeError("teleop teardown failed")
+
+        hw.stop_teleoperate = _raise_teleop  # type: ignore[assignment]
+
+        stopped: list[str] = []
+        hw.mesh = types.SimpleNamespace(stop=lambda: stopped.append("mesh"))
+
+        # Must not raise despite stop_teleoperate blowing up...
+        hw.cleanup()
+
+        # ...and cleanup must have continued past the failure to tear the mesh down.
+        assert stopped == ["mesh"]
+
 
 # ---------------------------------------------------------------------------
 # Status / spec surface
@@ -680,6 +737,21 @@ class TestStatusSurface:
         status = asyncio.run(hw.get_status())
         assert status["task_status"] == "error"
         assert status["task_error"] == "gripper stalled"
+        hw.cleanup()
+
+    def test_get_status_lists_the_devices_configured_cameras(self):
+        """The operator health probe enumerates the arm's configured cameras.
+
+        A follower with wrist/front cameras must surface those camera names
+        under ``cameras`` so a supervising agent knows which image streams
+        exist before starting a policy run. An arm with no cameras reports an
+        empty list (already covered by the connection-status test).
+        """
+        fake = _FakeLeRobot(connected=True)
+        fake.config = type("Cfg", (), {"cameras": {"wrist_cam": object(), "front_cam": object()}})()
+        hw = _make_robot(fake)
+        status = asyncio.run(hw.get_status())
+        assert status["cameras"] == ["wrist_cam", "front_cam"]
         hw.cleanup()
 
     def test_tool_spec_advertises_actions(self):
@@ -834,6 +906,25 @@ class TestTeleopStopAndStatus:
         assert "gamepad" in hw._input_publishers
         hw.cleanup()
 
+    def test_stop_named_device_removes_only_the_matching_receiver_by_suffix(self):
+        """``stop_teleop(device_name=...)`` tears down the receiver whose
+        ``<source>/<device>`` key ends in that device and leaves other
+        sources' receivers running, so a follower can drop one operator's
+        input stream without disturbing another live session.
+        """
+        hw = _make_robot()
+        leader = _FakeReceiver()
+        gamepad = _FakeReceiver()
+        hw._input_publishers = {}
+        hw._input_receivers = {"opA/leader": leader, "opB/gamepad": gamepad}
+        result = hw.stop_teleop(device_name="leader")
+        assert result["status"] == "success"
+        assert "opA/leader" not in hw._input_receivers
+        assert "opB/gamepad" in hw._input_receivers
+        assert leader.stopped is True
+        assert gamepad.stopped is False
+        hw.cleanup()
+
     def test_stop_with_no_sessions(self):
         hw = _make_robot()
         result = hw.stop_teleop()
@@ -892,6 +983,21 @@ class TestCleanup:
         hw = _make_robot(fake)
         asyncio.run(hw.stop())
         assert fake.is_connected is False
+
+    def test_async_stop_is_fail_soft_when_disconnect_raises(self):
+        """``stop()`` is the operator teardown path; a device whose
+        ``disconnect()`` raises (e.g. the USB cable was already pulled) must
+        not propagate the fault out of ``stop()`` and abort the shutdown.
+        """
+
+        class _RaisingDisconnect(_FakeLeRobot):
+            def disconnect(self) -> None:
+                raise RuntimeError("device already gone")
+
+        hw = _make_robot(_RaisingDisconnect(connected=True))
+        # Must not raise despite the disconnect fault.
+        asyncio.run(hw.stop())
+        hw.cleanup()
 
 
 class TestExecuteTaskSync:
@@ -1185,3 +1291,73 @@ def test_connect_robot_rolls_back_half_open_connect() -> None:
     assert fake.connect_attempts == 2
     assert fake.bus_disconnect_calls == [False, False]
     hw.cleanup()
+
+
+class TestConnectRobotErrorBranches:
+    """`_connect_robot` error handling: tolerate benign "already connected"
+    signals, fail loudly when the port never actually opens, and never let a
+    rollback failure mask the original connect error."""
+
+    def test_device_already_connected_error_is_tolerated(self) -> None:
+        """lerobot raises ``DeviceAlreadyConnectedError`` when the port is
+        already open; a connect that raises it (leaving the port live) is a
+        success, not an error."""
+        from lerobot.utils.errors import DeviceAlreadyConnectedError
+
+        class _AlreadyOpen(_FakeLeRobot):
+            def connect(self, calibrate: bool = False) -> None:  # noqa: ARG002 - lerobot signature
+                self._connected = True
+                raise DeviceAlreadyConnectedError("already connected")
+
+        hw = _make_robot(_AlreadyOpen(connected=False))
+        ok, err = asyncio.run(hw._connect_robot())
+        assert ok is True and err == ""
+        hw.cleanup()
+
+    def test_string_already_connected_is_tolerated(self) -> None:
+        """Some drivers raise a plain exception whose message says "already
+        connected" instead of the typed error; that must be tolerated too, not
+        re-raised."""
+
+        class _StringAlready(_FakeLeRobot):
+            def connect(self, calibrate: bool = False) -> None:  # noqa: ARG002 - lerobot signature
+                self._connected = True
+                raise RuntimeError("Device is already connected")
+
+        hw = _make_robot(_StringAlready(connected=False))
+        ok, err = asyncio.run(hw._connect_robot())
+        assert ok is True and err == ""
+        hw.cleanup()
+
+    def test_clean_connect_that_stays_disconnected_reports_failure(self) -> None:
+        """connect() returns without raising but the port never actually
+        opened: the final ``is_connected`` gate must catch it and report a
+        failure rather than a false success."""
+
+        class _NoOpConnect(_FakeLeRobot):
+            def connect(self, calibrate: bool = False) -> None:  # noqa: ARG002 - lerobot signature
+                pass  # never flips _connected -> stays disconnected
+
+        hw = _make_robot(_NoOpConnect(connected=False))
+        ok, err = asyncio.run(hw._connect_robot())
+        assert ok is False
+        assert "failed to connect" in err.lower()
+        hw.cleanup()
+
+    def test_rollback_swallows_disconnect_error(self) -> None:
+        """A half-open connect triggers rollback; if the port close itself
+        raises, that failure must be swallowed so the caller still sees the
+        original connect error, not the cleanup error."""
+
+        class _RollbackBoom(_HalfOpenConnectLeRobot):
+            def disconnect(self, disable_torque: bool = True) -> None:
+                self.bus_disconnect_calls.append(disable_torque)
+                raise OSError("port close failed")
+
+        fake = _RollbackBoom()
+        hw = _make_robot(fake)
+        ok, err = asyncio.run(hw._connect_robot())
+        assert ok is False
+        assert "connection failed" in err.lower()  # original error, not the rollback OSError
+        assert fake.bus_disconnect_calls == [False]  # rollback was still attempted
+        hw.cleanup()

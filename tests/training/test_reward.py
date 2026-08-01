@@ -126,11 +126,17 @@ class TestRequireSarmProgress:
             reward_mod._require_sarm_progress()
 
     def test_old_lerobot_raises_clear_error(self, monkeypatch):
-        # matplotlib present, but the SARM module is absent (pre-0.5.2 lerobot).
+        # matplotlib present, but the SARM module is absent (too-old lerobot).
         monkeypatch.setattr(reward_mod, "require_optional", lambda *a, **k: None)
         monkeypatch.setitem(sys.modules, _SARM_MOD, None)
-        with pytest.raises(ImportError, match="lerobot >= 0.5.2"):
+        with pytest.raises(ImportError, match=r"lerobot >= 0\.6") as excinfo:
             reward_mod._require_sarm_progress()
+        # lerobot 0.6 (incl. the rewards package) ships from PyPI, so the hint
+        # must NOT send the caller chasing a from-source / git+ install.
+        msg = str(excinfo.value)
+        assert "from source" not in msg
+        assert "git+" not in msg
+        assert "0.5.2" not in msg
 
 
 class TestRewardProgress:
@@ -167,6 +173,23 @@ class TestRewardProgress:
 
         assert reward_progress(Model(), {}) == [0.5]
 
+    def test_torch_mock_models_the_detach_chain(self):
+        # reward_progress() normalizes a torch return via the chain
+        # ``rewards.detach().to("cpu").flatten().tolist()``. When real torch is
+        # absent, tests/conftest.py installs tests/mocks/torch_mock.MockTensor as
+        # ``torch``; ``pytest.importorskip("torch")`` above therefore resolves to
+        # the mock rather than skipping (the mock IS a torch module). The mock
+        # must implement every method in that chain or the "run all unit tests
+        # without PyTorch installed" contract in conftest breaks -- a
+        # torch-return test would fail with AttributeError only in the mocked
+        # (no-real-torch) environment. Pin that ``flatten``/``tolist`` (the two
+        # links the mock previously lacked) survive on MockTensor and that the
+        # full chain a torch tensor takes through reward_progress still yields
+        # the right floats.
+        torch = pytest.importorskip("torch")
+        t = torch.tensor([[0.1], [0.9]])
+        assert t.detach().to("cpu").flatten().tolist() == pytest.approx([0.1, 0.9], abs=1e-6)
+
 
 class TestLoadRewardModel:
     """load_reward_model() builds the reward config and delegates the load to lerobot."""
@@ -201,5 +224,9 @@ class TestLoadRewardModel:
 
     def test_old_lerobot_raises_clear_error(self, monkeypatch):
         monkeypatch.setattr(reward_mod.importlib.util, "find_spec", lambda name: None)
-        with pytest.raises(ImportError, match="lerobot >= 0.5.2"):
+        with pytest.raises(ImportError, match=r"lerobot >= 0\.6") as excinfo:
             load_reward_model("/ckpt/sarm", device="cpu")
+        msg = str(excinfo.value)
+        assert "from source" not in msg
+        assert "git+" not in msg
+        assert "0.5.2" not in msg

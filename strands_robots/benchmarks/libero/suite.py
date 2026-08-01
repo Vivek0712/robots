@@ -256,9 +256,10 @@ def load_libero_suite(
     bddl_dir: str | Path | None = None,
     scene_dir: str | Path | None = None,
     max_steps: int | None = None,
-    init_jitter: float = 0.02,
+    init_jitter: float = 0.0,
     key_prefix: str = "libero",
     load_init_states: bool = True,
+    adapter_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, LiberoAdapter]:
     """Register every task in ``suite_name`` under the benchmark registry.
 
@@ -273,7 +274,12 @@ def load_libero_suite(
             <task>.xml`` if the file exists; otherwise scene is left as
             ``None`` and the adapter assumes the scene is already loaded.
         max_steps: Forwarded to every :class:`LiberoAdapter`.
-        init_jitter: Forwarded to every :class:`LiberoAdapter`.
+        init_jitter: Per-episode xy jitter (metres) forwarded to every
+            :class:`LiberoAdapter`. Defaults to ``0.0`` to match
+            :class:`LiberoAdapter`'s own default - non-zero jitter perturbs
+            the canonical init states and puts checkpoints such as
+            ``nvidia/GR00T-N1.7-LIBERO`` out of distribution, so callers must
+            opt in explicitly.
         key_prefix: Registry key format is ``<key_prefix>-<suite>-<task>``.
             Pass ``key_prefix=""`` for ``<suite>-<task>``.
         load_init_states: When ``True`` (default), lazily import
@@ -288,6 +294,15 @@ def load_libero_suite(
             documents intent). When ``True`` and libero loading fails,
             registration continues with init_states=None and the
             adapter falls back to snapshot-and-restore.
+        adapter_kwargs: Extra keyword arguments forwarded verbatim to every
+            :meth:`LiberoAdapter.from_file` call - the hook backend drivers
+            use to configure backend-specific state sources (#1802:
+            ``examples/libero/run_isaac.py`` passes ``eef_body_name`` /
+            ``eef_pos_offset`` / ``eef_quat_offset`` / gripper joint names
+            that resolve on the Isaac Franka USD, where the MuJoCo defaults
+            do not exist). Unknown keys raise ``TypeError`` from the adapter
+            constructor - typos fail loudly rather than silently dropping a
+            state-source override.
 
     Returns:
         ``{registry_name: LiberoAdapter}`` for every successfully registered
@@ -331,6 +346,7 @@ def load_libero_suite(
                 max_steps=max_steps,
                 init_jitter=init_jitter,
                 init_states=task_init_states,
+                **(adapter_kwargs or {}),
             )
         except (BDDLParseError, FileNotFoundError, ValueError) as e:
             logger.warning("Skipping LIBERO task %s: %s", bddl_file.name, e)

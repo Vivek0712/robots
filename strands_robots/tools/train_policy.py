@@ -122,7 +122,8 @@ def train_policy(
         lora_r / lora_alpha / lora_target_modules: LoRA hyperparameters.
         tune: Fine-grained component toggles for GR00T
             (``{"llm","visual","projector","diffusion"}``).
-        val_episodes: Hold out the LAST N episodes for validation.
+        val_episodes: Hold out the LAST N episodes for validation; the run
+            logs an eval loss over them at the checkpoint cadence.
         augmentation: Backend-specific augmentation dict.
         fps: Dataset control rate (when a backend needs it).
         extra: Backend-specific passthrough. lerobot: ``policy_type``,
@@ -140,10 +141,12 @@ def train_policy(
     Dependencies (per provider - the base ``[lerobot]`` extra is not always
     enough):
         - ``lerobot_local`` + ACT/diffusion: ``pip install 'strands-robots[lerobot]'``.
-        - ``lerobot_local`` + ``smolvla``/``pi0``/``pi05``: needs lerobot's
-          ``[smolvla]``/``[pi]`` extra, which pins ``transformers==5.3.0``. A
-          newer transformers crashes the VLA import (``non-default argument
-          'backbone_cfg' follows default argument``) - pin it.
+        - ``lerobot_local`` + ``smolvla``/``pi0``/``pi05``: add lerobot's
+          ``[smolvla]``/``[pi]`` extra on top of ``strands-robots[lerobot]``
+          (which pins ``lerobot>=0.6.0``). Those extras layer
+          ``transformers>=5.4.0,<5.6.0`` (plus num2words / scipy); do NOT pin
+          ``transformers==5.3.0`` - it conflicts with lerobot 0.6's transformers
+          floor.
         - ``groot``/``cosmos3``: install the upstream package into THIS
           interpreter (the trainer imports it and calls its library functions
           in-process - no subprocess). Point ``extra['groot_root']``/``GR00T_ROOT``

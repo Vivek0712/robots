@@ -21,26 +21,32 @@ Usage:
     recorder.push_to_hub()
 """
 
+import importlib.util
 import json
 import logging
 import re
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from strands_robots.utils import lerobot_version
+
 logger = logging.getLogger(__name__)
 
 
-# Every LeRobot surface in the supported ``>=0.5.0,<0.6.0`` range validates the
-# codec against the same codec-name allowlist - ``video_utils.VALID_VIDEO_CODECS
-# = {"h264", "hevc", "libsvtav1", "auto"} | HW_ENCODERS`` - and *rejects* the
-# ffmpeg library names ("libx264"/"libx265"). This holds for the flat ``vcodec``
-# kwarg (0.5.0/0.5.1) just as much as for the ``RGBEncoderConfig`` /
-# ``VideoEncoderConfig`` surfaces a later minor may expose. So there is exactly
-# one correct normalization direction: ffmpeg name -> codec name, applied to
-# whichever surface is present. Callers may pass either spelling.
+# Every LeRobot codec surface validates the requested codec against the same
+# codec-name allowlist - ``configs.video.VALID_VIDEO_CODECS = {"h264", "hevc",
+# "libsvtav1", "libaom-av1", "auto"} | HW_VIDEO_CODECS`` - and *rejects* the
+# ffmpeg library names ("libx264"/"libx265"). This holds for the current
+# ``rgb_encoder=RGBEncoderConfig(vcodec=...)`` surface (lerobot >=0.6.0,<0.7.0,
+# the supported range) exactly as it did for the flat ``vcodec`` kwarg and the
+# interim ``camera_encoder=VideoEncoderConfig(...)`` surface the tolerant
+# routing below still handles. So there is exactly one correct normalization
+# direction: ffmpeg name -> codec name, applied to whichever surface is present.
+# Callers may pass either spelling.
 _ENCODER_CODEC_NAMES = {"libx264": "h264", "libx265": "hevc"}
 
 
@@ -55,16 +61,16 @@ def _codec_create_kwargs(sig_params: Any, vcodec: str, *, context: str = "create
       * 0.5.0 / 0.5.1: a flat ``create/resume(..., vcodec=...)`` kwarg.
       * an interim build briefly exposed
         ``camera_encoder=VideoEncoderConfig(vcodec=...)``.
-      * a later minor may move the codec into
+      * lerobot >= 0.6 (the supported range) moved the codec into
         ``rgb_encoder=RGBEncoderConfig(vcodec=...)``.
 
     Every one of these surfaces validates against LeRobot's codec-name allowlist
-    (``{"h264", "hevc", "libsvtav1", "auto"} | HW_ENCODERS``) and rejects the
-    ffmpeg library names ("libx264"/"libx265"). So the codec is normalized to its
-    codec-name spelling once and routed onto whichever surface is present. The
-    caller may pass either spelling ("h264" or "libx264"). An unknown codec
-    raises loudly (LeRobot's own ValueError) rather than silently falling back
-    to the default.
+    (``{"h264", "hevc", "libsvtav1", "libaom-av1", "auto"} | HW_VIDEO_CODECS``)
+    and rejects the ffmpeg library names ("libx264"/"libx265"). So the codec is
+    normalized to its codec-name spelling once and routed onto whichever surface
+    is present. The caller may pass either spelling ("h264" or "libx264"). An
+    unknown codec raises loudly (LeRobot's own ValueError) rather than silently
+    falling back to the default.
 
     Args:
         sig_params: ``inspect.Signature.parameters`` of ``create``/``resume``.
@@ -114,6 +120,194 @@ def _codec_create_kwargs(sig_params: Any, vcodec: str, *, context: str = "create
 _BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+
+def sync_dataset_to_bucket(
+    root: str | Path,
+    bucket: str,
+    run_id: str | None = None,
+    *,
+    create: bool = True,
+    private: bool = True,
+    delete: bool = False,
+) -> dict[str, Any]:
+    """Sync an on-disk LeRobotDataset into an HF Storage Bucket (Phase 1/2).
+
+    Lifecycle-independent: needs only a finalized dataset directory on disk
+    (``meta/`` present) and the ``hf`` CLI - no live
+    :class:`DatasetRecorder`, no sim world. Covers syncing a dataset
+    recorded earlier in the process, one recorded on hardware via
+    ``lerobot-record``, or a daily re-sync of a directory that grew. Both
+    :meth:`DatasetRecorder.sync_to_bucket` and the idle-path bucket sync in
+    ``stop_recording`` delegate here so input validation and CLI
+    orchestration exist exactly once.
+
+    Mutable, Xet-deduplicated dump target for COLLECTION - avoids git-LFS
+    history bloat of push_to_hub during recording. Daily re-sync uploads
+    only changed chunks (content-defined chunking). Requires the ``hf`` CLI
+    with the ``buckets``/``sync`` subcommands (``huggingface_hub>=1.0``)
+    and ``hf auth login``.
+
+    ``bucket`` and ``run_id`` are validated against an allowlist before any
+    subprocess or URI interpolation: ``bucket`` must be ``"name"`` or
+    ``"org/name"`` and ``run_id`` a single path segment, both restricted to
+    ``[A-Za-z0-9._-]`` (no path traversal or shell metacharacters). This
+    path is agent-reachable via ``stop_recording(bucket=, run_id=)``. A
+    rejected value returns ``{"status": "error", ...}`` without running ``hf``.
+
+    The shard layout is already Xet/bucket-friendly at lerobot's defaults
+    (100 MB data parquet / 200 MB video MP4 shards), and ``meta/`` MUST
+    ship or downstream loses normalization stats.
+
+    Args:
+        root: Local dataset directory, ``str`` or ``Path`` (must contain
+            ``meta/``).
+        bucket: Bucket target, ``"name"`` or ``"org/name"``.
+        run_id: Subpath inside the bucket; defaults to the dataset directory
+            name (``Path(root).name``).
+        create: Create the bucket first (pre-existing bucket is not an error).
+        private: Create the bucket as private (only used with ``create=True``).
+        delete: Forward ``--delete`` to ``hf sync`` (mirror semantics -
+            remove remote files absent locally).
+
+    Returns:
+        ``{"status": "success", "bucket_uri": ...}`` or
+        ``{"status": "error", "message": ...}``. Never raises on ``hf``
+        failure; errors are surfaced in the result dict.
+    """
+    import subprocess
+
+    hf = _hf_executable()
+    if hf is None:
+        return {
+            "status": "error",
+            "message": '`hf` CLI not found. pip install -U "huggingface_hub>=1.0" and run `hf auth login`.',
+        }
+
+    # `hf buckets` / `hf sync` need huggingface_hub>=1.0; on 0.x the CLI
+    # exists but rejects those subcommands with argparse noise. Gate on the
+    # installed package version so users get an upgrade instruction instead.
+    version_error = _huggingface_hub_version_error()
+    if version_error is not None:
+        return {"status": "error", "message": version_error}
+
+    if not _BUCKET_RE.match(bucket):
+        return {
+            "status": "error",
+            "message": f"invalid bucket {bucket!r}: must match "
+            "'name' or 'org/name' using [A-Za-z0-9._-] (no path traversal "
+            "or shell metacharacters).",
+        }
+
+    local_root = str(root)
+    # meta/ must ship or downstream loses normalization stats.
+    if not (Path(local_root) / "meta").exists():
+        return {
+            "status": "error",
+            "message": f"No meta/ under {local_root}; the dataset was never finalized. "
+            "Call finalize() (stop_recording does this) before syncing to a bucket "
+            "(stats/info required for streaming/training).",
+        }
+
+    run_id = run_id or Path(local_root).name
+    if not _RUN_ID_RE.match(run_id):
+        return {
+            "status": "error",
+            "message": f"invalid run_id {run_id!r}: must be a single path "
+            "segment using [A-Za-z0-9._-] (no '/', path traversal, or shell "
+            "metacharacters).",
+        }
+    dest = f"hf://buckets/{bucket}/{run_id}"
+
+    if create:
+        cp = subprocess.run(
+            [hf, "buckets", "create", bucket] + (["--private"] if private else []),
+            capture_output=True,
+            text=True,
+        )
+        blob = (cp.stderr + cp.stdout).lower()
+        # An already-created bucket is the normal case for a daily re-sync, so it
+        # must not fail the sync. The hub reports it as "You already created this
+        # bucket repo" with a 409, which does not contain "exists" - match the
+        # status code and both phrasings rather than one substring.
+        already_exists = "exist" in blob or "409" in blob or "already created" in blob
+        if cp.returncode != 0 and not already_exists:
+            return {
+                "status": "error",
+                "message": f"bucket create failed: {cp.stderr.strip()}",
+            }
+
+    cmd = [hf, "sync", local_root, dest]
+    if delete:
+        cmd.append("--delete")
+    logger.info("Syncing %s -> %s", local_root, dest)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return {
+            "status": "error",
+            "message": proc.stderr.strip() or proc.stdout.strip(),
+        }
+
+    return {"status": "success", "bucket_uri": dest}
+
+
+def _hf_executable() -> str | None:
+    """Resolve the ``hf`` CLI, preferring the one in the running interpreter's
+    environment before falling back to PATH.
+
+    ``huggingface_hub`` installs the ``hf`` entry point next to the active
+    Python (e.g. inside a virtualenv's ``bin``/``Scripts``). A bare ``hf`` on
+    PATH is only found when that environment is also on PATH, which is often not
+    the case for a subprocess launched from a venv whose ``bin`` was never
+    activated. Checking ``sys.executable``'s directory first makes
+    ``sync_to_bucket`` work from any environment where ``huggingface_hub`` is
+    installed, not just an activated one. Returns ``None`` if no ``hf`` is found.
+    """
+    import shutil
+
+    exe_dir = Path(sys.executable).parent
+    for name in ("hf", "hf.exe"):
+        candidate = exe_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("hf")
+
+
+def _huggingface_hub_version_error() -> str | None:
+    """Return an actionable error message if ``huggingface_hub`` is too old for bucket sync.
+
+    The ``hf buckets`` / ``hf sync`` subcommands ship in huggingface_hub>=1.0.
+    On older releases (e.g. the 0.36.x stable line) the ``hf`` binary exists,
+    so :func:`_hf_executable` succeeds, but the subcommands fail with argparse
+    usage noise ("invalid choice: 'buckets'") that gives no hint the fix is an
+    upgrade. Version-checking the installed package up front turns that noise
+    into a clear upgrade instruction without spawning a subprocess.
+
+    Returns ``None`` (no error) when:
+
+    - the installed version is >= 1.0, or
+    - ``huggingface_hub`` is not importable in this interpreter (the ``hf``
+      binary may come from a different environment on PATH whose version we
+      cannot see; the normal subprocess error path still applies), or
+    - the version string is unparseable (fail open rather than block a
+      possibly-capable CLI on a cosmetic version format).
+    """
+    try:
+        import huggingface_hub
+    except ImportError:
+        return None
+
+    version = getattr(huggingface_hub, "__version__", "")
+    match = re.match(r"(\d+)\.(\d+)", version)
+    if match is None:
+        return None
+    if (int(match.group(1)), int(match.group(2))) >= (1, 0):
+        return None
+    return (
+        f"bucket sync requires huggingface_hub>=1.0 (`hf buckets`/`hf sync`); "
+        f"installed: {version}. pip install -U 'huggingface_hub>=1.0'."
+    )
+
+
 # Lazy check for LeRobot availability.
 # We must NOT import lerobot at module level because it pulls in
 # `datasets` -> `pandas`, which can crash with a numpy ABI mismatch on
@@ -135,22 +329,133 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HAS_LEROBOT_DATASET: list[bool] = []
 
 
-def has_lerobot_dataset() -> bool:
-    """Return True if lerobot's ``LeRobotDataset`` can be imported.
+#: The packages ``lerobot[dataset]`` installs and that
+#: ``lerobot.datasets.lerobot_dataset`` imports at module scope. Named in the
+#: install hint so a single command fixes every one of them at once; the
+#: authoritative set is lerobot's own extra, so this is a hint for a human, not
+#: a second source of truth strands-robots probes against.
+_LEROBOT_DATASET_PACKAGES = "datasets, pandas, pyarrow, av, torchcodec"
+
+#: The module strands-robots imports to record a LeRobotDataset. Named in the
+#: drift diagnosis so a caller can check it against their lerobot directly.
+_LEROBOT_DATASET_MODULE = "lerobot.datasets.lerobot_dataset"
+
+
+def _lerobot_installed() -> bool:
+    """Whether the ``lerobot`` package itself is present.
+
+    Uses a spec lookup rather than an import so it has no side effects and does
+    not pay lerobot's import cost just to answer a question about an error
+    message.
+    """
+    if "lerobot" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("lerobot") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _describe_lerobot_import_failure(exc: BaseException) -> str:
+    """Turn an import failure into the diagnosis a caller can act on.
+
+    Four unrelated failures reach here and they need four different
+    instructions, so the message has to say which one happened:
+
+    * lerobot itself is absent -- installing the extra is the fix;
+    * lerobot is present but a package its dataset stack needs is not
+      (``datasets``, ``pandas``, ``pyarrow``, ``av``, ...). Plain ``pip install
+      lerobot`` does not pull those in, so "install lerobot" is not a usable
+      instruction here: the package it names is already installed;
+    * lerobot is present but does not provide what strands-robots imports -- an
+      out-of-range or from-source lerobot that moved or renamed the module;
+    * the import failed without any module being missing (``ValueError`` /
+      ``RuntimeError``, typically a pandas built against a different numpy).
+      Nothing is absent, so no install fixes it.
+
+    Only a non-``ImportError`` may claim that nothing is missing: an
+    ``ImportError`` whose ``name`` is unset still reports a failed import, and
+    telling that caller to reconcile binary versions would send them after a
+    conflict they may not have.
+
+    Args:
+        exc: The exception raised while importing ``LeRobotDataset``.
+
+    Returns:
+        An actionable diagnosis naming the cause and the install that fixes it.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+
+    if not _lerobot_installed():
+        return (
+            f"lerobot is not installed ({detail}). Install lerobot >= 0.6.0 with: pip install 'strands-robots[lerobot]'"
+        )
+
+    version = lerobot_version()
+
+    if not isinstance(exc, ImportError):
+        return (
+            f"lerobot {version} is installed and no module is missing, but importing its dataset "
+            f"stack failed ({detail}). That is a conflict between installed packages -- commonly a "
+            f"pandas built against a different numpy -- so no install of lerobot or its extra fixes "
+            f"it; reconcile the conflicting packages instead."
+        )
+
+    missing = getattr(exc, "name", None) or ""
+    if missing and missing.split(".")[0] != "lerobot":
+        return (
+            f"lerobot {version} is installed, but {missing!r}, which its dataset stack needs, is "
+            f"not ({detail}). Install that whole set with: pip install 'lerobot[dataset]' "
+            f"-- {_LEROBOT_DATASET_PACKAGES}. Installing lerobot without that extra does not pull "
+            f"them in, so reinstalling lerobot alone will not fix this."
+        )
+
+    return (
+        f"lerobot {version} is installed, but it does not provide "
+        f"{_LEROBOT_DATASET_MODULE} ({detail}). strands-robots supports "
+        f"lerobot >= 0.6.0,<0.7.0; an out-of-range or from-source lerobot can move or rename "
+        f"that module. Install a supported one with: pip install 'strands-robots[lerobot]'"
+    )
+
+
+def lerobot_dataset_import_error() -> str | None:
+    """Return None if lerobot's ``LeRobotDataset`` imports, else why it does not.
+
+    This is the probe :func:`has_lerobot_dataset` answers yes/no from, and the
+    one a caller should use when it has to tell a human what to do: the reason
+    is what distinguishes "install the lerobot extra" from the cases that
+    instruction cannot fix.
 
     A successful probe is cached; a failed probe is intentionally re-attempted
     on the next call so a transient import failure does not permanently disable
     recording for the process.
+
+    Returns:
+        ``None`` when ``LeRobotDataset`` is importable, otherwise a
+        ready-to-display diagnosis naming the cause and the install that fixes
+        it (see :func:`_describe_lerobot_import_failure`).
     """
     if _HAS_LEROBOT_DATASET:
-        return True
+        return None
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: F401
     except (ImportError, ValueError, RuntimeError) as exc:
-        logger.debug("lerobot not available: %s", exc)
-        return False
+        reason = _describe_lerobot_import_failure(exc)
+        logger.debug("lerobot dataset stack unavailable: %s", reason)
+        return reason
     _HAS_LEROBOT_DATASET.append(True)
-    return True
+    return None
+
+
+def has_lerobot_dataset() -> bool:
+    """Return True if lerobot's ``LeRobotDataset`` can be imported.
+
+    A thin predicate over :func:`lerobot_dataset_import_error` so the two cannot
+    disagree about whether recording is available. Callers that must explain the
+    unavailability to a human should use that function instead: a bare False
+    cannot say which of several unrelated causes applied.
+    """
+    return lerobot_dataset_import_error() is None
 
 
 def _get_lerobot_dataset_class():
@@ -176,6 +481,186 @@ def _get_lerobot_dataset_class():
         raise ImportError(
             f"lerobot not available ({exc}). Install with: pip install lerobot\nRequired for LeRobotDataset recording."
         ) from exc
+
+
+def _lerobot_home() -> Path:
+    """Return LeRobot's on-disk dataset home (``$HF_LEROBOT_HOME``).
+
+    Uses lerobot's own ``HF_LEROBOT_HOME`` constant when importable so the
+    resolved path matches exactly where ``LeRobotDataset`` reads/writes
+    (honouring the ``HF_LEROBOT_HOME`` environment override). Falls back to the
+    documented default ``~/.cache/huggingface/lerobot`` when lerobot is absent.
+    """
+    try:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        return Path(HF_LEROBOT_HOME)
+    except (ImportError, ValueError, RuntimeError):
+        return Path.home() / ".cache" / "huggingface" / "lerobot"
+
+
+def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
+    """Resolve the on-disk directory a dataset will live in.
+
+    Mirrors ``LeRobotDataset`` root resolution so callers can inspect the
+    target before ``create``/``resume``:
+
+    * explicit ``root`` -> used verbatim;
+    * a ``repo_id`` that is itself a path (absolute, ``./`` prefixed, or with no
+      ``owner/name`` slash) -> treated as a local directory;
+    * otherwise ``$HF_LEROBOT_HOME/{repo_id}``.
+
+    Args:
+        repo_id: HuggingFace dataset id (``owner/name``) or a local path.
+        root: Explicit local dataset directory, if any.
+
+    Returns:
+        The resolved dataset directory as a :class:`~pathlib.Path`.
+    """
+    if root:
+        return Path(root)
+    if "/" not in repo_id or repo_id.startswith("/") or repo_id.startswith("./"):
+        return Path(repo_id)
+    return _lerobot_home() / repo_id
+
+
+def _prepare_create_target(dataset_dir: Path, *, overwrite: bool) -> None:
+    """Make ``dataset_dir`` safe for a fresh ``LeRobotDataset.create()``.
+
+    ``LeRobotDataset.create()`` calls ``mkdir(exist_ok=False)`` and raises a
+    bare ``FileExistsError`` whenever its target directory already exists - even
+    when empty. This resolves the situation up front with an actionable error:
+
+    * ``overwrite=True``: remove any existing target, then create() fresh.
+    * existing dataset (contains a ``meta/`` dir): raise ``FileExistsError``
+      naming ``overwrite=True`` (fresh) and :meth:`DatasetRecorder.resume`
+      (append) - ``create`` never silently appends or clobbers a real dataset.
+    * existing EMPTY dir (e.g. ``tempfile.mkdtemp()``): remove it so create()
+      does not trip over its own pre-existing-directory guard.
+    * existing NON-empty, non-dataset dir: raise ``ValueError`` instead of
+      clobbering unrelated files.
+
+    Args:
+        dataset_dir: Resolved on-disk dataset root.
+        overwrite: When True, replace any existing target.
+
+    Raises:
+        FileExistsError: Target is an existing LeRobotDataset and
+            ``overwrite`` is False.
+        ValueError: Target exists, is not a LeRobotDataset, is not empty, and
+            ``overwrite`` is False.
+    """
+    import shutil
+
+    if not dataset_dir.exists():
+        return
+    if overwrite:
+        if dataset_dir.is_dir():
+            shutil.rmtree(dataset_dir)
+        else:
+            dataset_dir.unlink()
+        logger.info("Removed existing dataset target for overwrite: %s", dataset_dir)
+        return
+    if not dataset_dir.is_dir():
+        raise ValueError(
+            f"Recording target {dataset_dir} exists and is not a directory. "
+            "Pass a directory path as root=, or overwrite=True to replace it."
+        )
+    if (dataset_dir / "meta").exists():
+        raise FileExistsError(
+            f"A LeRobotDataset already exists at {dataset_dir}. Pass overwrite=True "
+            "to replace it with a fresh dataset, or use DatasetRecorder.resume() "
+            "to append new episodes to it."
+        )
+    if not any(dataset_dir.iterdir()):
+        # Empty dir (e.g. from tempfile.mkdtemp()): clear it so create() does
+        # not trip over LeRobot's exist_ok=False guard.
+        shutil.rmtree(dataset_dir)
+        logger.info("Cleared empty recording target for fresh dataset: %s", dataset_dir)
+        return
+    raise ValueError(
+        f"Recording target {dataset_dir} already exists, is not a LeRobotDataset "
+        "(no meta/ directory), and is not empty. Refusing to overwrite unrelated "
+        "files. Pass overwrite=True to replace it, or choose a new/empty root=."
+    )
+
+
+def unrecordable_action_columns_error(
+    action: Mapping[str, Any],
+    declared: Sequence[str],
+    required: Sequence[str] | None,
+) -> str | None:
+    """Reject a frame whose action omits a declared column the caller requires.
+
+    A LeRobot action column must hold the command that was issued at that step.
+    When the dataset schema declares a column the frame's action dict does not
+    carry, there is no such command, and every candidate placeholder is wrong:
+
+    * ``0.0`` is itself a command wherever the action space is absolute
+      position - a LeRobot ``<motor>.pos`` follower, a MuJoCo position actuator
+      - so the joint TRAVELS to zero at servo speed on replay rather than
+      staying where the un-commanded joint actually stayed.
+    * A joint's measured position is in different units from a normalized or
+      tendon-driven actuator's command, so substituting it moves those
+      actuators too.
+    * The command standing on the actuator cannot be read back, because the
+      action-to-``ctrl`` mapping is deliberately not injective (a normalized
+      open/close fraction and a raw tendon-unit command can share one ``ctrl``).
+
+    So the frame is refused instead of persisted, which keeps the recorded
+    action columns equal to what the policy issued and keeps ``replay_episode``
+    a faithful round trip.
+
+    ``required`` scopes the check to the columns the caller knows must come from
+    this frame - typically the action keys of the robot being driven. Columns
+    outside it (in a shared scene, the robots this rollout does not drive) are
+    not this frame's to supply and are left alone.
+
+    Args:
+        action: The frame's action dict, keyed as the dataset schema spells it.
+        declared: Action column names declared by the dataset schema.
+        required: Column names this frame must supply, or ``None`` to skip the
+            check entirely (the historical behaviour).
+
+    Returns:
+        An actionable message naming the missing columns, or ``None`` when every
+        required column is present.
+    """
+    if required is None:
+        return None
+    declared_set = set(declared)
+    missing = [key for key in required if key in declared_set and key not in action]
+    if not missing:
+        return None
+    return (
+        f"Recorded action column(s) {missing} have no value in this frame's action, so the "
+        "recording would persist a command that was never issued. No placeholder is correct: "
+        "0.0 is a 'travel to zero' command for an absolute-position actuator, a joint's measured "
+        "position is in different units from a normalized or tendon actuator's command, and the "
+        "command standing on the actuator cannot be read back (the action-to-ctrl mapping is not "
+        "injective). Record with a policy that produces a value for every declared action column "
+        "- an action vector narrower than the actuator list is reported by diagnose_action_dim - "
+        "or record a schema covering only the actuators it drives."
+    )
+
+
+class RecordingFrameError(RuntimeError):
+    """A frame the dataset recorder could not write, in fail-fast mode.
+
+    Raised by :meth:`DatasetRecorder.add_frame` when the underlying
+    ``LeRobotDataset`` write fails and the recorder was constructed with
+    ``strict=True`` (the default). The frame is already gone at that point, so
+    the episode on disk is shorter than the rollout that produced it and every
+    surviving frame is re-timestamped from the declared ``fps`` - the caller has
+    to be told.
+
+    A distinct type, rather than the underlying error, so a rollout driver can
+    tell a lost recording frame apart from a failure in a caller's telemetry
+    hook. The drivers deliberately tolerate a few consecutive telemetry
+    failures; granting that tolerance to a lost recording frame truncates the
+    dataset while the rollout still reports success. The originating error is
+    chained and its text preserved.
+    """
 
 
 class DatasetRecorder:
@@ -208,6 +693,11 @@ class DatasetRecorder:
         self._closed = False
         self._cached_state_keys: list[str] | None = None
         self._cached_action_keys: list[str] | None = None
+        # Ordered SOURCE keys to read observation.state from, when they diverge
+        # from the flat schema ``names`` (e.g. a floating base's ``base_quat``
+        # source key expands to 4 per-component ``base_quat.*`` schema names).
+        # ``None`` -> derive the read order from the schema names (scalar-only).
+        self._state_source_keys: list[str] | None = None
         # Optional remap of observed camera stream names -> declared schema
         # names. Keys/values are bare camera names (no "observation.images."
         # prefix); a leading prefix on either side is tolerated and stripped.
@@ -255,16 +745,18 @@ class DatasetRecorder:
         camera_dims: dict[str, tuple[int, int]] | None = None,
         joint_names: list[str] | None = None,
         action_names: list[str] | None = None,
+        extra_state_specs: list[tuple[str, list[str]]] | None = None,
         task: str = "",
         root: str | None = None,
         use_videos: bool = True,
         vcodec: str = "h264",
         streaming_encoding: bool = True,
         image_writer_threads: int = 4,
-        video_backend: str = "auto",
+        video_backend: str | None = None,
         video_width: int = 640,
         video_height: int = 480,
         camera_key_map: dict[str, str] | None = None,
+        overwrite: bool = False,
     ) -> "DatasetRecorder":
         """Create a new DatasetRecorder with auto-detected features.
 
@@ -281,6 +773,13 @@ class DatasetRecorder:
                 space diverges from the joint names (e.g. actuator short-names
                 from SimEngine.robot_action_keys, where a tendon gripper is an
                 actuator with no matching joint). Falls back to joint_names.
+            extra_state_specs: Optional vector state signals to append to the
+                observation.state schema as per-component scalar columns, as
+                ``(source_key, [component_suffixes])`` pairs. Each source key is
+                read from the observation and flattened in order (e.g. a
+                floating base's ``("base_quat", ["w","x","y","z"])`` adds four
+                ``base_quat.*`` columns). Scalar joint/action fallbacks ignore
+                these; add_frame reads the source keys, not the expanded names.
             task: Default task description
             root: Local directory for dataset storage
             use_videos: Encode camera frames as video (True) or keep as images
@@ -293,13 +792,28 @@ class DatasetRecorder:
                 wheels commonly cannot decode it and silently yield 0 frames.
             streaming_encoding: Stream-encode video during capture
             image_writer_threads: Threads for writing image frames
-            video_backend: Video backend for encoding ("auto" for HW encoder auto-detect)
+            video_backend: LeRobot video *decode* backend for read-back
+                ("torchcodec" or "pyav"). Left as None by default so LeRobot
+                picks its platform default; only forwarded when explicitly set.
+                Encoder selection is controlled by ``vcodec`` (not this param).
             camera_key_map: Optional remap of observed camera stream names to the
                 declared schema names (e.g. {"front_camera": "image",
                 "wrist_camera": "wrist_image"}). Bare names or fully-qualified
                 "observation.images.*" keys are accepted on either side. Use it
                 when a policy declares image_keys that differ from the names the
                 sim/hardware streams emit, otherwise those frames are dropped.
+            overwrite: When the resolved dataset directory already exists,
+                ``LeRobotDataset.create`` raises a bare ``FileExistsError`` (its
+                ``mkdir`` uses ``exist_ok=False``). With ``overwrite=True`` the
+                existing directory is removed first so a fresh dataset is
+                created. With ``overwrite=False`` (default) an existing dataset
+                (a directory containing ``meta/``) raises a clear
+                ``FileExistsError`` naming ``overwrite=True`` (fresh) and
+                :meth:`resume` (append) instead of the cryptic LeRobot error; an
+                existing EMPTY directory (e.g. from ``tempfile.mkdtemp()``) is
+                cleared so ``create`` does not dead-end on its own existence
+                guard; a non-empty NON-dataset directory raises ``ValueError``
+                rather than clobbering unrelated files.
         """
         # Lazy import - this is where we actually need lerobot
         LeRobotDatasetCls = _get_lerobot_dataset_class()
@@ -312,6 +826,7 @@ class DatasetRecorder:
             camera_dims=camera_dims,
             joint_names=joint_names,
             action_names=action_names,
+            extra_state_specs=extra_state_specs,
             use_videos=use_videos,
             video_width=video_width,
             video_height=video_height,
@@ -344,11 +859,26 @@ class DatasetRecorder:
         # streaming_encoding / video_backend only in newer LeRobot versions
         if "streaming_encoding" in create_params:
             create_kwargs["streaming_encoding"] = streaming_encoding
-        if "video_backend" in create_params:
+        if "video_backend" in create_params and video_backend is not None:
             create_kwargs["video_backend"] = video_backend
+
+        # Resolve create-vs-crash for an existing target BEFORE calling
+        # LeRobotDataset.create(), which mkdir()s with exist_ok=False and would
+        # otherwise dead-end on a bare FileExistsError. This also keeps the
+        # resume() docstring and its no-resume RuntimeError message honest: both
+        # point callers at an ``overwrite=`` parameter that now exists here.
+        _prepare_create_target(resolve_dataset_dir(repo_id, root), overwrite=overwrite)
+
         dataset = LeRobotDatasetCls.create(**create_kwargs)
 
         recorder = cls(dataset=dataset, task=task, camera_key_map=camera_key_map)
+        # When vector state specs expand the schema (e.g. a floating base),
+        # add_frame must read the SOURCE keys (``base_quat``) rather than the
+        # expanded per-component schema names (``base_quat.w``). Record the
+        # source order: scalar state keys first, then each vector source key.
+        if extra_state_specs:
+            scalar_source = list(joint_names) if joint_names else []
+            recorder._state_source_keys = scalar_source + [k for k, _ in extra_state_specs]
         logger.info("DatasetRecorder ready: %s", repo_id)
         return recorder
 
@@ -361,7 +891,7 @@ class DatasetRecorder:
         vcodec: str = "h264",
         streaming_encoding: bool = True,
         image_writer_threads: int = 4,
-        video_backend: str = "auto",
+        video_backend: str | None = None,
         camera_key_map: dict[str, str] | None = None,
     ) -> "DatasetRecorder":
         """Resume recording into an EXISTING LeRobotDataset (append episodes).
@@ -389,7 +919,9 @@ class DatasetRecorder:
                 config). See create() for the H.264-vs-AV1 trade-off.
             streaming_encoding: Stream-encode video during capture.
             image_writer_threads: Threads for writing image frames.
-            video_backend: Video backend for encoding.
+            video_backend: LeRobot video *decode* backend for read-back
+                ("torchcodec" or "pyav"); None uses LeRobot's platform default.
+                Encoder selection is controlled by ``vcodec`` (not this param).
             camera_key_map: Optional remap of observed camera stream names to
                 the declared schema names (see create()).
 
@@ -418,7 +950,7 @@ class DatasetRecorder:
             resume_kwargs["streaming_encoding"] = streaming_encoding
         if "image_writer_threads" in resume_sig:
             resume_kwargs["image_writer_threads"] = image_writer_threads
-        if "video_backend" in resume_sig:
+        if "video_backend" in resume_sig and video_backend is not None:
             resume_kwargs["video_backend"] = video_backend
 
         dataset = LeRobotDatasetCls.resume(**resume_kwargs)
@@ -445,6 +977,7 @@ class DatasetRecorder:
         camera_dims: dict[str, tuple[int, int]] | None = None,
         joint_names: list[str] | None = None,
         action_names: list[str] | None = None,
+        extra_state_specs: list[tuple[str, list[str]]] | None = None,
         use_videos: bool = True,
         video_height: int = 480,
         video_width: int = 640,
@@ -494,6 +1027,19 @@ class DatasetRecorder:
             state_dim = len(joint_names)
             state_names = list(joint_names)
 
+        # Preserve additional vector state signals (e.g. a floating base's
+        # ``base_quat`` / ``base_ang_vel``) as per-component scalar columns so
+        # they are not silently dropped from ``observation.state``. Each spec is
+        # ``(source_key, [component_suffixes])``; ``add_frame`` reads the source
+        # key from the observation and flattens it in this same order. The
+        # scalar joint/action fallbacks below use the pre-expansion dims.
+        scalar_state_dim = state_dim
+        scalar_state_names = list(state_names)
+        if extra_state_specs:
+            for src_key, comps in extra_state_specs:
+                state_names.extend(f"{src_key}.{c}" for c in comps)
+                state_dim += len(comps)
+
         if state_dim > 0:
             features["observation.state"] = {
                 "dtype": "float32",
@@ -522,9 +1068,9 @@ class DatasetRecorder:
         elif joint_names:
             action_dim = len(joint_names)
             action_col_names = list(joint_names)
-        elif state_dim > 0:
-            action_dim = state_dim  # Same dim as state by default
-            action_col_names = state_names[:]
+        elif scalar_state_dim > 0:
+            action_dim = scalar_state_dim  # Same dim as scalar state by default
+            action_col_names = scalar_state_names[:]
 
         if action_dim > 0:
             features["action"] = {
@@ -541,6 +1087,7 @@ class DatasetRecorder:
         action: dict[str, Any],
         task: str | None = None,
         camera_keys: list[str] | None = None,
+        required_action_keys: Sequence[str] | None = None,
     ) -> None:
         """Add a single control-loop frame to the dataset.
 
@@ -552,6 +1099,21 @@ class DatasetRecorder:
             action: Action dict (joint_name → float)
             task: Task description (uses default if None)
             camera_keys: Which keys in observation are camera images
+            required_action_keys: Action column names this frame must
+                supply a value for - typically the action keys of the robot
+                being driven. A declared column in this set that ``action``
+                omits raises ``ValueError`` rather than being written as a
+                fabricated command; see
+                :func:`unrecordable_action_columns_error`. ``None`` skips
+                the check.
+
+        Raises:
+            ValueError: A column in ``required_action_keys`` is declared by
+                the dataset schema but absent from ``action``.
+            RecordingFrameError: The dataset write failed and this recorder is
+                ``strict`` (the default). With ``strict=False`` the frame is
+                counted in ``dropped_frame_count`` and a warning is logged
+                instead.
         """
         if self._closed:
             return
@@ -578,9 +1140,14 @@ class DatasetRecorder:
         if state_keys:
             state_vals = []
             if self._cached_state_keys is None:
-                feat = self.dataset.features.get("observation.state", {})
-                state_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
-                self._cached_state_keys = state_names if state_names else sorted(state_keys)
+                if self._state_source_keys is not None:
+                    # Vector-expanded schema: read SOURCE keys (e.g. ``base_quat``);
+                    # the list/ndarray branch below flattens each in schema order.
+                    self._cached_state_keys = list(self._state_source_keys)
+                else:
+                    feat = self.dataset.features.get("observation.state", {})
+                    state_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
+                    self._cached_state_keys = state_names if state_names else sorted(state_keys)
 
             for k in self._cached_state_keys:
                 v = observation.get(k)
@@ -599,15 +1166,26 @@ class DatasetRecorder:
                 frame["observation.state"] = np.array(state_vals, dtype=np.float32)
 
         # Action → flattened vector
-        # Use feature schema ordering for actions too.
+        # Use feature schema ordering for actions too. Resolved before the
+        # `if action:` guard so a frame carrying NO action for a column the
+        # caller requires is refused rather than silently skipped. The sorted()
+        # fallback still only runs for a non-empty action, so an observation-only
+        # frame cannot cache an empty key list for the rest of the episode.
+        if self._cached_action_keys is None:
+            feat = self.dataset.features.get("action", {})
+            action_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
+            if action_names:
+                self._cached_action_keys = list(action_names)
+            elif action:
+                self._cached_action_keys = sorted(action.keys())
+
+        gap = unrecordable_action_columns_error(action, self._cached_action_keys or [], required_action_keys)
+        if gap is not None:
+            raise ValueError(gap)
+
         if action:
             action_vals = []
-            if self._cached_action_keys is None:
-                feat = self.dataset.features.get("action", {})
-                action_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
-                self._cached_action_keys = action_names if action_names else sorted(action.keys())
-
-            for k in self._cached_action_keys:
+            for k in self._cached_action_keys or []:
                 v = action.get(k)
                 if v is None:
                     action_vals.append(0.0)
@@ -696,7 +1274,16 @@ class DatasetRecorder:
             self.episode_frame_count += 1
         except Exception as e:
             if self.strict:
-                raise  # Fail-fast per AGENTS.md convention #5
+                # Fail-fast per AGENTS.md convention #5. Raised as
+                # RecordingFrameError so a rollout driver does not absorb it
+                # into the tolerance it grants a caller's telemetry hook - the
+                # frame is lost, so silently continuing writes a short episode
+                # and reports success. The original error is chained.
+                raise RecordingFrameError(
+                    f"dataset add_frame failed after {self.frame_count} frame(s) written; "
+                    f"the recording is incomplete from this frame on "
+                    f"(strict=True, so it is not dropped silently): {e}"
+                ) from e
             self.dropped_frame_count += 1
             n = self.dropped_frame_count
             # Log at 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, then every 1000
@@ -861,94 +1448,34 @@ class DatasetRecorder:
     ) -> dict[str, Any]:
         """Sync the on-disk LeRobotDataset into an HF Storage Bucket (Phase 1/2).
 
-        Mutable, Xet-deduplicated dump target for COLLECTION - avoids git-LFS
-        history bloat of push_to_hub during recording. Daily re-sync uploads
-        only changed chunks (content-defined chunking). Requires the ``hf`` CLI
-        (huggingface_hub>=1.x) and ``hf auth login``.
-
-        ``bucket`` and ``run_id`` are validated against an allowlist before any
-        subprocess or URI interpolation: ``bucket`` must be ``"name"`` or
-        ``"org/name"`` and ``run_id`` a single path segment, both restricted to
-        ``[A-Za-z0-9._-]`` (no path traversal or shell metacharacters). This
-        path is agent-reachable via ``stop_recording(bucket=, run_id=)``. A
-        rejected value returns ``{"status": "error", ...}`` without running ``hf``.
-
-        The shard layout is already Xet/bucket-friendly at the 100 MB default,
-        and ``meta/`` MUST ship or downstream loses normalization stats.
+        Thin delegate to :func:`sync_dataset_to_bucket` (the lifecycle-
+        independent module-level helper, which holds the input validation and
+        ``hf`` CLI orchestration), passing this recorder's dataset root and
+        defaulting ``run_id`` to the dataset name (the last segment of
+        ``repo_id``). On success the result is augmented with this recorder's
+        ``episodes`` and ``frames`` counts.
         """
-        import shutil
-        import subprocess
-
-        if shutil.which("hf") is None:
-            return {
-                "status": "error",
-                "message": "`hf` CLI not found. pip install -U huggingface_hub (>=1.x) and run `hf auth login`.",
-            }
-
-        if not _BUCKET_RE.match(bucket):
-            return {
-                "status": "error",
-                "message": f"invalid bucket {bucket!r}: must match "
-                "'name' or 'org/name' using [A-Za-z0-9._-] (no path traversal "
-                "or shell metacharacters).",
-            }
-
-        local_root = str(self.dataset.root)
-        # meta/ must ship or downstream loses normalization stats.
-        if not (Path(local_root) / "meta").exists():
-            return {
-                "status": "error",
-                "message": f"No meta/ under {local_root}; call finalize() before "
-                "sync_to_bucket (stats/info required for streaming/training).",
-            }
-
-        run_id = run_id or self.dataset.repo_id.split("/")[-1]
-        if not _RUN_ID_RE.match(run_id):
-            return {
-                "status": "error",
-                "message": f"invalid run_id {run_id!r}: must be a single path "
-                "segment using [A-Za-z0-9._-] (no '/', path traversal, or shell "
-                "metacharacters).",
-            }
-        dest = f"hf://buckets/{bucket}/{run_id}"
-
-        if create:
-            cp = subprocess.run(
-                ["hf", "buckets", "create", bucket] + (["--private"] if private else []),
-                capture_output=True,
-                text=True,
-            )
-            blob = (cp.stderr + cp.stdout).lower()
-            if cp.returncode != 0 and "exist" not in blob:
-                return {
-                    "status": "error",
-                    "message": f"bucket create failed: {cp.stderr.strip()}",
-                }
-
-        cmd = ["hf", "sync", local_root, dest]
-        if delete:
-            cmd.append("--delete")
-        logger.info("Syncing %s -> %s", local_root, dest)
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            return {
-                "status": "error",
-                "message": proc.stderr.strip() or proc.stdout.strip(),
-            }
-
-        return {
-            "status": "success",
-            "bucket_uri": dest,
-            "episodes": self.episode_count,
-            "frames": self.frame_count,
-        }
+        result = sync_dataset_to_bucket(
+            str(self.dataset.root),
+            bucket,
+            run_id=run_id or self.dataset.repo_id.split("/")[-1],
+            create=create,
+            private=private,
+            delete=delete,
+        )
+        if result.get("status") == "success":
+            result["episodes"] = self.episode_count
+            result["frames"] = self.frame_count
+        return result
 
     @property
     def repo_id(self) -> str:
+        """The Hugging Face ``repo_id`` of the dataset being recorded."""
         return self.dataset.repo_id
 
     @property
     def root(self) -> str:
+        """Filesystem path to the dataset's on-disk root directory, as a string."""
         return str(self.dataset.root)
 
     def __repr__(self) -> str:
@@ -1042,11 +1569,23 @@ def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
             Returned alongside the parquet truth so callers can cross-check the
             two metadata sources for agreement - a healthy dataset has
             ``info_total_episodes == total_episodes``.
+          - ``unreadable_files``: ``"<path relative to root>: <error>"`` for
+            every ``meta/episodes`` parquet that could not be read (empty list
+            for a healthy dataset). A partially-corrupt dataset - one truncated
+            file out of twenty, the usual outcome of an interrupted sync or hub
+            download - still yields the episode truth of the readable files, so
+            callers can localise the damage instead of seeing zero episodes.
+            The episode counts above cover ONLY the readable files, so any
+            non-empty ``unreadable_files`` means the totals are a lower bound
+            and the dataset must not be certified as complete.
 
     Raises:
         ImportError: If ``pyarrow`` is not installed.
         FileNotFoundError: If no ``meta/episodes`` parquet exists under ``root``
             (no episode was ever flushed - the dataset is empty/unfinalized).
+        ValueError: If every ``meta/episodes`` parquet is unreadable, so there
+            is no episode ground truth at all. The message lists each file and
+            its read error.
     """
     try:
         import pyarrow.parquet as pq
@@ -1063,8 +1602,21 @@ def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
 
     pairs: list[tuple[int, int]] = []
     seen: set[int] = set()
+    unreadable_files: list[str] = []
+    readable_files = 0
     for pf in parquet_files:
-        table = pq.read_table(pf)
+        # A corrupt / truncated / foreign parquet raises ArrowInvalid (a
+        # ValueError subclass); an unreadable one raises OSError. Damage is
+        # usually confined to a few files (interrupted rsync, partial hub
+        # download), so record which file failed and keep reading the rest -
+        # aborting the whole read here would report zero episodes for a dataset
+        # that is mostly intact and hide which file is actually broken.
+        try:
+            table = pq.read_table(pf)
+        except (ValueError, OSError) as e:
+            unreadable_files.append(f"{pf.relative_to(root_path)}: {e}")
+            continue
+        readable_files += 1
         cols = table.column_names
         if "episode_index" not in cols:
             continue
@@ -1078,6 +1630,12 @@ def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
             seen.add(ep_int)
             length = int(lengths[i]) if lengths is not None and lengths[i] is not None else 0
             pairs.append((ep_int, length))
+
+    if unreadable_files and readable_files == 0:
+        # Nothing readable at all: there is no ground truth to return, so this
+        # is a hard read failure rather than a partial one.
+        detail = "; ".join(unreadable_files)
+        raise ValueError(f"No readable meta/episodes parquet under {root_path}: {detail}")
 
     pairs.sort(key=lambda p: p[0])
     episode_indices = [p[0] for p in pairs]
@@ -1105,4 +1663,5 @@ def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
         "total_frames": sum(frames_per_episode) if has_lengths else 0,
         "frames_per_episode": frames_per_episode if has_lengths else [],
         "info_total_episodes": info_total_episodes,
+        "unreadable_files": unreadable_files,
     }

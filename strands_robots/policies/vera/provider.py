@@ -41,6 +41,7 @@ from typing import Any
 import numpy as np
 
 from strands_robots.policies.base import Policy
+from strands_robots.utils import name_list_error
 
 from .client import VeraWebsocketClient
 from .config import VeraConfig
@@ -111,7 +112,9 @@ class VeraPolicy(Policy):
         host: Server hostname.
         image_keys: Explicit ordered camera keys to width-concat. When ``None``
             the server's ``view_keys`` (from the connect handshake) are used,
-            matched against the observation's image keys.
+            matched against the observation's image keys. Must be a list of
+            distinct non-blank names; a single key passed as a bare string is
+            refused rather than read one key per character.
         action_mapping: ``{action_column_name: robot_actuator_name}`` rename of
             the server's action columns to robot actuator names. When ``None``
             columns keep their server names (``action_0``, ``action_1``, …).
@@ -152,6 +155,12 @@ class VeraPolicy(Policy):
         server_runner: VeraServerRunner | None = None,
         config: VeraConfig | None = None,
     ) -> None:
+        # Refused before any server or config work: image_keys names the camera
+        # keys read out of the observation, and a bare string is iterable per
+        # character, so an unchecked one raises KeyError mid-rollout - after the
+        # policy server has been launched and the model loaded.
+        if image_keys and (err := name_list_error(image_keys, "image_keys", "VeraPolicy")):
+            raise ValueError(err)
         self.config = config or VeraConfig(
             embodiment=embodiment,  # type: ignore[arg-type]
             host=host,
@@ -209,13 +218,28 @@ class VeraPolicy(Policy):
 
     @property
     def provider_name(self) -> str:
+        """Registry key for this provider (``"vera"``)."""
         return "vera"
 
     @property
     def requires_images(self) -> bool:
+        """VERA conditions on camera frames - always needs images."""
         return True
 
     def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
+        """Record the robot's ordered joint/state keys used to build the state vector.
+
+        Raises:
+            ValueError: If ``robot_state_keys`` is not an ordered list of
+                distinct non-blank names, per
+                :func:`~strands_robots.utils.name_list_error`. A single name
+                passed as a bare string is the mistake this catches: ``str`` is
+                iterable per character, so it would bind one joint per letter.
+        """
+        if robot_state_keys and (
+            error := name_list_error(robot_state_keys, "robot_state_keys", "set_robot_state_keys")
+        ):
+            raise ValueError(error)
         self._robot_state_keys = list(robot_state_keys)
 
     def set_ik_target(

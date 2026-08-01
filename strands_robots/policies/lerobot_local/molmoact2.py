@@ -43,7 +43,7 @@ import json
 import logging
 from typing import Any
 
-from ...utils import require_optionals
+from ...utils import name_list_error, require_optionals
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +58,17 @@ MOLMOACT2_TYPE = "molmoact2"
 _MOLMOACT2_RUNTIME_DEPS = ("transformers", "peft", "scipy")
 
 #: Install hint for when lerobot itself is too old / absent. MolmoAct2Policy and
-#: the ``lerobot.configs`` feature symbols only exist in lerobot >= 0.5.2 (merged
-#: in lerobot PR #3604), which is not yet on PyPI -- so the fix is a from-source
-#: install. This is NOT the right advice when a *transitive* dependency is the
-#: thing missing (see ``_factory_import_error``).
+#: the ``lerobot.configs`` feature symbols ship in lerobot >= 0.6.0 (merged in
+#: lerobot PR #3604), which ``strands-robots[molmoact2]`` pulls straight from
+#: PyPI via the ``strands-robots[lerobot]`` (>=0.6.0) pin -- no from-source
+#: install is needed. This is NOT the right advice when a *transitive*
+#: dependency is the thing missing (see ``_factory_import_error``).
 _LEROBOT_VERSION_HINT = (
-    "MolmoAct2 requires lerobot >= 0.5.2 (PR #3604), which is not yet on "
-    "PyPI (latest release 0.5.1 lacks MolmoAct2Policy). Install the extra "
-    "plus lerobot from source:\n"
-    "  uv pip install 'strands-robots[molmoact2]' "
-    "'lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git'\n"
-    "On Jetson/aarch64, add --no-build-isolation if pyav fails to build."
+    "MolmoAct2 requires lerobot >= 0.6.0 (which ships MolmoAct2Policy via "
+    "lerobot PR #3604). Install (or reinstall) the extra -- it pulls a "
+    "compatible lerobot from PyPI:\n"
+    "  uv pip install 'strands-robots[molmoact2]'\n"
+    "On Jetson/aarch64, add --no-build-isolation if a wheel fails to build."
 )
 
 
@@ -81,7 +81,8 @@ def _factory_import_error(exc: ImportError) -> ImportError:
 
     * lerobot itself is too old or absent -- the ``lerobot`` package is missing,
       or the MolmoAct2-era symbols it should expose are not there yet. The fix
-      is a lerobot >= 0.5.2 from-source install (:data:`_LEROBOT_VERSION_HINT`).
+      is to (re)install ``strands-robots[molmoact2]``, which pulls lerobot
+      >= 0.6.0 from PyPI (:data:`_LEROBOT_VERSION_HINT`).
     * a *transitive* dependency that the factory pulls in is missing -- here
       ``exc.name`` names a non-lerobot package. The fix is to install THAT
       package; telling the caller to reinstall lerobot is a dead end that sends
@@ -119,9 +120,18 @@ def is_molmoact2(pretrained_name_or_path: str, policy_type: str | None) -> bool:
     """Return True if this checkpoint should use the MolmoAct2 wrapper path.
 
     Detection (cheap → expensive):
-      1. Explicit ``policy_type == "molmoact2"``.
-      2. ``config.json`` has ``model_type == "molmoact2"`` (transformers-native)
+      1. An explicit ``policy_type`` is authoritative and short-circuits with no
+         I/O: ``"molmoact2"`` (case-insensitive) -> True, any other declared type
+         -> False. A caller who names a lerobot-native type (e.g. ``"act"``) has
+         already told us this is not a transformers-native MolmoAct2 checkpoint.
+      2. Only in auto-detect mode (``policy_type`` is ``None`` / empty):
+         ``config.json`` has ``model_type == "molmoact2"`` (transformers-native)
          AND no lerobot ``type`` key. Reads local file or HF Hub config.json.
+
+    The config.json probe in step 2 is a Hub round-trip, so it MUST NOT run when
+    the caller already declared the type -- otherwise every explicitly-typed load
+    (the common case) pays a needless network request that stalls or fails when
+    the Hub is slow/unreachable.
 
     Args:
         pretrained_name_or_path: HF repo id or local dir.
@@ -130,8 +140,8 @@ def is_molmoact2(pretrained_name_or_path: str, policy_type: str | None) -> bool:
     Returns:
         True if the MolmoAct2 wrapper path applies.
     """
-    if policy_type and policy_type.lower() == MOLMOACT2_TYPE:
-        return True
+    if policy_type:
+        return policy_type.lower() == MOLMOACT2_TYPE
     if not pretrained_name_or_path:
         return False
 
@@ -229,8 +239,20 @@ def derive_image_keys(image_keys: list[str] | None, embodiment_spec: Any | None)
 
     Returns:
         Non-empty list of ``observation.images.*`` feature keys.
+
+    Raises:
+        ValueError: When ``image_keys`` is supplied but is not a list of
+            distinct non-blank names - most often a single key passed as a bare
+            string, which is iterable per character.
     """
     if image_keys:
+        # The single funnel for the model feature list: build_policy and the
+        # pre-flight converse check (_undeclared_image_feature_error) both route
+        # here, so validating the shape once covers the load path and the check
+        # that reports on it. Without this a bare string reaches list() and is
+        # read one feature per character.
+        if err := name_list_error(image_keys, "image_keys", "molmoact2"):
+            raise ValueError(err)
         return list(image_keys)
 
     targets = _embodiment_image_targets(embodiment_spec)

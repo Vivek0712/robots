@@ -29,7 +29,7 @@ A ``Trainer`` is selected by the SAME provider name as its ``Policy``
 owns both the inference class and the training class. Adding a new policy =
 add a ``Policy`` + a ``Trainer`` under one provider entry.
 
-See :class:`MockTrainer` (``strands_robots/training/mock.py``) for the canonical
+See :class:`~strands_robots.training.mock.MockTrainer` for the canonical
 no-dependency reference implementation.
 """
 
@@ -108,7 +108,10 @@ class TrainSpec:
             (GR00T: ``{"llm": bool, "visual": bool, "projector": bool,
             "diffusion": bool}``). Ignored by backends that don't.
         val_episodes: Hold out the LAST N episodes as a validation set
-            (deterministic split; lerobot ``--dataset.episodes=[0..total-N-1]``).
+            (deterministic split). A backend MUST make the reserved episodes
+            produce a validation signal, not merely shrink the training set;
+            the lerobot backend maps it onto ``--dataset.eval_split`` plus a
+            non-zero ``--eval_steps`` so an eval loss is logged periodically.
         augmentation: Backend-specific data augmentation (GR00T
             ``color_jitter_params`` / ``random_rotation_angle``; Cosmos
             dataset filter dict).

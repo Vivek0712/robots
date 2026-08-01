@@ -20,12 +20,73 @@ from typing import Any
 import numpy as np
 import torch
 
-from .. import Policy
-from .embodiment import ZeroActionMonitor, diagnose_action_dim
+from ...utils import name_list_error
+from .. import Policy, align_action_values, chunk_count_error
+from .embodiment import ZeroActionMonitor, diagnose_action_dim, hardware_pos_keys, state_key_remedy
 from .processor import ProcessorBridge
 from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_hub
 
 logger = logging.getLogger(__name__)
+
+
+def _scalar_observation_keys(observation_dict: dict[str, Any]) -> list[str]:
+    """Observation keys that can carry a joint/state scalar, in observation order.
+
+    Excludes ``task`` (the instruction string) and any array with 2+ dimensions
+    (a camera frame). Both observation-to-batch paths derive their state-ordering
+    fallback from this, and the state-key diagnostics quote it back to the
+    caller, so all three must agree on what counts as a state key.
+
+    Args:
+        observation_dict: Raw strands/sim observation for this step.
+
+    Returns:
+        The candidate state keys, in the observation's own insertion order.
+    """
+    return [k for k, v in observation_dict.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)]
+
+
+def _state_key_cause(configured: list[str]) -> str:
+    """Name the likely cause of an all-missing ``robot_state_keys`` binding.
+
+    The diagnostic used to assert the generic-key cause unconditionally, which
+    holds only when the configured keys actually have that shape. A caller who
+    configured a NAMED set describing a different robot - the sim ``so101``
+    embodiment names ``'1'..'6'``, none of which a hardware observation's
+    ``'<motor>.pos'`` keys carry - was told their keys were auto-generated
+    ``joint_N`` placeholders they never configured, i.e. the diagnostic
+    mis-described the one mistake it exists to explain. Reading the configured
+    keys keeps the sentence true for either shape.
+
+    The placeholders are recognised by the exact shape the loader emits:
+    ``joint_0`` through ``joint_{n-1}``, consecutive and zero-based. A bare
+    ``joint_`` prefix is NOT enough to conclude a key was auto-generated - the
+    registry ships ``kinova_gen3``, whose real joint names are ``joint_1``
+    through ``joint_7`` (one-based), so a prefix test would tell a Kinova
+    operator that the arm's own joint names were placeholders it invented.
+    Matching the generator exactly keeps both callers' sentences true, and the
+    alternative sentence asserts nothing about genericity, so it holds for every
+    other set - named, one-based, reordered or mixed.
+
+    The loader records no flag when it fills the list in, so the shape is the
+    only signal available - and it is also the honest one, since a hand-written
+    ``joint_0..joint_N`` set carries exactly the ambiguity the generic sentence
+    describes.
+
+    Args:
+        configured: The ``robot_state_keys`` that matched nothing. Empty is
+            accepted (the caller's guard returns before then) and takes the
+            non-generic branch rather than vacuously claiming the shape.
+
+    Returns:
+        One sentence naming the cause, ending in a period.
+    """
+    if configured and configured == [f"{_GENERIC_STATE_KEY_PREFIX}{i}" for i in range(len(configured))]:
+        return (
+            "This usually means generic auto-generated keys (joint_0..joint_N) were "
+            "paired with a robot/sim that reports named joints."
+        )
+    return "The configured keys describe a different robot/sim than the one reporting this observation."
 
 
 def _declared_feature_is_image(name: str, feature: Any = None) -> bool:
@@ -82,6 +143,126 @@ def _merge_obs_rename(base: dict[str, str], override: dict[str, str | None] | No
         else:
             merged.pop(src, None)
     return merged
+
+
+# Prefix of the placeholder state keys the loader fills in when a checkpoint
+# declares a state/action dim but the caller named no joints: it emits the
+# consecutive zero-based run ``joint_0..joint_{n-1}``. The all-missing
+# diagnostic rebuilds that run to decide whether the generic-key explanation
+# applies, and the user-facing sentence quotes the shape, so the three must stay
+# in step. Real robots can also have joint_-prefixed names (the registry's
+# kinova_gen3 is joint_1..joint_7), which is why the run, not the prefix, is
+# what identifies a placeholder.
+_GENERIC_STATE_KEY_PREFIX = "joint_"
+
+_VELOCITY_SUFFIX = ".vel"
+
+
+def _undeclared_image_feature_error(
+    targets: list[str],
+    embodiment_name: str,
+    policy_config: dict[str, Any],
+) -> str | None:
+    """Report image features the embodiment feeds but ``image_keys`` withholds.
+
+    An explicit ``image_keys=`` is priority 1 in
+    :func:`~strands_robots.policies.lerobot_local.molmoact2.derive_image_keys`,
+    so it replaces the feature list that would otherwise be derived from the
+    embodiment's ``obs_rename`` targets. When the supplied list does not cover
+    those targets, the model is built declaring features the pipeline never
+    feeds, and ``EmbodimentMap.validate`` refuses the mismatch - but only after
+    the weight download, which is exactly what :meth:`LerobotLocalPolicy.preflight`
+    exists to get ahead of. Both inputs are in ``policy_config``, so the verdict
+    is available for free beforehand.
+
+    Scope: ``image_keys`` is honored only on the MolmoAct2 load path and is
+    documented as inert for every other policy type, so the check defers to
+    :func:`~strands_robots.policies.lerobot_local.molmoact2.is_molmoact2` rather
+    than refusing a list some other checkpoint would ignore. That predicate
+    short-circuits with no I/O when the caller declared ``policy_type``; in
+    auto-detect mode it reads ``config.json`` (cached, and returning ``None`` on
+    any failure), which the load path reads anyway.
+
+    Args:
+        targets: Image rename targets the embodiment feeds, as collected by
+            :meth:`LerobotLocalPolicy.preflight`.
+        embodiment_name: Resolved embodiment name, for the message.
+        policy_config: Provider kwargs (``image_keys``, ``policy_type``,
+            ``pretrained_name_or_path``, ``embodiment``, ...).
+
+    Returns:
+        The refusal message, or ``None`` when the configuration is consistent
+        (no explicit ``image_keys``, a non-MolmoAct2 checkpoint, or every target
+        declared).
+    """
+    image_keys = policy_config.get("image_keys")
+    if not image_keys:
+        # Not supplied: the feature list is derived FROM the embodiment, so the
+        # two sides cannot diverge.
+        return None
+
+    from . import molmoact2 as _molmoact2
+
+    if not _molmoact2.is_molmoact2(
+        policy_config.get("pretrained_name_or_path") or "", policy_config.get("policy_type")
+    ):
+        return None
+
+    # Forwarded verbatim rather than through list(): derive_image_keys owns the
+    # shape contract, and coercing here first would split a bare string into
+    # per-character names before it can be reported as one.
+    declared = _molmoact2.derive_image_keys(image_keys, policy_config.get("embodiment"))
+    undeclared = [t for t in targets if t not in set(declared)]
+    if not undeclared:
+        return None
+
+    return (
+        f"Embodiment {embodiment_name!r} feeds image feature(s) {undeclared}, but the explicit "
+        f"image_keys={list(declared)} does not declare them, so the model would be built without "
+        f"the inputs the embodiment routes and its configuration is refused after the weight "
+        f"download. Either:\n"
+        f"  (a) drop image_keys= so the features are derived from the embodiment "
+        f"(-> {list(targets)}), or\n"
+        f"  (b) pass image_keys={list(targets)!r} to declare what the embodiment feeds, or\n"
+        f"  (c) pass policy_config={{'obs_rename_override': {{'<your_camera_name>': "
+        f"{declared[0]!r}}}}} for EVERY key you declared, so each declared feature is a "
+        f"rename target."
+    )
+
+
+def _drop_velocity_siblings(scalar_keys: list[str]) -> list[str]:
+    """Drop each ``<joint>.vel`` whose ``<joint>`` position companion is present.
+
+    Used only for the OBSERVATION-DERIVED state ordering (see
+    :meth:`LerobotLocalPolicy._resolve_state_order`), which is built from the
+    observation's own insertion order. The MuJoCo backend emits a velocity
+    sibling beside every joint position (``simulation/mujoco/rendering.py``:
+    ``obs[jnt_name] = qpos`` then ``obs[f"{jnt_name}.vel"] = qvel``), so that
+    order alternates ``[pos0, vel0, pos1, vel1, ...]``. Feeding it to a policy
+    trained on positions puts a velocity in every other slot of
+    ``observation.state`` and, once truncated to the model's state dim, drops
+    the trailing joints entirely - a wrong state vector with no error raised.
+    The producer documents ``<name>.vel`` as an ADDITIVE key that position-only
+    consumers are unaffected by; this restores that contract here.
+
+    A ``.vel`` key with NO position companion is KEPT, because some embodiments
+    legitimately declare velocity state and dropping it would corrupt those
+    instead: ``embodiments.json`` gives LeKiwi body-frame base velocities
+    ``x.vel`` / ``y.vel`` / ``theta.vel`` with no ``x`` / ``y`` / ``theta``
+    position key. Pairing is therefore decided per key, not by suffix alone.
+
+    Explicitly configured ``robot_state_keys`` are NOT filtered - an operator
+    naming ``elbow.vel`` is stating the model's input, and this only cleans up
+    an ordering inferred from whatever the observation happened to contain.
+
+    Args:
+        scalar_keys: Candidate state keys in observation insertion order.
+
+    Returns:
+        The same list, order preserved, minus the paired velocity siblings.
+    """
+    present = set(scalar_keys)
+    return [k for k in scalar_keys if not (k.endswith(_VELOCITY_SUFFIX) and k[: -len(_VELOCITY_SUFFIX)] in present)]
 
 
 # Fallback control rate used ONLY when RTC runs without the runtime having
@@ -206,7 +387,11 @@ class LerobotLocalPolicy(Policy):
             call. Defaults to 1 (closed-loop). When left at the default,
             it is auto-set from the loaded model's ``config.n_action_steps``
             (the model's trained open-loop chunk size) if that exceeds 1;
-            pass an explicit value > 1 to override the auto-detection.
+            pass an explicit value > 1 to override the auto-detection. Must be
+            a positive ``int`` - it bounds a slice of the action chunk, and any
+            other value both suppresses that auto-detection (which only fires
+            at the default) and is floored to 1 when the horizon is read, so it
+            is refused here instead.
         use_processor: Whether to load the model's processor pipeline.
         processor_overrides: Dict of overrides for processor pipeline steps.
         tokenizer_max_length: Max token length for VLA language tokenization.
@@ -214,7 +399,10 @@ class LerobotLocalPolicy(Policy):
         rtc_enabled: Enable Real-Time Chunking for flow-matching policies.
             Auto-detected from model config if None.
         rtc_execution_horizon: Number of timesteps from the prefix to use for
-            guidance. Defaults to model config value or 10.
+            guidance - with RTC active this is the re-query interval
+            :attr:`~strands_robots.policies.base.Policy.execution_horizon`
+            resolves, so it must be a positive whole number. ``None`` (the
+            default) adopts the model config value, else 10.
         rtc_max_guidance_weight: Maximum guidance weight for RTC correction.
             Defaults to model config value or 10.0.
         camera_key_map: Optional explicit mapping of robot/sim camera name
@@ -226,6 +414,15 @@ class LerobotLocalPolicy(Policy):
             fallback) if any camera name cannot be matched to a declared
             policy image key by exact name and no ``camera_key_map`` covers
             it. Defaults to False (positional fallback).
+        pad_short_actions: When the model emits FEWER action values than the
+            robot declares actuator keys, command the unmatched actuators to
+            ``0.0`` instead of omitting them. Defaults to False: an omitted
+            actuator holds its position, whereas ``0.0`` is an absolute target
+            on a LeRobot ``<motor>.pos`` follower or a MuJoCo position
+            actuator, so padding TRAVELS those joints to zero. Enable only when
+            the consumer needs a fixed-width action dict and zero is a
+            meaningful target for every key it pads. Either way the dim
+            mismatch itself is reported once via ``diagnose_action_dim``.
     """
 
     def __init__(
@@ -249,6 +446,7 @@ class LerobotLocalPolicy(Policy):
         camera_key_map: dict[str, str] | None = None,
         obs_rename_override: dict[str, str | None] | None = None,
         strict_keys: bool = False,
+        pad_short_actions: bool = False,
         cache_model: bool = True,
         revision: str | None = None,
         **kwargs,
@@ -259,6 +457,16 @@ class LerobotLocalPolicy(Policy):
         self.revision = revision
         self.policy_type = policy_type
         self.requested_device = device
+        # Validated here, where the caller's value arrives and before any
+        # checkpoint is downloaded (``_load_model`` below): the read path
+        # (``execution_horizon``) floors it to 1, which for this provider
+        # ALSO silently forfeits the auto-adoption of the checkpoint's
+        # trained chunk length, since _auto_detect_actions_per_step reads
+        # any value other than the default 1 as a horizon the caller pinned
+        # deliberately. See ``chunk_count_error``.
+        error = chunk_count_error(actions_per_step, "actions_per_step", "lerobot_local")
+        if error:
+            raise ValueError(error)
         self.actions_per_step = actions_per_step
         self.use_processor = use_processor
         self.processor_overrides = processor_overrides
@@ -298,6 +506,11 @@ class LerobotLocalPolicy(Policy):
         # camera_key_map covers them). Defaults to False (positional fallback
         # with a warning), preserving zero-config ergonomics.
         self.strict_keys = strict_keys
+        # When the model emits fewer action values than the robot declares
+        # actuator keys, False (the default) omits the unmatched actuators so
+        # they hold position; True commands them 0.0, which on an absolute-
+        # position action space travels them to zero. See align_action_values.
+        self.pad_short_actions = bool(pad_short_actions)
         # Routing-degradation telemetry. The heuristic (non-declarative)
         # remap path can keep a run alive while silently producing
         # meaningless inputs - a camera routed to an arbitrary model image
@@ -321,6 +534,11 @@ class LerobotLocalPolicy(Policy):
         # dedicated load path (see lerobot_local.molmoact2). These are inert
         # for every other policy type.
         self._molmoact2_norm_tag = norm_tag
+        # Refused here rather than at first use so a shape mistake is reported
+        # before the multi-minute weight download below, and before a bare
+        # string is read one feature per character.
+        if image_keys and (err := name_list_error(image_keys, "image_keys", "LerobotLocalPolicy")):
+            raise ValueError(err)
         self._molmoact2_image_keys = image_keys
         self._molmoact2_inference_action_mode = inference_action_mode
 
@@ -351,6 +569,17 @@ class LerobotLocalPolicy(Policy):
         # RTC state
         self._rtc_requested = rtc_enabled
         self._rtc_enabled = False
+        # Same domain and the same reason as ``actions_per_step`` above: with RTC
+        # active this IS the re-query interval ``execution_horizon`` resolves,
+        # through the same ``max(1, int(...))`` floor, and a value other than
+        # ``None`` also suppresses ``_init_rtc``'s adoption of the checkpoint's
+        # own ``rtc_config.execution_horizon``. ``None`` is the documented
+        # "adopt the model's value" request rather than a count, so only a
+        # supplied one is checked. See ``chunk_count_error``.
+        if rtc_execution_horizon is not None:
+            error = chunk_count_error(rtc_execution_horizon, "rtc_execution_horizon", "lerobot_local")
+            if error:
+                raise ValueError(error)
         self._rtc_execution_horizon = rtc_execution_horizon
         self._rtc_max_guidance_weight = rtc_max_guidance_weight
         self._rtc_prev_chunk: torch.Tensor | None = None
@@ -406,6 +635,7 @@ class LerobotLocalPolicy(Policy):
 
     @property
     def provider_name(self) -> str:
+        """Registry key for this provider (``"lerobot_local"``)."""
         return "lerobot_local"
 
     @property
@@ -439,7 +669,11 @@ class LerobotLocalPolicy(Policy):
         * otherwise -> ``actions_per_step`` (the trained chunk, consumed whole).
 
         Falls back to ``actions_per_step`` when RTC is enabled but the horizon
-        was never resolved (defensive; ``_init_rtc`` always sets it).
+        was never resolved (defensive; ``_init_rtc`` always sets it). A
+        ``rtc_execution_horizon`` the consumer cannot execute reached this
+        fallback too, so RTC silently collapsed to the open-loop replay the
+        paragraph above describes; the constructor now refuses such a value, so
+        the horizon read here always matches the one the model is given.
         """
         if self._rtc_enabled and self._rtc_execution_horizon:
             return max(1, int(self._rtc_execution_horizon))
@@ -516,8 +750,17 @@ class LerobotLocalPolicy(Policy):
 
         Raises:
             ValueError: If keys are empty and no model features available for
-                auto-detection.
+                auto-detection, or if ``robot_state_keys`` is not an ordered
+                list of distinct non-blank names, per
+                :func:`~strands_robots.utils.name_list_error`. A single name
+                passed as a bare string is the mistake the latter catches:
+                ``str`` is iterable per character, so it would bind one joint
+                per letter.
         """
+        if robot_state_keys and (
+            error := name_list_error(robot_state_keys, "robot_state_keys", "set_robot_state_keys")
+        ):
+            raise ValueError(error)
         if robot_state_keys:
             self.robot_state_keys = robot_state_keys
             logger.info(
@@ -860,6 +1103,8 @@ class LerobotLocalPolicy(Policy):
                 overrides=self.processor_overrides or {},
                 policy_type=self.policy_type,
                 policy_config=getattr(self._policy, "config", None),
+                revision=self.revision,
+                norm_tag=self._molmoact2_norm_tag,
             )
         except (FileNotFoundError, ValueError, ImportError) as exc:
             # Processor bridge is optional - models work without it via the raw
@@ -978,12 +1223,22 @@ class LerobotLocalPolicy(Policy):
             Many policies declare ``config.n_action_steps`` - the number of
             actions emitted per inference that the model was trained to replay
             open-loop before requerying observation (e.g. MolmoAct2 SO-100/101 =
-            30, ACT = 100, Diffusion = 32). The default ``actions_per_step=1`` is
+            30, ACT = 100). The default ``actions_per_step=1`` is
             a closed-loop convention that re-queries every step; for a chunk-
             trained model that is out of distribution and the shift compounds
             every chunk. When left at the default ``1`` we adopt
             ``n_action_steps`` so the chunk is consumed as trained. An explicit
             ``actions_per_step > 1`` from the caller is respected here.
+
+        Observation history (``config.n_obs_steps > 1``):
+            Diffusion (2) and VQBeT (5) consume a short observation history and
+            MUST run through ``select_action()`` (it maintains the obs-history
+            queue). Their ``predict_action_chunk()`` offline branch stacks a
+            single live frame as ``n_obs_steps=1`` and ``generate_actions()``
+            asserts, so the ``actions_per_step > 1`` regime crashes them. We keep
+            ``actions_per_step=1`` for these checkpoints; ``select_action()``
+            still replays the ``n_action_steps`` chunk from its internal queue,
+            so open-loop chunk replay is preserved - just correctly.
 
         Logged at INFO so the active regime is always visible.
         """
@@ -1015,6 +1270,29 @@ class LerobotLocalPolicy(Policy):
             return
         if self.actions_per_step != 1:
             return  # caller pinned an explicit horizon - never override it
+        # Observation-history policies (``n_obs_steps > 1``, e.g. Diffusion=2,
+        # VQBeT=5) MUST be driven per-step through ``select_action()``. That path
+        # maintains the required ``n_obs_steps`` observation queue AND still
+        # caches the model's ``n_action_steps`` chunk internally (re-querying the
+        # model only when the queue drains - the same open-loop chunk replay,
+        # done correctly). The ``actions_per_step > 1`` regime instead calls
+        # ``predict_action_chunk()`` on a SINGLE live observation frame; its
+        # offline branch stacks that lone frame as ``n_obs_steps=1``, so
+        # ``generate_actions()`` trips ``assert n_obs_steps == config.n_obs_steps``
+        # and crashes. Keep ``actions_per_step=1`` for these checkpoints so the
+        # per-step ``select_action()`` path is used.
+        n_obs_steps = getattr(config, "n_obs_steps", 1)
+        if isinstance(n_obs_steps, int) and n_obs_steps > 1:
+            logger.info(
+                "lerobot_local: %s consumes an observation history "
+                "(n_obs_steps=%d) - driving per-step via select_action() (which "
+                "keeps the obs-history queue and still replays the model's "
+                "n_action_steps chunk from its internal queue). Keeping "
+                "actions_per_step=1.",
+                type(self._policy).__name__,
+                n_obs_steps,
+            )
+            return
         n_action_steps = getattr(config, "n_action_steps", None)
         if isinstance(n_action_steps, int) and n_action_steps > 1:
             self.actions_per_step = n_action_steps
@@ -1148,10 +1426,23 @@ class LerobotLocalPolicy(Policy):
         ``obs_rename`` first, so an explicit override that maps a present camera
         onto the feature satisfies the check.
 
+        The converse is also checked: an explicit ``image_keys=`` replaces the
+        feature list that would be derived from those same rename targets (it is
+        priority 1 in ``derive_image_keys``), so a list that does not cover them
+        builds a model without the inputs the embodiment routes. That mismatch is
+        refused by ``EmbodimentMap.validate`` only after the weight download, and
+        both sides of it are already in ``policy_config`` here - see
+        :func:`_undeclared_image_feature_error`, which also explains why the check
+        applies to the MolmoAct2 load path only.
+
         No-op when no ``embodiment`` is configured (the policy then uses the
         legacy heuristic camera routing, which this hook cannot reason about),
         or when the embodiment name/spec cannot be resolved (``create_policy``
         surfaces that error authoritatively).
+
+        The parameter-shape guards below (``actions_per_step``, ``image_keys``,
+        ``rtc_execution_horizon``) run before that early-return, because all
+        three are honored whether or not an embodiment is configured.
 
         Args:
             observation_keys: Runtime observation keys (joint + camera names).
@@ -1159,9 +1450,41 @@ class LerobotLocalPolicy(Policy):
                 ``obs_rename_override``, ...).
 
         Raises:
-            ValueError: When a model image feature has no satisfiable source
-                camera key in ``observation_keys``.
+            ValueError: When ``actions_per_step`` or ``rtc_execution_horizon``
+                is not a positive whole number, when ``image_keys`` is not a
+                list of distinct non-blank names,
+                when a model image feature has no satisfiable source camera key
+                in ``observation_keys``, or when an explicit ``image_keys``
+                withholds a feature the embodiment feeds.
         """
+        # Checked before the embodiment early-return below, so a chunk count
+        # the consumer cannot execute is refused for every configuration rather
+        # than only for the ones that declare an embodiment. Running here (and
+        # not only in ``__init__``) is what turns it into a structured error
+        # from the rollout entry point instead of a raise, and refuses it before
+        # the weight download rather than after.
+        if "actions_per_step" in policy_config:
+            error = chunk_count_error(policy_config["actions_per_step"], "actions_per_step", "lerobot_local")
+            if error:
+                raise ValueError(error)
+
+        # Same reasoning for the image_keys shape: it is honored whether or not
+        # an embodiment is configured, so a shape mistake must be refused on
+        # both paths. Ordered after the chunk-count guard so the parameter error
+        # that landed first keeps its existing precedence.
+        supplied_image_keys = policy_config.get("image_keys")
+        if supplied_image_keys and (err := name_list_error(supplied_image_keys, "image_keys", "preflight")):
+            raise ValueError(err)
+
+        # The RTC re-query count, on the same domain as ``actions_per_step``: it
+        # replaces that horizon whenever RTC is active, which the model config
+        # decides, so it cannot be scoped to an embodiment either. Checked for a
+        # supplied value only - ``None`` asks for the checkpoint's own horizon.
+        if policy_config.get("rtc_execution_horizon") is not None:
+            error = chunk_count_error(policy_config["rtc_execution_horizon"], "rtc_execution_horizon", "lerobot_local")
+            if error:
+                raise ValueError(error)
+
         spec = policy_config.get("embodiment")
         if spec is None:
             return
@@ -1184,6 +1507,13 @@ class LerobotLocalPolicy(Policy):
                 targets.setdefault(dst, []).append(src)
         if not targets:
             return
+
+        # A declared-feature contradiction is independent of the runtime camera
+        # names and no camera rename can resolve it, so it is reported before the
+        # source-availability check below.
+        undeclared_error = _undeclared_image_feature_error(sorted(targets), embodiment.name, policy_config)
+        if undeclared_error:
+            raise ValueError(undeclared_error)
 
         obs = set(observation_keys)
         unsatisfied = {dst: srcs for dst, srcs in targets.items() if not any(s in obs for s in srcs)}
@@ -1367,17 +1697,16 @@ class LerobotLocalPolicy(Policy):
             logger.debug("RTC disabled for policy '%s'", type(self._policy).__name__)
             return
 
-        # Read RTC parameters from config, with user overrides
-        if rtc_config is not None:
-            if self._rtc_execution_horizon is None:
-                self._rtc_execution_horizon = getattr(rtc_config, "execution_horizon", 10)
-            if self._rtc_max_guidance_weight is None:
-                self._rtc_max_guidance_weight = getattr(rtc_config, "max_guidance_weight", 10.0)
-        else:
-            if self._rtc_execution_horizon is None:
-                self._rtc_execution_horizon = 10
-            if self._rtc_max_guidance_weight is None:
-                self._rtc_max_guidance_weight = 10.0
+        # Read RTC parameters from config, honoring user-provided overrides.
+        # Reaching this point guarantees rtc_config is not None: RTC is only
+        # enabled when a non-None rtc_config was found (see the auto-detect and
+        # explicit-enable branches above), so no rtc_config-is-None fallback is
+        # needed here. getattr still supplies the 10 / 10.0 defaults when the
+        # config object omits the attributes.
+        if self._rtc_execution_horizon is None:
+            self._rtc_execution_horizon = getattr(rtc_config, "execution_horizon", 10)
+        if self._rtc_max_guidance_weight is None:
+            self._rtc_max_guidance_weight = getattr(rtc_config, "max_guidance_weight", 10.0)
 
         logger.info(
             "RTC enabled for '%s': execution_horizon=%d, max_guidance_weight=%.1f",
@@ -1672,6 +2001,42 @@ class LerobotLocalPolicy(Policy):
 
     # Inference
 
+    def _hardware_action_keys(self, observation_dict: dict[str, Any]) -> list[str] | None:
+        """Actuator names to emit actions under when a SIM embodiment is driven from hardware.
+
+        lerobot ``SOFollower`` & friends key joint scalars as ``'<motor>.pos'``.
+        When a SIM embodiment (numeric / named sim joints) is fed a hardware
+        observation, the action tensor must still be emitted under those
+        ``'.pos'`` names, and WITHOUT the sim unit conversion, for
+        ``SOFollower.send_action`` to accept it.
+
+        Detection uses the same :func:`hardware_pos_keys` predicate as the state
+        side (``PackStateProcessorStep``). The two used to be written separately
+        and could disagree: this side ran a plain-``float`` pass and only tried a
+        numpy pass ``if not _pos:``, so a PARTIALLY matching first pass poisoned
+        the retry and left the override unset, while the state side - one
+        combined pass - succeeded on the same observation. The model was then fed
+        raw hardware degrees while its action was emitted with the sim
+        radian->degree conversion applied (~57x under-scaled), and nothing
+        warned, because the state side had succeeded.
+
+        Args:
+            observation_dict: The raw observation for this step.
+
+        Returns:
+            The hardware actuator names to bind the action vector to, or ``None``
+            when this is not a hardware observation (or the embodiment already
+            declares ``'.pos'`` action keys, making the override a no-op).
+        """
+        if self._embodiment is None or not self._embodiment.action_keys:
+            return None
+        if any(str(key).endswith(".pos") for key in self._embodiment.action_keys):
+            return None
+        pos_keys = hardware_pos_keys(observation_dict)
+        if len(pos_keys) < len(self._embodiment.action_keys):
+            return None
+        return pos_keys[: len(self._embodiment.action_keys)]
+
     async def get_actions(self, observation_dict: dict[str, Any], instruction: str, **kwargs) -> list[dict[str, Any]]:
         """Get actions from policy given observation and instruction.
 
@@ -1696,6 +2061,8 @@ class LerobotLocalPolicy(Policy):
         observation = dict(observation_dict)
         if instruction and "task" not in observation:
             observation["task"] = instruction
+
+        _hw_action_keys = self._hardware_action_keys(observation_dict)
 
         # When the processor bridge has a preprocessor, delegate normalization
         # and tokenization to it, then fix up any remaining raw arrays/tensors
@@ -1777,7 +2144,7 @@ class LerobotLocalPolicy(Policy):
         if self._processor_bridge and self._processor_bridge.has_postprocessor:
             action_tensor = self._processor_bridge.postprocess(action_tensor)
 
-        return self._tensor_to_action_dicts(action_tensor)
+        return self._tensor_to_action_dicts(action_tensor, hw_action_keys=_hw_action_keys)
 
     # Observation batch building
 
@@ -1940,31 +2307,51 @@ class LerobotLocalPolicy(Policy):
             fall back to the observation's own scalar keys so the state is
             populated rather than silently dropped.
 
+        The cause that message names is read from the configured keys
+        (:func:`_state_key_cause`) rather than asserted, so a caller who
+        configured a NAMED set describing a different robot is not told their
+        keys were auto-generated placeholders they never configured. The remedy
+        is chosen from the observation (:func:`state_key_remedy`), so the two
+        halves of the message answer the two different questions the caller has.
+
+        Any ordering derived from the observation (both the fallback above and
+        the no-``robot_state_keys`` case) is position-only: a ``<joint>.vel``
+        sibling of a present ``<joint>`` is dropped by
+        :func:`_drop_velocity_siblings`, so a MuJoCo observation does not
+        interleave velocities into ``observation.state``. An unpaired ``.vel``
+        key (LeKiwi's base velocities) is kept, and an explicitly configured
+        ``robot_state_keys`` ordering is returned untouched.
+
         Args:
             observation_dict: Raw strands/sim observation for this step.
             scalar_keys: Non-image, non-``task`` scalar keys present in the
                 observation, used as the fallback ordering.
 
         Returns:
-            The ordered keys to pull scalar joint values from.
+            The ordered keys to pull scalar joint values from - the configured
+            ``robot_state_keys`` verbatim, or an observation-derived ordering
+            with paired velocity siblings removed.
 
         Raises:
             ValueError: When ``strict_keys`` is set and no configured key
                 matches the observation.
         """
         if not self.robot_state_keys:
-            return scalar_keys
+            return _drop_velocity_siblings(scalar_keys)
         if any(k in observation_dict for k in self.robot_state_keys):
             return self.robot_state_keys
         shown = self.robot_state_keys[:8]
         ellipsis = "..." if len(self.robot_state_keys) > 8 else ""
         msg = (
             f"None of the configured robot_state_keys {shown}{ellipsis} are present "
-            f"in the observation. Observed joint/state keys: {scalar_keys}. This "
-            "usually means generic auto-generated keys (joint_0..joint_N) were "
-            "paired with a robot/sim that reports named joints. Pass "
-            "embodiment='<name>' (e.g. embodiment='so101') or call "
-            "set_robot_state_keys([...]) with the robot's actual joint names."
+            f"in the observation. Observed joint/state keys: {scalar_keys}. "
+            # Cause read from the configured keys, so the sentence does not
+            # assert a key shape they do not have.
+            + _state_key_cause(self.robot_state_keys)
+            + " "
+            # Remedy chosen from the observation, so the advice cannot name an
+            # embodiment whose state_keys would land back on this same guard.
+            + state_key_remedy(scalar_keys)
         )
         if self.strict_keys:
             raise ValueError("strict_keys=True: " + msg)
@@ -1975,7 +2362,7 @@ class LerobotLocalPolicy(Policy):
         if not self._state_key_mismatch_warned:
             logger.warning(msg)
             self._state_key_mismatch_warned = True
-        return scalar_keys
+        return _drop_velocity_siblings(scalar_keys)
 
     def _collect_state_values(self, observation_dict: dict[str, Any], order: list[str]) -> list[float]:
         """Pull the joint-state vector from ``observation_dict`` in ``order``.
@@ -2038,8 +2425,10 @@ class LerobotLocalPolicy(Policy):
                 f"observation: {shown}{ellipsis}. Present joints keep their index and the "
                 "missing dims are zero-filled in place, but the sim/robot does not report "
                 "those joints - commonly a mimic/tendon gripper whose actuator name differs "
-                "from the observation's finger-joint names. Pass embodiment='<name>' or call "
-                "set_robot_state_keys([...]) with names the observation actually contains."
+                "from the observation's finger-joint names. "
+                # Same registry-checked remedy as the all-missing guard, so one
+                # rule serves both degradations.
+                + state_key_remedy(_scalar_observation_keys(observation_dict))
             )
             if self.strict_keys:
                 raise ValueError("strict_keys=True: " + msg)
@@ -2144,9 +2533,7 @@ class LerobotLocalPolicy(Policy):
             used_feats.add(feat)
 
         # 2) Collect scalar joint values into observation.state.
-        scalar_keys = [
-            k for k, v in observation_dict.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)
-        ]
+        scalar_keys = _scalar_observation_keys(observation_dict)
         # Resolve the joint-state ordering, raising/warning loudly when the
         # configured robot_state_keys cannot describe this observation (the
         # generic joint_0..N vs named-joint mismatch) instead of silently
@@ -2471,9 +2858,7 @@ class LerobotLocalPolicy(Policy):
         # raises (strict_keys) or warns + falls back to the observation's own
         # scalar keys, instead of silently dropping observation.state and
         # running the policy open-loop (see _resolve_state_order).
-        scalar_keys = [
-            k for k, v in observation_dict.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)
-        ]
+        scalar_keys = _scalar_observation_keys(observation_dict)
         order = self._resolve_state_order(observation_dict, scalar_keys)
 
         # Collect state values index-aligned with the resolved order. A key in
@@ -2571,7 +2956,9 @@ class LerobotLocalPolicy(Policy):
             return True
         return type(policy).__name__ == "MolmoAct2Policy"
 
-    def _tensor_to_action_dicts(self, action_tensor: torch.Tensor) -> list[dict[str, Any]]:
+    def _tensor_to_action_dicts(
+        self, action_tensor: torch.Tensor, hw_action_keys: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         """Convert action tensor to list of robot action dicts.
 
         Maps tensor values to robot_state_keys by index. Handles:
@@ -2623,7 +3010,9 @@ class LerobotLocalPolicy(Policy):
         emb_name = self._embodiment.name if self._embodiment is not None else ""
         n_values = len(actions_list[0]) if actions_list else 0
         if not self._action_dim_warned:
-            dim_msg = diagnose_action_dim(n_values, len(self.robot_state_keys), name=emb_name)
+            dim_msg = diagnose_action_dim(
+                n_values, len(self.robot_state_keys), name=emb_name, pad_short=self.pad_short_actions
+            )
             if dim_msg:
                 logger.warning("lerobot_local: %s", dim_msg)
                 self._action_dim_warned = True
@@ -2640,18 +3029,32 @@ class LerobotLocalPolicy(Policy):
         # arm freezes. EmbodimentMap.model_action_to_sim is a no-op when
         # action_units == "native" (the default / real-hardware path).
         emb = self._embodiment
-        convert = emb is not None and getattr(emb, "action_units", "native") != "native"
+        # HARDWARE OVERRIDE: when the caller detected real-hardware '.pos' obs
+        # keys (see get_actions), emit actions under those '.pos' names and SKIP
+        # the sim unit conversion. A SIM embodiment (e.g. so101, action_units=
+        # "degrees") would otherwise (a) key the action by numeric sim joints
+        # ('1'..'6') that the lerobot SOFollower.send_action does not accept, and
+        # (b) convert model DEGREES -> sim RADIANS, feeding ~0.003 rad to a
+        # hardware bus that expects degrees. Both are wrong on the physical arm.
+        # The '.pos' keys are already the model's native units, so pack raw.
+        if hw_action_keys:
+            out_keys = list(hw_action_keys)
+            convert = False
+        else:
+            out_keys = list(self.robot_state_keys)
+            convert = emb is not None and getattr(emb, "action_units", "native") != "native"
 
         result = []
         for action_values in actions_list:
-            vals = [
-                float(action_values[i]) if i < len(action_values) else 0.0 for i in range(len(self.robot_state_keys))
-            ]
+            # Align the model's vector with the actuator keys BEFORE any unit
+            # conversion, so a short vector converts only the columns the model
+            # actually produced (the embodiment's gripper column is positional).
+            vals, keys = align_action_values(action_values, out_keys, pad_short=self.pad_short_actions)
             # `convert` already implies `emb is not None`; the explicit guard lets
             # the type checker narrow `emb` from `EmbodimentMap | None` at the call.
             if convert and emb is not None:
                 vals = emb.model_action_to_sim(vals)
-            action_dict = {key: vals[index] for index, key in enumerate(self.robot_state_keys)}
+            action_dict = dict(zip(keys, vals, strict=True))
             result.append(action_dict)
 
         return result

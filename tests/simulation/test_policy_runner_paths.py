@@ -9,8 +9,10 @@ Covers:
 * ``replay()`` with actions that have ``.numpy()`` and ``.tolist()`` methods
   (tensor-backed dataset frames)
 * ``_extract_frame_ndarray`` handles render blocks without images
-* ``_resolve_success_fn`` "contact" - raise, missing-hook, and positive
-  (n_contacts / contacts-list) detection paths
+* ``_resolve_success_fn`` "contact" - raise (NotImplementedError),
+  missing-hook, positive (n_contacts / contacts-list) detection, and the
+  degradation branches: an unexpected error, a zero-contact negative, and a
+  non-dict result all resolve to False without propagating
 * ``_maybe_sim_time`` get_state() fallback (nested ``content[].json.sim_time``)
 * ``evaluate()`` "never-succeeds" default path (no success_fn)
 """
@@ -157,6 +159,69 @@ def test_replay_bool_speed_rejected(monkeypatch):
     assert "positive" in r["content"][0]["text"]
 
 
+def test_replay_nan_speed_rejected_before_loading(monkeypatch):
+    """A non-finite ``speed`` (``nan``/``inf``) must be rejected up front.
+
+    ``nan`` is never ``<= 0``, so it slipped past a bare ``speed <= 0`` guard
+    into ``frame_interval = 1 / (dataset_fps * speed)`` (= ``nan``) and then
+    ``time.sleep(nan - elapsed)``, which raises a bare ``ValueError`` deep in
+    the playback loop -- breaking replay()'s documented "returns a status dict"
+    contract -- while also reporting a meaningless "Speed: nanx". The guard must
+    reject it before the dataset loader runs.
+    """
+    sim = _MinimalSim(robots=["r0"])
+
+    import strands_robots.dataset_recorder as dr
+
+    def _must_not_load(*args, **kwargs):
+        raise AssertionError("load_lerobot_episode reached despite non-finite speed")
+
+    monkeypatch.setattr(dr, "load_lerobot_episode", _must_not_load, raising=False)
+
+    for bad in (float("nan"), float("inf")):
+        r = PolicyRunner(sim).replay(repo_id="some/dataset", robot_name="r0", speed=bad)
+        assert r["status"] == "error"
+        assert "positive" in r["content"][0]["text"]
+
+
+def test_replay_numpy_scalar_speed_accepted(monkeypatch):
+    """A NumPy-scalar ``speed`` (e.g. read from a config array) is a valid
+    positive rate and must not be rejected.
+
+    ``isinstance(x, (int, float))`` is ``False`` for every NumPy scalar except
+    ``np.float64``, so a ``np.float32(2.0)`` speed was wrongly rejected with
+    "speed must be a positive number" even though 2.0 is valid. Once accepted,
+    the scalar must be coerced to a plain ``float`` so it does not raise a
+    ``TypeError`` in ``time.sleep`` on the playback path, and the returned
+    ``"speed"`` status field is a plain float.
+    """
+
+    class _TinyDataset:
+        fps = 30
+
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, idx):
+            return {"action": [0.1 * idx, 0.2, 0.3]}
+
+    def loader(repo_id, episode, root):
+        return _TinyDataset(), 0, 2
+
+    sim = _MinimalSim(robots=["r0"])
+
+    import strands_robots.dataset_recorder as dr
+
+    monkeypatch.setattr(dr, "load_lerobot_episode", loader, raising=False)
+
+    # speed=100.0 magnitude keeps the test fast; use a NumPy float32 scalar.
+    r = PolicyRunner(sim).replay(repo_id="fake/tiny", robot_name="r0", speed=np.float32(100.0))
+    assert r["status"] == "success"
+    reported = r["content"][1]["json"]["speed"]
+    assert reported == 100.0
+    assert type(reported) is float
+
+
 def test_replay_with_tensor_like_actions(monkeypatch):
     """Dataset actions may be torch tensors; replay must call .numpy().tolist()."""
 
@@ -189,9 +254,18 @@ def test_replay_with_tensor_like_actions(monkeypatch):
     assert r["status"] == "success"
 
 
-def test_replay_with_action_vector_larger_than_joint_count(monkeypatch):
-    """When dataset has more action dims than robot joints, replay truncates
-    (``break`` path in the replay loop)."""
+def test_replay_rejects_action_vector_wider_than_action_keys(monkeypatch):
+    """A recorded vector wider than the action-key map is rejected, not truncated.
+
+    Replay's contract is fidelity: reproduce the recorded trajectory. A dataset
+    with 5 action dims cannot be reproduced on a 3-actuator robot -- the last two
+    recorded DOFs have no key to be written through. Truncating them (the former
+    behaviour) reported ``status="success"`` with ``Frames: 2/2`` for a replay
+    that dropped 40% of every commanded action, so the caller had no signal that
+    the dataset and the robot did not match. ``send_action`` already rejects a
+    raw action vector whose length differs from the actuator count instead of
+    truncating it; replay now matches that.
+    """
 
     class _FatDataset:
         fps = 30
@@ -200,7 +274,7 @@ def test_replay_with_action_vector_larger_than_joint_count(monkeypatch):
             return 2
 
         def __getitem__(self, idx):
-            # 5 values but robot only has 3 joints → extras must be dropped
+            # 5 recorded values but the robot exposes only 3 action keys.
             return {"action": [0.1, 0.2, 0.3, 0.4, 0.5]}
 
     def loader(repo_id, episode, root):
@@ -213,7 +287,13 @@ def test_replay_with_action_vector_larger_than_joint_count(monkeypatch):
     monkeypatch.setattr(dr, "load_lerobot_episode", loader, raising=False)
 
     r = PolicyRunner(sim).replay(repo_id="fake/fat", speed=100.0)
-    assert r["status"] == "success"
+    assert r["status"] == "error"
+    text = r["content"][0]["text"]
+    assert "5 values" in text and "3 action keys" in text
+    # Nothing was applied, and the report says so instead of claiming 2/2.
+    assert "Applied 0/2 frames" in text
+    # No action reached the sim: the mismatch is caught before the first send.
+    assert not [c for c in sim.calls if c[0] == "send_action"]
 
 
 def test_replay_reads_actions_without_video_decode(monkeypatch):
@@ -460,5 +540,54 @@ def test_contact_success_fn_false_when_no_get_contacts():
         get_contacts = None
 
     sim = _NoContactsSim(robots=["r0"])
+    fn = PolicyRunner(sim)._resolve_success_fn("contact")
+    assert fn({}) is False
+
+
+def test_contact_success_fn_false_on_unexpected_get_contacts_error():
+    """A generic (non-NotImplementedError) error from ``get_contacts`` must
+    degrade the contact probe to False, never propagate.
+
+    The NotImplementedError case (backend genuinely lacks contact support) is
+    the expected miss, but a best-effort success probe must also swallow an
+    unexpected fault (a transient backend/state error) rather than aborting the
+    whole evaluation. This pins the ``except Exception`` fail-safe branch.
+    """
+
+    class _BrokenContactSim(_MinimalSim):
+        def get_contacts(self):
+            raise RuntimeError("contact query blew up mid-episode")
+
+    sim = _BrokenContactSim(robots=["r0"])
+    fn = PolicyRunner(sim)._resolve_success_fn("contact")
+    assert fn is not None
+    assert fn({}) is False
+
+
+def test_contact_success_fn_false_on_zero_contacts():
+    """When ``get_contacts`` reports zero contacts, the probe returns False.
+
+    A dict with ``n_contacts == 0`` and no populated ``contacts`` list is the
+    genuine "nothing is touching" negative - it must not be mistaken for
+    success. This pins the correct-negative return that the positive-detection
+    tests do not reach (they return early on the True branch).
+    """
+    sim = _MinimalSim(robots=["r0"])  # default get_contacts -> {"n_contacts": 0}
+    fn = PolicyRunner(sim)._resolve_success_fn("contact")
+    assert fn is not None
+    assert fn({}) is False
+
+
+def test_contact_success_fn_false_on_non_dict_result():
+    """A ``get_contacts`` that returns a non-dict (e.g. a bare list or None)
+    is treated as no-success rather than crashing on ``.get``. Pins the final
+    fallthrough return for an unrecognised result shape.
+    """
+
+    class _ListResultSim(_MinimalSim):
+        def get_contacts(self):
+            return ["unexpected", "shape"]
+
+    sim = _ListResultSim(robots=["r0"])
     fn = PolicyRunner(sim)._resolve_success_fn("contact")
     assert fn({}) is False

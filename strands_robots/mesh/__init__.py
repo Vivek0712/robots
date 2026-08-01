@@ -23,6 +23,7 @@ Submodules
 - ``input`` - InputPublisher / InputReceiver for teleoperation over mesh
 """
 
+from strands_robots.mesh.ackermann_robot import AckermannRosRobot
 from strands_robots.mesh.audit import log_safety_event
 from strands_robots.mesh.core import (
     _LOCAL_ROBOTS,
@@ -33,6 +34,7 @@ from strands_robots.mesh.core import (
 )
 from strands_robots.mesh.input import InputPublisher, InputReceiver
 from strands_robots.mesh.ros_bridge import RosBridgedRobot
+from strands_robots.mesh.rosbridge_robot import RosbridgeRobot
 from strands_robots.mesh.rtps_robot import RtpsRobot
 from strands_robots.mesh.session import (
     clear_peers,
@@ -48,10 +50,12 @@ from strands_robots.mesh.session import (
 
 __all__ = [
     # Core types
+    "AckermannRosRobot",
     "Mesh",
     "InputPublisher",
     "InputReceiver",
     "RosBridgedRobot",
+    "RosbridgeRobot",
     "RtpsRobot",
     # Factory & registry
     "init_mesh",

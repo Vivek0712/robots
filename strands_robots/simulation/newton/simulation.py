@@ -31,13 +31,13 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
 from strands_robots.assets import resolve_model_path, resolve_robot_name
 from strands_robots.registry.discovery import discover_urdf_path, list_urdf_discoverable
-from strands_robots.simulation.base import SimEngine
+from strands_robots.simulation.base import SimEngine, reject_setup_kwargs
 from strands_robots.simulation.model_registry import (
     list_available_models,
     resolve_model,
@@ -45,14 +45,29 @@ from strands_robots.simulation.model_registry import (
 from strands_robots.simulation.model_registry import (
     register_urdf as _register_urdf,
 )
-from strands_robots.simulation.models import SimCamera, SimObject, SimRobot, SimWorld
+from strands_robots.simulation.models import (
+    SimCamera,
+    SimObject,
+    SimRobot,
+    SimWorld,
+    registered,
+    registry_entry,
+)
 from strands_robots.simulation.newton.backend import ensure_newton, resolve_solver_class, solver_registry
 from strands_robots.simulation.newton.randomization import DomainRandomizationMixin
 from strands_robots.simulation.newton.recording import NewtonRecordingMixin
-from strands_robots.utils import require_optional
+from strands_robots.utils import (
+    camera_fov_error,
+    coerce_pose_vector,
+    entity_name_error,
+    positive_count_error,
+    require_optional,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from strands_robots.rendering import CameraParams
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +104,28 @@ def _short_joint_name(label: str) -> str:
     return label.rsplit("/", 1)[-1]
 
 
+def _quat_rotate_inverse_wxyz(quat_wxyz: list[float], vec: list[float]) -> list[float]:
+    """Express a WORLD-frame 3-vector in the body frame given a (w,x,y,z) quaternion.
+
+    Computes ``R(q)^T @ vec`` (the standard "rotate by the inverse"), used to
+    turn Newton's world-frame free-joint angular velocity into the BODY frame so
+    ``base_ang_vel`` matches the MuJoCo backend and the IMU-gyro convention WBC /
+    locomotion controllers consume. The quaternion is normalised internally; a
+    ~zero-norm quaternion returns ``vec`` unchanged.
+    """
+    q = np.asarray(quat_wxyz, dtype=np.float64)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-8:
+        return [float(v) for v in vec]
+    w, x, y, z = q / norm
+    v = np.asarray(vec, dtype=np.float64)
+    q_vec = np.array([x, y, z], dtype=np.float64)
+    a = v * (2.0 * w * w - 1.0)
+    b = np.cross(q_vec, v) * (w * 2.0)
+    c = q_vec * (float(np.dot(q_vec, v)) * 2.0)
+    return [float(t) for t in (a - b + c)]
+
+
 class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine):
     """GPU-native simulation backend built on Newton (Warp / MuJoCo-Warp).
 
@@ -123,12 +160,30 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 ``None`` selects Warp's default device (GPU when available).
             default_width: Default render width in pixels.
             default_height: Default render height in pixels.
-            **kwargs: Ignored; accepted for forward compatibility.
+            **kwargs: Ignored; accepted for forward compatibility. Robot-setup
+                arguments (``robot_name`` / ``robot``) are rejected rather than
+                dropped - use ``Robot("so101", mode="sim")`` or ``add_robot``.
 
         Raises:
             ValueError: If ``solver`` is not a known solver name.
         """
+        reject_setup_kwargs(kwargs)
         super().__init__()
+        # State that teardown (destroy/cleanup/__del__) touches must be set
+        # before any fallible construction step. Otherwise a partially built
+        # engine -- e.g. ensure_newton() raising when warp is absent, or an
+        # unknown solver -- leaves __del__ to acquire self._lock during GC and
+        # raise AttributeError, masking the real construction error with log
+        # noise. Initialising the lock and viewer handles first keeps destroy()
+        # a clean no-op on a half-constructed instance.
+        self._lock = threading.RLock()
+        self._world: SimWorld | None = None
+        # Interactive viewer handle (newton.viewer.ViewerGL/ViewerViser/
+        # ViewerNull). None until open_viewer() is called; synced once per
+        # control step from _advance() on the stepping thread.
+        self._viewer: Any = None
+        self._viewer_kind: str | None = None
+
         self._nt, self._wp = ensure_newton()
         if solver.lower() not in solver_registry():
             raise ValueError(f"Unknown Newton solver {solver!r}. Available: {sorted(solver_registry())}")
@@ -138,15 +193,6 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         self.device = device
         self.default_width = default_width
         self.default_height = default_height
-
-        self._world: SimWorld | None = None
-        self._lock = threading.RLock()
-
-        # Interactive viewer handle (newton.viewer.ViewerGL/ViewerViser/
-        # ViewerNull). None until open_viewer() is called; synced once per
-        # control step from _advance() on the stepping thread.
-        self._viewer: Any = None
-        self._viewer_kind: str | None = None
 
         # Newton handles (rebuilt on every scene mutation via _rebuild).
         self._model: Any = None
@@ -168,6 +214,12 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         # Distinct from _joint_coord_index because free joints have more
         # coordinates (quaternion) than DOFs; arm joints are 1:1.
         self._joint_dof_index: dict[tuple[str, str], int] = {}
+        # Short name of each robot's floating-base free joint (a humanoid's
+        # named ``floating_base_joint``), when it has one. Used to surface the
+        # 6-DoF base pose/twist as the structured base_* keys and to EXCLUDE the
+        # free joint from the scalar joint state (its qpos is [xyz+quat], not a
+        # single angle) - matching get_robot_state and the MuJoCo backend.
+        self._robot_free_base_joint: dict[str, str] = {}
         # Ordered full body labels per robot (rebuilt with the model).
         self._robot_body_map: dict[str, list[str]] = {}
         # Parsed mesh geometry keyed by resolved mesh_path, so rebuilds do not
@@ -185,6 +237,10 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
 
         logger.info("Newton simulation engine initialised (solver=%s)", self._solver_name)
 
+        # Construction complete - the finalizer may now release what we hold.
+        # See SimEngine._init_complete: this must be the final statement.
+        self._init_complete = True
+
     # World lifecycle
 
     def create_world(
@@ -192,6 +248,8 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         timestep: float | None = None,
         gravity: list[float] | None = None,
         ground_plane: bool = True,
+        terrain: str | None = None,
+        difficulty: float = 1.0,
     ) -> dict[str, Any]:
         """Create an empty Newton world.
 
@@ -200,14 +258,73 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 ``default_timestep``).
             gravity: Gravity vector ``[x, y, z]`` (default ``[0, 0, -9.81]``).
             ground_plane: Whether to add a ground plane.
+            terrain: Heightfield terrain kind (e.g. ``"rough"``/``"stairs"``/``"pyramid"``/``"slope"``,
+                MuJoCo backend only). The Newton backend has no heightfield
+                ground yet, so a non-None value is rejected with an actionable
+                error.
+            difficulty: Terrain curriculum elevation scale (MuJoCo backend
+                only, alongside ``terrain``); accepted for signature parity with
+                the base contract. Since Newton has no heightfield terrain,
+                ``difficulty`` can never take effect, so a non-default
+                (``!= 1.0``) value is rejected with an actionable error (the base
+                ``create_world`` contract: reject rather than silently ignore it)
+                rather than silently having no effect.
 
         Returns:
             Status dict with a human-readable confirmation.
         """
+        if terrain is not None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"terrain={terrain!r} is not supported on the Newton backend "
+                            "(heightfield terrain, e.g. 'rough'/'stairs'/'pyramid'/'slope', is MuJoCo-only); use "
+                            "create_simulation(backend='mujoco') for terrain, or omit terrain "
+                            "for a flat ground plane."
+                        )
+                    }
+                ],
+            }
+        # Base create_world contract: reject a non-default difficulty with no
+        # terrain rather than silently ignoring it. On Newton difficulty is
+        # doubly inert - there is no heightfield terrain for it to scale (a
+        # non-None terrain is already rejected above) - so any != 1.0 value is
+        # meaningless here; surface that instead of a status=success no-op.
+        if float(difficulty) != 1.0:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"difficulty={difficulty!r} has no effect on the Newton backend "
+                            "(it scales a heightfield terrain's elevation, and this backend "
+                            "has no heightfield terrain); use create_simulation(backend='mujoco') "
+                            "for a terrain curriculum, or omit difficulty for a flat ground plane."
+                        )
+                    }
+                ],
+            }
+        # Same contract as set_timestep / set_gravity (and the MuJoCo backend):
+        # never build a world around a dt or gravity vector the setters would
+        # refuse. The effective timestep is validated so an unusable engine
+        # default surfaces under its own name rather than driving the solver.
+        effective_timestep = self.default_timestep if timestep is None else timestep
+        timestep_param = "default_timestep" if timestep is None else "timestep"
+        if err := self._validate_timestep(effective_timestep, "create_world", timestep_param):
+            return err
+        if gravity is None:
+            components = [0.0, 0.0, -9.81]
+        else:
+            normalized, gravity_error = self._normalize_gravity(gravity, "create_world")
+            if normalized is None:
+                return cast("dict[str, Any]", gravity_error)
+            components = normalized
         with self._lock:
             self._world = SimWorld(
-                timestep=timestep or self.default_timestep,
-                gravity=gravity or [0.0, 0.0, -9.81],
+                timestep=float(effective_timestep),
+                gravity=components,
                 ground_plane=ground_plane,
             )
             self._rebuild()
@@ -317,6 +434,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         data_config: str | None = None,
         position: list[float] | None = None,
         orientation: list[float] | None = None,
+        keyframe: str | int | None = None,
         source: str | None = None,
     ) -> dict[str, Any]:
         """Add a robot to the world from a registered name, MJCF, or URDF.
@@ -329,7 +447,9 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         Args:
             name: Robot name in the registry / ``robot_descriptions``, or an
                 arbitrary instance name when ``urdf_path`` points at an explicit
-                MJCF/URDF file.
+                MJCF/URDF file. Required, and a non-empty ``str`` containing no
+                NUL (:func:`~strands_robots.utils.entity_name_error`); this
+                backend has no derive-a-label short form.
             urdf_path: Optional explicit MJCF/URDF path. When given it wins
                 outright and ``source`` is ignored.
             data_config: Accepted for ABC parity; unused by Newton.
@@ -342,12 +462,25 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 the registry; ``"robot_descriptions"`` resolves the URDF directly
                 via ``robot_descriptions.<name>_description.URDF_PATH``. See
                 :func:`~strands_robots.registry.discovery.list_urdf_discoverable`.
+            keyframe: Canonical spawn pose. Not yet supported on the Newton
+                backend (the MuJoCo backend applies a source ``<keyframe>``);
+                passing a non-``None`` value is a clean error rather than a
+                silent ignore.
 
         Returns:
             Status dict including the resolved joint names.
         """
         if self._world is None:
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
+
+        # Refuse a name that cannot address the robot this call creates, on the
+        # shared ``entity_name_error`` domain. Unlike the MuJoCo backend this
+        # method documents no "derive a label" short form - ``name`` is required
+        # and doubles as the registry/robot_descriptions key - so there is no
+        # value to pass through here.
+        if (name_err := entity_name_error("add_robot", "name", name)) is not None:
+            return {"status": "error", "content": [{"text": name_err}]}
+
         if name in self._world.robots:
             return {"status": "error", "content": [{"text": f"Robot '{name}' already exists."}]}
         if source not in _ROBOT_SOURCES:
@@ -358,6 +491,18 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                         "text": (
                             f"Unknown source {source!r}. "
                             f"Valid: {[s for s in _ROBOT_SOURCES if s is not None]} or None (default)."
+                        )
+                    }
+                ],
+            }
+        if keyframe is not None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            "keyframe= is not yet supported on the Newton backend; "
+                            "spawn keyframe home poses are a MuJoCo-backend feature."
                         )
                     }
                 ],
@@ -394,7 +539,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
 
     def remove_robot(self, name: str) -> dict[str, Any]:
         """Remove a robot and rebuild the world."""
-        if self._world is None or name not in self._world.robots:
+        if self._world is None or not registered(self._world.robots, name):
             return {"status": "error", "content": [{"text": f"Robot '{name}' not found."}]}
         with self._lock:
             del self._world.robots[name]
@@ -409,7 +554,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
 
     def robot_joint_names(self, robot_name: str) -> list[str]:
         """Return ordered short joint names for ``robot_name``."""
-        if self._world is None or robot_name not in self._world.robots:
+        if self._world is None or not registered(self._world.robots, robot_name):
             return []
         return list(self._world.robots[robot_name].joint_names)
 
@@ -431,7 +576,9 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         """Add a primitive or mesh object to the scene.
 
         Args:
-            name: Unique object name.
+            name: Unique object name; a non-empty ``str`` containing no NUL, the
+                same domain the MuJoCo backend's ``add_object`` accepts
+                (:func:`~strands_robots.utils.entity_name_error`).
             shape: One of ``"box"``, ``"sphere"``, ``"capsule"``,
                 ``"cylinder"``, or ``"mesh"``. ``"mesh"`` requires
                 ``mesh_path``.
@@ -457,6 +604,16 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         """
         if self._world is None:
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
+
+        # Refuse a name that cannot address the object this call creates, on the
+        # same shared domain the MuJoCo backend's ``add_object`` uses, so a name
+        # one backend refuses is refused by both. It precedes the duplicate-name
+        # test below, which is itself partial: ``name in self._world.objects``
+        # raises ``TypeError: unhashable type`` for a list/dict/set name rather
+        # than reaching the error path it guards.
+        if (name_err := entity_name_error("add_object", "name", name)) is not None:
+            return {"status": "error", "content": [{"text": name_err}]}
+
         if material is not None:
             return {
                 "status": "error",
@@ -515,7 +672,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
 
     def remove_object(self, name: str) -> dict[str, Any]:
         """Remove an object and rebuild the world."""
-        if self._world is None or name not in self._world.objects:
+        if self._world is None or not registered(self._world.objects, name):
             return {"status": "error", "content": [{"text": f"Object '{name}' not found."}]}
         with self._lock:
             del self._world.objects[name]
@@ -545,7 +702,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         """
         if self._world is None or self._model is None:
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
-        if name not in self._world.objects:
+        if not registered(self._world.objects, name):
             return {"status": "error", "content": [{"text": f"Object '{name}' not found."}]}
         with self._lock:
             obj = self._world.objects[name]
@@ -595,8 +752,13 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         Returns:
             Mapping of short joint name to joint position (float), plus one
             entry per registered camera (name -> RGB ndarray) when
-            ``skip_images`` is False. Empty when no world exists or the robot
-            is unknown.
+            ``skip_images`` is False. A robot with a floating base additionally
+            carries ``base_pos`` (world x,y,z incl. height), ``base_quat``
+            (orientation, w,x,y,z), ``base_lin_vel`` (m/s, WORLD frame) and
+            ``base_ang_vel`` (rad/s, BODY frame - matching the MuJoCo backend and
+            the IMU-gyro frame WBC / locomotion controllers consume) for
+            locomotion controllers. Empty when no world exists or the robot is
+            unknown.
         """
         if self._world is None or self._model is None:
             return {}
@@ -604,7 +766,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             robot_name = self._resolve_single_robot(robot_name)
         except ValueError:
             return {}
-        if robot_name not in self._world.robots:
+        if not registered(self._world.robots, robot_name):
             return {}
         if skip_images and self._world._backend_state.get("recording"):
             # T26: dataset recording needs every frame's image obs. Override
@@ -615,9 +777,20 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             skip_images = False
         with self._lock:
             joint_q = self._state_0.joint_q.numpy()
+            joint_qd = self._state_0.joint_qd.numpy()
             robot_joints = self._world.robots[robot_name].joint_names
+            free_short = self._robot_free_base_joint.get(robot_name)
             obs: dict[str, Any] = {}
             for jname in robot_joints:
+                # A 6-DoF free joint (floating base) is not a scalar joint: its
+                # coordinate 0 is the base x-position, so obs[jname] =
+                # joint_q[idx] would report base-x as a joint angle (dropping the
+                # rest of the pose + twist) - a degenerate scalar and a duplicate
+                # of base_pos.x. Its full state is surfaced below as the
+                # structured base_pos/base_quat/base_lin_vel/base_ang_vel keys,
+                # matching get_robot_state and the MuJoCo backend.
+                if jname == free_short:
+                    continue
                 idx = self._joint_coord_index.get((robot_name, jname))
                 if idx is not None and idx < len(joint_q):
                     obs[jname] = float(joint_q[idx])
@@ -625,6 +798,17 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         # camera frames are added afterwards (and carry their own jitter via the
         # render path), so the result holds mixed float/ndarray values.
         obs_out: dict[str, Any] = dict(self._apply_joint_pos_noise(obs))
+        # Floating-base IMU-style signals for a robot with a free root (a
+        # humanoid / mobile base): ``base_quat`` (orientation, w,x,y,z) and
+        # ``base_ang_vel`` (rad/s), consumed by WBC / locomotion controllers.
+        # Additive and absent for fixed-base arms; left un-noised, matching the
+        # MuJoCo backend's contract.
+        base = self._free_base_pose(robot_name, joint_q, joint_qd)
+        if base is not None:
+            obs_out["base_pos"] = base["position"]
+            obs_out["base_quat"] = base["quaternion"]
+            obs_out["base_lin_vel"] = base["linear_velocity"]
+            obs_out["base_ang_vel"] = base["angular_velocity"]
         if not skip_images:
             from strands_robots.simulation.policy_runner import _extract_frame_ndarray
 
@@ -667,7 +851,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             robot_name = self._resolve_single_robot(robot_name)
         except ValueError as exc:
             return {"status": "error", "content": [{"text": str(exc)}]}
-        if robot_name not in self._world.robots:
+        if not registered(self._world.robots, robot_name):
             return {"status": "error", "content": [{"text": f"Robot '{robot_name}' not found."}]}
 
         action_map, coerce_error = self._coerce_action(action, robot_name)
@@ -815,41 +999,79 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         body transform. Empty/``None`` = a world-fixed camera. Call
         :meth:`list_bodies` to discover valid mount points.
 
+        Validation: ``position`` and ``target`` must each be 3 finite numbers
+        (a list, tuple or NumPy array; NumPy scalar elements accepted, ``bool``
+        refused). Omit a vector to take its default - an empty vector is a
+        wrong-length request and is rejected rather than silently placing the
+        camera at the default pose. ``fov`` must be a finite angle in ``(0,
+        180)`` degrees. These are the same bounds the MuJoCo backend's
+        ``add_camera`` enforces, on the shared
+        :func:`~strands_robots.utils.pose_vector_error` /
+        :func:`~strands_robots.utils.camera_fov_error` domains, so a camera
+        configuration one backend refuses is refused by both. Invalid values are
+        rejected here at config time rather than deferring an uncaught
+        ``ValueError`` (non-numeric) or a silently degenerate camera
+        (``nan``/``inf`` in the look-at basis or the derived intrinsics) to the
+        first render.
+
+        ``width`` and ``height`` must each be a positive integer, the same
+        floor :meth:`render` and the MuJoCo backend's ``add_camera`` enforce
+        (:func:`~strands_robots.utils.positive_count_error`). Newton ray-traces
+        each frame on demand and has no offscreen framebuffer, so unlike MuJoCo
+        there is no upper cap.
+
         Args:
-            name: Unique camera name. Duplicate names are rejected; remove the
-                existing camera with :meth:`remove_camera` first.
+            name: Unique camera name; a non-empty ``str`` containing no NUL, the
+                same domain the MuJoCo backend's ``add_camera`` accepts
+                (:func:`~strands_robots.utils.entity_name_error`). Duplicate
+                names are rejected; remove the existing camera with
+                :meth:`remove_camera` first.
             position: Camera eye ``[x, y, z]`` (world frame, or the parent
-                body's local frame when ``parent_body`` is set).
+                body's local frame when ``parent_body`` is set). 3 finite
+                numbers.
             target: Look-at point ``[x, y, z]`` (same frame as ``position``).
-            fov: Vertical field of view in degrees.
-            width: Render width in pixels for this camera.
-            height: Render height in pixels for this camera.
+                3 finite numbers.
+            fov: Vertical field of view in degrees; a finite angle in the open
+                interval ``(0, 180)``.
+            width: Render width in pixels for this camera; a positive integer.
+            height: Render height in pixels for this camera; a positive integer.
             parent_body: Optional body label to mount the camera on. ``None``
                 or empty leaves the camera world-fixed.
 
         Returns:
             Status dict confirming the registration, or an error dict when no
-            world exists, the pose is invalid, the name is taken, or the mount
-            body is unknown.
+            world exists, the pose, ``fov`` or a pixel dimension is invalid, the
+            name is taken, or the mount body is unknown. Never raises.
         """
         if self._world is None or self._model is None:
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
 
-        pos = list(position) if position is not None else [1.0, 1.0, 1.0]
-        tgt = list(target) if target is not None else [0.0, 0.0, 0.0]
-        for _lbl, _vec in (("position", pos), ("target", tgt)):
-            try:
-                if len(_vec) != 3:
-                    return {
-                        "status": "error",
-                        "content": [{"text": f"add_camera: '{_lbl}' must be 3 elements [x,y,z], got {len(_vec)}"}],
-                    }
-                _vec[:] = [float(v) for v in _vec]
-            except (TypeError, ValueError):
-                return {
-                    "status": "error",
-                    "content": [{"text": f"add_camera: '{_lbl}' must be a list of 3 numbers"}],
-                }
+        # Refuse a name that cannot address the camera this call creates, on the
+        # shared ``entity_name_error`` domain the MuJoCo backend's ``add_camera``
+        # uses, so a camera name one backend refuses is refused by both.
+        if (name_err := entity_name_error("add_camera", "name", name)) is not None:
+            return {"status": "error", "content": [{"text": name_err}]}
+
+        # Validate shape, element type AND finiteness with the shared helpers the
+        # MuJoCo backend uses, so a camera pose one backend refuses is refused by
+        # both - the invariant ``pose_vector_error`` documents. The local
+        # coercion this replaces only applied ``float(v)``: that caught a
+        # non-numeric element but passed a ``nan``/``inf`` component (and a
+        # ``bool``, silently reading ``True`` as the coordinate 1.0) straight
+        # through to the registry. Nothing downstream catches it either - the
+        # degenerate-orientation check below compares
+        # ``abs(pos[i] - tgt[i]) < 1e-9``, which is False for a ``nan``, and
+        # ``_look_at_quat`` then divides the view vector by a ``nan`` norm, so
+        # ``render``/``get_frame`` return a frame from an all-NaN camera
+        # quaternion under a success result.
+        position, _perr = coerce_pose_vector("add_camera", "position", position, 3)
+        if _perr is not None:
+            return {"status": "error", "content": [{"text": _perr}]}
+        target, _terr = coerce_pose_vector("add_camera", "target", target, 3)
+        if _terr is not None:
+            return {"status": "error", "content": [{"text": _terr}]}
+        pos = [1.0, 1.0, 1.0] if position is None else position
+        tgt = [0.0, 0.0, 0.0] if target is None else target
         if all(abs(pos[i] - tgt[i]) < 1e-9 for i in range(3)):
             return {
                 "status": "error",
@@ -859,6 +1081,32 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                     }
                 ],
             }
+        # Validate the field of view at config time, on the same shared domain
+        # the MuJoCo backend uses. It was previously coerced by a bare
+        # ``float(fov)`` inside the lock below, so a non-numeric value raised a
+        # ``ValueError`` straight through the structured tool-result contract,
+        # and ``nan``/``inf``/``0``/``>=180`` registered a degenerate camera
+        # under a success result: :meth:`get_camera_params` derives the pinhole
+        # intrinsics ``0.5 * h / tan(radians(fov) / 2)``, which is ``nan`` for a
+        # ``nan`` fov and raises ``ZeroDivisionError`` for ``0``.
+        if (e := camera_fov_error("add_camera", "fov", fov)) is not None:
+            return {"status": "error", "content": [{"text": e}]}
+        # Validate the pixel dimensions on the shared floor the MuJoCo backend's
+        # ``_validate_render_dims`` already applies, so a resolution one backend
+        # refuses is refused by all of them. They were previously coerced by a
+        # bare ``int(width)`` inside the lock below, which validated nothing: a
+        # non-numeric value raised ``ValueError`` straight through the structured
+        # tool-result contract (``None`` a ``TypeError``, ``nan`` a
+        # ``ValueError``, ``inf`` an ``OverflowError``), and ``0`` / a negative
+        # registered a camera that cannot produce a frame under a success
+        # result - deferring the failure to the first render, far from the call
+        # that caused it. A fractional or ``bool`` value was silently truncated
+        # (``2.7`` stored as 2, ``True`` as 1) while the success text below
+        # echoed the value the caller passed, reporting a resolution that was
+        # never registered.
+        for _param, _value in (("width", width), ("height", height)):
+            if (e := positive_count_error(_value, _param, "add_camera")) is not None:
+                return {"status": "error", "content": [{"text": e}]}
         if name in (None, "", "default", "free"):
             return {
                 "status": "error",
@@ -892,8 +1140,8 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 position=pos,
                 target=tgt,
                 fov=float(fov),
-                width=int(width),
-                height=int(height),
+                width=width,
+                height=height,
                 parent_body=mount,
             )
         where = f" mounted on '{mount}'" if mount else ""
@@ -914,7 +1162,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         """
         if self._world is None or self._model is None:
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
-        if name not in self._world.cameras:
+        if not registered(self._world.cameras, name):
             return {
                 "status": "error",
                 "content": [{"text": f"Camera '{name}' not found. Registered: {list(self._world.cameras)}"}],
@@ -959,28 +1207,16 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
 
         is_default = camera_name in (None, "", "default", "free")
-        if is_default:
-            label = "default"
-            eye = (0.6, 0.6, 0.5)
-            target = (0.0, 0.0, 0.15)
-            fov_deg = 50.0
-            w = width or self.default_width
-            h = height or self.default_height
-        else:
-            cam = self._world.cameras.get(camera_name)
-            if cam is None:
-                return {
-                    "status": "error",
-                    "content": [{"text": f"Camera '{camera_name}' not found. Available: {self.list_cameras()}"}],
-                }
-            label = camera_name
-            try:
-                eye, target = self._resolve_camera_pose(cam)
-            except ValueError as exc:
-                return {"status": "error", "content": [{"text": f"Render failed: {exc}"}]}
-            fov_deg = cam.fov
-            w = width or cam.width
-            h = height or cam.height
+        label = "default" if is_default else camera_name
+        try:
+            eye, target, fov_deg, w, h = self._resolve_camera_view(camera_name, width, height)
+        except KeyError:
+            return {
+                "status": "error",
+                "content": [{"text": f"Camera '{camera_name}' not found. Available: {self.list_cameras()}"}],
+            }
+        except ValueError as exc:
+            return {"status": "error", "content": [{"text": f"Render failed: {exc}"}]}
 
         try:
             img = self._render_rgb(w, h, eye=eye, target=target, fov_deg=fov_deg)
@@ -1094,6 +1330,138 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         frame = rgba[0, 0] if rgba.ndim == 5 else rgba[0]
         frame = np.ascontiguousarray(frame[..., :3])
         return self._maybe_jitter_frame(frame)
+
+    def get_frame(
+        self, camera_name: str = "default", width: int | None = None, height: int | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Render a camera to raw ``(rgb, depth)`` ndarrays.
+
+        Newton's ray-traced tiled camera has **no depth output path**, so the
+        depth element is always ``None`` -- per the raw-frame API contract
+        (issue #1537) this is explicit rather than a zero-filled buffer, and
+        depth-dependent consumers (``HybridCompositor``) raise a clear error
+        instead of silently compositing wrong pixels.
+
+        Args:
+            camera_name: ``"default"`` (or ``None``/``""``/``"free"``) for
+                the built-in three-quarter view, or a camera registered via
+                ``add_camera``.
+            width: image width; ``None`` uses the camera's configured
+                resolution (or the engine default for the built-in view).
+            height: image height; same fallback as ``width``.
+
+        Returns:
+            ``(rgb, None)`` -- ``rgb`` is ``(H, W, 3) uint8``.
+
+        Raises:
+            RuntimeError: no world created.
+            KeyError: unknown camera name.
+            ValueError: the camera's mount body is no longer in the model.
+        """
+        if self._world is None or self._model is None:
+            raise RuntimeError("No world. Call create_world first.")
+        eye, target, fov_deg, w, h = self._resolve_camera_view(camera_name, width, height)
+        rgb = self._render_rgb(w, h, eye=eye, target=target, fov_deg=fov_deg)
+        return np.asarray(rgb, dtype=np.uint8), None
+
+    def get_camera_params(
+        self, camera_name: str = "default", width: int | None = None, height: int | None = None
+    ) -> CameraParams:
+        """Return pinhole :class:`~strands_robots.rendering.CameraParams`.
+
+        ``K`` is derived from the camera's vertical FOV with square pixels
+        and a centered principal point (the same pinhole model
+        ``_render_rgb`` traces rays with); ``T_world_cam`` is the OpenGL
+        optical frame (+X right, +Y up, -Z forward) of the camera's live
+        look-at pose (body-mounted cameras resolve against the current body
+        transform). Newton exposes no scene clip planes; the params carry a
+        conventional ``znear=0.01`` and a far plane "at infinity"
+        (``zfar=1e6``) for the background-compositing depth convention.
+
+        Args:
+            camera_name: a camera registered via ``add_camera``. The built-in
+                free view (``"default"``/``None``/``""``/``"free"``) is
+                accepted and reports the fixed default vantage.
+            width: image width to compute ``K`` for; ``None`` uses the
+                camera's configured resolution.
+            height: image height to compute ``K`` for.
+
+        Raises:
+            RuntimeError: no world created.
+            KeyError: unknown camera name.
+            ValueError: the camera's mount body is no longer in the model.
+        """
+        from strands_robots.rendering import CameraParams as _CameraParams
+
+        if self._world is None or self._model is None:
+            raise RuntimeError("No world. Call create_world first.")
+        eye, target, fov_deg, w, h = self._resolve_camera_view(camera_name, width, height)
+
+        fy = 0.5 * h / math.tan(math.radians(fov_deg) / 2.0)
+        K = np.array([[fy, 0.0, 0.5 * w], [0.0, fy, 0.5 * h], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        # Look-at basis in the OpenGL optical convention: -Z forward.
+        fwd = np.asarray(target, dtype=np.float64) - np.asarray(eye, dtype=np.float64)
+        norm = float(np.linalg.norm(fwd))
+        if norm < 1e-12:
+            raise ValueError(f"camera '{camera_name}': eye and target coincide; look-at pose is undefined")
+        fwd /= norm
+        world_up = np.array([0.0, 0.0, 1.0])
+        if abs(float(fwd @ world_up)) > 1.0 - 1e-6:
+            world_up = np.array([0.0, 1.0, 0.0])  # straight up/down view: fall back
+        right = np.cross(fwd, world_up)
+        right /= np.linalg.norm(right)
+        up = np.cross(right, fwd)
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = np.stack([right, up, -fwd], axis=1)
+        T[:3, 3] = np.asarray(eye, dtype=np.float64)
+        return _CameraParams(K=K, T_world_cam=T, width=w, height=h, znear=0.01, zfar=1_000_000.0)
+
+    def _resolve_camera_view(
+        self, camera_name: str | None, width: int | None, height: int | None
+    ) -> tuple[tuple[float, ...], tuple[float, ...], float, int, int]:
+        """Resolve ``(eye, target, fov_deg, width, height)`` for a camera name.
+
+        Shared by :meth:`render`, :meth:`get_frame` and
+        :meth:`get_camera_params` so all three agree on the built-in default
+        view and per-camera config fallbacks.
+
+        A supplied ``width`` / ``height`` is validated on the same shared floor
+        (:func:`~strands_robots.utils.positive_count_error`) that
+        ``add_camera`` applies, so the config-time and call-time domains agree
+        and every render entry point reports the same refusal. ``None`` means
+        "take the camera's configured size"; membership decides that, not
+        truthiness - reading ``0`` as omitted would render at the default
+        resolution and report it as the requested one.
+
+        Raises:
+            KeyError: unknown camera name.
+            ValueError: ``width`` / ``height`` is not a positive integer, or
+                the camera's mount body is no longer in the model.
+        """
+        for param, value in (("width", width), ("height", height)):
+            if value is not None and (text := positive_count_error(value, param, "render")) is not None:
+                raise ValueError(text)
+        if camera_name in (None, "", "default", "free"):
+            return (
+                (0.6, 0.6, 0.5),
+                (0.0, 0.0, 0.15),
+                50.0,
+                self.default_width if width is None else width,
+                self.default_height if height is None else height,
+            )
+        assert camera_name is not None  # the free-camera tokens were handled above
+        cam = registry_entry(self._world.cameras, camera_name) if self._world is not None else None
+        if cam is None:
+            raise KeyError(f"Camera '{camera_name}' not found. Available: {self.list_cameras()}")
+        eye, target = self._resolve_camera_pose(cam)
+        return (
+            eye,
+            target,
+            float(cam.fov),
+            cam.width if width is None else width,
+            cam.height if height is None else height,
+        )
 
     # Interactive viewer
 
@@ -1244,6 +1612,56 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
 
     # Robot / scene discovery
 
+    def _free_base_pose(self, robot_name: str, joint_q: Any, joint_qd: Any) -> dict[str, list[float]] | None:
+        """Return a robot's floating-base 6-DoF pose + twist, or None.
+
+        For a robot whose root is a free joint (a humanoid's named
+        ``floating_base_joint``), returns a dict with ``position`` (xyz),
+        ``quaternion`` (w,x,y,z), ``linear_velocity`` (world frame) and
+        ``angular_velocity`` (BODY frame), mirroring the MuJoCo backend's
+        ``base`` entry. Newton stores the free joint's coordinates as
+        ``[xyz, quat_xyzw]`` and its DOFs as ``[linear(3), angular(3)]`` in the
+        WORLD frame, so the quaternion is reordered ``xyzw -> wxyz`` to match the
+        MuJoCo (w,x,y,z) contract, the linear velocity maps directly (world on
+        both backends), and the angular velocity is rotated world -> body so it
+        matches MuJoCo's body-frame convention (the IMU-gyro frame WBC /
+        locomotion controllers consume). Returns None for a fixed-base robot.
+
+        Args:
+            robot_name: The robot to query.
+            joint_q: The world's ``joint_q`` array (already ``.numpy()``).
+            joint_qd: The world's ``joint_qd`` array (already ``.numpy()``).
+
+        Returns:
+            The base pose/twist dict, or None when the robot has no free root.
+        """
+        base_jname = self._robot_free_base_joint.get(robot_name)
+        if base_jname is None:
+            return None
+        q = self._joint_coord_index.get((robot_name, base_jname))
+        d = self._joint_dof_index.get((robot_name, base_jname))
+        if q is None or d is None or q + 7 > len(joint_q) or d + 6 > len(joint_qd):
+            return None
+        quat_wxyz = [
+            float(joint_q[q + 6]),
+            float(joint_q[q + 3]),
+            float(joint_q[q + 4]),
+            float(joint_q[q + 5]),
+        ]
+        # Newton stores the free joint's angular velocity in the WORLD frame,
+        # while the MuJoCo backend reports it in the BODY frame (MuJoCo's
+        # free-joint qvel angular block is local) - the IMU-gyro convention WBC /
+        # locomotion controllers consume via get_observation's base_ang_vel.
+        # Rotate world -> body so base_ang_vel agrees across both backends; the
+        # linear velocity stays world-frame on both, so it maps directly.
+        ang_world = [float(joint_qd[d + 3]), float(joint_qd[d + 4]), float(joint_qd[d + 5])]
+        return {
+            "position": [float(v) for v in joint_q[q : q + 3]],
+            "quaternion": quat_wxyz,
+            "linear_velocity": [float(v) for v in joint_qd[d : d + 3]],
+            "angular_velocity": _quat_rotate_inverse_wxyz(quat_wxyz, ang_world),
+        }
+
     def get_robot_state(self, robot_name: str | None = None) -> dict[str, Any]:
         """Return per-joint position and velocity for a robot.
 
@@ -1253,6 +1671,16 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         ``joint_q`` via the per-joint coordinate index and velocities from
         ``joint_qd`` via the per-joint DOF index (the two indices differ once
         a free-floating object adds a quaternion coordinate).
+
+        A robot with a floating base (a 6-DoF free root, e.g. a humanoid's
+        named ``floating_base_joint``) additionally carries a ``"base"`` entry
+        with ``position`` (xyz), ``quaternion`` (w,x,y,z), ``linear_velocity``
+        and ``angular_velocity``. The free joint is NOT reported as a scalar
+        joint (its coordinates are [xyz + quat], not a single angle), and the
+        base ``quaternion``/``angular_velocity`` match get_observation's
+        ``base_quat``/``base_ang_vel`` for the same robot (``angular_velocity``
+        is in the BODY frame, ``linear_velocity`` in the WORLD frame, matching
+        the MuJoCo backend).
 
         Args:
             robot_name: Robot to query. ``None`` resolves to the sole robot
@@ -1268,25 +1696,48 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             robot_name = self._resolve_single_robot(robot_name)
         except ValueError as exc:
             return {"status": "error", "content": [{"text": str(exc)}]}
-        if robot_name not in self._world.robots:
+        if not registered(self._world.robots, robot_name):
             return {"status": "error", "content": [{"text": f"Robot '{robot_name}' not found."}]}
 
         with self._lock:
             joint_q = self._state_0.joint_q.numpy()
             joint_qd = self._state_0.joint_qd.numpy()
             state: dict[str, dict[str, float]] = {}
+            base_jname = self._robot_free_base_joint.get(robot_name)
             for jname in self._world.robots[robot_name].joint_names:
+                # A FREE joint (6-DoF floating base) has no scalar hinge value:
+                # its coordinates are [xyz + quaternion]. Reading joint_q[start]
+                # as a "position" reports the base x-coordinate and drops the
+                # orientation, so skip it and surface a structured ``base`` below.
+                if jname == base_jname:
+                    continue
                 q_idx = self._joint_coord_index.get((robot_name, jname))
                 d_idx = self._joint_dof_index.get((robot_name, jname))
                 pos = float(joint_q[q_idx]) if q_idx is not None and q_idx < len(joint_q) else 0.0
                 vel = float(joint_qd[d_idx]) if d_idx is not None and d_idx < len(joint_qd) else 0.0
                 state[jname] = {"position": pos, "velocity": vel}
         state = self._apply_state_noise(state)
+        # Floating base: surface the full 6-DoF pose + twist under a ``base``
+        # key (sibling of ``state``, left un-noised), consistent with
+        # get_observation's base_quat / base_ang_vel and the MuJoCo backend.
+        base = self._free_base_pose(robot_name, joint_q, joint_qd)
 
         text = f"'{robot_name}' state (t={self._world.sim_time:.3f}s):\n"
         for jnt, vals in state.items():
             text += f"{jnt}: pos={vals['position']:.4f}, vel={vals['velocity']:.4f}\n"
-        return {"status": "success", "content": [{"text": text}, {"json": {"state": state}}]}
+        if base is not None:
+            p_, q_ = base["position"], base["quaternion"]
+            lv_, av_ = base["linear_velocity"], base["angular_velocity"]
+            text += (
+                f"base: pos=[{p_[0]:.4f}, {p_[1]:.4f}, {p_[2]:.4f}], "
+                f"quat=[{q_[0]:.4f}, {q_[1]:.4f}, {q_[2]:.4f}, {q_[3]:.4f}], "
+                f"lin_vel=[{lv_[0]:.4f}, {lv_[1]:.4f}, {lv_[2]:.4f}], "
+                f"ang_vel=[{av_[0]:.4f}, {av_[1]:.4f}, {av_[2]:.4f}]\n"
+            )
+        json_payload: dict[str, Any] = {"state": state}
+        if base is not None:
+            json_payload["base"] = base
+        return {"status": "success", "content": [{"text": text}, {"json": json_payload}]}
 
     def list_robots_info(self) -> dict[str, Any]:
         """Pretty-printed robot listing (dict-shaped, for agent display).
@@ -1333,7 +1784,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             return {"status": "error", "content": [{"text": "No world. Call create_world first."}]}
 
         if robot_name is not None:
-            if robot_name not in self._world.robots:
+            if not registered(self._world.robots, robot_name):
                 return {
                     "status": "error",
                     "content": [
@@ -1383,7 +1834,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
 
         m = self._model
         if robot_name is not None:
-            if robot_name not in self._world.robots:
+            if not registered(self._world.robots, robot_name):
                 return {"status": "error", "content": [{"text": f"Robot '{robot_name}' not found."}]}
             joint_names = list(self._world.robots[robot_name].joint_names)
             scoped = {robot_name: self._world.robots[robot_name]}
@@ -1524,9 +1975,27 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 ),
                 "remove_object": "(name: str) -> dict  (remove a previously added object)",
                 "get_robot_state": "(robot_name: str | None = None) -> dict (per-joint position + velocity)",
+                "get_state": (
+                    "() -> dict (whole-world snapshot: sim time, step count, timestep, gravity, "
+                    "robot / object / camera / body / joint / actuator counts)"
+                ),
                 "get_observation": "(robot_name: str | None = None, *, skip_images: bool = False) -> dict",
                 "send_action": "(action: dict, robot_name: str | None = None, n_substeps: int = 1) -> dict",
                 "run_policy": "(robot_name: str, policy_provider='mock', n_episodes=1, ...) -> dict",
+                "evaluate_benchmark": (
+                    "(benchmark_name: str, robot_name=None, policy_provider='mock', "
+                    "n_episodes=1, seed=None, video=None, ...) -> dict  (score a registered "
+                    "success/failure/dense_reward benchmark over a rollout; max_steps comes "
+                    "from the benchmark, not a parameter)"
+                ),
+                "list_benchmarks": (
+                    "() -> dict  (enumerate registered benchmarks -- names, supported robots, "
+                    "default robot, max_steps -- the source of the benchmark_name evaluate_benchmark expects)"
+                ),
+                "register_benchmark_from_file": (
+                    "(benchmark_name: str, spec_path: str) -> dict  (author a declarative "
+                    "success/failure/dense_reward benchmark spec as YAML/JSON at runtime and register it)"
+                ),
                 "list_robots_info": "() -> dict (pretty robot listing)",
                 "list_bodies": "(robot_name: str | None = None) -> dict (body labels + gripper_body)",
                 "list_objects": "() -> dict",
@@ -1558,6 +2027,16 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 "set_obs_noise": (
                     "(joint_pos_std=0.0, joint_vel_std=0.0, camera_jitter_px=0.0, seed=None) -> dict "
                     "(additive Gaussian sensor noise on observations + rendered frames)"
+                ),
+                "create_world": (
+                    "(timestep=None, gravity=None, ground_plane=True, terrain=None, "
+                    "difficulty=1.0) -> dict  (create a fresh simulation world - the "
+                    "world-lifecycle entry point that precedes add_robot / add_object; "
+                    "gravity is [gx, gy, gz], ground_plane lays a floor)"
+                ),
+                "destroy": (
+                    "() -> dict  (tear down the world and release all resources, joining "
+                    "any running background policy first; the inverse of create_world)"
                 ),
                 "reset": "() -> dict (restore baseline joint configuration)",
                 "step": "(n_steps: int = 1) -> dict",
@@ -1742,11 +2221,10 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         self._joint_coord_index = {}
         self._joint_dof_index = {}
         self._robot_joint_map = {}
+        self._robot_free_base_joint = {}
         self._robot_body_map = {}
 
         for robot_name, robot in self._world.robots.items():
-            coord_before = builder.joint_coord_count
-            dof_before = builder.joint_dof_count
             label_before = len(builder.joint_label)
             body_before = builder.body_count
             xform = wp.transform(
@@ -1761,12 +2239,34 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             else:
                 builder.add_mjcf(model_path, xform=xform, collapse_fixed_joints=True)
             new_labels = builder.joint_label[label_before:]
+            # Map each joint to its coordinate index in joint_q and its DOF index
+            # in joint_qd. These are NOT the joint's ordinal position: a floating
+            # base (a free joint) spans 7 coordinates (xyz + quaternion) and 6
+            # DOFs, a ball joint 4/3, while a revolute/prismatic joint spans 1/1.
+            # So once a robot has a multi-coordinate joint (e.g. a humanoid whose
+            # root is a free joint), every joint after it is offset. Read the
+            # authoritative per-joint coordinate/DOF starts the builder tracks
+            # (joint_q_start / joint_qd_start) instead of assuming one coordinate
+            # and one DOF per joint - otherwise get_observation and
+            # get_robot_state report the base coordinates for the first child
+            # joint and shift the reading of every joint after it.
+            q_start = builder.joint_q_start
+            qd_start = builder.joint_qd_start
             short_names: list[str] = []
             for offset, label in enumerate(new_labels):
                 short = _short_joint_name(label)
                 short_names.append(short)
-                self._joint_coord_index[(robot_name, short)] = coord_before + offset
-                self._joint_dof_index[(robot_name, short)] = dof_before + offset
+                joint_index = label_before + offset
+                self._joint_coord_index[(robot_name, short)] = int(q_start[joint_index])
+                self._joint_dof_index[(robot_name, short)] = int(qd_start[joint_index])
+                # A free root (6-DoF floating base) is not a scalar joint: its
+                # coordinates are [xyz + quaternion]. Remember it so state/obs
+                # queries surface a structured base pose (see _free_base_pose).
+                if (
+                    builder.joint_type[joint_index] == self._nt.JointType.FREE
+                    and robot_name not in self._robot_free_base_joint
+                ):
+                    self._robot_free_base_joint[robot_name] = short
             self._robot_joint_map[robot_name] = short_names
             self._robot_body_map[robot_name] = list(builder.body_label[body_before:])
 

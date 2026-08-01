@@ -55,7 +55,8 @@ from strands_robots.training import create_trainer, TrainSpec
 sim = Robot("so100", mesh=False)
 sim.add_camera(name="front", position=[0.5, 0.0, 0.4], target=[0.2, 0, 0.05])
 sim.start_recording(repo_id="local/demo", root="/tmp/demo_ds",
-                    fps=30, task="pick up the red cube", overwrite=True)
+                    # fps must equal the rollout's control_frequency (default 50.0)
+                    fps=50, task="pick up the red cube", overwrite=True)
 sim.run_policy(robot_name="so100", policy_object=MockPolicy(),
                instruction="pick up the red cube", n_steps=60)
 sim.stop_recording()        # writes a LeRobotDataset v3 at /tmp/demo_ds
@@ -258,6 +259,28 @@ TrainSpec(
 Only `pi0` / `pi05` / `pi0_fast` expose `use_relative_actions`; the flag is
 rejected (not silently ignored) for any other policy type.
 
+#### Quantile normalization (molmoact2, pi05)
+
+Some policies normalize `STATE`/`ACTION` with `NormalizationMode.QUANTILES`
+(currently `molmoact2` and `pi05`) rather than mean/std or min/max. Quantile
+normalization reads the dataset stats' quantile keys (`q01`..`q99`); a dataset
+recorded *before* quantile stats existed carries only mean/std/min/max, so
+lerobot either raises or silently mis-normalizes deep inside its stats plumbing
+at train time. `validate()` catches this at spec time: when the resolved policy
+normalizes with quantiles and a local `meta/stats.json` lacks the quantile keys,
+it returns an actionable problem naming lerobot's remedy:
+
+```bash
+python -m lerobot.scripts.augment_dataset_quantile_stats \
+    --repo-id=<your-dataset-repo-id> --root=/data/my_v3_dataset
+```
+
+Datasets recorded by `Robot.start_recording()` / `DatasetRecorder` on current
+lerobot already include quantile stats (lerobot's `compute_episode_stats`
+computes them by default), so they train `molmoact2` / `pi05` with no manual
+stats surgery. The check is conservative: a Hub dataset with no local cache is
+left unflagged (its quantiles are verified by lerobot when the shards load).
+
 #### Streaming a large Hub dataset (no full download)
 
 Real datasets (BitRobot / HIW-500, ~50-500 GB) do not fit on a single edge node.
@@ -310,8 +333,8 @@ that matches your `extra["policy_type"]` / provider — verified on an L40S GPU:
 | Provider / policy | Install | Notes |
 |---|---|---|
 | `lerobot_local` + ACT / diffusion | `pip install 'strands-robots[lerobot]'` | works out of the box (torch + torchcodec + datasets) |
-| `lerobot_local` + `smolvla` | `pip install 'lerobot[smolvla]==0.5.1'` | **needs `transformers==5.3.0`** (lerobot's pinned `[smolvla]` extra). A newer transformers (e.g. 5.12) crashes smolvla import with `non-default argument 'backbone_cfg' follows default argument`. Pin it. |
-| `lerobot_local` + `pi0` / `pi05` | `pip install 'lerobot[pi]==0.5.1'` | same `transformers==5.3.0` pin via lerobot's `[pi]` extra |
+| `lerobot_local` + `smolvla` | `pip install 'strands-robots[lerobot]' 'lerobot[smolvla]'` | lerobot 0.6's `[smolvla]` extra layers `transformers>=5.4.0,<5.6.0` + num2words on top. Do **not** pin `transformers==5.3.0` - it conflicts with lerobot 0.6's transformers floor. |
+| `lerobot_local` + `pi0` / `pi05` | `pip install 'strands-robots[lerobot]' 'lerobot[pi]'` | lerobot 0.6's `[pi]` extra (same `transformers>=5.4.0,<5.6.0` range + scipy) |
 | `groot` | Isaac-GR00T checkout + its own venv (`omegaconf`, `tyro`, …); point `extra["groot_root"]` / `GR00T_ROOT` at it | launched as a subprocess, so it uses GR00T's interpreter, not ours |
 | `cosmos3` | cosmos-framework checkout (`uv sync --group=cu130-train`); point `extra["cosmos_root"]` / `COSMOS_ROOT` at it | torchrun-driven; same subprocess-interpreter rule |
 

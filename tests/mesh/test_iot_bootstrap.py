@@ -122,7 +122,7 @@ class TestEnsureRuleIdempotence:
             "strands_robots.mesh.iot.bootstrap._ensure_iot_action_role",
             return_value="arn:iam:role",
         ):
-            result = boot_mod._ensure_safety_to_dynamodb_rule(iot, "arn:t", a)
+            result = boot_mod._ensure_safety_to_dynamodb_rule(iot, MagicMock(), "arn:t", a)
         assert result == "arn:rule"
         iot.create_topic_rule.assert_not_called()
 
@@ -146,7 +146,7 @@ class TestEnsureRuleIdempotence:
             "strands_robots.mesh.iot.bootstrap._ensure_iot_action_role",
             return_value="arn:iam:role",
         ):
-            boot_mod._ensure_safety_to_dynamodb_rule(iot, "arn:t", a)
+            boot_mod._ensure_safety_to_dynamodb_rule(iot, MagicMock(), "arn:t", a)
 
         # Rule was created (UnauthorizedException treated as not-found).
         iot.create_topic_rule.assert_called_once()
@@ -399,11 +399,12 @@ class TestEnsureSafetyToDynamoDbRuleCreate:
         }
 
         a = BootstrappedAccount(region="us-west-2", account_id="123")
+        iam = MagicMock()
         with patch(
             "strands_robots.mesh.iot.bootstrap._ensure_iot_action_role",
             return_value="arn:iam:action-role",
         ):
-            arn = _ensure_safety_to_dynamodb_rule(iot, "arn:t:safety", a)
+            arn = _ensure_safety_to_dynamodb_rule(iot, iam, "arn:t:safety", a)
 
         assert arn  # non-empty
         iot.create_topic_rule.assert_called_once()
@@ -434,12 +435,8 @@ class TestEnsureIotActionRoleCreate:
         iam.get_role.side_effect = _NotFound()
         iam.create_role.return_value = {"Role": {"Arn": "arn:iam:action"}}
 
-        boto3_mock = MagicMock()
-        boto3_mock.client.return_value = iam
-        monkeypatch.setattr("strands_robots.mesh.iot.bootstrap._require_boto3", lambda: boto3_mock)
-
         a = BootstrappedAccount(region="us-west-2", account_id="123")
-        arn = _ensure_iot_action_role(a)
+        arn = _ensure_iot_action_role(iam, a)
 
         assert arn == "arn:iam:action"
         # Trust must allow iot.amazonaws.com
@@ -476,11 +473,12 @@ class TestEnsureProvisioningTemplateCreate:
         iot.create_provisioning_template.return_value = {"templateArn": "arn:iot:template:provisioning"}
 
         a = BootstrappedAccount(region="us-west-2", account_id="123")
+        iam = MagicMock()
         with patch(
             "strands_robots.mesh.iot.bootstrap._ensure_provisioning_role",
             return_value="arn:iam:provisioning",
         ):
-            arn = _ensure_provisioning_template(iot, a)
+            arn = _ensure_provisioning_template(iot, iam, a)
 
         assert arn == "arn:aws:iot:us-west-2:123:provisioningtemplate/strands-mesh-fleet-provisioning"
         kw = iot.create_provisioning_template.call_args.kwargs
@@ -503,10 +501,85 @@ class TestEnsureProvisioningTemplateCreate:
         iot = MagicMock()
         iot.describe_provisioning_template.return_value = {"templateArn": "arn:iot:template:existing"}
         a = BootstrappedAccount(region="us-west-2", account_id="123")
-        arn = _ensure_provisioning_template(iot, a)
+        iam = MagicMock()
+        arn = _ensure_provisioning_template(iot, iam, a)
         assert arn == "arn:aws:iot:us-west-2:123:provisioningtemplate/strands-mesh-fleet-provisioning"
         iot.create_provisioning_template.assert_not_called()
         assert f"iot-prov-template:{PROVISIONING_TEMPLATE}" in a.skipped
+
+    def test_retries_role_propagation_race_then_raises(self, _no_sleep):
+        """Role propagation races the IoT AssumeRole check: create_provisioning_template
+        keeps raising ``cannot be assumed``. After exhausting the retry budget the
+        helper must surface a RuntimeError (never hang or swallow the failure)."""
+        from strands_robots.mesh.iot.bootstrap import (
+            BootstrappedAccount,
+            _ensure_provisioning_template,
+        )
+
+        class _NotFound(Exception):
+            pass
+
+        class _InvalidRequest(Exception):
+            pass
+
+        iot = MagicMock()
+        iot.exceptions = MagicMock()
+        iot.exceptions.ResourceNotFoundException = _NotFound
+        iot.exceptions.InvalidRequestException = _InvalidRequest
+        iot.describe_provisioning_template.side_effect = _NotFound()
+        iot.create_provisioning_template.side_effect = _InvalidRequest(
+            "Role arn:aws:iam::123:role/x cannot be assumed by AWS IoT"
+        )
+
+        a = BootstrappedAccount(region="us-west-2", account_id="123")
+        with (
+            patch(
+                "strands_robots.mesh.iot.bootstrap._ensure_provisioning_role",
+                return_value="arn:iam:provisioning",
+            ),
+            pytest.raises(RuntimeError, match="after retries"),
+        ):
+            _ensure_provisioning_template(iot, MagicMock(), a)
+
+        # The loop retries the full budget (6 attempts) before giving up, and
+        # the resource is never recorded as created.
+        assert iot.create_provisioning_template.call_count == 6
+        assert not any("iot-prov-template" in entry for entry in a.created)
+
+    def test_reraises_non_role_invalid_request_immediately(self, _no_sleep):
+        """A non-role InvalidRequestException (e.g. a malformed body) is a real
+        error, not an eventual-consistency race: it must propagate on the first
+        attempt rather than being retried."""
+        from strands_robots.mesh.iot.bootstrap import (
+            BootstrappedAccount,
+            _ensure_provisioning_template,
+        )
+
+        class _NotFound(Exception):
+            pass
+
+        class _InvalidRequest(Exception):
+            pass
+
+        iot = MagicMock()
+        iot.exceptions = MagicMock()
+        iot.exceptions.ResourceNotFoundException = _NotFound
+        iot.exceptions.InvalidRequestException = _InvalidRequest
+        iot.describe_provisioning_template.side_effect = _NotFound()
+        iot.create_provisioning_template.side_effect = _InvalidRequest("Template body is malformed")
+
+        a = BootstrappedAccount(region="us-west-2", account_id="123")
+        with (
+            patch(
+                "strands_robots.mesh.iot.bootstrap._ensure_provisioning_role",
+                return_value="arn:iam:provisioning",
+            ),
+            pytest.raises(_InvalidRequest, match="malformed"),
+        ):
+            _ensure_provisioning_template(iot, MagicMock(), a)
+
+        # Non-retryable: raised on the first attempt, no backoff retries.
+        assert iot.create_provisioning_template.call_count == 1
 
 
 class TestEnsureProvisioningRoleCreate:
@@ -525,12 +598,8 @@ class TestEnsureProvisioningRoleCreate:
         iam.get_role.side_effect = _NotFound()
         iam.create_role.return_value = {"Role": {"Arn": "arn:iam:provisioning"}}
 
-        boto3_mock = MagicMock()
-        boto3_mock.client.return_value = iam
-        monkeypatch.setattr("strands_robots.mesh.iot.bootstrap._require_boto3", lambda: boto3_mock)
-
         a = BootstrappedAccount(region="us-west-2", account_id="123")
-        arn = _ensure_provisioning_role(a)
+        arn = _ensure_provisioning_role(iam, a)
         assert arn == "arn:iam:provisioning"
         # Managed policy attachment for fleet provisioning
         iam.attach_role_policy.assert_called()
@@ -655,17 +724,21 @@ class TestTeardownAccount:
         # Both topic rules removed.
         deleted_rules = {c.kwargs["ruleName"] for c in iot.delete_topic_rule.call_args_list}
         assert deleted_rules == {RULE_SAFETY_TO_DYNAMODB, RULE_ESTOP_FANOUT}
-        # E-stop Lambda and DynamoDB table and log group and template all removed.
-        lam.delete_function.assert_called_once()
+        # Both managed Lambdas removed: E-stop fan-out AND provisioning hook
+        # (leaving the hook behind strands a live IoT invoke grant).
+        torn_fns = {c.kwargs["FunctionName"] for c in lam.delete_function.call_args_list}
+        assert torn_fns == {ESTOP_LAMBDA_NAME, boot_mod.PROVISIONING_HOOK_LAMBDA_NAME}
+        # DynamoDB table and log group and template all removed.
         ddb.delete_table.assert_called_once_with(TableName=SAFETY_TABLE_NAME)
         logs.delete_log_group.assert_called_once_with(logGroupName=LOG_GROUP_NAME)
         iot.delete_provisioning_template.assert_called_once_with(templateName=PROVISIONING_TEMPLATE)
-        # All three managed roles cleaned up.
+        # All FOUR managed roles cleaned up (including the provisioning-hook role).
         torn_roles = {c.kwargs["RoleName"] for c in iam.delete_role.call_args_list}
         assert torn_roles == {
             boot_mod.ESTOP_LAMBDA_ROLE,
-            "strands-mesh-iot-action-role",
+            boot_mod.IOT_ACTION_ROLE,
             boot_mod.PROVISIONING_ROLE,
+            boot_mod.PROVISIONING_HOOK_ROLE,
         }
 
     def test_swallows_per_resource_failures(self, monkeypatch):

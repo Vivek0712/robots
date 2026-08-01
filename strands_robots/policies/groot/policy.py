@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 
 from strands_robots.policies.base import Policy
+from strands_robots.utils import name_list_error, tcp_port_error
 
 from .client import Gr00tInferenceClient
 from .data_config import Gr00tDataConfig, load_data_config
@@ -111,7 +112,7 @@ class ObservationMapping:
         for robot_key, model_key in self.video.items():
             if model_key not in model_video:
                 raise ValueError(
-                    f"Observation mapping: robot '{robot_key}' → model video "
+                    f"Observation mapping: robot '{robot_key}' -> model video "
                     f"'{model_key}', but model only has: {sorted(model_video)}"
                 )
 
@@ -119,7 +120,7 @@ class ObservationMapping:
         for robot_key, model_key in self.state.items():
             if model_key not in model_state:
                 raise ValueError(
-                    f"Observation mapping: robot '{robot_key}' → model state "
+                    f"Observation mapping: robot '{robot_key}' -> model state "
                     f"'{model_key}', but model only has: {sorted(model_state)}"
                 )
 
@@ -219,7 +220,7 @@ def _auto_infer_action_mapping(
         )
     for mdl, our in zip(remaining_model, remaining_ours):
         actions[mdl] = our
-        logger.info("Auto-mapped action: model '%s' → robot '%s' (positional)", mdl, our)
+        logger.info("Auto-mapped action: model '%s' -> robot '%s' (positional)", mdl, our)
     return ActionMapping(actions=actions)
 
 
@@ -256,7 +257,7 @@ def _match_keys(ours: list[str], model: list[str], label: str, strict_keys: bool
         )
     for our, mdl in zip(remaining_ours, remaining_model):
         mapping[our] = mdl
-        logger.info("Auto-mapped %s: '%s' → '%s' (positional)", label, our, mdl)
+        logger.info("Auto-mapped %s: '%s' -> '%s' (positional)", label, our, mdl)
     return mapping
 
 
@@ -312,6 +313,36 @@ def _coerce_action_row(row: Any) -> float | list[float]:
     return float(row) if np.ndim(row) == 0 else list(row)
 
 
+def _action_chunk_horizon(chunk: dict[str, np.ndarray]) -> int:
+    """Return the shared time-axis length of a normalized action chunk.
+
+    Both unpack paths reduce each action value to ``(horizon,)`` or
+    ``(horizon, action_dim)`` and then iterate ``range(horizon)``. Every value
+    must therefore carry a leading time axis. A 0-D / scalar value has no time
+    axis, so a server or model that emits one is malformed; surface it as an
+    actionable error instead of the opaque ``IndexError: tuple index out of
+    range`` that a ``.shape[0]`` read on a 0-D array would otherwise raise.
+
+    Args:
+        chunk: Normalized ``{bare_key: np.ndarray}`` action mapping (non-empty).
+
+    Returns:
+        The leading-axis length shared by the chunk's values.
+
+    Raises:
+        ValueError: If any value is 0-D (has no leading time axis).
+    """
+    scalar_keys = [k for k, v in chunk.items() if v.ndim == 0]
+    if scalar_keys:
+        shapes = {k: tuple(chunk[k].shape) for k in scalar_keys}
+        raise ValueError(
+            f"GR00T returned scalar (0-D) action value(s) for {scalar_keys} "
+            f"(shapes {shapes}); expected a leading time axis of shape (horizon,) "
+            "or (horizon, action_dim). The action chunk is malformed."
+        )
+    return next(iter(chunk.values())).shape[0]
+
+
 # Gr00tPolicy
 
 
@@ -326,7 +357,10 @@ class Gr00tPolicy(Policy):
     Args:
         data_config: Config name or :class:`Gr00tDataConfig`.
         host: Service host.
-        port: Service port.
+        port: Service port, an ``int`` in ``[1, 65535]``. Only read in
+            service mode; ``model_path`` selects local mode, which never
+            dials. A value outside the range is refused rather than
+            interpolated into ``tcp://<host>:<port>``.
         model_path: HF model ID or local path (triggers local mode).
         embodiment_tag: Embodiment tag string.
         device: ``"cuda"`` or ``"cpu"``.
@@ -405,6 +439,15 @@ class Gr00tPolicy(Policy):
             self._init_mappings()
         else:
             self._mode = "service"
+            # ``port`` addresses the inference service this client dials, so a
+            # value that cannot name one is refused here rather than
+            # interpolated into ``tcp://<host>:<port>``. ZMQ's ``connect`` is
+            # lazy, so an out-of-range or fractional port is accepted by the
+            # socket and only surfaces later as an inference timeout that
+            # implicates the server rather than the port. Local mode never
+            # dials, so the port is validated only on the branch that reads it.
+            if (port_error := tcp_port_error(port, "port", type(self).__name__)) is not None:
+                raise ValueError(port_error)
             logger.info("GR00T service mode, %s:%s", host, port)
             # Resolve api_token from env var if not provided as parameter
             resolved_token = api_token or os.environ.get("GROOT_API_TOKEN")
@@ -619,10 +662,29 @@ class Gr00tPolicy(Policy):
 
     @property
     def provider_name(self) -> str:
+        """Registry key for this provider (``"groot"``)."""
         return "groot"
 
     def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
-        """No-op.  Mappings handle key translation."""
+        """Validate the joint-name list; the keys themselves are unused.
+
+        Gr00t translates keys through its own mappings, so nothing is stored.
+        The shape is still checked, because the same call must reach the same
+        verdict on every provider - an operator who mis-types this parameter
+        should be told so here rather than have it depend on which policy
+        happens to be loaded.
+
+        Raises:
+            ValueError: If ``robot_state_keys`` is not an ordered list of
+                distinct non-blank names, per
+                :func:`~strands_robots.utils.name_list_error`. A single name
+                passed as a bare string is the mistake this catches: ``str`` is
+                iterable per character, so it would bind one joint per letter.
+        """
+        if robot_state_keys and (
+            error := name_list_error(robot_state_keys, "robot_state_keys", "set_robot_state_keys")
+        ):
+            raise ValueError(error)
 
     def reset(self, seed: int | None = None) -> None:
         """Per-episode reset.
@@ -637,10 +699,12 @@ class Gr00tPolicy(Policy):
         The standard ``gr00t.eval.run_gr00t_server`` registers a ``reset``
         endpoint that maps to ``policy.reset(options=...)`` (see
         ``server_client.py:94``). The default ``Gr00tPolicy.reset`` upstream
-        is a no-op; deployments that need per-episode RNG control should
-        either patch the server (see
-        ``examples/gr00t_server_deterministic_wrapper.py`` in robots-sim)
-        or use the ``Robot()`` factory which auto-mounts the wrapper.
+        is a no-op, so the forwarded seed does nothing unless the server is
+        patched. Deployments that need per-episode RNG control should
+        start the server through the packaged determinism wrapper
+        (:mod:`strands_robots.policies.groot.server_wrapper`), which the
+        ``gr00t_inference`` container-lifecycle tool mounts for you when
+        called with ``deterministic=True``.
 
         In LOCAL mode, applies the same client-side reseed
         ``set_eval_seed`` would (Python / NumPy / torch / cuDNN), which
@@ -687,6 +751,14 @@ class Gr00tPolicy(Policy):
         logger.debug("Gr00tPolicy.reset: local-mode reseed applied (seed=%r)", seed)
 
     async def get_actions(self, observation_dict: dict[str, Any], instruction: str, **kwargs) -> list[dict[str, Any]]:
+        """Predict an action chunk for one observation.
+
+        Dispatches to local in-process inference when the policy was loaded in
+        ``"local"`` mode, otherwise forwards the observation to the GR00T
+        inference service. Returns a list of per-timestep action dicts keyed by
+        actuator name; ``instruction`` is the language goal and extra ``kwargs``
+        are ignored by this provider.
+        """
         if self._mode == "local":
             return self._local_get_actions(observation_dict, instruction)
         return self._service_get_actions(observation_dict, instruction)
@@ -799,7 +871,7 @@ class Gr00tPolicy(Policy):
             return []
 
         assert self._action_mapping is not None, "Action mapping not initialized"
-        horizon = next(iter(squeezed.values())).shape[0]
+        horizon = _action_chunk_horizon(squeezed)
         mapped_keys = set(self._action_mapping.actions.keys())
 
         actions: list[dict[str, Any]] = []
@@ -925,7 +997,7 @@ class Gr00tPolicy(Policy):
         if not normalized:
             return []
 
-        horizon = next(iter(normalized.values())).shape[0]
+        horizon = _action_chunk_horizon(normalized)
 
         # If we have action mappings, use them for consistent key translation
         if self._action_mapping and self._action_mapping.actions:

@@ -239,12 +239,19 @@ class TestExternalForces:
         assert result["status"] == "error"
 
     def test_force_changes_acceleration(self, sim):
-        # Get initial state
+        """A latched force accelerates the body it names.
+
+        Asserts the motion rather than a physics buffer: which buffer carries
+        the latch is an implementation choice, whereas a 100 N upward force on
+        a 1 kg box under gravity has to lift it.
+        """
         data = sim._world._data
-        old_qfrc = data.qfrc_applied.copy()
-        sim.apply_force(body_name="box1", force=[0, 0, 100])
-        # qfrc_applied should change
-        assert not np.array_equal(old_qfrc, data.qfrc_applied)
+        z_before = float(data.qpos[2])
+
+        assert sim.apply_force(body_name="box1", force=[0, 0, 100])["status"] == "success"
+        sim.step(50)
+
+        assert float(data.qpos[2]) > z_before, "box1 did not rise under a 100 N upward force"
 
 
 class TestMassMatrix:
@@ -276,6 +283,48 @@ class TestMassMatrix:
         assert np.all(eigvals > 0), f"mass matrix must be PD, got eigvals {eigvals}"
 
 
+class _LegacyMjData:
+    """MjData proxy exposing the pre-3.11 legacy ancestor-walk buffer ``qM``.
+
+    MuJoCo 3.11 removed ``data.qM``, so a test driving the legacy
+    ``mj_fullM(model, dst, qM)`` order cannot read that buffer off the
+    installed MjData. Presenting one here keeps the drift coverage portable
+    across every supported MuJoCo instead of only the builds that still have
+    the attribute.
+    """
+
+    def __init__(self, data, qm):
+        self._data = data
+        self.qM = qm
+
+    def __getattr__(self, attr):
+        return getattr(self._data, attr)
+
+
+class _CsrOnlyMjData:
+    """MjData proxy exposing the inertia only as the CSR ``M`` (MuJoCo >= 3.11)."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def __getattr__(self, attr):
+        if attr == "qM":
+            raise AttributeError(attr)
+        return getattr(self._data, attr)
+
+
+class _NoInertiaMjData:
+    """MjData proxy exposing the joint-space inertia under neither name."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def __getattr__(self, attr):
+        if attr in ("qM", "M"):
+            raise AttributeError(attr)
+        return getattr(self._data, attr)
+
+
 class TestFullMassMatrixSignatureDrift:
     """Regression: ``mj_fullM`` changed its binding signature across MuJoCo
     releases. ``_full_mass_matrix`` must work against every variant rather than
@@ -297,6 +346,12 @@ class TestFullMassMatrixSignatureDrift:
         # (model, data, dst) order and expects (model, dst, qM). The helper
         # must transparently fall back and still produce the correct matrix.
         #
+        # BOTH halves of that older build are emulated: the module (a shim
+        # mj_fullM) and MjData (a proxy carrying the legacy `qM` buffer, which
+        # MuJoCo 3.11 removed). Reading the buffer off the installed MjData
+        # instead would pin this drift test to one MuJoCo layout - the exact
+        # coupling it exists to catch.
+        #
         # The legacy emulation must not delegate to the installed mj_fullM in a
         # fixed argument order: the installed binding may itself be the legacy
         # one (mujoco < 3.10), so a hard-coded modern call would raise and make
@@ -306,6 +361,7 @@ class TestFullMassMatrixSignatureDrift:
         model, data = sim._world._model, sim._world._data
         mj.mj_forward(model, data)
         reference = _full_mass_matrix(mj, model, data)
+        legacy_qm = np.linspace(1.0, 2.0, model.nM)
 
         class _LegacyShim:
             """Proxy mujoco module exposing only a legacy mj_fullM."""
@@ -315,25 +371,120 @@ class TestFullMassMatrixSignatureDrift:
 
             @staticmethod
             def mj_fullM(m, a, b):
-                # Reject the modern call where the 3rd arg is the dst buffer
-                # (i.e. the 2nd arg is MjData), forcing the legacy path.
-                import mujoco as _mj
-
-                if isinstance(a, _mj.MjData):
+                # Reject the modern call, whose 2nd arg is MjData rather than
+                # the dst buffer, forcing the legacy path.
+                if not isinstance(a, np.ndarray):
                     raise TypeError("legacy binding: expected (model, dst, qM)")
                 # Legacy contract: a is the dense dst buffer, b is the sparse
                 # inertia qM (1D or [m, 1]). Validate that contract, then fill
                 # dst from the known-correct reference (version-independent, so
                 # the emulation works whatever signature the installed mujoco
                 # binding actually uses).
-                assert isinstance(a, np.ndarray) and a.flags["WRITEABLE"]
-                qm = np.asarray(b).reshape(-1)
-                assert qm.shape[0] == data.qM.shape[0]
+                assert a.flags["WRITEABLE"]
+                # The helper must forward the buffer it read off MjData, not a
+                # differently-shaped stand-in.
+                assert np.array_equal(np.asarray(b).reshape(-1), legacy_qm)
                 a[...] = reference
 
-        shim = _LegacyShim()
-        M = _full_mass_matrix(shim, model, data)
+        M = _full_mass_matrix(_LegacyShim(), model, _LegacyMjData(data, legacy_qm))
         assert np.allclose(M, reference)
+
+    def test_helper_falls_back_to_1d_only_legacy_signature(self, sim):
+        # Oldest binding: mj_fullM(model, dst, qM) accepts ONLY a raw 1-D sparse
+        # buffer and rejects the [m, 1] column form the first legacy attempt
+        # passes. The helper must fall through that inner TypeError to the flat
+        # 1-D call and still reconstruct the correct matrix. This pins the
+        # innermost fallback (the widest-compatibility call) the other drift
+        # tests never reach, because their shim accepts both buffer shapes.
+        model, data = sim._world._model, sim._world._data
+        mj.mj_forward(model, data)
+        reference = _full_mass_matrix(mj, model, data)
+        legacy_qm = np.linspace(1.0, 2.0, model.nM)
+
+        class _OneDLegacyShim:
+            """mujoco proxy whose mj_fullM accepts only (model, dst, qM_1d)."""
+
+            def __getattr__(self, attr):
+                return getattr(mj, attr)
+
+            @staticmethod
+            def mj_fullM(m, a, b):
+                # Reject the modern (model, data, dst) order.
+                if not isinstance(a, np.ndarray):
+                    raise TypeError("legacy binding: expected (model, dst, qM)")
+                # Reject the [m, 1] column buffer the first legacy attempt uses:
+                # only the raw 1-D sparse form is accepted here.
+                arr = np.asarray(b)
+                if arr.ndim != 1:
+                    raise TypeError("oldest binding: expected a 1-D sparse buffer")
+                assert a.flags["WRITEABLE"]
+                assert np.array_equal(arr, legacy_qm)
+                a[...] = reference
+
+        M = _full_mass_matrix(_OneDLegacyShim(), model, _LegacyMjData(data, legacy_qm))
+        assert np.allclose(M, reference)
+
+    def test_helper_reads_csr_inertia_when_the_legacy_buffer_is_gone(self, sim):
+        # MuJoCo 3.11 removed data.qM: the joint-space inertia lives only in the
+        # CSR data.M. With the modern mj_fullM order rejected there is no legacy
+        # buffer left to pass, so the helper must convert the CSR form rather
+        # than reach for an attribute that release deleted.
+        model, data = sim._world._model, sim._world._data
+        mj.mj_forward(model, data)
+        reference = _full_mass_matrix(mj, model, data)
+        if not hasattr(data, "M"):
+            pytest.skip("installed mujoco predates the CSR data.M inertia")
+
+        class _ModernOnlyShim:
+            """mujoco proxy whose mj_fullM rejects every argument order."""
+
+            def __getattr__(self, attr):
+                return getattr(mj, attr)
+
+            @staticmethod
+            def mj_fullM(m, a, b):
+                raise TypeError("mj_fullM unavailable in this binding")
+
+        M = _full_mass_matrix(_ModernOnlyShim(), model, _CsrOnlyMjData(data))
+        # The CSR conversion is exact, not an approximation of mj_fullM.
+        assert np.array_equal(M, reference)
+        assert M.flags["C_CONTIGUOUS"]
+        assert M.dtype == np.float64
+
+    def test_helper_names_both_buffers_when_neither_exists(self, sim):
+        # Nothing left to read: fail with a message naming both spellings and
+        # the installed version, rather than an opaque AttributeError raised by
+        # whichever attribute the code happened to touch last.
+        model, data = sim._world._model, sim._world._data
+        mj.mj_forward(model, data)
+
+        class _NoFullMShim:
+            def __getattr__(self, attr):
+                return getattr(mj, attr)
+
+            @staticmethod
+            def mj_fullM(m, a, b):
+                raise TypeError("mj_fullM unavailable in this binding")
+
+        with pytest.raises(AttributeError) as exc:
+            _full_mass_matrix(_NoFullMShim(), model, _NoInertiaMjData(data))
+        message = str(exc.value)
+        assert "data.qM" in message
+        assert "data.M" in message
+        assert mj.__version__ in message
+
+    def test_get_mass_matrix_tool_works_without_the_legacy_buffer(self, sim):
+        # End-to-end through the agent-facing tool: a build without data.qM must
+        # still report a symmetric positive-definite M(q), not an error.
+        model, data = sim._world._model, sim._world._data
+        mj.mj_forward(model, data)
+        if not hasattr(data, "M"):
+            pytest.skip("installed mujoco predates the CSR data.M inertia")
+        reference = _full_mass_matrix(mj, model, data)
+        M = _full_mass_matrix(mj, model, _CsrOnlyMjData(data))
+        assert np.allclose(M, reference)
+        assert np.allclose(M, M.T)
+        assert np.all(np.linalg.eigvalsh(M) > 0)
 
     def test_helper_returns_empty_for_zero_dof(self):
         # A model with no DoFs must return a well-typed (0, 0) array, never
@@ -371,6 +522,77 @@ class TestStateCheckpointing:
     def test_load_nonexistent_checkpoint(self, sim):
         result = sim.load_state(name="doesnt_exist")
         assert result["status"] == "error"
+
+    def test_save_load_round_trips_ctrl(self, sim):
+        # ctrl (servo targets) MUST survive a checkpoint round-trip. Previously
+        # save_state used mjSTATE_FULLPHYSICS, which excludes ctrl/qfrc_applied,
+        # so the first step after load_state drove toward the pre-restore
+        # targets. Regression for that silent drop.
+        sim._world._data.ctrl[0] = 0.8
+        mj.mj_forward(sim._world._model, sim._world._data)
+
+        result = sim.save_state(name="ctrl_ckpt")
+        assert result["status"] == "success"
+
+        # Clobber ctrl after the checkpoint.
+        sim._world._data.ctrl[0] = -0.5
+        mj.mj_forward(sim._world._model, sim._world._data)
+        assert sim._world._data.ctrl[0] == pytest.approx(-0.5)
+
+        result = sim.load_state(name="ctrl_ckpt")
+        assert result["status"] == "success"
+        assert sim._world._data.ctrl[0] == pytest.approx(0.8)
+
+    def test_load_state_after_recompile_returns_structured_error(self, sim):
+        # A scene recompile that resizes the state vector (add_object inserts a
+        # free joint -> nq/nv grow) must invalidate an earlier checkpoint. The
+        # stale vector must NOT be applied: previously mj_setState raised a raw
+        # ValueError or silently misaligned qpos. Expect a structured error dict.
+        result = sim.save_state(name="pre_add")
+        assert result["status"] == "success"
+
+        add = sim.add_object(name="dropped_cube", shape="box", size=[0.05, 0.05, 0.05])
+        assert add["status"] == "success"
+
+        result = sim.load_state(name="pre_add")
+        assert result["status"] == "error"
+        assert "stale" in result["content"][0]["text"].lower()
+
+        # The checkpoint saved AFTER the mutation applies cleanly.
+        result = sim.save_state(name="post_add")
+        assert result["status"] == "success"
+        result = sim.load_state(name="post_add")
+        assert result["status"] == "success"
+
+    def test_load_state_after_same_shape_recompile_returns_error(self, sim):
+        # A same-shape recompile (remove one free-jointed object, add another)
+        # leaves nq/nv/na/nu unchanged but the joint addresses now map to
+        # different bodies. The recompile-generation stamp must catch this and
+        # return a structured error - applying the stale vector would silently
+        # teleport the new object into the old objects saved pose/velocity.
+        add1 = sim.add_object(name="obj_a", shape="sphere", size=[0.03])
+        assert add1["status"] == "success"
+
+        result = sim.save_state(name="with_a")
+        assert result["status"] == "success"
+
+        # Remove obj_a, add obj_b - same shape (one free joint each), so
+        # nq/nv/na/nu are identical after both mutations.
+        rm = sim.remove_object(name="obj_a")
+        assert rm["status"] == "success"
+        add2 = sim.add_object(name="obj_b", shape="sphere", size=[0.03])
+        assert add2["status"] == "success"
+
+        # The fingerprint must detect the stale checkpoint.
+        result = sim.load_state(name="with_a")
+        assert result["status"] == "error"
+        assert "stale" in result["content"][0]["text"].lower()
+
+        # A fresh checkpoint saved after the mutation applies cleanly.
+        result = sim.save_state(name="with_b")
+        assert result["status"] == "success"
+        result = sim.load_state(name="with_b")
+        assert result["status"] == "success"
 
 
 class TestInverseDynamics:
@@ -570,19 +792,59 @@ class TestRuntimeModification:
         assert sim.set_body_properties(body_name="box1", mass=0.5)["status"] == "success"
         assert model.body_inertia[body_id] == pytest.approx(cur_inertia * (0.5 / cur_mass))
 
-    def test_set_body_mass_massless_body_no_crash(self, sim):
-        """A massless frame (mass 0, inertia 0) is handled without dividing by zero.
+    def test_set_body_mass_on_a_massless_body_is_refused(self, sim):
+        """A massless frame has no inertial to scale, so the mass is refused.
 
-        There is no geometry-derived inertia to scale from a zero prior mass, so
-        the inertia stays zero; the mass update still succeeds.
+        ``arm_base`` is a pure kinematic frame: no ``<inertial>`` and no geom of
+        its own, so its compiled mass is 0 and there is nothing for a mass change
+        to scale. Reporting success here produced a body heavy in translation with
+        zero rotational resistance - the same physically inconsistent state
+        ``test_set_body_mass_rejects_nonfinite`` exists to prevent, differing only
+        in which component is corrupt. It was also a value nothing could keep: the
+        mass lives on a body's inertial or on its geoms, and this body has
+        neither, so the next scene recompile discarded it.
+
+        The division by zero this test originally guarded is still not reached -
+        the refusal happens before the ratio is taken.
         """
         model = sim._world._model
         body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "arm_base")
         assert float(model.body_mass[body_id]) == pytest.approx(0.0)
         result = sim.set_body_properties(body_name="arm_base", mass=2.0)
-        assert result["status"] == "success"
-        assert model.body_mass[body_id] == pytest.approx(2.0)
+        assert result["status"] == "error"
+        assert "no mass of its own" in result["content"][0]["text"]
+        assert model.body_mass[body_id] == pytest.approx(0.0)
         assert model.body_inertia[body_id] == pytest.approx([0.0, 0.0, 0.0])
+
+    def test_set_body_mass_rejects_nonfinite(self, sim):
+        """A non-finite mass is rejected instead of silently corrupting the model.
+
+        ``float('nan') <= 0`` and ``float('inf') <= 0`` are both ``False``, so a
+        bare ``mass <= 0`` guard lets NaN/+Inf slip through: the body's mass and
+        (mass-tracking) inertia would be set to NaN/Inf and the next ``mj_step``
+        would produce a non-finite ``qacc`` -- a silent physics corruption
+        reported as ``status="success"``. The guard must also reject non-finite
+        values, matching the finiteness contract already enforced by
+        ``set_timestep`` / ``set_gravity``.
+        """
+        model = sim._world._model
+        body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "box1")
+        good_mass = float(model.body_mass[body_id])
+        good_inertia = model.body_inertia[body_id].copy()
+        assert good_mass > 0 and (good_inertia > 0).all()
+
+        for bad in (float("nan"), float("inf"), -float("inf")):
+            result = sim.set_body_properties(body_name="box1", mass=bad)
+            assert result["status"] == "error", f"mass={bad!r} was not rejected"
+            assert "finite" in result["content"][0]["text"]
+            # Neither mass nor inertia was mutated by the rejected call.
+            assert model.body_mass[body_id] == pytest.approx(good_mass)
+            assert model.body_inertia[body_id] == pytest.approx(good_inertia)
+            # And the world remains integrable (no NaN leaked into the model).
+            mj.mj_forward(model, sim._world._data)
+            import numpy as np
+
+            assert np.all(np.isfinite(sim._world._data.qacc))
 
     def test_set_geom_color(self, sim):
         result = sim.set_geom_properties(geom_name="box_geom", color=[0, 1, 0, 1])
@@ -601,8 +863,7 @@ class TestRuntimeModification:
     def test_set_geom_size_resizes_geom(self, sim):
         """set_geom_properties(size=...) writes the new half-extents into the
         live model so the next step / render sees the resized geom (no
-        recompile). Only the leading ``min(len(size), 3)`` entries are set,
-        matching MuJoCo's per-type geom_size layout."""
+        recompile). A box defines three half-extents, so all three are set."""
         geom_id = mj.mj_name2id(sim._world._model, mj.mjtObj.mjOBJ_GEOM, "box_geom")
         result = sim.set_geom_properties(geom_name="box_geom", size=[0.25, 0.3, 0.35])
         assert result["status"] == "success"
@@ -612,16 +873,23 @@ class TestRuntimeModification:
         assert new_size[1] == pytest.approx(0.3)
         assert new_size[2] == pytest.approx(0.35)
 
-    def test_set_geom_size_shorter_than_three_leaves_tail_untouched(self, sim):
-        """A partial size list updates only the entries provided and leaves the
-        remaining half-extents at their compiled value."""
+    def test_set_geom_size_shorter_than_the_type_defines_is_rejected(self, sim):
+        """A size vector shorter than the geom's type defines is refused.
+
+        This previously wrote the components provided and left the rest at their
+        compiled value, so ``size=[0.2]`` on a box resized x only and reported
+        success for a box the caller never described (0.2 x old_y x old_z). There
+        is no meaningful value to invent for the omitted components, so the whole
+        write is refused and the compiled half-extents stay intact.
+        """
         geom_id = mj.mj_name2id(sim._world._model, mj.mjtObj.mjOBJ_GEOM, "box_geom")
-        original_tail = float(sim._world._model.geom_size[geom_id][2])
+        original = sim._world._model.geom_size[geom_id].copy()
         result = sim.set_geom_properties(geom_name="box_geom", size=[0.2])
-        assert result["status"] == "success"
-        new_size = sim._world._model.geom_size[geom_id]
-        assert new_size[0] == pytest.approx(0.2)
-        assert float(new_size[2]) == pytest.approx(original_tail)
+        assert result["status"] == "error"
+        text = result["content"][0]["text"]
+        assert "exactly 3 component(s)" in text
+        assert "box" in text
+        assert sim._world._model.geom_size[geom_id] == pytest.approx(original)
 
     def test_set_geom_size_grow_recomputes_rbound_and_aabb(self, sim):
         """Growing a size-defined primitive refreshes its collision bounds.
@@ -983,10 +1251,13 @@ class TestDirectJointControlListForm:
 
 
 class TestMultiRaycast:
-    """Batch raycasting: origin validation plus per-ray fail-soft contract.
+    """Batch raycasting: origin validation plus the all-or-nothing batch contract.
 
-    A single malformed ray must not abort the whole batch; it produces a
-    per-ray error entry while valid rays still resolve.
+    A single malformed direction refuses the whole batch, naming its index. The
+    batch previously cast the remaining rays and reported ``distance: None`` for
+    the malformed one, which is exactly what a genuine miss reports - so a ray
+    that was never cast read as free space in the very clearance checks this
+    method serves.
     """
 
     def test_multi_raycast_origin_wrong_length(self, sim):
@@ -999,23 +1270,25 @@ class TestMultiRaycast:
         assert result["status"] == "error"
         assert "list of 3 numbers" in result["content"][0]["text"]
 
-    def test_multi_raycast_per_ray_bad_direction_length(self, sim):
+    def test_multi_raycast_bad_direction_length_refuses_the_batch(self, sim):
+        """A 2-component direction refuses the batch and names its index."""
         result = sim.multi_raycast(origin=[0, 0, 2], directions=[[0, 0, -1], [0, 1]])
-        assert result["status"] == "success"
-        rays = _extract_json_block(result, 1)["rays"]
-        assert "must have 3 elements" in rays[1]["error"]
+        assert result["status"] == "error"
+        invalid = _extract_json_block(result, 1)["invalid_directions"]
+        assert [entry["index"] for entry in invalid] == [1]
+        assert "must have exactly 3 component" in invalid[0]["error"]
 
-    def test_multi_raycast_per_ray_zero_direction(self, sim):
+    def test_multi_raycast_zero_direction_refuses_the_batch(self, sim):
         result = sim.multi_raycast(origin=[0, 0, 2], directions=[[0, 0, 0]])
-        assert result["status"] == "success"
-        rays = _extract_json_block(result, 1)["rays"]
-        assert "zero-length" in rays[0]["error"]
+        assert result["status"] == "error"
+        invalid = _extract_json_block(result, 1)["invalid_directions"]
+        assert "zero-length" in invalid[0]["error"]
 
-    def test_multi_raycast_per_ray_direction_not_iterable(self, sim):
+    def test_multi_raycast_direction_not_iterable_refuses_the_batch(self, sim):
         result = sim.multi_raycast(origin=[0, 0, 2], directions=[7])
-        assert result["status"] == "success"
-        rays = _extract_json_block(result, 1)["rays"]
-        assert "list of 3 numbers" in rays[0]["error"]
+        assert result["status"] == "error"
+        invalid = _extract_json_block(result, 1)["invalid_directions"]
+        assert "must be a sequence of numbers" in invalid[0]["error"]
 
     def test_multi_raycast_hit_from_above(self, sim):
         # Cast straight down from above the ground plane: expect a hit.
@@ -1075,3 +1348,61 @@ class TestRaycastReflectsCurrentPose:
 
         after = _extract_json_block(sim.multi_raycast(origin=[0, 0, 2], directions=dirs), 1)["rays"]
         assert after[0]["distance"] == pytest.approx(2.0, abs=1e-3)  # now hits ground
+
+
+class TestContactForcesReflectsCurrentPose:
+    """get_contact_forces must reflect the CURRENT qpos, exactly like get_contacts.
+
+    ``mj_contactForce`` reads ``data.contact[]``/``data.ncon`` (collision output)
+    and ``data.efc_force`` (constraint solve) -- all recomputed only by
+    ``mj_forward``/``mj_step``. A manual ``qpos`` write (planning/IK loop), a
+    pose set right after ``reset``/``add_robot``, or a policy thread
+    mid-``mj_step`` leaves them stale, so without a forward the method reports
+    phantom contacts with fabricated forces while returning ``status=success``.
+    ``get_contacts`` already forwards; the two contact queries must agree.
+    """
+
+    @staticmethod
+    def _box_in_forces(result):
+        for block in result["content"]:
+            if "json" in block:
+                return any("box_geom" in (c["geom1"], c["geom2"]) for c in block["json"].get("contacts", []))
+        return False
+
+    @staticmethod
+    def _lift_box(sim):
+        model, data = sim._world._model, sim._world._data
+        jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, "box_free")
+        adr = int(model.jnt_qposadr[jid])
+        data.qpos[adr : adr + 3] = [0.0, 0.0, 3.0]  # lift the box 3m into the air
+        data.qpos[adr + 3 : adr + 7] = [1.0, 0.0, 0.0, 0.0]
+        # deliberately NO mj_forward / mj_step here
+
+    def test_get_contact_forces_reflects_pose_change_without_forward(self, sim):
+        # Settle the box on the ground -> a real box_geom<->ground contact.
+        for _ in range(500):
+            mj.mj_step(sim._world._model, sim._world._data)
+        base = sim.get_contact_forces()
+        assert base["status"] == "success"
+        assert self._box_in_forces(base)
+
+        self._lift_box(sim)
+
+        # Query FIRST (before any other call forwards). The box is 3m up with no
+        # possible contact, so a correct query no longer reports box_geom.
+        # Pre-fix reads the stale contact list + fabricated force for the box.
+        after = sim.get_contact_forces()
+        assert after["status"] == "success"
+        assert not self._box_in_forces(after)
+
+    def test_contact_queries_agree_after_pose_change(self, sim):
+        for _ in range(500):
+            mj.mj_step(sim._world._model, sim._world._data)
+        self._lift_box(sim)
+        # get_contact_forces must be queried FIRST; get_contacts forwards and
+        # would otherwise clear the staleness for the second call. After the
+        # box is lifted, neither query may still report the airborne box.
+        forces_has_box = self._box_in_forces(sim.get_contact_forces())
+        contacts_text = sim.get_contacts()["content"][0]["text"]
+        assert forces_has_box is False
+        assert "box_geom" not in contacts_text

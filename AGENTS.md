@@ -80,10 +80,217 @@ hatch run format            # ruff check --fix, ruff format
 
 1. Create feature branch from `main`
 2. Make changes, run `hatch run format && hatch run lint && hatch run test`
-3. All tests must pass, lint must be clean
-4. Open PR from your fork, address all review comments
-5. Track follow-up items as issues on the [project board](https://github.com/orgs/strands-labs/projects/2)
-6. Squash merge into `main`
+3. Record the change as a news fragment: `changelog.d/<pr-number>-<slug>.md`
+   (see [`changelog.d/README.md`](changelog.d/README.md)). **Never append to
+   `## [Unreleased]` in `CHANGELOG.md` directly** - every branch inserts at the
+   same anchor, so two PRs open at once conflict on ordering alone, and because
+   stale approvals are dismissed on push each resolution costs a re-approval
+   round that reviews no changed behaviour. A fragment is its own file, so there
+   is nothing to conflict on. `CHANGELOG.md` is assembled from the accumulated
+   fragments when a tag is cut (`python scripts/assemble_changelog.py --apply`).
+   This is enforced by `.github/workflows/changelog-fragment.yml`: the rule was
+   documented in two places and enforced by nothing until #1784, and a pull
+   request reached `APPROVED` / `SUCCESS` / `CLEAN` having appended to the log.
+4. All tests must pass, lint must be clean
+5. Open PR from your fork, address all review comments
+6. Track follow-up items as issues on the [project board](https://github.com/orgs/strands-labs/projects/2)
+
+   **Read the board with `PAT_TOKEN`, not the Actions `GITHUB_TOKEN`.** An
+   installation token that cannot see an organization project does not fail the
+   query - `issue.projectItems` comes back as an empty list, which is
+   indistinguishable from an issue nobody has tracked. The same one query, run
+   twice on #1762, #1768 and #1770:
+
+   | token | `issue.projectItems` |
+   |---|---|
+   | `GITHUB_TOKEN` | `[]` for all three |
+   | `PAT_TOKEN` | one item each; #1768 and #1770 already at `Done` |
+
+   Two things follow. First, adding an issue to the board is almost never the
+   missing step: all three items were created by `github-project-automation`
+   within three seconds of the issue itself, and the automation also moves them
+   to `Done` on close, so a merged fix needs no manual flip. What it cannot
+   infer is a status like `In review` while a PR is open - that is the part
+   worth setting by hand. Second, acting on the empty read looks harmless and
+   is not: `addProjectV2ItemById` is idempotent and returns the *existing*
+   item's id, so no duplicate ever appears and the false-empty read leaves no
+   trace - until a `Status` written on the strength of it silently overwrites a
+   value that was never read. Read a field before you set it, and treat an
+   empty project read as unknown rather than as absent.
+7. Squash merge into `main`
+8. **Verify a PR's state by reading it back - before and after you change it.**
+   Neither direction can be inferred:
+   - *Before.* Query `timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT])`
+     before closing or reopening. A lone `CLOSED_EVENT` is safe to re-apply; an
+     alternating run means something is undoing you, and a further flip only
+     lengthens it. #1667 - the retired `pr/consolidated-local-work` staging PR -
+     was closed and reopened **ten times in under fourteen hours**, each reopen 2-22
+     minutes after the preceding close, because independent contributors read
+     the same PR and reached opposite conclusions. Its extraction plan and
+     terminal state live in #1723; do not flip #1667 again.
+   - *After.* A `mergePullRequest` mutation can report `Pull Request is not
+     mergeable` on a merge that in fact landed - observed on #1756, where the
+     mutation returned that error and the squash was already on `main`. Confirm
+     with `state`/`merged`, or `git log origin/main`, before concluding a merge
+     failed and redoing the work.
+   - *And on `main` afterwards.* A rollup of `FAILURE` on a merge commit is not
+     evidence that the squash broke anything: a **cancelled** check aggregates
+     into `FAILURE`. `pr-and-push.yml` keys its concurrency group on
+     `github.event.pull_request.number || github.ref`, and on a push there is no
+     PR number, so every push to `refs/heads/main` shares one group under
+     `cancel-in-progress: true` - each merge kills the run of the merge before
+     it. Read each context's own `conclusion` before you believe the rollup.
+     Four PRs merged in the 22 minutes from 03:03:44 to 03:25:25 left three
+     consecutive commits - #1788, #1794, #1796 - each reporting rollup
+     `FAILURE` whose only non-`SUCCESS` context was
+     `call-test-lint / Test and Lint` = `CANCELLED`, killed at 1m07s, 15m00s
+     and 5m38s into their runs. Nothing had failed. See #1800.
+
+     The same timings carry a cost that is not a misread: that suite had not
+     finished in 15m00s, so merging faster than it runs leaves **only the tip
+     verified** and no intermediate commit attributable. A batch is still
+     defensible - each of those four was individually green, passed
+     `Detect an untested overlap with the base branch`, and touched a file set
+     disjoint from the others - but price it knowingly: a red tip then costs a
+     manual bisect, and an intermediate commit's green is not available to lean
+     on. Do not read the intermediate `FAILURE`s as the culprit; they are the
+     batching, not a defect.
+   - *And when `main` itself is red, a re-run cannot clear the PRs it blocked.*
+     `pr-and-push.yml` checks out the PR **head commit**, not
+     `refs/pull/N/merge` - the job log reads `HEAD is now at <branch head>` - so
+     a branch's green is a statement about the branch's own tree, which is the
+     reason `Detect an untested overlap with the base branch` has to exist as a
+     separate check. It follows that a fix landing on `main` is invisible to the
+     branch until the branch absorbs it, and
+     `POST /actions/runs/{id}/rerun-failed-jobs` re-uses the head SHA the run
+     recorded, so re-running changes nothing. Measured on #1824, which fixed the
+     three `test_deferred_physics_and_warmup.py` failures open as #1823: #1827
+     and #1829, both re-run after #1824 was on `main`, reported the same single
+     failure (`1 failed, 6287 passed` and `1 failed, 6277 passed`). Merge `main`
+     into the branch and push; there is no cheaper route.
+
+     **That push is free when the merge is conflict-free.** The intuition that
+     it costs the approval is wrong, and the difference is measurable before you
+     push. Two pushes onto #1821, both merges of `main` into an approved branch:
+
+     | push | `git show --cc` | PR diff vs merge base | approval |
+     |---|---|---|---|
+     | `b365d60`, resolved a conflict | 82 lines | changed | dismissed 45s later |
+     | `79cbdad`, clean base merge | 0 lines | identical, `4 files, +158/-7` | survived, still `APPROVED` |
+
+     Dismissal keys on the **PR's own diff**, not on the head SHA changing: a
+     merge that only brings the base forward leaves the diff a reviewer read
+     byte-identical, and nothing is dismissed. A conflict resolution is new,
+     unreviewed text - a combined diff is exactly the text belonging to neither
+     parent - and that is what costs a round. So refreshing an approved branch
+     over a fixed `main` is cheap, and the expensive case is the one worth
+     avoiding structurally, which is what step 3's fragment rule already does for
+     the file every branch used to conflict on.
+
+     Two consequences remain. Merge the fix for a red `main` ahead of the queue
+     rather than alongside it: while it is red nothing on top of it can merge at
+     all, whatever its own state. And do not push the refresh onto a
+     **contributor's** branch - that is the `require_last_push_approval` identity
+     problem below, which is independent of dismissal and does not care that the
+     merge was clean. Ask the contributor to absorb `main` so they stay the last
+     pusher; #1827 was left alone for that reason.
+   And before merging, `reviewDecision: APPROVED` alone is not the gate: poll
+   `statusCheckRollup.state == SUCCESS` and `mergeStateStatus == CLEAN`
+   together, since `reviewDecision` flips before the checks finish.
+
+   Those three together are still not sufficient. They are all evaluated against
+   the base the branch was tested on, so none of them can see a **semantic**
+   conflict with a PR that landed on `main` after those checks ran. #1766 and
+   #1763 both edited `_recompile_preserving_state` for unrelated reasons: the
+   text merged with no conflict, #1763 stayed `MERGEABLE`/`CLEAN` with
+   `SUCCESS` checks after #1766 landed, and the squash still broke `main`,
+   because #1763 carried a *premise* test asserting the very defect #1766 had
+   just fixed. Neither PR's CI ever compiled the two together.
+
+   So when a second approved PR touches a file - especially a function - that a
+   just-merged PR also touched, do not merge on the green alone. Merge `main`
+   into the branch (or check out the merge locally) and run the affected tests
+   before issuing the mutation. A `CLEAN` status is a statement about text, not
+   about meaning. This is cheap: the check that would have caught the above was
+   one `pytest` invocation on two files.
+
+   Read that run as a **delta, not an absolute**. The environment you verify in
+   is almost never the one CI uses, and a partial one fails tests for reasons
+   that have nothing to do with the merge. Composing #1786 and #1804 - both
+   approved, both `CLEAN`, both editing `simulation/predicates.py`, neither ever
+   compiled with the other - the affected suite reported **376 failed, 34
+   errors** on the composition, which on its own reads as a broken merge and a
+   reason to stop. The same command on the unmerged base reported the same
+   **376 failed, 34 errors**, and 4185 passed against the composition's 4229:
+   every failure pre-existed (a hosted runner has no GPU and only software
+   OSMesa, so the rendering tests fail there whatever the diff), and the whole
+   effect of the merge was **+44 passes** - exactly the 24 + 20 tests the two
+   branches add. The reading matters in both directions: an absolute count can
+   invent a regression and cost a good merge, and it can equally hide a real one
+   inside the noise. Run the same command on the base *before* you read the
+   number, and compare the two.
+
+   Then confirm the tree you verified is the tree that landed -
+   `git diff --name-only <local-composition> origin/main -- strands_robots/ tests/`
+   should be empty. Squash rewrites the commits, so nothing but that equivalence
+   ties your local run to `main`; and on a batch, where only the tip's
+   `call-test-lint` survives the concurrency group above, it is the sole evidence
+   the intermediate commits were ever compiled together.
+
+   Fixing forward beats reverting here - the two production changes were both
+   correct, and only an assertion and its justification were stale. Prefer a
+   narrow follow-up that re-pins the invalidated premise over reverting a
+   reviewed change. If a premise test is invalidated by a fix landing, replace it
+   rather than deleting it: the conclusion it supported usually still holds for a
+   different reason, and that reason is what the next reader needs.
+
+   The converse happens too: every signal above satisfied, and the PR still
+   refuses to merge with no field naming the reason. #1722 carried one current
+   `APPROVED` review that post-dated its head commit, all four review threads
+   resolved, `call-test-lint` `SUCCESS` - and `reviewDecision`
+   `REVIEW_REQUIRED`. The `default` branch ruleset sets
+   `require_last_push_approval: true`, so the most recent push must be approved
+   by **someone other than whoever pushed it**, and the agent had pushed that
+   head commit with `PAT_TOKEN`. GitHub attributes a push to the token's
+   *owner*, which was the same account that then approved. No number of further
+   approvals from that account can clear it.
+
+   What makes this worth writing down is that the commit metadata asserts the
+   opposite. `d938686`'s author *and* committer are `strands-robots`, an
+   identity distinct from the approver, so reading the commit list says the rule
+   is satisfied. The pusher is in none of the fields you would check:
+   `reviewDecision` is `REVIEW_REQUIRED` and `mergeStateStatus` is `BLOCKED`,
+   which is also exactly what a PR with no approval at all looks like. The one
+   place it is legible:
+
+   ```
+   GET /repos/{owner}/{repo}/actions/runs?head_sha=<head>  ->  triggering_actor
+   ```
+
+   #1035 is the control - same author, same fork, same `strands_robots/mesh/`
+   files, one approval from the same account post-dating its head commit,
+   threads clear, checks green, and no CODEOWNERS file in the tree to make
+   `require_code_owner_review` bite. It differs in exactly one input, and reads
+   `APPROVED`:
+
+   | PR | commit author | `triggering_actor` | approver | `reviewDecision` |
+   |---|---|---|---|---|
+   | #1035 | the contributor | the contributor | the maintainer | `APPROVED` |
+   | #1722 | `strands-robots` | the maintainer | the maintainer | `REVIEW_REQUIRED` |
+
+   So **pushing a fix to a contributor's branch consumes the approval of
+   whoever owns the token you push with**, turning a PR one maintainer could
+   merge into one that needs a second. It compounds with
+   `dismiss_stale_reviews_on_push`, which drops the existing approval in the
+   same motion that disqualifies that account from re-supplying it. Prefer
+   leaving the change for the contributor to push, so they stay the last
+   pusher; when the agent must push, that PR now requires a second approver,
+   and saying so is the difference between a one-line request and a branch that
+   never merges.
+
+   The general rule behind all three: **a decision recorded only in a PR or
+   issue comment is not durable** - the next contributor will not read the same
+   comment. If a decision must survive, it belongs in this file.
 
 
 ## Registry conventions (strands_robots/registry/robots.json)

@@ -9,11 +9,15 @@ resume-schema guard.
 """
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from strands_robots.simulation.mujoco.backend import _NO_WORLD_MSG, _ensure_mujoco
-from strands_robots.simulation.recording import DatasetRecordingMixin
+from strands_robots.simulation.models import registry_entry
+from strands_robots.simulation.mujoco.backend import _NO_WORLD_MSG, _ensure_mujoco, mj_name_to_id
+from strands_robots.simulation.recording import (
+    DatasetRecordingMixin,
+    dataset_recording_option_error,
+)
+from strands_robots.utils import name_list_error
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +50,9 @@ class RecordingMixin(DatasetRecordingMixin):
         def robot_action_keys(self, robot_name: str) -> list[str]:
             """Actuator-ordered action keys for ``robot_name`` (concrete on SimEngine)."""
 
+        def _robot_free_base_joint_id(self, model: Any, robot: Any) -> int:
+            """Free-base joint id for ``robot`` or -1 (concrete on RenderingMixin)."""
+
     def start_recording(
         self,
         repo_id: str = "local/sim_recording",
@@ -74,6 +81,21 @@ class RecordingMixin(DatasetRecordingMixin):
         rather than freezing on the chunk-start observation.
 
         Args:
+            fps: Dataset frame rate recorded in the LeRobot metadata. Must be a
+                positive whole number - a fractional or non-numeric rate cannot
+                be written and is rejected up front rather than aborting the
+                rollout behind a ``status="success"`` return. It must EQUAL the
+                rollout's ``control_frequency``: the recorder captures one frame
+                per control step and never decimates, so a differing rate cannot
+                be honored, only mislabelled. The disagreement is refused
+                before any frame is written whichever call comes first: by every
+                rollout entry point when a rollout starts against an open
+                recording, and here when a recording is opened against a rollout
+                already in flight. When an existing
+                dataset is RESUMED (``overwrite=False``), it must equal that
+                dataset's on-disk rate: a resumed dataset keeps the rate it was
+                created at, so a differing request is refused with the on-disk
+                value rather than silently appending frames on a wrong timebase.
             root: On-disk dataset directory (defaults to the LeRobot cache under
                 ``repo_id``). An existing EMPTY directory (e.g. from
                 ``tempfile.mkdtemp()``) is accepted and recorded into; an
@@ -110,28 +132,57 @@ class RecordingMixin(DatasetRecordingMixin):
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
 
+        # Reject an fps no dataset can be written at before creating or
+        # resuming the recorder: an unusable rate was reported as success and
+        # then cost the caller the whole episode (see
+        # dataset_recording_option_error). Checked ahead of the lerobot-extra
+        # probe so the same caller mistake reports the same way regardless of
+        # which optional extras this install has.
+        if error := dataset_recording_option_error("start_recording", fps):
+            return error
+        # ``cameras`` names an ordered list of DISTINCT camera names, so it is
+        # refused on the shared name-list domain before any dataset is created. Neither
+        # mistake this catches could be honored as written: a single name passed
+        # as a bare string is iterable per character, so it was read as one
+        # camera per letter, and a repeated name collapsed in the feature dict, declaring
+        # fewer camera columns than the caller asked for.
+        if cameras and (text := name_list_error(cameras, "cameras", "start_recording")):
+            return {"status": "error", "content": [{"text": text}]}
+
+        # Reject a rate a rollout already in flight is not capturing at. The
+        # rollout entry points cover the record-then-rollout ordering; this is
+        # the same disagreement with the calls the other way round, refused
+        # before any dataset is created so a refusal leaves nothing on disk.
+        if error := self._validate_recording_start_rate(fps, "start_recording"):
+            return error
+
         _DatasetRecorder: Any = None
-        _has_lerobot = False
+        unavailable: str | None = None
         try:
             from strands_robots.dataset_recorder import DatasetRecorder as _DatasetRecorder
-            from strands_robots.dataset_recorder import has_lerobot_dataset as _check_lerobot
+            from strands_robots.dataset_recorder import lerobot_dataset_import_error
 
-            _has_lerobot = _check_lerobot()
-        except ImportError:
-            pass
+            unavailable = lerobot_dataset_import_error()
+        except ImportError as exc:
+            # strands_robots.dataset_recorder itself did not import (a partial or
+            # drifted install); report that rather than blaming the lerobot extra.
+            unavailable = f"strands_robots.dataset_recorder is unavailable ({exc})."
+        if unavailable is None and _DatasetRecorder is None:
+            unavailable = "strands_robots.dataset_recorder did not provide DatasetRecorder."
 
-        if not _has_lerobot or _DatasetRecorder is None:
+        if unavailable is not None:
             return {
                 "status": "error",
                 "content": [
                     {
                         "text": (
-                            "start_recording produces a LeRobotDataset (parquet + video) and "
-                            "requires the lerobot extra. For plain MP4 video under the "
-                            "[sim-mujoco] extra alone, use start_cameras_recording instead.\n"
+                            "start_recording produces a LeRobotDataset (parquet + video), which "
+                            "needs lerobot's dataset stack:\n"
                             "\n"
-                            "  - Dataset + policy training data:  pip install 'strands-robots[lerobot]'\n"
-                            "  - Plain MP4 only:                  start_cameras_recording(cameras=..., output_dir=...)"
+                            f"  {unavailable}\n"
+                            "\n"
+                            "For plain MP4 video under the [sim-mujoco] extra alone, use "
+                            "start_cameras_recording(cameras=..., output_dir=...) instead."
                         )
                     }
                 ],
@@ -142,12 +193,12 @@ class RecordingMixin(DatasetRecordingMixin):
         self._world._backend_state["push_to_hub"] = push_to_hub
 
         # Resolve the on-disk dataset dir (shared by overwrite + resume logic).
-        if root:
-            dataset_dir = Path(root)
-        elif "/" not in repo_id or repo_id.startswith("/") or repo_id.startswith("./"):
-            dataset_dir = Path(repo_id)
-        else:
-            dataset_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
+        # Delegates to the same resolver DatasetRecorder.create() uses so the
+        # facade and the low-level recorder agree on where a dataset lives
+        # (honouring $HF_LEROBOT_HOME).
+        from strands_robots.dataset_recorder import resolve_dataset_dir
+
+        dataset_dir = resolve_dataset_dir(repo_id, root)
         # Stash the resolved root so verify_dataset_episodes can read the parquet
         # after stop_recording has finalized the dataset and dropped the recorder.
         self._world._backend_state["last_dataset_root"] = str(dataset_dir)
@@ -179,16 +230,56 @@ class RecordingMixin(DatasetRecordingMixin):
             camera_keys: list[str] = []
             robot_type = "unknown"
             multi_robot = len(self._world.robots) > 1
+            mj = _ensure_mujoco()
+            model = self._world._model
             for rname, robot in self._world.robots.items():
+                # Exclude a floating base's 6-DoF free joint from the scalar
+                # joint schema: its full state is recorded as the structured
+                # base_pos / base_quat / base_lin_vel / base_ang_vel columns
+                # below, and get_observation no longer emits it as a scalar
+                # (its qpos is [xyz+quat], not a single angle), so declaring a
+                # floating_base_joint scalar column would record a degenerate /
+                # dead value. Mirrors get_observation / get_robot_state.
+                pfx = robot.namespace or ""
+                scalar_joint_names: list[str] = []
+                for jn in robot.joint_names:
+                    jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, (pfx + jn) if pfx else jn)
+                    if jid < 0 and pfx:
+                        jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jn)
+                    if jid >= 0 and model.jnt_type[jid] == mj.mjtJoint.mjJNT_FREE:
+                        continue
+                    scalar_joint_names.append(jn)
                 if multi_robot:
-                    joint_names.extend(f"{rname}__{jn}" for jn in robot.joint_names)
+                    joint_names.extend(f"{rname}__{jn}" for jn in scalar_joint_names)
                     action_names.extend(f"{rname}__{ak}" for ak in self.robot_action_keys(rname))
                 else:
-                    joint_names.extend(robot.joint_names)
+                    joint_names.extend(scalar_joint_names)
                     action_names.extend(self.robot_action_keys(rname))
                 robot_type = robot.data_config or rname
 
-            mj = _ensure_mujoco()
+            # A floating-base robot (humanoid / mobile) exposes full base
+            # kinematics via get_observation - position (base_pos, world x,y,z
+            # incl. height), orientation (base_quat, w,x,y,z), linear velocity
+            # (base_lin_vel, m/s) and angular velocity (base_ang_vel, rad/s) -
+            # but the observation.state schema above is derived from scalar joint
+            # names, so those base signals would be dropped. Preserve them as
+            # per-component scalar columns so a locomotion / velocity-tracking /
+            # whole-body-control policy trained on the dataset is not base-blind.
+            # Detected via the shared free-base joint finder; multi-robot base
+            # columns are prefixed like joint ids (``alice__base_quat.w``) to
+            # match the prefixed observation keys the recording hook emits.
+            base_state_specs: list[tuple[str, list[str]]] = []
+            for rname, robot in self._world.robots.items():
+                if self._robot_free_base_joint_id(self._world._model, robot) >= 0:
+                    prefix = f"{rname}__" if multi_robot else ""
+                    base_state_specs.append((f"{prefix}base_pos", ["x", "y", "z"]))
+                    base_state_specs.append((f"{prefix}base_quat", ["w", "x", "y", "z"]))
+                    base_state_specs.append((f"{prefix}base_lin_vel", ["x", "y", "z"]))
+                    base_state_specs.append((f"{prefix}base_ang_vel", ["x", "y", "z"]))
+            # Full observation.state schema names (scalar joints + expanded base
+            # components) - used to validate a resumed dataset's on-disk schema.
+            state_names_full = list(joint_names) + [f"{src}.{c}" for src, comps in base_state_specs for c in comps]
+
             # Declare each camera in the dataset schema at the SAME
             # resolution it actually renders at. Cameras added via add_camera
             # carry their own width/height (e.g. 256x256 for a LIBERO VLA),
@@ -213,7 +304,9 @@ class RecordingMixin(DatasetRecordingMixin):
                 safe_name = cam_name.replace("/", "__")
                 raw_to_safe[cam_name] = safe_name
                 camera_keys.append(safe_name)
-                cam_info = self._world.cameras.get(cam_name) or self._world.cameras.get(safe_name)
+                cam_info = registry_entry(self._world.cameras, cam_name) or registry_entry(
+                    self._world.cameras, safe_name
+                )
                 if cam_info is not None:
                     camera_dims[safe_name] = (int(cam_info.height), int(cam_info.width))
                 else:
@@ -303,7 +396,7 @@ class RecordingMixin(DatasetRecordingMixin):
                 # a camera resolution between episodes would otherwise yield a
                 # cryptic per-feature shape error on the next add_frame. Compare
                 # up front and raise a clear schema-diff instead.
-                self._verify_resume_schema(resumed, joint_names, camera_keys, camera_dims, action_names)
+                self._verify_resume_schema(resumed, state_names_full, camera_keys, camera_dims, action_names, fps=fps)
                 self._world._backend_state["dataset_recorder"] = resumed
             else:
                 self._world._backend_state["dataset_recorder"] = _DatasetRecorder.create(
@@ -312,6 +405,7 @@ class RecordingMixin(DatasetRecordingMixin):
                     robot_type=robot_type,
                     joint_names=joint_names,
                     action_names=action_names,
+                    extra_state_specs=base_state_specs,
                     camera_keys=camera_keys,
                     camera_dims=camera_dims,
                     task=task,

@@ -1,25 +1,14 @@
 """Strands Robots Simulation - multi-backend simulation framework.
 
-Architecture::
-
-    simulation/
-    ├ __init__.py          ← this file (re-exports, lazy loading)
-    ├ base.py              ← SimEngine ABC
-    ├ factory.py           ← create_simulation() + backend registration
-    ├ models.py            ← shared dataclasses (SimWorld, SimRobot, ...)
-    ├ model_registry.py    ← URDF/MJCF resolution (shared across backends)
-    └ mujoco/              ← MuJoCo CPU backend
-        ├ __init__.py
-        ├ backend.py       ← lazy mujoco import + GL config
-        ├ spec_builder.py  ← MjSpec-based scene builder/mutator
-        ├ physics.py       ← advanced physics (raycasting, jacobians, forces)
-        ├ scene_ops.py     ← live scene mutation via spec.recompile()
-        ├ rendering.py     ← render RGB/depth, observations
-        ├ policy_runner.py ← run_policy, eval_policy, replay
-        ├ randomization.py ← domain randomization
-        ├ recording.py     ← LeRobotDataset recording
-        ├ tool_spec.json   ← AgentTool input schema
-        └ simulation.py    ← Simulation (AgentTool orchestrator)
+A backend-agnostic layer built around the :class:`~strands_robots.simulation.base.SimEngine`
+ABC, shared dataclasses (:class:`~strands_robots.simulation.models.SimWorld`,
+:class:`~strands_robots.simulation.models.SimRobot`,
+:class:`~strands_robots.simulation.models.SimObject`, ...), a shared
+URDF/MJCF resolver (:mod:`strands_robots.simulation.model_registry`), and a
+:func:`~strands_robots.simulation.factory.create_simulation` factory that
+selects a registered backend. The default backend is
+:mod:`strands_robots.simulation.mujoco` (CPU physics + offscreen rendering, no
+GPU required); the Isaac Sim and Newton backends load lazily on demand.
 
 Usage::
 
@@ -52,6 +41,8 @@ from typing import TYPE_CHECKING, Any
 # TYPE_CHECKING-only eager imports so mypy can resolve the heavy classes
 # below to concrete types instead of the dynamic __getattr__ -> Any. PEP 562.
 if TYPE_CHECKING:
+    from strands_robots.simulation.isaac.config import IsaacConfig
+    from strands_robots.simulation.isaac.simulation import IsaacSimulation
     from strands_robots.simulation.mujoco.simulation import Simulation
     from strands_robots.simulation.mujoco.simulation import Simulation as MuJoCoSimulation
     from strands_robots.simulation.mujoco.spec_builder import SpecBuilder
@@ -70,6 +61,10 @@ from strands_robots.simulation.benchmark import (
 from strands_robots.simulation.benchmark_spec import (
     DeclarativeBenchmark,
     register_benchmark_from_file,
+)
+from strands_robots.simulation.builtin_benchmarks import (
+    builtin_benchmark_specs,
+    register_builtin_benchmarks,
 )
 from strands_robots.simulation.factory import (
     create_simulation,
@@ -103,6 +98,11 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "Simulation": ("strands_robots.simulation.mujoco.simulation", "MuJoCoSimEngine"),
     "MuJoCoSimulation": ("strands_robots.simulation.mujoco.simulation", "MuJoCoSimEngine"),
     "SpecBuilder": ("strands_robots.simulation.mujoco.spec_builder", "SpecBuilder"),
+    # Isaac Sim backend (heavy - needs NVIDIA Isaac Sim / Omniverse, installed
+    # out-of-band). Kept lazy so ``import strands_robots.simulation`` never
+    # triggers an omni/isaacsim import.
+    "IsaacSimulation": ("strands_robots.simulation.isaac.simulation", "IsaacSimulation"),
+    "IsaacConfig": ("strands_robots.simulation.isaac.config", "IsaacConfig"),
     "_configure_gl_backend": ("strands_robots.simulation.mujoco.backend", "_configure_gl_backend"),
     "_ensure_mujoco": ("strands_robots.simulation.mujoco.backend", "_ensure_mujoco"),
     "_is_headless": ("strands_robots.simulation.mujoco.backend", "_is_headless"),
@@ -120,6 +120,9 @@ __all__ = [
     "MuJoCoSimEngine",
     "Simulation",
     "MuJoCoSimulation",
+    # Isaac Sim backend (lazy - heavy NVIDIA Isaac Sim / Omniverse deps)
+    "IsaacSimulation",
+    "IsaacConfig",
     # Shared dataclasses
     "SimStatus",
     "SimRobot",
@@ -146,6 +149,8 @@ __all__ = [
     # Declarative DSL + predicates
     "DeclarativeBenchmark",
     "register_benchmark_from_file",
+    "register_builtin_benchmarks",
+    "builtin_benchmark_specs",
     "PREDICATE_REGISTRY",
     "make_predicate",
     "register_predicate",

@@ -1,8 +1,14 @@
 """Tests for strands_robots.utils - require_optional lazy import helper."""
 
+import numpy as np
 import pytest
 
-from strands_robots.utils import process_rss_mb, require_optional, require_optionals
+from strands_robots.utils import (
+    coerce_pose_vector,
+    process_rss_mb,
+    require_optional,
+    require_optionals,
+)
 
 
 class TestRequireOptional:
@@ -81,6 +87,44 @@ class TestSafeJoin:
         # Empty / dot path resolves to base itself - must not raise
         result = safe_join(tmp_path, ".")
         assert result == tmp_path
+
+    def test_rejects_symlink_escape_when_resolving(self, tmp_path):
+        from strands_robots.utils import safe_join
+
+        # A symlink whose target lies outside *base* stays lexically under base
+        # yet resolves outside it; with resolve_symlinks it must be rejected.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret").write_text("x")
+        base = tmp_path / "base"
+        base.mkdir()
+        (base / "link").symlink_to(outside)
+        with pytest.raises(ValueError, match="via symlink"):
+            safe_join(base, "link/secret", resolve_symlinks=True)
+
+    def test_symlink_escape_allowed_by_default(self, tmp_path):
+        from strands_robots.utils import safe_join
+
+        # Default (lexical) mode returns the managed path even when a component
+        # is a symlink: the asset cache intentionally symlinks robot dirs to
+        # installed packages outside the cache, and must not be rejected.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        base = tmp_path / "base"
+        base.mkdir()
+        (base / "link").symlink_to(outside)
+        assert safe_join(base, "link/model.xml") == base / "link" / "model.xml"
+
+    def test_allows_symlink_within_base_when_resolving(self, tmp_path):
+        from strands_robots.utils import safe_join
+
+        # A symlink that resolves back inside *base* must still be permitted so
+        # the symlink hardening does not over-block legitimate asset layouts.
+        base = tmp_path / "base"
+        (base / "real").mkdir(parents=True)
+        (base / "alias").symlink_to(base / "real")
+        result = safe_join(base, "alias/model.xml", resolve_symlinks=True)
+        assert result == base / "alias" / "model.xml"
 
 
 class TestGetSearchPaths:
@@ -318,3 +362,98 @@ class TestProcessRssMb:
         monkeypatch.setitem(sys.modules, "resource", None)
 
         assert process_rss_mb() is None
+
+
+class TestPoseVectorDomain:
+    """Accepted domain of the shared pose-vector guard.
+
+    Promoted out of the MuJoCo facade so the scene-construction calls and the
+    motion primitives (which live in a module the facade imports) cannot hold
+    different opinions about the same ``[x, y, z]``.
+    """
+
+    def test_an_omitted_vector_is_not_an_error(self):
+        assert coerce_pose_vector("m", "position", None, 3) == (None, None)
+
+    def test_numpy_components_are_normalized_to_plain_floats(self):
+        values, error = coerce_pose_vector("m", "position", np.array([0.1, 0.2, 0.3]), 3)
+        assert error is None
+        assert all(type(v) is float for v in values)
+
+    @pytest.mark.parametrize(
+        "bad", [0.5, np.float64(1.0), [0.1, 0.2], [0.1, "b", 0.3], [0.1, float("nan"), 0.3], [True, 0.2, 0.3]]
+    )
+    def test_a_vector_that_cannot_be_honored_returns_a_message(self, bad):
+        values, error = coerce_pose_vector("m", "position", bad, 3)
+        assert values is None
+        assert error and error.startswith("m: 'position'")
+
+
+class TestLerobotVersion:
+    """``lerobot_version`` degrades instead of raising.
+
+    Promoted out of the streaming-dataset reader so it and
+    :mod:`strands_robots.dataset_recorder` - which both name the installed
+    version in an error message - cannot report it differently.
+    """
+
+    def test_an_unresolvable_distribution_reads_as_unknown(self, monkeypatch):
+        # A source checkout without dist-info cannot resolve the version. The
+        # value only ever enriches an error message, so a PackageNotFoundError
+        # must not escape and mask the failure being reported.
+        import importlib.metadata as md
+
+        from strands_robots.utils import lerobot_version
+
+        def _raise(_name):
+            raise md.PackageNotFoundError("lerobot")
+
+        monkeypatch.setattr(md, "version", _raise)
+
+        assert lerobot_version() == "unknown"
+
+    def test_a_resolvable_distribution_reads_as_its_version(self, monkeypatch):
+        import importlib.metadata as md
+
+        from strands_robots.utils import lerobot_version
+
+        monkeypatch.setattr(md, "version", lambda _name: "0.6.1")
+
+        assert lerobot_version() == "0.6.1"
+
+    def test_an_unimportable_metadata_module_reads_as_unknown(self, monkeypatch):
+        """The other documented failure - the import itself - must also degrade.
+
+        ``importlib.metadata`` is stdlib, so this handler is the defensive half.
+        A handler that cannot run is not a defence though: naming
+        ``PackageNotFoundError`` beside ``ImportError`` bound it as a local the
+        failing import never reaches, so evaluating the handler raised
+        ``UnboundLocalError`` - from a function documented never to raise, and
+        exactly on the branch the second name appeared to cover.
+        """
+        import builtins
+
+        from strands_robots.utils import lerobot_version
+
+        real_import = builtins.__import__
+
+        def _no_metadata(name, *args, **kwargs):
+            if name == "importlib.metadata":
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _no_metadata)
+
+        assert lerobot_version() == "unknown"
+
+    def test_an_unresolvable_distribution_is_already_an_import_error(self):
+        """The single handler rests on a stdlib hierarchy, so assert it.
+
+        ``version`` raises ``PackageNotFoundError`` and the one-name handler
+        catches it as an ``ImportError``. Were a future CPython to stop deriving
+        it from ``ModuleNotFoundError``, that handler would silently stop
+        catching it, so the premise is pinned here rather than left to prose.
+        """
+        import importlib.metadata as md
+
+        assert issubclass(md.PackageNotFoundError, ImportError)

@@ -36,7 +36,13 @@ Usage::
 
 from typing import TYPE_CHECKING
 
-from strands_robots.policies.base import ChunkedPolicy, Policy, resolve_chunk_length
+from strands_robots.policies.base import (
+    ChunkedPolicy,
+    Policy,
+    align_action_values,
+    chunk_count_error,
+    resolve_chunk_length,
+)
 
 # Cosmos3Policy is import-safe: it depends only on numpy. The WebSocket
 # client uses a self-contained msgpack+websockets transport (no
@@ -47,6 +53,7 @@ from strands_robots.policies.factory import (
     UntrustedRemoteCodeError,
     create_policy,
     list_providers,
+    policy_mapping_error,
     preflight_policy,
     register_policy,
 )
@@ -62,11 +69,14 @@ __all__ = [
     "Policy",
     "ChunkedPolicy",
     "resolve_chunk_length",
+    "align_action_values",
+    "chunk_count_error",
     "MockPolicy",
     "Cosmos3Policy",
     "CompositePolicy",
     "create_policy",
     "preflight_policy",
+    "policy_mapping_error",
     "register_policy",
     "list_providers",
     "list_policy_types",

@@ -106,14 +106,15 @@ sim.step(100)   # publishes /so101/joint_states + camera image_raw on the ROS 2 
 
 - **Sim-first, safe by default.** `Robot("so100")` spins up a MuJoCo world. You
   never accidentally drive real servos - `mode="real"` is an explicit opt-in.
-- **50+ robots, 8 categories.** Arms, humanoids, quadrupeds, hands, drones,
+- **70+ robots, 8 categories.** Arms, humanoids, quadrupeds, hands, drones,
   bimanual rigs - resolved from a single registry with auto-download of assets.
 - **Any policy.** VLA models (NVIDIA GR00T, LeRobot ACT/Pi0/SmolVLA/Diffusion),
   plus classical motion planners, MPC, and scripted controllers behind one ABC.
 - **Mesh networking built in.** Every robot is a Zenoh peer. `tell()` another
   robot what to do; broadcast an E-STOP; bridge to AWS IoT Core for fleets.
-- **65-action simulation tool.** World building, physics, rendering, domain
-  randomization, and LeRobotDataset recording - all agent-callable.
+- **67-action simulation tool.** World building, physics, rendering, domain
+  randomization, procedural terrain (`create_world(terrain="rough"|"stairs"|"pyramid"|"slope")`
+  for locomotion), and LeRobotDataset recording - all agent-callable.
 - **ROS 2 interop.** Observe + command any ROS 2 graph (`use_ros`), act as a
   robot with no rclpy (`use_rtps`), or expose a running sim as a ROS node.
 - **One mental model.** Sim and hardware share the same policy interface,
@@ -158,10 +159,12 @@ extras you need:
 
 | Extra | Installs | Use for |
 |-------|----------|---------|
-| `sim-mujoco` | MuJoCo, robot_descriptions, imageio | Simulation (recommended starting point) |
+| `sim-mujoco` | MuJoCo, robot_descriptions, imageio, mink + qpsolvers[daqp] | Simulation (recommended starting point). mink/qpsolvers are the differential-IK solver behind the `move_to` Cartesian transport primitive; `qpsolvers` ships no solver of its own, so the `[daqp]` backend extra is declared with it. |
 | `sim-newton` | Newton, Warp, MuJoCo-Warp, trimesh | GPU-native simulation (NVIDIA GPU; batched envs, headless ray-traced render) |
+| `sim-isaac` | usd-core, imageio (Isaac Sim installed separately) | NVIDIA Isaac Sim backend - photorealistic RTX rendering, synthetic data, GPU-batched sensors, USD-native scenes. Install Isaac Sim itself separately: via its pip wheels on Python 3.12 (`isaacsim[all,extscache]` from pypi.nvidia.com - see the caveats in [`docs/simulation/isaac.md`](docs/simulation/isaac.md)), the Omniverse Launcher, Isaac Lab, or the NGC docker image. This extra pulls only the pip-installable Python helpers. (NVIDIA RTX GPU; GPU-only, not in `[all]`.) |
+| `sim-gs` | gsplat, plyfile, torch | 3D Gaussian Splatting hybrid rendering (`strands_robots.rendering`): composite any sim backend's robot over a captured photoreal 3DGS scene. `gsplat` ships as a source dist that JIT-compiles CUDA kernels via `nvcc` on first use - probe with `strands_robots.rendering.gsplat_rasterizer_available()`; the zero-GPU `PanoramaBackground` works without this extra. (CUDA GPU; GPU-only, not in `[all]`.) |
 | `lerobot` | LeRobot | Real hardware, local VLA inference, dataset recording |
-| `molmoact2` | LeRobot + transformers, peft, scipy | MolmoAct2 transformers-native VLA (needs lerobot from source until PyPI >= 0.5.2) |
+| `molmoact2` | LeRobot + transformers, peft, scipy | MolmoAct2 transformers-native VLA (resolves from PyPI via lerobot >= 0.6) |
 | `groot-service` | pyzmq, msgpack | NVIDIA GR00T inference client |
 | `cosmos3-service` | websockets, msgpack | NVIDIA Cosmos 3 policy-server client |
 | `curobo` | _(empty; install cuRobo from source)_ | In-process collision-aware motion planning (CUDA GPU) |
@@ -171,7 +174,7 @@ extras you need:
 | `mesh-iot` | awsiotsdk, awscrt, boto3 | AWS IoT Core mesh transport for fleets |
 | `device-connect` | device-connect-edge, device-connect-agent-tools | Device-aware networking - discovery, RPC, events, safety (falls back to the built-in mesh if absent) |
 | `benchmark-libero` | libero | LIBERO benchmark evaluation |
-| `all` | everything above | Kitchen sink |
+| `all` | everything above except the GPU-only `sim-isaac` / `sim-gs` extras | Kitchen sink |
 
 ```bash
 # Most users start here:
@@ -180,13 +183,25 @@ uv pip install "strands-robots[sim-mujoco]"
 # Real hardware + local policies:
 uv pip install "strands-robots[sim-mujoco,lerobot]"
 
-# MolmoAct2 VLA (lerobot from source until a PyPI >= 0.5.2 ships PR #3604):
-uv pip install "strands-robots[molmoact2]" \
-    "lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git"
+# MolmoAct2 VLA (transformers-native; resolves from PyPI via lerobot >= 0.6):
+uv pip install "strands-robots[molmoact2]"
 
 # Everything:
 uv pip install "strands-robots[all]"
 ```
+
+The **Isaac Sim** GPU backend is a built-in, in-tree peer of `mujoco` and
+`newton` (it lives at `strands_robots.simulation.isaac`). Its pip-installable
+helpers ship in the `sim-isaac` extra, but the Isaac Sim runtime itself (~30 GB)
+is provisioned separately - via its own pip wheels on Python 3.12
+(`pip install 'isaacsim[all,extscache]==6.0.*' --extra-index-url https://pypi.nvidia.com`,
+with coverage/EULA caveats documented in
+[`docs/simulation/isaac.md`](docs/simulation/isaac.md)), the Omniverse
+Launcher, Isaac Lab, or the NGC docker image. Install the helpers with
+`pip install 'strands-robots[sim-isaac]'`, then select the backend with
+`create_simulation("isaac")` - see
+[Simulation (MuJoCo)](#simulation-mujoco) and
+[`docs/simulation/isaac.md`](docs/simulation/isaac.md).
 
 From source:
 
@@ -209,7 +224,7 @@ agent = Agent(tools=[robot])
 agent("Wave the arm using the mock policy for 200 steps, then render a top-down view")
 ```
 
-`Robot("so100")` returns a `Simulation` instance - the full 65-action
+`Robot("so100")` returns a `Simulation` instance - the full 67-action
 simulation AgentTool. Drive it in natural language through an `Agent`, call its
 methods directly (`robot.render(camera_name="topdown")`), or dispatch an action
 by calling it (`robot(action="render", camera_name="topdown")`). See
@@ -324,7 +339,9 @@ for frame in reader:
 
 `stream_dataset()` is the in-process read counterpart to
 `start_recording`/`stop_recording`. For full training, the upstream trainer uses
-the same engine — `python -m lerobot.scripts.train dataset.repo_id=... dataset.streaming=true`.
+the same engine — `lerobot-train --policy.type=act --dataset.repo_id=... --dataset.streaming=true --num_workers=4`
+(the `lerobot-train` entry point wraps `python -m lerobot.scripts.lerobot_train`;
+flags are draccus `--dotted.key=value` form).
 
 **Verify episode integrity.** A recording's ground truth is the parquet under
 `meta/episodes/`, not the count a model narrates while collecting. Collect
@@ -353,11 +370,31 @@ Phase 1/2 collection target that avoids git-LFS history bloat) with one kwarg:
 sim.stop_recording(bucket="your-org/robot-fave")   # → hf://buckets/your-org/robot-fave/demo
 ```
 
-Requires the `hf` CLI (`pip install -U huggingface_hub` + `hf auth login`).
+Requires the `hf` CLI with the `buckets`/`sync` subcommands
+(`pip install -U "huggingface_hub>=1.0"` + `hf auth login` — 0.x releases of
+`huggingface_hub` ship an `hf` entry point without them).
+
+Any on-disk dataset directory can be synced (or daily re-synced) without a live
+recording session — one recorded earlier in the process, or on hardware via
+`lerobot-record`:
+
+```python
+from strands_robots import sync_dataset_to_bucket
+
+sync_dataset_to_bucket("/tmp/demo", "your-org/robot-fave")
+# → {"status": "success", "bucket_uri": "hf://buckets/your-org/robot-fave/demo"}
+```
+
+`run_id` defaults to the directory name; pass `run_id="nightly"` to choose the
+bucket subpath, and `delete=True` for mirror semantics.
 
 **Proprio-only / no video** (e.g. edge devices without a torchcodec wheel):
-`sim.stream_dataset(repo_id, drop_videos=True)` streams state/action only and
-never touches the video decoder.
+`sim.stream_dataset(repo_id, drop_videos=True, delta_timestamps={...})` streams
+state/action only and never touches the video decoder. `drop_videos=True`
+requires a `delta_timestamps` with at least one non-video key (e.g.
+`{"observation.state": [0.0], "action": [0.0]}`) - without one, every feature
+including video would stream, so the call raises `ValueError` instead of
+silently no-opping.
 
 > **macOS note (zero-touch).** torchcodec links ffmpeg via `@rpath`, and
 > Homebrew's ffmpeg (`/opt/homebrew/lib`) is not on the default dyld search
@@ -388,7 +425,7 @@ Robot("my_arm", urdf_path="arm.xml") # bring your own MJCF/URDF
 |-----------|------|---------|-------------|
 | `name` | `str` | required | Robot name or alias (see [Supported robots](#supported-robots)) |
 | `mode` | `str` | `"sim"` | `"sim"`, `"real"`, or `"auto"` (case-insensitive) |
-| `backend` | `str` | `"mujoco"` | Sim backend (Isaac/Newton on the roadmap) |
+| `backend` | `str` | `"mujoco"` | Sim backend: `"mujoco"`, `"newton"`, or `"isaac"` (all built-in; `isaac` needs the `sim-isaac` extra) |
 | `urdf_path` | `str` | `None` | Explicit MJCF/URDF path (skips registry lookup) |
 | `cameras` | `dict` | `None` | Camera config (**`mode="real"` only**) |
 | `position` | `list[float]` | `[0,0,0]` | Spawn position in the sim world |
@@ -405,7 +442,7 @@ Safety/validation rules:
 
 ## Supported robots
 
-50+ robots across 8 categories, resolved from
+70+ robots across 8 categories, resolved from
 [`registry/robots.json`](strands_robots/registry/robots.json). Assets
 (MJCF + meshes) auto-download from
 [robot_descriptions](https://github.com/robot-descriptions/robot_descriptions.py)
@@ -481,6 +518,7 @@ AgentTool returning `{"status", "content"}`.
 | `lerobot_calibrate` | List, view, back up, restore LeRobot calibrations |
 | `lerobot_teleoperate` | Record demonstrations, replay episodes |
 | `pose_tool` | Store, recall, and execute named robot poses |
+| `harness_memory` | Persist task solution traces + global success rules / failure models across agent sessions (Harness-VLA-style memory) |
 | `serial_tool` | Low-level Feetech servo / raw serial communication |
 | `download_assets` | Pre-fetch robot MJCF + meshes into the asset cache |
 
@@ -493,7 +531,7 @@ AgentTool returning `{"status", "content"}`.
 | `start` | `instruction`, `policy_port`, `duration` | Non-blocking async start |
 | `status` | - | Current task status |
 | `stop` | - | Interrupt running task (emergency stop) |
-In sim mode the same tool exposes the 65 Simulation actions - see Simulation (MuJoCo).
+In sim mode the same tool exposes the 67 Simulation actions - see Simulation (MuJoCo).
 </details>
 
 <details>
@@ -556,6 +594,8 @@ create_policy("lerobot/act_aloha_sim_transfer_cube")   # local HF inference
 | `groot` | NVIDIA GR00T N1.5/N1.6/N1.7 | Service mode (ZMQ to a Docker container) or local in-process (`model_path=`) |
 | `cosmos3` | NVIDIA Cosmos 3 omnimodal VLA | Service mode (WebSocket to a Cosmos Framework RoboLab policy server); embodiments: `droid`, `umi`, `av`, `bridge` |
 | `lerobot_local` | HuggingFace | Direct ACT / Pi0 / SmolVLA / Diffusion inference, no server |
+| `lerobot_async` | HuggingFace via gRPC | Offload a LeRobot policy to a remote `PolicyServer` over lerobot's native async-inference gRPC transport (edge/light robot host) |
+| `remote` | any policy, over WebSocket | Drop-in client that forwards observations to a remote `PolicyServer` and returns its action chunk: `create_policy("remote", endpoint="ws://gpu-box:8765")` (or the smart string `create_policy("ws://gpu-box:8765")`). For a light robot host with a GPU box elsewhere; mirrors the server policy's RTC support |
 | `vera` | MIT VERA (DFoT/WAN planner + Jacobian IDM) | Two-stage video-to-action over a WebSocket GPU server (Docker); PushT + MimicGen, IK for eef-delta arms. **Git-only** (not on PyPI, no extra): `pip install 'vera @ git+https://github.com/sizhe-li/VERA.git'` plus `websockets msgpack numpy` |
 
 ```mermaid
@@ -677,7 +717,7 @@ policy = create_policy(
 arm, so use the `franka` (or `panda`) sim asset:
 
 ```bash
-MUJOCO_GL=egl python examples/cosmos3_sim_rollout.py --record /tmp/c3.mp4
+MUJOCO_GL=egl python examples/vla/cosmos3_sim_rollout.py --record /tmp/c3.mp4
 ```
 
 Embodiments: `droid` (10D, chunk 32, 15 fps), `umi`, `av`, `bridge`. If the
@@ -816,7 +856,7 @@ torch-free until an RL provider is resolved on first use.
 ## Simulation (MuJoCo)
 
 `Robot("so100")` (sim mode) returns a `Simulation` - a MuJoCo-backed AgentTool
-exposing **65 actions** for world composition, physics, rendering, policy
+exposing **67 actions** for world composition, physics, rendering, policy
 execution, and dataset recording. Build it directly when you want full control:
 
 ```python
@@ -850,7 +890,7 @@ frame = sim.render(camera_name="topdown")   # {status, content:[text, image]}
   `list_urdfs`, `register_urdf`, `get_features`.
 - **Objects**: `add_object`, `remove_object`, `move_object`, `list_objects`.
 - **Cameras & rendering**: `add_camera`, `remove_camera`, `render`,
-  `render_depth`, `render_all`, `start_cameras_recording`,
+  `render_depth`, `render_all`, `get_world_point`, `start_cameras_recording`,
   `stop_cameras_recording`, `get_cameras_recording_status`.
 - **Physics**: `step`, `set_timestep`, `set_gravity`, `apply_force`, `raycast`,
   `multi_raycast`, `get_contacts`, `get_contact_forces`, `get_body_state`,
@@ -898,24 +938,24 @@ requires parameter Y."*, and vectors/dtypes are validated before MuJoCo sees
 them - so the agent learns the contract without crashing the process.
 
 **Third-party backends.** `create_simulation(name)` discovers backends beyond
-the built-in `mujoco`/`newton` registry via Python
+the built-in `mujoco`/`newton`/`isaac` registry via Python
 [entry points](https://packaging.python.org/en/latest/specifications/entry-points/).
-A sibling package - e.g. [`strands-robots-sim`](https://github.com/strands-labs/robots-sim),
-which ships the heavy Isaac Sim and Newton backends out-of-tree - registers its
-`SimEngine` subclasses under the `strands_robots.backends` group in its
-`pyproject.toml`, and they become available on `pip install` without patching
-this package:
+A sibling package registers its `SimEngine` subclasses under the
+`strands_robots.backends` group in its `pyproject.toml`, and they become
+available on `pip install` without patching this package:
 
 ```toml
 [project.entry-points."strands_robots.backends"]
-isaac = "strands_robots_sim.isaac.simulation:IsaacSimulation"
-newton = "strands_robots_sim.newton.simulation:NewtonSimulation"
-warp = "strands_robots_sim.newton.simulation:NewtonSimulation"
+my_engine = "my_pkg.backend:MyEngine"
 ```
 
 Built-in backends always take precedence over plugins of the same name, plugin
 discovery is lazy (it never slows cold import), and `list_backends()` returns
-the merged builtin + plugin set.
+the merged builtin + plugin set. Requesting a known-but-uninstalled plugin
+backend (e.g. `create_simulation("isaac")` without the plugin) raises a
+`ValueError` carrying the exact install hint. See
+[`docs/simulation/isaac.md`](docs/simulation/isaac.md) for the Isaac Sim
+backend's install, usage, config, and `STRANDS_ISAAC_*` env vars.
 
 ## Mesh networking
 
@@ -1024,6 +1064,7 @@ touches ROS 2.
 |----------|-------------|---------|
 | `STRANDS_ROBOT_MODE` | `Robot()` factory mode: `sim` / `real` / `auto` | `sim` |
 | `STRANDS_ASSETS_DIR` | Robot model asset cache directory | `~/.strands_robots/assets/` |
+| `STRANDS_MEMORY_DIR` | Harness memory store (`harness_memory` tool: task solution traces + global success rules / failure models) | `~/.strands_robots/memory/` |
 | `STRANDS_ROBOTS_RENDER_ROOT` | Sandbox directory that `Simulation.render(output_path=...)` may write into | `~/.strands_robots/renders/` |
 | `STRANDS_ROBOTS_RENDER_ALLOW_ABS` | Set `1` to allow `render(output_path=...)` to write absolute paths outside the render sandbox | unset |
 | `STRANDS_ROBOTS_RENDER_MAX_BYTES` | Max PNG size `render(output_path=...)` will persist | `52428800` (50 MB) |
@@ -1032,6 +1073,9 @@ touches ROS 2.
 | `STRANDS_TRUST_REMOTE_CODE` | Set `1` to allow HF `trust_remote_code` for `lerobot_local` | unset |
 | `STRANDS_ROBOTS_NO_DYLD_SHIM` | Set `1` to disable the macOS auto-fix that puts Homebrew ffmpeg on the dyld path for torchcodec video streaming (see [Recording & streaming datasets](#recording--streaming-datasets)) | unset |
 | `MUJOCO_GL` | MuJoCo GL backend (`egl`, `osmesa`, `glfw`) | auto |
+| `STRANDS_ISAAC_HEADLESS` | Isaac Sim backend: run without a GUI (`true`/`1`/`yes` = headless). Overrides `IsaacConfig(headless=...)` | unset (config default `true`) |
+| `STRANDS_ISAAC_RTX_PATHTRACING` | Isaac Sim backend: set `true`/`1`/`yes` to enable RTX path-tracing (photorealistic, slow) instead of the default render mode | unset |
+| `STRANDS_ISAAC_NUCLEUS_URL` | Isaac Sim backend: override the Omniverse Nucleus asset-server URL | unset (Isaac default) |
 | `GROOT_API_TOKEN` | API token for the GR00T inference service | unset |
 | `STRANDS_MESH` | Set `false` to disable Zenoh mesh globally | `true` |
 | `STRANDS_MESH_LOCAL_DEV` | Set `1` for a one-var localhost preset (auth `none`, no second factor needed) | unset |
@@ -1050,13 +1094,16 @@ touches ROS 2.
 | `STRANDS_MESH_CA_PINS` | Additional SHA-256 CA pins (comma-separated 64-char hex) | unset |
 | `STRANDS_MESH_DISABLE_CA_PIN` | Skip CA pin check on download path (break-glass) | `false` |
 | `STRANDS_MESH_CAMERA_PRESIGN_TTL` | TTL (s) for S3 presigned camera URLs; capped at 3600 | `60` |
-| `STRANDS_MESH_ACL_FILE` | Path to a JSON5 Zenoh ACL file; unset = permissive default. See `examples/mesh_acl_example.json5` (role-scoped) and `examples/mesh_acl_strict_per_peer.json5` (per-peer). **⚠️ Required on any WAN/cloud router: mTLS gives identity, not least-privilege — without a topic-level ACL one device cert can read all fleet traffic and command any robot. See [security docs](docs/security.md#production-posture-required-off-trusted-networks).** | unset |
+| `STRANDS_MESH_ACL_FILE` | Path to a JSON5 Zenoh ACL file; unset = permissive default. See `examples/mesh/mesh_acl_example.json5` (role-scoped) and `examples/mesh/mesh_acl_strict_per_peer.json5` (per-peer). **⚠️ Required on any WAN/cloud router: mTLS gives identity, not least-privilege — without a topic-level ACL one device cert can read all fleet traffic and command any robot. See [security docs](docs/security.md#production-posture-required-off-trusted-networks).** | unset |
 | `STRANDS_MESH_POLICY_HOST_ALLOW` | Comma-separated allowlist of VLA policy-server hosts/CIDRs for inference | loopback only |
 | `STRANDS_MESH_HITL_ACTIONS` | `robot_mesh` actions needing a human-in-the-loop interrupt: `all` / `none` / subset of `emergency_stop,broadcast,tell,send,stop,subscribe,watch` | actuation default |
 | `STRANDS_MESH_SUBSCRIBE_ALLOW` | Extra Zenoh key-expr patterns the `robot_mesh` `subscribe` action may target, beyond the built-in low-impact set | shared classes only |
 | `STRANDS_MESH_OVERRIDE_CODE` | Shared secret for e-stop resume HMAC proof; unset means no remote resume possible | unset |
 | `STRANDS_MESH_INPUT_VALUE_ABS` | Absolute value clamp for teleop joint commands (radians) | `12.566` (4pi) |
-| `STRANDS_MESH_INPUT_MAX_HZ` | Per-receiver teleop apply-rate ceiling (0 = unlimited) | `100` |
+| `STRANDS_MESH_INPUT_MAX_HZ` | Per-receiver teleop apply-rate ceiling (0 = unlimited). A value no rate check can be built from -- unparsable, or non-finite like `inf`/`nan` -- falls back to the default so the ceiling stays enforced | `100` |
+| `STRANDS_MESH_INPUT_SLEW_ABS` | Per-joint speed bound for teleop commands, in frame units per second (widen for degree-valued or normalized actuators; cannot be disabled) | `25.133` (8pi) |
+| `STRANDS_MESH_POSE_HZ`, `_IMU_HZ`, `_ODOM_HZ`, `_HEALTH_HZ`, `_LIDAR_SUMMARY_HZ`, `_HAND_HZ`, `_MAP_INFO_HZ` | Per-topic sensor publish rate; `0` (or any non-positive value) switches that topic off. A value the loop cannot pace itself with keeps the built-in rate | per topic: `10`/`10`/`10`/`0.5`/`5`/`50`/`0.2` |
+| `STRANDS_MESH_CAMERA_HZ` | Camera publish rate; opt-in because frames are large. Unset, non-positive, or unusable leaves camera publishing off | `0` (off) |
 | `STRANDS_MESH_MAX_PEERS` | Peer registry cap; evicts oldest on overflow | `1024` |
 | `STRANDS_MESH_RESUME_MAX_FAILS` | Failed resume attempts before cooldown engages | `5` |
 | `STRANDS_MESH_RESUME_BACKOFF_S` | Cooldown (seconds) after exceeding resume fail threshold | `30` |
@@ -1066,6 +1113,24 @@ touches ROS 2.
 | `STRANDS_MESH_BRIDGE_TOPICS_PREFIX` | Comma-separated topic suffixes the bridge matches as a path **prefix** (so `response` matches `response/<turn-id>`). Extend this (not `STRANDS_MESH_BRIDGE_TOPICS`) when adding an RPC-shape topic with a per-turn tail | `response` |
 | `STRANDS_GR00T_IMAGE` | Container image the `gr00t_inference` tool runs (must pass the image allowlist; agent cannot choose it) | `gr00t:latest` |
 | `STRANDS_GR00T_IMAGE_ALLOW` | Extra image-name patterns (trailing `*` = tag wildcard) added to the built-in allowlist (`gr00t:*`, `nvcr.io/nvidia/isaac-gr00t:*`) | built-in only |
+| `STRANDS_GR00T_SERVER_SEED` | Default seed the GR00T determinism wrapper applies at server start and on seedless `reset` calls (used with `gr00t_inference(..., deterministic=True)`; forwarded into the container) | `42` |
+| `STRANDS_GR00T_STRICT_DETERMINISTIC` | `1` makes the determinism wrapper additionally enable `torch.use_deterministic_algorithms(True, warn_only=True)` (slower kernels, strictest reproducibility; forwarded into the container) | `0` |
+
+</details>
+
+<details>
+<summary><b>Isaac Sim backend env vars (<code>strands-robots[sim-isaac]</code>)</b></summary>
+
+These are read by the built-in, in-tree Isaac Sim backend
+(`pip install 'strands-robots[sim-isaac]'`) when it builds its
+`IsaacConfig`; an explicit `create_simulation("isaac", ...)` kwarg always wins.
+See [`docs/simulation/isaac.md`](docs/simulation/isaac.md).
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `STRANDS_ISAAC_NUCLEUS_URL` | Override the Omniverse Nucleus server URL (when `nucleus_url` is not passed) | unset (Isaac defaults) |
+| `STRANDS_ISAAC_HEADLESS` | Truthy (`1`/`true`/`yes`) forces headless; falsy forces a window | unset (uses `headless` kwarg) |
+| `STRANDS_ISAAC_RTX_PATHTRACING` | Truthy forces `render_mode="rtx_pathtracing"` | unset |
 
 </details>
 
@@ -1115,12 +1180,14 @@ strands_robots/
 │   ├── mock.py            # MockPolicy (non-VLA reference)
 │   ├── groot/             # NVIDIA GR00T (ZMQ/HTTP client + data configs)
 │   └── lerobot_local/     # Direct HuggingFace inference (RTC, processors)
-├── registry/              # robots.json (50+) + policies.json + loaders
+├── registry/              # robots.json (70+) + policies.json + loaders
 ├── simulation/
 │   ├── base.py            # SimEngine ABC
 │   ├── factory.py         # create_simulation() + backend registry
 │   ├── models.py          # SimWorld / SimRobot / SimObject / SimCamera
-│   └── mujoco/            # MuJoCo backend (65-action AgentTool)
+│   └── mujoco/            # MuJoCo backend (67-action AgentTool)
+├── rendering/             # Hybrid rendering: CameraParams, backgrounds (panorama/3DGS),
+│                          #   HybridCompositor, encode_clip / mjpeg_frames
 ├── mesh/                  # Zenoh mesh: core, sensors, input, audit, transport, iot
 ├── benchmarks/libero/     # LIBERO suite + BDDL parser + adapter
 └── tools/                 # gr00t_inference, lerobot_*, pose, serial, robot_mesh

@@ -16,6 +16,19 @@ sim.add_object(name="table", shape="box", size=[0.5, 0.5, 0.02],
 sim.add_camera(name="overhead", position=[0.0, 0.0, 1.5], target=[0.0, 0.0, 0.0])
 ```
 
+## Setup entry points
+
+`Robot("so100")` is the one-step way to get a ready-to-drive engine: it builds
+the world and adds the named robot for you. Constructing a backend directly -
+`create_simulation("mujoco")` or `Simulation()` - gives an **empty** engine; you
+then call `create_world()` and `add_robot("so100")` yourself.
+
+`robot_name` therefore belongs to `Robot(...)` and `add_robot(...)`, never to a
+backend constructor. Passing it to the constructor
+(`Simulation(robot_name="so100")`) is rejected with a `TypeError` rather than
+silently ignored, so the mistake is caught up front instead of surfacing later
+as an unrelated `No world` error.
+
 ## Strategies
 
 | Need | Approach |
@@ -24,6 +37,141 @@ sim.add_camera(name="overhead", position=[0.0, 0.0, 1.5], target=[0.0, 0.0, 0.0]
 | Replace entire world | `load_scene(scene_path=...)` |
 | Procedural scene | loop over `add_object` |
 | Raw MJCF tweak without recompile | `patch_scene_mjcf(ops)` |
+
+## Spawn pose (keyframes)
+
+By default a robot spawns at the all-zero joint configuration. Many MuJoCo
+Menagerie models ship a canonical ready pose in a MJCF `<keyframe>` (panda,
+ur5e, fr3, kuka `home`; aloha `neutral_pose`; quadrupeds/humanoids a standing
+`home`). Pass `keyframe=` to spawn in that pose instead - important when a
+policy was trained from the home pose, since the zero configuration is
+out-of-distribution:
+
+```python
+sim.add_robot(name="panda", data_config="panda", keyframe="home")  # or keyframe=0
+```
+
+The pose is applied to the robot's joints by name and is restored by `reset()`,
+so a keyframe spawn is sticky across episodes. An
+unknown keyframe name/index
+is an error that lists the model's available keyframes. `keyframe=None` (the
+default) keeps the zero-pose spawn. (MuJoCo backend; the Newton backend rejects
+`keyframe=` as not-yet-supported.)
+
+### Adding a robot does not disturb the scene it joins
+
+Only the robot being added is placed at a defined configuration - its keyframe,
+or the zero pose. Everything already in the world is left exactly as it was: an
+arm keeps the pose it is in (whether that is its keyframe pose or wherever a
+policy or `send_action` has driven it) *and* the actuator setpoints holding it
+there, objects stay where they settled or were carried to, latched `apply_force`
+wrenches persist, and the clock keeps counting.
+
+So a scene can be composed in any order, and a robot can be added mid-session
+without invalidating what has already happened in it:
+
+```python
+sim.run_policy(robot_name="panda", ...)   # arm ends up somewhere useful
+sim.add_robot(name="helper", data_config="so101", position=[0.0, -0.6, 0.0])
+# 'panda' is still where the rollout left it; 'helper' starts at its zero pose
+```
+
+To return the *whole* world to its initial state - every robot, every object and
+the clock - call `reset()`, which is what that method is for.
+
+## Declared physics options
+
+A robot MJCF may declare the solver settings its contacts and actuators were
+tuned for. `add_robot` carries them onto the scene, because MuJoCo's `<option>`
+is model-global and does not survive the spec attach:
+
+```python
+sim.create_world()
+sim.add_robot(name="panda")          # model declares integrator="implicitfast"
+sim.mj_model.opt.integrator          # -> mjINT_IMPLICITFAST
+```
+
+This matters for manipulation. Under the default Euler integrator a Panda's
+position servos diverge enough that a top-down grasp pushes the object away and
+squeezes through it; `so100`, `so101`, `aloha`, `shadow_hand` and `robotiq_2f85`
+likewise declare `cone="elliptic" impratio="10"` so their grippers can hold load.
+
+Precedence, highest first:
+
+| Source | Wins for |
+| --- | --- |
+| `create_world(timestep=, gravity=)` | `timestep`, `gravity` - always |
+| Your own scene MJCF (`replace_scene_mjcf`) | any field it sets |
+| First robot attached that declares the field | everything else |
+
+A model-global field holds one value, so if a second robot declares a different
+value for a field already set, the existing value is kept and the discarded
+request is logged with the field, both values and the robot name. Add that robot
+first, or declare the value in your own scene MJCF, to make it win.
+
+Vector environment fields (`wind`, `magnetic`, contact overrides) and the flag
+bitfields describe the world rather than the robot and are never adopted.
+
+Adoption is committed only once the robot is actually in the scene, so an
+`add_robot` that reports an error leaves the world's solver settings exactly as
+they were - and leaves the field free for the next robot that declares it.
+
+## Rough terrain
+
+By default `create_world()` lays down a flat ground plane. A locomotion
+policy is only interesting on ground it can trip on, so pass a `terrain=`
+kind to lay down a deterministic heightfield instead - a floating-base robot
+then settles onto and walks over it. Four kinds ship:
+
+- `terrain="rough"` - smoothed value-noise bumps (robustness to uneven ground).
+- `terrain="stairs"` - a flight of discrete step plateaus rising along +x
+  (foot placement + climbing).
+- `terrain="pyramid"` - concentric square step plateaus rising toward the centre
+  from every direction (an omnidirectional climb).
+- `terrain="slope"` - a constant-grade inclined ramp rising along +x
+  (a continuous uphill pitch).
+
+```python
+sim.create_world(terrain="rough")        # bumpy heightfield ground
+sim.add_robot("unitree_go2", keyframe="home")
+```
+
+The field spans the same +/-5 m footprint as the flat plane (the reachable
+workspace is unchanged), its surface ranges from 0 up to ~8 cm on a solid
+base slab (flush with `z=0` at its lowest point, so a robot never falls
+below the nominal floor), and it is regenerated identically on every
+`reset()` (deterministic given the terrain kind), so a benchmark that
+evaluates a policy on rough ground is reproducible. `terrain` only applies
+when `ground_plane=True` (the default, which is the master floor switch);
+an unknown kind is rejected with an error listing the supported kinds. It
+is the ground-generation primitive a terrain *curriculum* (progressive
+difficulty across resets) builds on. (MuJoCo backend; the Newton backend
+rejects `terrain=` as not-yet-supported.)
+
+That curriculum knob is `difficulty`, which scales the terrain's peak
+elevation (the metre height its normalized `[0, 1]` field maps to) without
+changing the terrain *kind*:
+
+```python
+sim.create_world(terrain="rough", difficulty=0.3)  # gentle bumps (early stage)
+# ... later, harder stages ...
+sim.create_world(terrain="rough", difficulty=1.0)  # full ~8 cm bumps (default)
+sim.create_world(terrain="rough", difficulty=2.0)  # exaggerated ~16 cm bumps
+```
+
+`difficulty=1.0` (the default) is the full-height terrain, byte-identical to
+omitting it; `<1` is gentler, `>1` harsher. It must be a finite value `> 0`,
+and it only applies with a `terrain` - setting `difficulty != 1.0` on a flat
+world (no `terrain`) is rejected with an error rather than silently having no
+effect. A locomotion curriculum ramps `difficulty` across resets to grow the
+terrain the policy must handle.
+
+A floating-base robot added to a terrain world (or reset in one) spawns
+SEATED on the local terrain surface: its base is raised by the heightfield
+height beneath its `(x, y)` so its feet rest on the ground, rather than at
+the flat-ground keyframe height (which would leave them buried below a raised
+heightfield). A flat ground plane and a fixed-base arm (no free joint) are
+unaffected.
 
 ## Procedural objects
 
@@ -39,6 +187,58 @@ for i in range(5):
         color=[random.random(), random.random(), random.random(), 1.0],
     )
 ```
+
+## Object size
+
+`size` is the **full extent in meters** along each local axis - not MuJoCo's
+native half-extent. It is halved when the geom is compiled, so
+`size=[0.05, 0.05, 0.05]` is a 5 cm cube.
+
+Pass every component the shape consumes; a partial vector is rejected rather
+than completed from a default, because a completed vector compiles a
+differently-sized object while `add_object` reports success:
+
+| Shape | Components consumed |
+|-------|---------------------|
+| `box` / `ellipsoid` | `[x, y, z]` - all three full edge lengths / diameters |
+| `cylinder` / `capsule` | `[diameter, unused, full height]` - three (index 1 is ignored) |
+| `sphere` | `[diameter]` - one is enough |
+| `plane` | `[x]` or `[x, y]` visual half-widths (`y` mirrors `x` when omitted) |
+| `mesh` | none - the asset's own units define the extent |
+
+At most 3 components are accepted; omit `size` entirely for the 5 cm default.
+
+```python
+sim.add_object("crate", shape="box", size=[0.5])
+# status=error: box needs 3 'size' component(s) [x, y, z] full edge lengths,
+#               got 1 (size=[0.5]). ...
+sim.add_object("crate", shape="box", size=[0.5, 0.5, 0.5])   # 50 cm crate
+```
+
+## Object mass
+
+`mass` (kg) applies to dynamic objects and must be a finite number greater than
+zero - the same domain `set_body_properties(mass=...)` enforces when it writes
+the same body. A mass outside it is rejected up front, naming the parameter,
+instead of surfacing as a recompile failure:
+
+```python
+sim.add_object("crate", shape="box", mass=0)
+# status=error: add_object: 'mass' must be a finite number > 0, got 0.0
+sim.add_object("crate", shape="box", mass=1e-16)
+# status=error: add_object: 'mass' must be >= MuJoCo's mjMINVAL (1e-15 kg) ...
+```
+
+This matters beyond the one object: a body's mass divides every force acting on
+it, and the solver keeps a single state vector, so an infinite mass turns the
+whole world's `qpos`/`qvel` to `nan` on the next step - every other body
+included. `is_static=True` needs no mass (MuJoCo derives it from the geom's
+density), so `mass` is ignored there.
+
+Whatever the reason for a rejection - mass, `size`, an unsupported `shape`, an
+unloadable mesh - the scene is rolled back to its previous compilable state and
+the object name stays reusable, so a corrected retry under the same name works
+and one bad add never bricks later scene edits.
 
 ## Mesh objects
 
@@ -93,10 +293,67 @@ sim.add_object("floor_tile", shape="box", size=[0.3, 0.3, 0.01], is_static=True,
 Specify **either** `texture` **or** `builtin`, not both. An invalid texture
 path, an unknown `builtin` name, or specifying both fails loudly with a
 `ValueError` (returned as a `status=error` dict through the agent tool) - there
-is no silent fallback to the flat-plastic default. For natural surfaces prefer
+is no silent fallback to the flat-plastic default.
+
+Only the keys in the table above are accepted. A key outside it (a typo such as
+`rgb_1`, or a field borrowed from another renderer such as `roughness`), an
+empty `material={}`, or `rgb1`/`rgb2`/`texdim` without `builtin` is rejected the
+same way - the alternative is an object that compiles with MuJoCo's glossy
+defaults while `add_object` reports success:
+
+```python
+sim.add_object("cube", material={"builtin": "checker", "rgb_1": [1, 0, 0]})
+# status=error: unknown material key(s): 'rgb_1' (did you mean 'rgb1'?).
+#               Accepted keys: builtin, reflectance, rgb1, rgb2, shininess, ...
+```
+
+For natural surfaces prefer
 an **image texture**; the `checker` builtin reads as a literal checkerboard.
 Materials are currently supported by the MuJoCo backend; the Newton backend
 rejects a non-`None` `material` rather than silently ignoring it.
+
+## Surgical MJCF edits
+
+`patch_scene_mjcf(ops)` applies a list of structured ops to the live spec and
+recompiles once, preserving joint state for untouched joints. Each op accepts
+only the keys it reads:
+
+| Op | Keys |
+|----|------|
+| `add_body` | `parent` (default `"world"`), `name` (required), `pos`, `quat` |
+| `add_geom` | `body` (required), `type` (default `"box"`), `size`, `rgba`, `name`, `pos`, `quat` |
+| `add_site` | `body` (default `"world"`), `name` (required), `pos`, `size`, `rgba` |
+| `set_body_pos` | `name` (required), `pos` |
+| `set_body_quat` | `name` (required), `quat` |
+| `delete_body` | `name` (required) |
+
+Any other key is rejected. Every field above has a fallback default (`pos` the
+origin, `quat` identity, `type` `"box"`, `parent` the worldbody), so a key the op
+does not read is not inert - it would leave that default in place while the patch
+reports success:
+
+```python
+sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "position": [0.4, 0, 0.9]}])
+# status=error: set_body_pos: unknown op key(s): 'position' (did you mean 'pos'?).
+#               Accepted keys: name, op, pos.
+```
+
+Every numeric field an op writes - `pos`, `quat`, `size`, `rgba` - must hold
+finite numbers, the same domain `add_object` / `add_camera` / `move_object` apply.
+MuJoCo bakes a `nan`/`inf` component into the model without complaint, so an
+unchecked one reports success and only surfaces later as a poisoned physics
+state:
+
+```python
+sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "pos": [float("nan"), 0, 0.3]}])
+# status=error: set_body_pos: 'pos' must contain finite numbers (no nan/inf),
+#               got [nan, 0, 0.3]
+```
+
+The batch is atomic: if any op is rejected the world is rolled back to its
+pre-patch state, so a bad key or a non-finite component never leaves a
+half-applied scene. Use
+`replace_scene_mjcf(xml)` for MJCF elements this vocabulary does not cover.
 
 ## Cameras
 
@@ -112,6 +369,12 @@ sim.add_camera(name="wrist", parent_body=mount,
 ```
 
 `list_bodies()` (no `robot_name`) lists every body in the world; with `robot_name` it scopes to that robot and also returns `gripper_body`, the best-guess end-effector mount.
+
+A mounted camera survives `remove_robot`, which rebuilds the whole scene: it is
+re-mounted on its body once every surviving robot is re-attached, keeping its
+local pose and its tracking. Removing the robot the camera is mounted ON leaves
+it with no mount point, so that camera is dropped (with a warning naming it)
+rather than blocking the removal.
 
 ## Multi-robot policies
 

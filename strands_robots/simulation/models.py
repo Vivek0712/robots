@@ -15,6 +15,7 @@ signatures reference them (e.g. ``create_world() → SimWorld``).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -52,6 +53,11 @@ class SimRobot:
     joint_names: list[str] = field(default_factory=list)
     actuator_ids: list[int] = field(default_factory=list)
     namespace: str = ""
+    # Canonical home pose applied by ``add_robot(keyframe=...)`` and re-applied
+    # on ``reset()``. Maps each (namespaced) joint name to its qpos slice. Empty
+    # for robots spawned without a keyframe (the default zero pose), so reset()
+    # stays byte-identical for those robots.
+    home_qpos: dict[str, list[float]] = field(default_factory=dict)
     policy_running: bool = False
     policy_steps: int = 0
     policy_instruction: str = ""
@@ -163,6 +169,13 @@ class SimWorld:
     timestep: float = 0.002  # 500Hz physics
     gravity: list[float] = field(default_factory=lambda: [0.0, 0.0, -9.81])
     ground_plane: bool = True
+    # Heightfield terrain kind (e.g. "rough"/"stairs"/"pyramid"); None -> flat plane. See
+    # strands_robots.simulation.terrain. Only meaningful when ground_plane=True.
+    terrain: str | None = None
+    # Curriculum difficulty scaling the terrain's peak elevation (1.0 = full
+    # height); only meaningful when terrain is set. See
+    # strands_robots.simulation.terrain.terrain_elevation.
+    terrain_difficulty: float = 1.0
     status: SimStatus = SimStatus.IDLE
     sim_time: float = 0.0
     step_count: int = 0
@@ -180,3 +193,57 @@ class SimWorld:
     # Kept as a top-level field - requested by @yinsong1986 during review to
     # avoid monkey-patching when ``reset()`` creates a fresh ``SimWorld``.
     _checkpoints: dict[str, Any] = field(default_factory=dict)
+    # Monotonically-incremented generation counter bumped whenever ``_model`` is
+    # swapped, by the one function that installs it
+    # (``scene_ops.install_compiled_model``). Checkpoints stamp this value so
+    # load_state can detect a swap that the nq/nv/na/nu counts alone cannot
+    # distinguish - a same-shape recompile (remove one free-jointed object, add
+    # another), or a whole scene replaced by one with the same counts.
+    _recompile_generation: int = 0
+
+
+def registered(registry: Mapping[str, object], name: object) -> bool:
+    """Whether ``name`` is an entity registered in ``registry``.
+
+    A simulation entity is addressed by a ``str`` name, and the registries that
+    hold entities are keyed by one - the :class:`SimWorld` ``robots``,
+    ``objects`` and ``cameras`` maps, and the engine's own per-robot maps such
+    as its policy threads. A name of any other type cannot be one of their
+    keys, so the honest answer is that no such entity exists.
+
+    A bare ``name in registry`` cannot say that: the membership test itself
+    raises ``TypeError: unhashable type`` for a name that is not hashable (a
+    list, a dict, a set), so the unknown-entity error path the test guards is
+    never reached and the exception escapes the agent-tool dict that the
+    surrounding method documents as its only failure channel. This test is
+    total instead: every name resolves to a verdict, and a name that cannot be
+    a key resolves to ``False``, which lets the caller report it with the
+    message it already has.
+
+    Args:
+        registry: A name-keyed registry of simulation entities.
+        name: A caller-supplied entity name, of any type.
+
+    Returns:
+        ``True`` only when ``name`` is a string that keys ``registry``.
+    """
+    return isinstance(name, str) and name in registry
+
+
+def registry_entry[V](registry: Mapping[str, V], name: object) -> V | None:
+    """The entry ``name`` refers to in ``registry``, or ``None`` if there is none.
+
+    The fetching counterpart to :func:`registered`, for the lookups that need
+    the entry rather than only its existence, and total for the same reason:
+    ``registry.get(name)`` raises ``TypeError`` for an unhashable name, so the
+    absent case cannot be reported by the code that handles it.
+
+    Args:
+        registry: A name-keyed registry of simulation entities.
+        name: A caller-supplied entity name, of any type.
+
+    Returns:
+        The registered entry, or ``None`` when ``name`` is not a string or
+        names nothing in ``registry``.
+    """
+    return registry.get(name) if isinstance(name, str) else None

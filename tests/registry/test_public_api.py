@@ -6,6 +6,7 @@ from strands_robots.registry import get_policy_provider, list_policy_providers, 
 from strands_robots.registry.loader import _load, _validate, reload
 from strands_robots.registry.policies import build_policy_kwargs, import_policy_class
 from strands_robots.registry.robots import (
+    LIST_ROBOTS_MODES,
     format_robot_table,
     get_hardware_type,
     get_robot,
@@ -95,6 +96,45 @@ class TestLoader:
         }
         with pytest.raises(ValueError, match="Duplicate URL pattern"):
             _validate("policies", bad_data)
+
+    def test_validate_policy_alias_collides_with_canonical_name_raises(self):
+        """An alias matching a different provider's canonical name should raise.
+
+        get_policy_provider resolves through the alias map before the canonical
+        name, so an alias equal to another provider's name silently shadows it.
+        """
+        bad_data = {
+            "providers": {
+                "prov_a": {"aliases": ["prov_b"], "shorthands": [], "url_patterns": []},
+                "prov_b": {"aliases": [], "shorthands": [], "url_patterns": []},
+            }
+        }
+        with pytest.raises(ValueError, match="collides with a canonical provider name"):
+            _validate("policies", bad_data)
+
+    def test_validate_policy_shorthand_collides_with_canonical_name_raises(self):
+        """A shorthand matching a different provider's canonical name should raise."""
+        bad_data = {
+            "providers": {
+                "prov_a": {"aliases": [], "shorthands": ["prov_b"], "url_patterns": []},
+                "prov_b": {"aliases": [], "shorthands": [], "url_patterns": []},
+            }
+        }
+        with pytest.raises(ValueError, match="collides with a canonical provider name"):
+            _validate("policies", bad_data)
+
+    def test_validate_policy_self_shorthand_allowed(self):
+        """A provider naming itself in its shorthands is idiomatic and must pass.
+
+        Every real provider lists its canonical name as a shorthand so the bare
+        name resolves; the canonical-collision guard must not reject that.
+        """
+        clean_data = {
+            "providers": {
+                "prov_a": {"aliases": [], "shorthands": ["prov_a"], "url_patterns": []},
+            }
+        }
+        _validate("policies", clean_data)
 
     def test_validate_clean_data_passes(self):
         """Well-formed data should pass validation without error."""
@@ -394,6 +434,28 @@ class TestRobotRegistry:
         assert "lekiwi" in names  # sim + real
         assert "reachy2" not in names
         assert "ur5e" not in names
+
+    def test_list_robots_unknown_mode_raises(self):
+        # A plausible-but-unsupported filter (hardware-capable robots) must not
+        # silently return the full, unfiltered list - that would mislead a
+        # caller into thinking every robot is hardware-backed. It raises instead.
+        with pytest.raises(ValueError, match="Unknown list_robots mode 'hardware'"):
+            list_robots("hardware")
+
+    def test_list_robots_typo_mode_raises_and_lists_valid_modes(self):
+        # A typo is rejected loudly, and the message enumerates the valid modes
+        # so the caller can self-correct without reading the source.
+        with pytest.raises(ValueError) as excinfo:
+            list_robots("sims")
+        msg = str(excinfo.value)
+        for valid in ("all", "sim", "real", "both"):
+            assert valid in msg
+
+    def test_list_robots_all_documented_modes_accepted(self):
+        # Every value advertised in LIST_ROBOTS_MODES must be accepted without
+        # raising, guarding the constant and the validation set against drift.
+        for mode in LIST_ROBOTS_MODES:
+            assert isinstance(list_robots(mode), list)
 
     def test_list_robots_by_category(self):
         by_cat = list_robots_by_category()

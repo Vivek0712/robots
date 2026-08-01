@@ -7,13 +7,14 @@ proprio-only ``drop_videos`` path, delta-grid validation, and the bucket-sync
 CLI construction + meta/ guard.
 """
 
+import logging
 import os
 import subprocess
 
 import pytest
 
+import strands_robots.dataset_recorder as dr
 import strands_robots.streaming_dataset as sd
-from strands_robots.dataset_recorder import DatasetRecorder
 
 
 class _FakeStreaming:
@@ -63,6 +64,111 @@ def test_open_drops_unknown_kwargs(monkeypatch):
     assert r.dataset.repo_id == "org/ds"
 
 
+def test_repo_type_forwarded_when_supported(monkeypatch):
+    """repo_type reaches a StreamingLeRobotDataset that declares the parameter."""
+
+    class _WithRepoType:
+        def __init__(self, repo_id, repo_type="dataset", **kw):
+            self.repo_id = repo_id
+            self.repo_type = repo_type
+            self.num_frames = self.num_episodes = self.fps = 0
+
+        def __iter__(self):
+            yield {}
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _WithRepoType, raising=False)
+    r = sd.StreamingDatasetReader.open("org/ds", repo_type="bucket", validate_deltas=False)
+    assert r.dataset.repo_type == "bucket"
+
+
+def test_repo_type_bucket_raises_when_unsupported(monkeypatch):
+    """repo_type='bucket' on a constructor without the parameter must raise,
+    never silently open the versioned dataset namespace instead (a different
+    storage system - the forbidden silent-kwarg-drop class)."""
+
+    class _Narrow:
+        def __init__(self, repo_id):
+            raise AssertionError("constructor must never be reached")
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _Narrow, raising=False)
+    with pytest.raises(RuntimeError, match=r"repo_type='bucket' is not supported by any released lerobot"):
+        sd.StreamingDatasetReader.open("org/ds", repo_type="bucket", validate_deltas=False)
+
+
+def test_bucket_guard_message_survives_unresolvable_lerobot_version(monkeypatch):
+    """The repo_type='bucket' fail-fast must surface as the actionable
+    RuntimeError even when lerobot's version metadata is unresolvable: the
+    version lookup that enriches the message must not raise a secondary
+    PackageNotFoundError that masks the primary, upgrade-actionable error."""
+    import importlib.metadata as md
+
+    class _Narrow:
+        def __init__(self, repo_id):
+            raise AssertionError("constructor must never be reached")
+
+    def _raise(_name):
+        raise md.PackageNotFoundError("lerobot")
+
+    monkeypatch.setattr(md, "version", _raise)
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _Narrow, raising=False)
+    with pytest.raises(RuntimeError, match=r"installed: unknown") as exc:
+        sd.StreamingDatasetReader.open("org/ds", repo_type="bucket", validate_deltas=False)
+    assert "repo_type='bucket' is not supported by any released lerobot" in str(exc.value)
+
+
+def test_repo_type_bucket_forwarded_via_var_kwargs(monkeypatch):
+    """A constructor with **kwargs accepts repo_type; the guard must not fire."""
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreaming, raising=False)
+    r = sd.StreamingDatasetReader.open("org/ds", repo_type="bucket", validate_deltas=False)
+    assert r.dataset.kw["repo_type"] == "bucket"
+
+
+def test_repo_type_dataset_default_ok_when_unsupported(monkeypatch):
+    """The 'dataset' default is semantics-preserving on an old lerobot: it is
+    skipped by tolerant forwarding and open() succeeds without error."""
+
+    class _Narrow:
+        def __init__(self, repo_id):
+            self.repo_id = repo_id
+            self.num_frames = self.num_episodes = self.fps = 0
+
+        def __iter__(self):
+            yield {}
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _Narrow, raising=False)
+    r = sd.StreamingDatasetReader.open("org/ds", repo_type="dataset", validate_deltas=False)
+    assert r.dataset.repo_id == "org/ds"
+
+
+def test_return_uint8_drop_warns_when_unsupported(monkeypatch, caplog):
+    """return_uint8=True on a lerobot whose StreamingLeRobotDataset lacks the
+    parameter is dropped (semantics unchanged) but streams float32 - ~4x the
+    bandwidth of uint8. That cost must be surfaced as a warning, not silent."""
+
+    class _Narrow:
+        def __init__(self, repo_id):
+            self.repo_id = repo_id
+            self.num_frames = self.num_episodes = self.fps = 0
+
+        def __iter__(self):
+            yield {}
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _Narrow, raising=False)
+    with caplog.at_level(logging.WARNING, logger=sd.logger.name):
+        sd.StreamingDatasetReader.open("org/ds", return_uint8=True, validate_deltas=False)
+    assert any("return_uint8=True dropped" in r.message for r in caplog.records)
+
+
+def test_return_uint8_no_warn_when_supported(monkeypatch, caplog):
+    """No bandwidth warning when the constructor accepts return_uint8 (**kwargs
+    here): the kwarg is forwarded and honored, so nothing is dropped."""
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreaming, raising=False)
+    with caplog.at_level(logging.WARNING, logger=sd.logger.name):
+        r = sd.StreamingDatasetReader.open("org/ds", return_uint8=True, validate_deltas=False)
+    assert r.dataset.kw["return_uint8"] is True
+    assert not any("return_uint8=True dropped" in rec.message for rec in caplog.records)
+
+
 def test_drop_videos_strips_camera_deltas(monkeypatch):
     monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreaming, raising=False)
     r = sd.StreamingDatasetReader.open(
@@ -80,16 +186,25 @@ def test_drop_videos_strips_camera_deltas(monkeypatch):
     assert "observation.state" in dt and "action" in dt
 
 
-def test_drop_videos_all_camera_keys_yields_none(monkeypatch):
+def test_drop_videos_all_camera_keys_raises(monkeypatch):
+    """If stripping camera keys leaves NO deltas, drop_videos would be a silent
+    no-op (every feature, videos included, would stream) - it must raise."""
     monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreaming, raising=False)
-    r = sd.StreamingDatasetReader.open(
-        "org/ds",
-        delta_timestamps={"observation.images.front": [-0.1, 0.0]},
-        drop_videos=True,
-        validate_deltas=False,
-    )
-    # All keys were camera keys → delta_timestamps drops out entirely.
-    assert "delta_timestamps" not in r.dataset.kw
+    with pytest.raises(ValueError, match="drop_videos=True requires delta_timestamps"):
+        sd.StreamingDatasetReader.open(
+            "org/ds",
+            delta_timestamps={"observation.images.front": [-0.1, 0.0]},
+            drop_videos=True,
+            validate_deltas=False,
+        )
+
+
+def test_drop_videos_without_deltas_raises(monkeypatch):
+    """drop_videos=True with no delta_timestamps at all previously did nothing
+    (video decode still ran); the documented behavior is now to raise."""
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreaming, raising=False)
+    with pytest.raises(ValueError, match="drop_videos=True requires delta_timestamps"):
+        sd.StreamingDatasetReader.open("org/ds", drop_videos=True, validate_deltas=False)
 
 
 def test_dataloader_ignores_shuffle(monkeypatch):
@@ -127,7 +242,7 @@ class _FakeDataset:
 
 
 def _recorder(tmp_path):
-    rec = DatasetRecorder(dataset=_FakeDataset(str(tmp_path)))
+    rec = dr.DatasetRecorder(dataset=_FakeDataset(str(tmp_path)))
     rec.episode_count = 3
     rec.frame_count = 300
     return rec
@@ -137,9 +252,7 @@ def test_sync_to_bucket_builds_cli(tmp_path, monkeypatch):
     (tmp_path / "meta").mkdir()  # satisfy the meta/ guard
     rec = _recorder(tmp_path)
 
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -164,9 +277,7 @@ def test_sync_to_bucket_builds_cli(tmp_path, monkeypatch):
 
 def test_sync_to_bucket_requires_meta(tmp_path, monkeypatch):
     rec = _recorder(tmp_path)  # NO meta/ dir
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
     res = rec.sync_to_bucket("my-org/robot-fave")
     assert res["status"] == "error"
     assert "meta/" in res["message"]
@@ -175,9 +286,7 @@ def test_sync_to_bucket_requires_meta(tmp_path, monkeypatch):
 def test_sync_to_bucket_missing_hf_cli(tmp_path, monkeypatch):
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: None)
+    monkeypatch.setattr(dr, "_hf_executable", lambda: None)
     res = rec.sync_to_bucket("my-org/robot-fave")
     assert res["status"] == "error"
     assert "hf` CLI" in res["message"] or "hf CLI" in res["message"]
@@ -188,9 +297,7 @@ def _guard_recorder(tmp_path, monkeypatch):
     subprocess call would be a security regression (the fake raises)."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
 
     def boom(*a, **k):  # subprocess must never run with a rejected target
         raise AssertionError(f"subprocess.run reached with {a!r}")
@@ -245,9 +352,7 @@ def test_sync_to_bucket_bucket_create_failure_surfaces_error(tmp_path, monkeypat
     never fall through to ``hf sync`` (a silent success would upload nowhere)."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -276,9 +381,7 @@ def test_sync_to_bucket_existing_bucket_proceeds_to_sync(tmp_path, monkeypatch):
     exists is idempotent: sync proceeds and the call succeeds."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -306,9 +409,7 @@ def test_sync_to_bucket_sync_failure_surfaces_stderr(tmp_path, monkeypatch):
     not a false success."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
 
     def fake_run(cmd, capture_output=True, text=True):
         is_create = cmd[:3] == ["hf", "buckets", "create"]
@@ -332,9 +433,7 @@ def test_sync_to_bucket_delete_flag_forwarded(tmp_path, monkeypatch):
     mirrored (removed-locally files are pruned remotely)."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    import shutil
-
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/hf")
+    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -357,6 +456,24 @@ def test_sync_to_bucket_delete_flag_forwarded(tmp_path, monkeypatch):
 
 
 # ── stream_dataset facade ──────────────────────────────────────────────────
+
+
+def test_module_level_stream_dataset_delegates(monkeypatch):
+    """stream_dataset(...) is a thin alias for StreamingDatasetReader.open -
+    dataset read-back must not require constructing a simulator."""
+    captured = {}
+
+    def fake_open(repo_id, **kw):
+        captured["repo_id"] = repo_id
+        captured["kw"] = kw
+        return "READER"
+
+    monkeypatch.setattr(sd.StreamingDatasetReader, "open", staticmethod(fake_open), raising=True)
+
+    out = sd.stream_dataset("org/ds", root="/tmp/x", shuffle=False, drop_videos=True)
+    assert out == "READER"
+    assert captured["repo_id"] == "org/ds"
+    assert captured["kw"] == {"root": "/tmp/x", "shuffle": False, "drop_videos": True}
 
 
 def test_recording_mixin_stream_dataset_delegates(monkeypatch):
@@ -498,6 +615,28 @@ def test_has_streaming_dataset_does_not_negatively_cache(monkeypatch):
     assert sd.has_streaming_dataset() is False
     # Failure clears: the symbol resolves again on the very next call.
     _install_fake_lerobot_datasets(monkeypatch, with_streaming=True)
+    assert sd.has_streaming_dataset() is True
+
+
+def test_has_streaming_dataset_positively_caches(monkeypatch):
+    """A successful availability probe is memoized: once the streaming symbol
+    resolves, later calls short-circuit and never re-import lerobot.
+
+    The mirror of :func:`test_has_streaming_dataset_does_not_negatively_cache`.
+    Hot-loop callers (agent / eval / replay loops) call this repeatedly, and on
+    Jetson the ``from lerobot.datasets import ...`` probe is expensive (numpy /
+    torch ABI). The contract is proven behaviorally by breaking the import
+    AFTER the first success: a fresh probe of that broken state returns False
+    (see the negative test above), so a warmed cache returning True can only be
+    the memoized short-circuit - not a re-probe.
+    """
+    monkeypatch.setattr(sd, "_HAS_STREAMING_DATASET", [], raising=False)
+    # First probe resolves the symbol and caches the positive result.
+    _install_fake_lerobot_datasets(monkeypatch, with_streaming=True)
+    assert sd.has_streaming_dataset() is True
+    # Break the import. A cold probe of this exact state returns False; the
+    # warmed cache must short-circuit past it and still report True.
+    _install_fake_lerobot_datasets(monkeypatch, with_streaming=False)
     assert sd.has_streaming_dataset() is True
 
 

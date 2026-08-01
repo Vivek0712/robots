@@ -63,6 +63,218 @@ class TestGetRobotState:
         assert engine_so100.get_robot_state("ghost")["status"] == "error"
 
 
+# A minimal floating-base model: a free-jointed root body carrying two hinge
+# children. The root's free joint spans 7 coordinates (xyz + quaternion) and 6
+# DOFs, so ``j1``/``j2`` live at coordinate indices 7/8 and DOF indices 6/7 -
+# NOT the ordinal 1/2 a naive per-joint offset would assign. Kept inline (no
+# downloaded asset) so the test runs anywhere Newton is importable.
+_FLOATER_MJCF = """<mujoco model="floater">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="base" pos="0 0 0.5">
+      <freejoint name="root"/>
+      <geom type="box" size="0.1 0.1 0.05" mass="1"/>
+      <body name="link1" pos="0.1 0 0">
+        <joint name="j1" type="hinge" axis="0 0 1"/>
+        <geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="0.2"/>
+        <body name="link2" pos="0.2 0 0">
+          <joint name="j2" type="hinge" axis="0 1 0"/>
+          <geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="0.2"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>"""
+
+
+@pytest.fixture
+def engine_floater(engine, tmp_path):
+    """Real Newton build of the inline floating-base model above."""
+    path = tmp_path / "floater.xml"
+    path.write_text(_FLOATER_MJCF)
+    assert engine.add_robot("floater", urdf_path=str(path))["status"] == "success"
+    return engine
+
+
+class TestFloatingBaseJointIndices:
+    """A free-jointed root must not shift every child joint's state reading.
+
+    Regression for the Newton index maps: ``_joint_coord_index`` /
+    ``_joint_dof_index`` were built from a per-joint ordinal offset (one
+    coordinate and one DOF per joint), which is wrong once a robot has a
+    multi-coordinate joint. A floating base (free joint: 7 coordinates, 6 DOFs)
+    made every child joint read the base's coordinates instead of its own, so
+    get_robot_state / get_observation reported garbage for a humanoid's leg and
+    arm joints (and the policy observation path saw the same garbage).
+    """
+
+    def test_index_maps_use_authoritative_joint_starts(self, engine_floater):
+        model = engine_floater._model
+        q_start = model.joint_q_start.numpy()
+        qd_start = model.joint_qd_start.numpy()
+        names = engine_floater._world.robots["floater"].joint_names
+        assert names == ["root", "j1", "j2"]
+        for i, jname in enumerate(names):
+            assert engine_floater._joint_coord_index[("floater", jname)] == int(q_start[i])
+            assert engine_floater._joint_dof_index[("floater", jname)] == int(qd_start[i])
+        # The hinges live past the free joint's 7 coordinates / 6 DOFs, not at
+        # the ordinal 1/2 that the buggy mapping produced.
+        assert engine_floater._joint_coord_index[("floater", "j1")] == 7
+        assert engine_floater._joint_dof_index[("floater", "j1")] == 6
+        assert engine_floater._joint_coord_index[("floater", "j2")] == 8
+        assert engine_floater._joint_dof_index[("floater", "j2")] == 7
+
+    def _set_position_sentinels(self, engine_floater):
+        """Write joint_q[i] = 100 + i so each position value encodes its coord index."""
+        q = engine_floater._state_0.joint_q.numpy().copy()
+        for i in range(len(q)):
+            q[i] = 100.0 + i
+        engine_floater._state_0.joint_q.assign(q)
+        return engine_floater._model.joint_q_start.numpy()
+
+    def test_get_robot_state_reads_hinge_coordinates_past_free_joint(self, engine_floater):
+        q_start = self._set_position_sentinels(engine_floater)
+        state = engine_floater.get_robot_state("floater")["content"][1]["json"]["state"]
+        # Each hinge must report the sentinel at ITS own coordinate index, not
+        # the base coordinate a per-joint offset would read.
+        assert state["j1"]["position"] == pytest.approx(100.0 + int(q_start[1]))
+        assert state["j2"]["position"] == pytest.approx(100.0 + int(q_start[2]))
+
+    def test_get_observation_reads_hinge_coordinates_past_free_joint(self, engine_floater):
+        q_start = self._set_position_sentinels(engine_floater)
+        obs = engine_floater.get_observation("floater", skip_images=True)
+        assert obs["j1"] == pytest.approx(100.0 + int(q_start[1]))
+        assert obs["j2"] == pytest.approx(100.0 + int(q_start[2]))
+
+    def test_fixed_base_arm_index_maps_are_the_identity(self, engine_so100):
+        # A robot with no multi-coordinate joint (an all-revolute arm) must be
+        # unchanged: coordinate/DOF index == ordinal position.
+        names = engine_so100._world.robots["so100"].joint_names
+        coords = [engine_so100._joint_coord_index[("so100", j)] for j in names]
+        dofs = [engine_so100._joint_dof_index[("so100", j)] for j in names]
+        assert coords == list(range(len(names)))
+        assert dofs == list(range(len(names)))
+
+
+class TestFloatingBaseSurfacing:
+    """A floating base must surface as a structured pose, not a garbage scalar.
+
+    Parity with the MuJoCo backend (get_observation ``base_quat``/``base_ang_vel``
+    and get_robot_state ``base``): a robot whose root is a free joint (a
+    humanoid's named ``floating_base_joint``) must NOT report the base
+    x-coordinate as a scalar joint value. The 6-DoF base pose + twist is
+    surfaced instead, with the quaternion reordered from Newton's native xyzw to
+    the MuJoCo (w,x,y,z) contract and the free-joint scalar removed from
+    get_robot_state's per-joint ``state`` map. The base angular velocity is
+    reported in the BODY frame (Newton stores it world-frame; it is rotated
+    by the base orientation) so ``base_ang_vel`` matches the MuJoCo backend
+    and the IMU-gyro convention WBC / locomotion controllers consume.
+    """
+
+    # A distinctive base pose (+90deg about Z) and twist; hinge sentinels.
+    _S = 0.7071067811865476  # sin(45) == cos(45)
+
+    def _set_base_and_hinges(self, engine):
+        q = engine._state_0.joint_q.numpy().copy()
+        q[0:3] = [0.3, 0.4, 0.9]  # base position
+        q[3:7] = [0.0, 0.0, self._S, self._S]  # xyzw: +90 about Z
+        q[7] = 0.55  # j1 sentinel
+        q[8] = -0.22  # j2 sentinel
+        engine._state_0.joint_q.assign(q)
+        qd = engine._state_0.joint_qd.numpy().copy()
+        qd[:] = 0.0
+        qd[0:3] = [1.1, 2.2, 3.3]  # base linear velocity
+        qd[3:6] = [4.4, 5.5, 6.6]  # base angular velocity
+        qd[6] = 0.7  # j1 velocity
+        qd[7] = -0.3  # j2 velocity
+        engine._state_0.joint_qd.assign(qd)
+
+    def test_get_robot_state_surfaces_base_not_a_scalar_joint(self, engine_floater):
+        self._set_base_and_hinges(engine_floater)
+        payload = engine_floater.get_robot_state("floater")["content"][1]["json"]
+        state = payload["state"]
+        # The free joint is NOT a scalar joint in ``state`` (its coordinates are
+        # [xyz + quat], not a single angle).
+        assert "root" not in state
+        assert set(state) == {"j1", "j2"}
+        # A structured ``base`` entry carries the 6-DoF pose + twist.
+        base = payload["base"]
+        assert base["position"] == pytest.approx([0.3, 0.4, 0.9], abs=1e-4)
+        # Quaternion is reordered xyzw -> wxyz to match the MuJoCo contract.
+        assert base["quaternion"] == pytest.approx([self._S, 0.0, 0.0, self._S], abs=1e-4)
+        assert base["linear_velocity"] == pytest.approx([1.1, 2.2, 3.3], abs=1e-4)
+        # angular_velocity is in the BODY frame (MuJoCo parity / IMU-gyro
+        # convention). Newton stores it world-frame; at the +90deg-about-Z base
+        # the world twist [4.4, 5.5, 6.6] expressed in the body frame is
+        # R(quat)^T @ [4.4, 5.5, 6.6] == [5.5, -4.4, 6.6].
+        assert base["angular_velocity"] == pytest.approx([5.5, -4.4, 6.6], abs=1e-4)
+        # Child hinges still read their own coordinates (not shifted / dropped).
+        assert state["j1"]["position"] == pytest.approx(0.55, abs=1e-4)
+        assert state["j2"]["position"] == pytest.approx(-0.22, abs=1e-4)
+
+    def test_get_observation_surfaces_full_base_kinematics(self, engine_floater):
+        self._set_base_and_hinges(engine_floater)
+        obs = engine_floater.get_observation("floater", skip_images=True)
+        # Full base pose + twist for locomotion / velocity tracking: position
+        # (world x,y,z incl. height), orientation (w,x,y,z), linear velocity
+        # (m/s) and angular velocity (rad/s). Parity with the MuJoCo backend.
+        assert obs["base_pos"] == pytest.approx([0.3, 0.4, 0.9], abs=1e-4)
+        assert obs["base_quat"] == pytest.approx([self._S, 0.0, 0.0, self._S], abs=1e-4)
+        assert obs["base_lin_vel"] == pytest.approx([1.1, 2.2, 3.3], abs=1e-4)
+        # base_ang_vel is BODY-frame (MuJoCo parity); the world twist
+        # [4.4, 5.5, 6.6] rotated into the +90deg-about-Z body frame is
+        # [5.5, -4.4, 6.6]. See test_base_ang_vel_is_body_frame_matching_mujoco.
+        assert obs["base_ang_vel"] == pytest.approx([5.5, -4.4, 6.6], abs=1e-4)
+        # The 6-DoF free joint ("root") is NOT emitted as a degenerate scalar
+        # joint entry (it would report base-x as a joint angle) - its full state
+        # is the structured base_* keys above, matching get_robot_state and the
+        # MuJoCo backend. The hinge joints past the free joint are still read.
+        assert "root" not in obs
+        assert obs["j1"] == pytest.approx(0.55, abs=1e-4)
+        assert obs["j2"] == pytest.approx(-0.22, abs=1e-4)
+
+    def test_base_ang_vel_is_body_frame_matching_mujoco(self, engine_floater):
+        """base_ang_vel is the body-frame angular velocity, not the raw world twist.
+
+        Newton stores a free joint's angular velocity in the WORLD frame, but the
+        MuJoCo backend (and the IMU-gyro convention the WBC / locomotion
+        observation builder consumes) reports it in the BODY frame. For a base
+        yawed +90deg about Z spinning about WORLD x, the body frame sees that as
+        a spin about body -y, so base_ang_vel must be [0, -w, 0], NOT the raw
+        [w, 0, 0]. An identity-oriented base leaves world == body unchanged.
+        """
+        S = self._S
+        q = engine_floater._state_0.joint_q.numpy().copy()
+        q[0:3] = [0.0, 0.0, 0.9]
+        q[3:7] = [0.0, 0.0, S, S]  # xyzw: +90 about Z
+        engine_floater._state_0.joint_q.assign(q)
+        qd = engine_floater._state_0.joint_qd.numpy().copy()
+        qd[:] = 0.0
+        qd[3:6] = [2.0, 0.0, 0.0]  # pure WORLD-x angular velocity
+        engine_floater._state_0.joint_qd.assign(qd)
+        obs = engine_floater.get_observation("floater", skip_images=True)
+        assert obs["base_ang_vel"] == pytest.approx([0.0, -2.0, 0.0], abs=1e-4)
+
+        # Identity orientation: world frame == body frame, value passes through.
+        q[3:7] = [0.0, 0.0, 0.0, 1.0]  # xyzw identity
+        engine_floater._state_0.joint_q.assign(q)
+        qd[3:6] = [0.3, 0.4, 0.5]
+        engine_floater._state_0.joint_qd.assign(qd)
+        obs2 = engine_floater.get_observation("floater", skip_images=True)
+        assert obs2["base_ang_vel"] == pytest.approx([0.3, 0.4, 0.5], abs=1e-4)
+
+    def test_fixed_base_arm_has_no_base_entry(self, engine_so100):
+        # A fixed-base arm (no free root) must be unchanged: no base pose, no
+        # base_quat / base_ang_vel keys.
+        payload = engine_so100.get_robot_state("so100")["content"][1]["json"]
+        assert "base" not in payload
+        obs = engine_so100.get_observation("so100", skip_images=True)
+        assert "base_quat" not in obs
+        assert "base_ang_vel" not in obs
+        assert "base_pos" not in obs
+        assert "base_lin_vel" not in obs
+
+
 class TestListBodies:
     def test_scoped_lists_only_robot_bodies_with_gripper(self, engine_so100):
         result = engine_so100.list_bodies("so100")
@@ -136,6 +348,77 @@ class TestRegistryPassthrough:
     def test_register_urdf_empty_path_errors(self, engine):
         assert engine.register_urdf("xx", "")["status"] == "error"
 
+    def test_register_urdf_success_binds_and_resolves(self, engine, tmp_path):
+        """A readable asset registers and round-trips through resolve_model.
+
+        The success path validates the file, binds it under the given config
+        name, and reports the resolved path back so a caller can add_robot the
+        custom asset without re-reading the registry.
+        """
+        asset = tmp_path / "my_arm.xml"
+        asset.write_text("<mujoco/>")
+        result = engine.register_urdf("my_custom_arm", str(asset))
+        assert result["status"] == "success"
+        text = result["content"][0]["text"]
+        assert "my_custom_arm" in text
+        assert str(asset) in text
+        # resolve_model round-trips the just-registered path (not "NOT FOUND").
+        assert "NOT FOUND" not in text
+
+    def test_register_urdf_directory_errors_as_not_a_file(self, engine, tmp_path):
+        """An existing-but-not-a-file path (a directory) is rejected distinctly
+        from the missing-file case, so the caller knows the path resolved but
+        pointed at the wrong kind of node."""
+        result = engine.register_urdf("dircfg", str(tmp_path))
+        assert result["status"] == "error"
+        assert "not a file" in result["content"][0]["text"]
+
+
+class TestWorldStateSummary:
+    """get_state() world summary + the no-world guards on the step/reset/state
+    lifecycle methods.
+
+    get_state is the human-readable introspection facade at MuJoCo parity; the
+    guards ensure the lifecycle methods fail soft with an actionable message
+    instead of dereferencing a None model when create_world was skipped.
+    """
+
+    def test_get_state_summarises_solver_time_and_counts(self, engine_so100):
+        result = engine_so100.get_state()
+        assert result["status"] == "success"
+        text = result["content"][0]["text"]
+        assert "Newton Simulation State" in text
+        # Names the active solver and the world/robot inventory a caller needs
+        # to sanity-check what is loaded before stepping.
+        assert "solver=mujoco" in text
+        assert "step 0" in text
+        assert "Robots: 1" in text
+        assert "Objects: 0" in text
+        assert "DOFs: 6" in text
+
+    def test_get_state_reflects_added_object(self, engine_so100):
+        engine_so100.add_object("cube", shape="box", position=[0.3, 0.0, 0.05], mass=0.2)
+        text = engine_so100.get_state()["content"][0]["text"]
+        assert "Objects: 1" in text
+
+    def test_get_state_without_world_errors(self):
+        from strands_robots.simulation.newton.simulation import NewtonSimEngine
+
+        sim = NewtonSimEngine(solver="mujoco")
+        assert sim.get_state()["status"] == "error"
+
+    def test_reset_without_world_errors(self):
+        from strands_robots.simulation.newton.simulation import NewtonSimEngine
+
+        sim = NewtonSimEngine(solver="mujoco")
+        assert sim.reset()["status"] == "error"
+
+    def test_step_without_world_errors(self):
+        from strands_robots.simulation.newton.simulation import NewtonSimEngine
+
+        sim = NewtonSimEngine(solver="mujoco")
+        assert sim.step()["status"] == "error"
+
 
 class TestDescribeSurface:
     def test_describe_exposes_new_methods(self, engine_so100):
@@ -143,6 +426,7 @@ class TestDescribeSurface:
         methods = described["methods"]
         for name in (
             "get_robot_state",
+            "get_state",
             "list_bodies",
             "move_object",
             "get_features",
@@ -157,3 +441,20 @@ class TestDescribeSurface:
         assert described["cameras"] == ["default"]
         assert described["bodies"]
         assert described["world_created"] is True
+
+    def test_describe_lists_benchmark_family_methods(self, engine_so100):
+        """describe() advertises the DSL-driven benchmark scoring family.
+
+        ``evaluate_benchmark`` / ``list_benchmarks`` /
+        ``register_benchmark_from_file`` are concrete facades on the base
+        engine that Newton inherits as real callables, so the Newton discovery
+        surface must name them too - otherwise a caller enumerating
+        ``describe()["methods"]`` could run a policy but not discover how to
+        score it against a benchmark.
+        """
+        methods = engine_so100.describe()["methods"]
+        for name in ("evaluate_benchmark", "list_benchmarks", "register_benchmark_from_file"):
+            assert name in methods, f"describe() omits benchmark-family method {name!r}"
+            assert callable(getattr(engine_so100, name, None))
+        assert "benchmark_name" in methods["evaluate_benchmark"]
+        assert "spec_path" in methods["register_benchmark_from_file"]
