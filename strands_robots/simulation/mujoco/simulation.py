@@ -114,6 +114,7 @@ from strands_robots.utils import (
     entity_name_error,
     finite_vector_error,
     pose_vector_error,
+    sequence_length,
 )
 
 if TYPE_CHECKING:
@@ -361,6 +362,10 @@ class MuJoCoSimEngine(
         # so consumers catch missing-dependency errors immediately.
         self._mj = _ensure_mujoco()
         logger.info("MuJoCo simulation tool '%s' initialized", tool_name)
+
+        # Construction complete - the finalizer may now release what we hold.
+        # See SimEngine._init_complete: this must be the final statement.
+        self._init_complete = True
 
     # Public Properties - read-only introspection.
     # WARNING: callers MUST NOT mutate the returned objects without holding
@@ -4745,16 +4750,21 @@ class MuJoCoSimEngine(
             if val is None:
                 continue
             expected_len = " or ".join(str(n) for n in accepted_lens)
-            if not hasattr(val, "__len__"):
+            n_components = sequence_length(val)
+            if n_components is None:
                 return None, {
                     "status": "error",
                     "content": [{"text": f"Parameter '{vparam}' must be a list of {expected_len} numbers."}],
                 }
-            if len(val) not in accepted_lens:
+            if n_components not in accepted_lens:
                 return None, {
                     "status": "error",
                     "content": [
-                        {"text": (f"Parameter '{vparam}' must be a list of {expected_len} numbers, got {len(val)}.")}
+                        {
+                            "text": (
+                                f"Parameter '{vparam}' must be a list of {expected_len} numbers, got {n_components}."
+                            )
+                        }
                     ],
                 }
             for i, component in enumerate(val):
@@ -5101,12 +5111,6 @@ class MuJoCoSimEngine(
 
     def __exit__(self, *exc: object) -> None:
         self.cleanup()
-
-    def __del__(self) -> None:
-        try:
-            self.cleanup()
-        except Exception:
-            pass
 
 
 # Backward-compatible aliases (PR #85 shipped as ``Simulation``)

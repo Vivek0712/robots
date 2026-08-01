@@ -327,6 +327,69 @@ def process_rss_mb() -> float | None:
         return None
 
 
+def is_boolean(value: Any) -> bool:
+    """Return True when ``value`` is a python or a numpy boolean.
+
+    The single boolean predicate behind every numeric domain in this module and
+    the runtime writers that reuse them. Two properties make a boolean worth its
+    own check rather than letting the numeric coercion decide:
+
+    * ``bool`` is an ``int`` subclass, so ``float(True)`` is ``1.0`` and a
+      boolean survives every ``float()`` / ``numbers.Real`` gate as a silent
+      ``1.0`` - one radian, one metre, one Newton, depending on where it landed.
+    * ``numpy.bool_`` is *not* a ``bool`` subclass, so ``isinstance(value, bool)``
+      alone misses the boolean a policy or a comparison produces
+      (``gripper > 0.5``). It is also not registered as ``numbers.Real``, which
+      is why the vector domains here reject it through their ``numbers.Real``
+      check; a writer that coerces with a bare ``float()`` has no such backstop
+      and needs this predicate.
+
+    The ``.item()`` unwrap covers a numpy boolean scalar and a 0-d boolean array
+    while leaving every numeric scalar - and every multi-element array, which
+    has no single item - reported as non-boolean.
+    """
+    if isinstance(value, bool):
+        return True
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return isinstance(item(), bool)
+        except (TypeError, ValueError):  # a multi-element array has no single item
+            return False
+    return False
+
+
+def sequence_length(value: Any) -> int | None:
+    """Return the length of ``value``, or ``None`` when it does not carry one.
+
+    Every validator that accepts a vector first asks "how many components is
+    this?", and the obvious spelling - ``hasattr(value, "__len__")`` followed by
+    ``len(value)`` - is unsafe for the value class this library actually
+    receives. A 0-d numpy array (``np.array(0.5)``, or the result of a reduction
+    such as ``np.mean(...)``) and a 0-d torch tensor both *declare* ``__len__``
+    and then raise from it, so the ``hasattr`` probe passes and the ``len()``
+    call escapes with a bare ``len() of unsized object`` that names neither the
+    parameter nor the method - past agent-tool dispatch, which is documented
+    never to raise.
+
+    ``TypeError`` is the narrowest superset: CPython raises it both for a value
+    with no ``__len__`` at all (a plain ``float``, a ``numpy.float64``) and for
+    one whose ``__len__`` exists but refuses. Both answer the caller's question
+    the same way - this value does not carry a component count - so both report
+    as ``None`` and one branch covers them.
+
+    Args:
+        value: Any caller-supplied value a validator needs the length of.
+
+    Returns:
+        The component count, or ``None`` when the value has no readable length.
+    """
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
 def positive_finite_number_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable positive finite number.
 
@@ -498,32 +561,129 @@ def positive_count_error(value: Any, param: str, context: str) -> str | None:
     return None
 
 
+def tcp_port_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` cannot address a TCP port.
+
+    Shared domain for every caller-supplied port number: the agent tools that
+    reach a service over TCP (``use_rosbridge``'s WebSocket,
+    ``gr00t_inference``'s inference service), the mesh bridges that construct
+    one, and the policy providers that dial one (``groot``, ``moveit2``,
+    ``cosmos3``, ``lerobot_async``). A port is an index into the 16-bit TCP port
+    space, so only an ``int`` in ``[1, 65535]`` names one: ``0`` asks the kernel
+    for an ephemeral port rather than naming a port, and a value outside the
+    range has nothing to bind or connect to.
+
+    A lazily-connecting transport makes the range load-bearing at the boundary
+    rather than at the socket: ZMQ's ``connect`` accepts ``tcp://host:99999``
+    and a WebSocket/gRPC target is only resolved on first use, so a port outside
+    the range is not refused by the transport - it fails much later as an
+    unreachable service, implicating the server rather than the port.
+
+    It lives here rather than beside one of its callers for the same reason
+    :func:`positive_count_error` does: those callers sit in different layers
+    (:mod:`strands_robots.tools` and :mod:`strands_robots.mesh` must not depend
+    on each other) and the accepted domain must not diverge between them - the
+    same port cannot be refused by one transport onto a service and accepted by
+    the next.
+
+    ``bool`` is rejected explicitly. It is an ``int`` subclass, so a bare
+    ``1 <= value <= 65535`` test lets ``True`` through as a silent port 1 - a
+    privileged port the caller never named.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter name it came from, used in the message.
+        context: Message prefix identifying the surface that received it - the
+            requested action for an agent tool, or the class name for a
+            constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        return f"{context}: invalid {param}: {value!r} (expected 1-65535)"
+    return None
+
+
+def non_negative_count_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a usable non-negative integer count.
+
+    Shared domain for a discrete count whose ``0`` is a first-class value rather
+    than a degenerate one - the number of control steps a loop executes while an
+    inference request is in flight
+    (:attr:`~strands_robots.policies.base.Policy.rtc_observed_delay_steps`).
+    That count is exactly ``0`` in the dominant case: a synchronous eval loop
+    pauses the world during inference, so no step elapses. Refusing ``0`` here
+    would therefore reject the common configuration, which is why this is a
+    separate domain rather than a caller of :func:`positive_count_error`.
+
+    In every other respect it mirrors :func:`positive_count_error`: the value is
+    consumed as an offset into an action chunk, so only a true ``int`` can be
+    honored (an integral float raises ``TypeError`` at the slice rather than
+    being coerced), and ``bool`` is rejected explicitly because as an ``int``
+    subclass a bare ``value < 0`` test lets ``True`` through as a silent count
+    of one.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter name it came from, used in the message.
+        context: Message prefix identifying the surface that received it - the
+            public method name, or the class name for a constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return f"{context}: {param} must be a non-negative integer, got {value!r}."
+    return None
+
+
 def name_list_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable list of distinct key names.
 
-    Shared domain for the parameters that carry an ordered list of KEY NAMES
-    into a policy: the LeRobot ``image_keys`` (model VISUAL feature keys to
-    declare on the config) and the VERA ``image_keys`` (observation camera keys
-    to width-concat into one frame). The two name different vocabularies, but
-    the shape contract is identical - several distinct non-blank names, in the
-    order the caller wants them - and both consumers reach the same failure when
-    it is not met, so the rule lives here rather than beside either of them.
+    Shared domain for every parameter that carries an ordered list of KEY
+    NAMES: the LeRobot ``image_keys`` (model VISUAL feature keys to declare on
+    the config), the VERA ``image_keys`` (observation camera keys to
+    width-concat into one frame), the simulation ``cameras`` subset accepted
+    by ``render_all``, the two plain-MP4 recorders and every backend's
+    ``start_recording``, and the ``robot_state_keys`` accepted by every
+    provider's :meth:`~strands_robots.policies.base.Policy.set_robot_state_keys`
+    (the ordered joint/motor names a policy emits as its action-dict keys).
+    They name different vocabularies, but the shape contract is identical -
+    several distinct non-blank names, in the order the caller wants them - and
+    every consumer reaches the same failure when it is not met, so the rule
+    lives here rather than beside any one of them.
+
+    On the ``robot_state_keys`` path the duplicate case is the dict collapse
+    above, reached twice over: the emitted action dict is keyed by these names,
+    so a three-entry list with one repeat emits two commands, and the
+    ``lerobot_async`` hardware-feature map declares fewer columns than the
+    action aligner is handed. Note that the two providers resolving these names
+    by membership rather than by position (WBC, MotionBricks) deliberately
+    tolerate a repeat - it resolves to its first occurrence - so they are not
+    callers of this function.
 
     The mistake this exists for is a single name passed as a bare string.
     ``str`` is iterable, so ``list("wrist")`` yields ``['w', 'r', 'i', 's', 't']``
     - five names the caller never wrote, one per character. Nothing downstream
     can tell that apart from a deliberate five-entry list, so it is accepted and
     the consequence surfaces far from the call: a model built declaring
-    per-character features, or a ``KeyError: 'w'`` raised mid-rollout when the
-    frame for a one-letter camera is looked up.
+    per-character features, a ``KeyError: 'w'`` raised mid-rollout when the
+    frame for a one-letter camera is looked up, or a recording refused as five
+    unknown cameras rather than as one mis-typed parameter.
 
     A ``Mapping`` is refused for the same reason in the other direction: it is
     iterable over its keys, so its values would be silently discarded.
 
-    A repeated name is refused because it cannot be honored as written - the
-    LeRobot side builds a feature dict, where a duplicate collapses and declares
-    fewer features than asked for, and the VERA side concatenates one panel per
-    entry, where a duplicate doubles the width of the frame the model sees.
+    A repeated name is refused because it cannot be honored as written, and the
+    consumers disagree on which way it fails. A duplicate collapses where the
+    name keys a dict - the LeRobot feature map, or a dataset schema, which then
+    declares fewer columns than asked for - and doubles where each entry drives
+    its own unit of work: VERA concatenates one panel per entry, so the frame
+    the model sees is twice as wide; ``render_all`` renders the same view twice;
+    and a plain-MP4 recorder opens a second encoder on the one output path, so
+    the same camera is rendered and appended twice per capture tick while the
+    artifact ledger reports two files where one exists.
 
     Only a :class:`~collections.abc.Sequence` is accepted, which excludes
     one-shot iterators. That matters on the LeRobot path, where the value is

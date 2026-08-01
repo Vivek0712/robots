@@ -49,7 +49,12 @@ if TYPE_CHECKING:
 # signature as a *string* annotation; ``from __future__ import
 # annotations`` (already in effect) makes that a no-op at runtime.
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
-from strands_robots.utils import positive_count_error, positive_finite_number_error
+from strands_robots.utils import (
+    is_boolean,
+    positive_count_error,
+    positive_finite_number_error,
+    sequence_length,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +138,45 @@ def unknown_kwargs_error(method: str, kwargs: Mapping[str, Any], accepted: Seque
     }
 
 
+_BOOLEAN_WORLD_REASON = (
+    "float(True) is 1.0, so a boolean survives a numeric coercion as the "
+    "quantity 1 in whatever unit the parameter carries - a 1 m/s^2 "
+    "acceleration, a 1-second integration step, a 1 kg body, a noise standard "
+    "deviation of 1, a randomization scale of 1. Each is a usable number on "
+    "its own terms, so the call reports success and the world is configured "
+    "with a value the caller never chose. Pass the quantity in the "
+    "parameter's own units."
+)
+
+
+def _boolean_world_error(method: str, param: str, value: Any) -> dict[str, Any]:
+    """Structured error for a boolean supplied as a world-physics quantity.
+
+    The world-parameter counterpart to :func:`_boolean_action_error`, sharing
+    the one predicate in :func:`strands_robots.utils.is_boolean` rather than
+    re-deciding what a boolean is. It carries its own reason because
+    :data:`_BOOLEAN_ACTION_REASON` argues from the *ambiguity* of ``1.0`` across
+    actuator drives, which does not apply here: gravity, a timestep and a mass
+    each read ``1.0`` as one unambiguous quantity, so a boolean is not ambiguous
+    but simply a value nobody asked for, applied under ``status="success"``.
+
+    Args:
+        method: Public method name, used to prefix the message.
+        param: Parameter name to quote.
+        value: The raw value, reported before coercion - ``float(True)`` is
+            ``1.0``, so the boolean is unrecoverable once coerced.
+
+    Returns:
+        A structured ``{"status": "error", ...}`` dict to surface.
+    """
+    return {
+        "status": "error",
+        "content": [
+            {"text": (f"{method}: '{param}' must be a number, not a bool (got {value!r}). {_BOOLEAN_WORLD_REASON}")}
+        ],
+    }
+
+
 def randomization_range_error(value: Any, param: str, *, allow_zero: bool = True) -> str | None:
     """Return why a ``(lo, hi)`` randomization range cannot be applied.
 
@@ -157,11 +201,22 @@ def randomization_range_error(value: Any, param: str, *, allow_zero: bool = True
     Returns:
         ``None`` when the range is usable, otherwise the reason as a string.
     """
+    # The unpack and the coercion are separate steps so the boolean check can sit
+    # between them; both report the same thing to the caller.
+    not_a_pair = f"{param} must be a (lo, hi) pair of numbers, got {value!r}"
     try:
         lo, hi = value
+    except (TypeError, ValueError):
+        return not_a_pair
+    # Before float(): a boolean bound is a scale factor of 1 (identity) or 0
+    # (erases the quantity it multiplies), and the sampler cannot tell either
+    # from a deliberate one once coerced.
+    if is_boolean(lo) or is_boolean(hi):
+        return f"{param} bounds must be numbers, not bools (got {value!r}). {_BOOLEAN_WORLD_REASON}"
+    try:
         lo, hi = float(lo), float(hi)
     except (TypeError, ValueError):
-        return f"{param} must be a (lo, hi) pair of numbers, got {value!r}"
+        return not_a_pair
     if not (math.isfinite(lo) and math.isfinite(hi)):
         return f"{param} bounds must be finite, got {value!r}"
     if lo > hi:
@@ -189,7 +244,10 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
     on the next step, and a negative half-width inverts the sampling bounds.
 
     Args:
-        value: The candidate magnitude.
+        value: The candidate magnitude. A boolean is refused: these are
+            standard deviations and half-widths, so ``True`` describes a
+            distribution of width 1 rather than the "noise off" a caller
+            passing a flag would have meant (``0`` is how noise is disabled).
         param: Parameter name to quote in the message.
         context: Method name to prefix the message with.
 
@@ -197,6 +255,12 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
         ``None`` when the value is a finite non-negative number, otherwise the
         reason as a string.
     """
+    # Before float(): these are standard deviations and half-widths, so a
+    # boolean reads as a distribution of width 1 in the sensor's own units -
+    # not a flag disabling the noise, which is what a caller passing True
+    # would most plausibly have meant.
+    if is_boolean(value):
+        return f"{context}: {param} must be a number, not a bool (got {value!r}). {_BOOLEAN_WORLD_REASON}"
     try:
         fvalue = float(value)
     except (TypeError, ValueError):
@@ -272,6 +336,75 @@ def _non_finite_action_error(label: str, value: Any) -> dict[str, Any] | None:
     }
 
 
+_BOOLEAN_ACTION_REASON = (
+    "A boolean cannot express an actuator command. float(True) is 1.0, and each "
+    "drive reads 1.0 in its own units: a 1-radian target on a joint-position "
+    "drive, a full-travel command on a normalized or tendon drive (a [0, 255] "
+    "tendon gripper reads 1.0 as fully open), and an out-of-range value that is "
+    "silently clamped on a drive whose ctrlrange excludes 1. The same True "
+    "therefore commands a different pose on every actuator. Pass the command in "
+    "the actuator's own units - for a binary gripper, the endpoint value rather "
+    "than a flag."
+)
+
+
+def _unwrap_single_element_action_value(value: Any) -> Any:
+    """Unwrap a length-1 sequence action value to its scalar, else return it as-is.
+
+    The ``Policy.get_actions -> list[dict]`` contract emits ``list[float]`` for
+    vector-valued keys, which for a 1-DOF key yields a length-1 list (GR00T's
+    service unpack emits ``{"x": [0.05], ...}`` for the LIBERO delta-EEF
+    layout). Such a value carries exactly one scalar and is unambiguous, so it
+    is unwrapped rather than rejected.
+
+    A 0-d numpy array (``np.array(True)``, ``np.mean(...)``) declares
+    ``__len__`` and ``__getitem__`` but raises from ``len()``, which is why the
+    length is read through :func:`strands_robots.utils.sequence_length` rather
+    than probed here: it reports such a value as carrying no length, so the
+    value is returned unchanged for the value checks to read (it already holds
+    exactly one scalar, so there is nothing to unwrap).
+    """
+    if isinstance(value, (str, bytes, Mapping)):
+        return value
+    if not hasattr(value, "__getitem__"):
+        return value
+    return value[0] if sequence_length(value) == 1 else value
+
+
+def _boolean_action_error(label: str, value: Any) -> dict[str, Any] | None:
+    """Structured error when an action value is a python or numpy boolean.
+
+    ``bool`` is an ``int`` subclass and ``numpy.bool_`` coerces the same way, so
+    a scalar-coercion check admits both and they reach the actuator command as a
+    silent ``1.0``/``0.0``. The teleop wire validator
+    (:func:`strands_robots.mesh.security.validate_input_frame`, which
+    ``InputReceiver`` applies through ``send_action``) already refuses a boolean
+    for exactly that reason, so a remote peer's frame is held to a stricter
+    domain than the local call it is applied through; this is the same rule for
+    the actuator-command path, applied to both accepted action shapes so a
+    mapping value and a vector entry cannot diverge.
+
+    Args:
+        label: How to name the offending element in the message - the caller
+            supplies it because a mapping names a key while a vector names a
+            position and the actuator key it binds to.
+        value: The raw value, before scalar coercion (``float(True)`` is 1.0, so
+            the boolean is unrecoverable once coerced).
+
+    Returns:
+        A structured ``{"status": "error", ...}`` dict, or ``None`` when the
+        value is not a boolean and is therefore usable as a command.
+    """
+    if not is_boolean(value):
+        return None
+    return {
+        "status": "error",
+        "content": [
+            {"text": (f"send_action: {label} must be a number, not a bool (got {value!r}). {_BOOLEAN_ACTION_REASON}")}
+        ],
+    }
+
+
 class SimEngine(ABC):
     """Abstract base class for simulation engines.
 
@@ -313,7 +446,24 @@ class SimEngine(ABC):
 
         # Cleanup
         sim.destroy()
+
+    Concrete engines must set ``self._init_complete = True`` as the final
+    statement of their ``__init__``. :meth:`__del__` consults it and skips an
+    instance that never finished construction, so a half-built engine is never
+    reported as a cleanup failure.
     """
+
+    # Whether ``__init__`` ran to completion, i.e. whether this instance holds
+    # engine resources that need releasing. :meth:`__del__` reads it to tell
+    # "never acquired anything" from "failed to release something": on a
+    # ``__new__`` skeleton, or an ``__init__`` that raised part-way, the class
+    # attribute below answers False and the finalizer skips ``cleanup()``
+    # instead of reporting whichever attribute ``__init__`` had not reached yet
+    # as a cleanup failure. Declared on the class rather than assigned in an
+    # ABC ``__init__`` so the read itself can never raise, and so lightweight
+    # subclasses and test doubles need not thread ``super().__init__()``
+    # through (the same constraint :meth:`_init_ros_bridge` documents).
+    _init_complete: bool = False
 
     def _init_ros_bridge(self, *, ros2_bridge: bool = False, ros2_domain: int = 0) -> None:
         """Initialize the optional ROS 2 telemetry bridge state.
@@ -861,10 +1011,24 @@ class SimEngine(ABC):
         clamped into ``ctrlrange``, i.e. silently rewritten into a full-travel
         command. The sibling state writers (:meth:`set_joint_positions` /
         :meth:`set_joint_velocities`) already refuse a non-finite value, so this
-        holds the actuator-command path to the same rule. The domain is finiteness
-        alone: a numeric string is an accepted spelling of a scalar here, and a
-        finite magnitude outside ``ctrlrange`` is a units question already
-        surfaced by the clamp warning.
+        holds the actuator-command path to the same rule.
+
+        A value must additionally not be a **boolean**. ``bool`` is an ``int``
+        subclass and ``numpy.bool_`` coerces identically, so the scalar check
+        admits both and they reach the actuator as ``1.0``/``0.0`` - and 1.0 is
+        not one command: it is a 1-radian target on a joint-position drive, a
+        full-travel command on a normalized or tendon drive, and an out-of-range
+        value that is silently clamped where ``ctrlrange`` excludes 1. A boolean
+        is the conventional binary-gripper action, so the value arrives at this
+        surface routinely rather than as a typo. The teleop wire validator
+        (:func:`strands_robots.mesh.security.validate_input_frame`) already
+        refuses a boolean so it "can't masquerade as a 1.0/0.0 command", and it
+        applies frames through ``send_action`` - so refusing it here holds the
+        local call to the domain its own remote surface enforces.
+
+        Otherwise the domain is finiteness: a numeric string is an accepted
+        spelling of a scalar here, and a finite magnitude outside ``ctrlrange``
+        is a units question already surfaced by the clamp warning.
 
         Args:
             action: A ``{name: value}`` mapping, or an ordered numeric vector
@@ -900,13 +1064,12 @@ class SimEngine(ABC):
             # atomically.
             normalized: dict[str, Any] = {}
             for key, value in action.items():
-                if (
-                    not isinstance(value, (str, bytes, Mapping))
-                    and hasattr(value, "__len__")
-                    and hasattr(value, "__getitem__")
-                    and len(value) == 1
-                ):
-                    value = value[0]
+                value = _unwrap_single_element_action_value(value)
+                # Before the scalar coercion: ``float(True)`` succeeds, so the
+                # coercion below cannot see a boolean and the value would reach
+                # the actuator as a silent 1.0/0.0 command.
+                if error := _boolean_action_error(f"action value for key '{key}'", value):
+                    return None, error
                 try:
                     float(value)
                 except (TypeError, ValueError):
@@ -930,7 +1093,7 @@ class SimEngine(ABC):
         # ``str``/``bytes`` are iterable but never a valid multi-joint action;
         # a scalar has no length. Reject both with an actionable message instead
         # of producing garbage character/positional keys downstream.
-        if isinstance(action, (str, bytes)) or not hasattr(action, "__len__"):
+        if isinstance(action, (str, bytes)) or sequence_length(action) is None:
             return None, {
                 "status": "error",
                 "content": [
@@ -945,7 +1108,10 @@ class SimEngine(ABC):
             }
 
         try:
-            values = [float(v) for v in action]
+            # Keep the raw entries: ``float`` erases a boolean into 1.0/0.0, so
+            # the bool gate below has to see the value the caller passed.
+            raw_entries = list(action)
+            values = [float(v) for v in raw_entries]
         except (TypeError, ValueError) as exc:
             return None, {
                 "status": "error",
@@ -968,8 +1134,11 @@ class SimEngine(ABC):
                 ],
             }
         bound: dict[str, Any] = {}
-        for idx, (name, value) in enumerate(zip(action_keys, values)):
-            if error := _non_finite_action_error(f"action vector entry {idx} ('{name}')", value):
+        for idx, (name, raw, value) in enumerate(zip(action_keys, raw_entries, values, strict=True)):
+            label = f"action vector entry {idx} ('{name}')"
+            if error := _boolean_action_error(label, raw):
+                return None, error
+            if error := _non_finite_action_error(label, value):
                 return None, error
             bound[name] = value
         return bound, None
@@ -1299,8 +1468,11 @@ class SimEngine(ABC):
             ``None`` when the value is usable.
         """
         message = f"{method}: {param} must be a finite positive number, got {timestep!r}."
-        if isinstance(timestep, bool):
-            return {"status": "error", "content": [{"text": message}]}
+        # is_boolean, not isinstance(timestep, bool): numpy.bool_ is not a bool
+        # subclass, so the narrower check refused a hand-typed True and admitted
+        # the np.True_ a comparison produces - a 1-second dt under success.
+        if is_boolean(timestep):
+            return _boolean_world_error(method, param, timestep)
         try:
             value = float(timestep)
         except (TypeError, ValueError):
@@ -1337,11 +1509,11 @@ class SimEngine(ABC):
             A structured ``{"status": "error", ...}`` dict to surface, or
             ``None`` when the value is usable.
         """
-        if isinstance(mass, bool):
-            return {
-                "status": "error",
-                "content": [{"text": f"{method}: '{param}' must be a positive number, got {mass!r}"}],
-            }
+        # is_boolean, not isinstance(mass, bool): numpy.bool_ is not a bool
+        # subclass, so the narrower check refused a hand-typed True and admitted
+        # the np.True_ a comparison produces - a 1 kg body under success.
+        if is_boolean(mass):
+            return _boolean_world_error(method, param, mass)
         try:
             value = float(mass)
         except (TypeError, ValueError):
@@ -1375,7 +1547,10 @@ class SimEngine(ABC):
 
         Args:
             gravity: A 3-element ``[x, y, z]`` sequence, or a real scalar taken
-                as the z-component (``[0, 0, z]``, matching
+                as the z-component. A boolean is refused in either form -
+                ``float(True)`` is ``1.0``, so ``True`` configured a +1 m/s^2
+                gravity pointing *up* and reported success (``[0, 0, z]``,
+                matching
                 :meth:`~strands_robots.simulation.mujoco.simulation.MuJoCoSimEngine.set_gravity`).
             method: Public method name, used to prefix the error message.
             param: Parameter name to quote in the message.
@@ -1384,6 +1559,15 @@ class SimEngine(ABC):
             ``(components, None)`` with three finite floats, or
             ``(None, error_dict)`` describing what is wrong with the value.
         """
+        # Refuse a boolean before either path coerces it. bool is an int
+        # subclass, so it satisfies numbers.Real and float(True) is 1.0 - a
+        # scalar True became a +1 m/s^2 gravity pointing *up*, reported as
+        # success. numpy.bool_ is not numbers.Real, so it missed the scalar
+        # branch and fell through to len(), which raised "len() of unsized
+        # object" and surfaced as a component-count complaint that described
+        # neither the value nor the reason.
+        if is_boolean(gravity):
+            return None, _boolean_world_error(method, param, gravity)
         # Accept any real scalar (numbers.Real) as a z-only gravity so a value
         # computed as a NumPy scalar (np.float32 / np.int64) is treated like a
         # plain float. A NumPy array is not numbers.Real, so it still takes the
@@ -1400,6 +1584,11 @@ class SimEngine(ABC):
                             {"text": f"{method}: '{param}' must be a 3-element list [x,y,z], got {len(vector)}"}
                         ],
                     }
+                # Per component too: the vector path coerces with float(), so a
+                # single True among three reals is otherwise a 1 m/s^2 axis.
+                for component in vector:
+                    if is_boolean(component):
+                        return None, _boolean_world_error(method, param, gravity)
                 components = [float(g) for g in vector]
             except (TypeError, ValueError) as e:
                 return None, {
@@ -3434,20 +3623,23 @@ class SimEngine(ABC):
                 f"{type(camera_name).__name__} ({camera_name!r}). Cameras are addressed by "
                 "name, not index; see add_camera / get_frame."
             )
-        if pixels is None or isinstance(pixels, (str, bytes)) or not hasattr(pixels, "__len__"):
+        n_pixels = None if pixels is None or isinstance(pixels, (str, bytes)) else sequence_length(pixels)
+        # ``pixels is None`` is retested rather than folded into ``n_pixels`` so
+        # the narrowing survives to the ``enumerate(pixels)`` walk below.
+        if pixels is None or n_pixels is None:
             return _err(
                 "get_world_point requires 'pixels': a non-empty list of [u, v] pixel coordinates, e.g. [[320, 240], [322, 238]]."
             )
-        if len(pixels) == 0:
+        if n_pixels == 0:
             return _err("get_world_point requires at least one [u, v] pixel; got an empty list.")
-        if len(pixels) > self._WORLD_POINT_MAX_PIXELS:
+        if n_pixels > self._WORLD_POINT_MAX_PIXELS:
             return _err(
                 f"get_world_point accepts at most {self._WORLD_POINT_MAX_PIXELS} pixels per call, "
-                f"got {len(pixels)}. Sample a handful of pixels on the target surface instead."
+                f"got {n_pixels}. Sample a handful of pixels on the target surface instead."
             )
         parsed: list[tuple[int, int]] = []
         for i, px in enumerate(pixels):
-            if isinstance(px, (str, bytes)) or not hasattr(px, "__len__") or len(px) != 2:
+            if isinstance(px, (str, bytes)) or sequence_length(px) != 2:
                 return _err(f"pixels[{i}] must be a [u, v] pair, got {px!r}.")
             coords: list[int] = []
             for axis, component in zip("uv", px, strict=True):
@@ -3719,7 +3911,14 @@ class SimEngine(ABC):
         }
 
     def cleanup(self) -> None:
-        """Release all resources. Called on __del__ / context exit."""
+        """Release all resources.
+
+        Called on context exit, and best-effort from :meth:`__del__` for an
+        engine whose ``__init__`` ran to completion. Implementations are
+        written against a fully-constructed instance: a caller whose
+        ``__init__`` raised part-way must release whatever it acquired itself
+        rather than relying on the finalizer.
+        """
         pass
 
     def __enter__(self) -> SimEngine:
@@ -3729,6 +3928,13 @@ class SimEngine(ABC):
         self.cleanup()
 
     def __del__(self) -> None:
+        if not self._init_complete:
+            # ``__init__`` never finished, so this instance holds no engine
+            # resources. Calling cleanup() here would raise on whichever
+            # attribute ``__init__`` had not reached yet and report that name
+            # as a cleanup failure - noise indistinguishable from a real leak,
+            # and a red herring for whoever reads it.
+            return
         try:
             self.cleanup()
         except Exception as e:

@@ -33,8 +33,47 @@ from strands_robots.simulation.mujoco.scene_ops import (
     persist_geom_properties,
     refresh_body_inertial_from_geometry,
 )
+from strands_robots.utils import is_boolean
 
 logger = logging.getLogger(__name__)
+
+
+# Why a runtime state write refuses a boolean, kept in one place because three
+# surfaces quote it (set_joint_positions, set_joint_velocities, apply_force).
+#
+# The actuator-command path refuses one for a stronger reason: 1.0 is re-read in
+# each drive's own units, so the same True commands a different pose on every
+# actuator. Here 1.0 is a single unambiguous quantity - 1 radian, 1 rad/s, 1 N -
+# so a boolean is merely wrong rather than ambiguous, which is why #1837 left
+# these writers alone and #1838 settled them separately.
+#
+# They refuse it anyway, and the deciding argument is consistency of the domain
+# rather than the severity of the outcome: every scene-construction vector in
+# strands_robots.utils already rejects a bool component for exactly this reason
+# ("float(True) would silently write 1.0 where a coordinate, extent or colour
+# channel belongs"). A caller who cannot place a body at True should not be able
+# to teleport a joint to True either, and no caller can plausibly mean "1 radian"
+# by True. The alternative - accepting it here - would leave the direct API and
+# the tool surface stating different domains for the same kind of number.
+_BOOLEAN_STATE_REASON = (
+    "float(True) is 1.0, so a boolean would be written as 1 radian, 1 rad/s or "
+    "1 N depending on the surface, and the call would report success. Pass the "
+    "quantity in the surface's own units."
+)
+
+# The vector counterpart to _BOOLEAN_STATE_REASON. It is worded separately
+# because that one names radians, rad/s and newtons, which are the wrong units
+# for what _coerce_finite_vector guards: a coordinate, a geom extent, a friction
+# coefficient or a colour channel. The wording here is the one already recorded
+# in utils.finite_vector_error, which refuses a bool component for this reason
+# on the scene-construction side - and whose docstring then defers a colour to
+# "the rgba coercion in strands_robots.simulation.mujoco.physics", i.e. to this
+# helper. Same library, same quantity, so the same answer.
+_BOOLEAN_VECTOR_REASON = (
+    "float(True) is 1.0, so a boolean would silently write 1.0 where a "
+    "coordinate, extent or colour channel belongs, and the call would report "
+    "success. Pass the component as a number."
+)
 
 
 def _coerce_finite_vector(
@@ -87,6 +126,22 @@ def _coerce_finite_vector(
         }
     out: list[float] = []
     for elem in seq:
+        # Before float(), which cannot tell a boolean apart afterwards: bool is
+        # an int subclass and numpy.bool_ coerces the same way, so both arrived
+        # as a silent 1.0/0.0 component under status="success". This is the one
+        # chokepoint for every vector the runtime writers take - a raycast
+        # origin and direction, a geom size and friction, an rgba colour, and
+        # each ray of a multi_raycast batch - so the gate belongs here rather
+        # than at the seven call sites.
+        if is_boolean(elem):
+            return None, {
+                "status": "error",
+                "content": [
+                    {
+                        "text": f"{method}: '{name}' elements must be numbers, not a bool (got {values!r}). {_BOOLEAN_VECTOR_REASON}"
+                    }
+                ],
+            }
         try:
             f = float(elem)
         except (TypeError, ValueError):
@@ -172,14 +227,17 @@ def _coerce_finite_joint_map(
 ) -> tuple[dict[str, float], dict[str, Any] | None]:
     """Coerce a ``{joint_name: value}`` map to finite floats before any write.
 
-    Each value must be a real number (Python or NumPy scalar) and finite. A
+    Each value must be a real number (Python or NumPy scalar) and finite, and
+    must not be a boolean. A
     non-numeric value would otherwise raise ``ValueError`` from ``float(value)``
     past the structured-error dispatch contract, and ``nan`` / ``inf`` would
     slip straight into ``data.qpos`` / ``data.qvel`` -- ``mj_forward`` then
     propagates the ``nan`` across the whole kinematic state (or an ``inf``
     velocity blows up the integrator) while the tool still reports
-    ``status="success"``. Validating up front keeps the write atomic: an invalid
-    value leaves the model untouched.
+    ``status="success"``. A boolean is refused for the reason in
+    :data:`_BOOLEAN_STATE_REASON`: it survives ``float()`` as a silent ``1.0``,
+    so it is the one invalid value the finiteness check cannot see. Validating up
+    front keeps the write atomic: an invalid value leaves the model untouched.
 
     Args:
         values: The ``{joint_name: value}`` mapping to validate.
@@ -193,6 +251,18 @@ def _coerce_finite_joint_map(
     """
     out: dict[str, float] = {}
     for jnt_name, value in values.items():
+        # Before float(): float(True) is 1.0, so the boolean is unrecoverable
+        # once coerced and the write would report success having set 1 rad /
+        # 1 rad/s. numpy.bool_ needs the .item() unwrap is_boolean applies.
+        if is_boolean(value):
+            return {}, {
+                "status": "error",
+                "content": [
+                    {
+                        "text": f"{method}: '{name}' value for joint '{jnt_name}' must be a number, not a bool (got {value!r}). {_BOOLEAN_STATE_REASON}"
+                    }
+                ],
+            }
         try:
             f = float(value)
         except (TypeError, ValueError):
@@ -682,7 +752,9 @@ class PhysicsMixin:
         ``reset()`` clears every latched wrench in the world.
 
         Each vector may be a list, a tuple or a NumPy array (a computed wrench
-        is an array), and every element must be a finite real number.
+        is an array), and every element must be a finite real number. A boolean
+        element (python or ``numpy.bool_``) is refused rather than applied as
+        ``1.0`` N - see :data:`_BOOLEAN_STATE_REASON`.
 
         Args:
             body_name: Target body name.
@@ -725,9 +797,21 @@ class PhysicsMixin:
                 # inside np.array(dtype=float64) - escaping the structured-error
                 # contract - and nan/inf or nested lists slip silently into
                 # mj_applyFT, injecting bad state into the physics buffer.
-                # bool is intentionally accepted (subclass of int -> finite);
-                # rejecting it is out of scope for numeric-element validation.
+                # A bool element is refused rather than accepted as finite. The
+                # earlier note here deferred it as "out of scope for numeric-element
+                # validation"; that scope note is what #1838 revisited, because
+                # float(True) is 1.0 and a True force component silently applies
+                # 1 N along that axis while the call reports success.
                 for _elem in _vec:
+                    if is_boolean(_elem):
+                        return {
+                            "status": "error",
+                            "content": [
+                                {
+                                    "text": f"apply_force: '{_name}' elements must be numbers, not a bool (got {_vec!r}). {_BOOLEAN_STATE_REASON}"
+                                }
+                            ],
+                        }
                     try:
                         _f = float(_elem)
                     except (TypeError, ValueError):
@@ -1372,8 +1456,9 @@ class PhysicsMixin:
           joint count (when ``robot_name`` is given, that robot's joints; otherwise the
           world must contain exactly one robot, or the call errors).
 
-        Every value must be a finite real number (Python or NumPy scalar). A
-        ``nan`` / ``inf`` or a non-numeric value returns a structured
+        Every value must be a finite real number (Python or NumPy scalar), and
+        must not be a boolean. A
+        ``nan`` / ``inf``, a boolean or a non-numeric value returns a structured
         ``status="error"`` and leaves ``qpos`` untouched, rather than corrupting
         the kinematic state (``mj_forward`` propagates a ``nan`` everywhere) or
         raising past the tool-dispatch contract.
@@ -1491,8 +1576,9 @@ class PhysicsMixin:
         Writes to qvel. Useful for initializing dynamics. Accepts dict or list
         (see set_joint_positions for list semantics).
 
-        Every value must be a finite real number (Python or NumPy scalar). A
-        ``nan`` / ``inf`` or a non-numeric value returns a structured
+        Every value must be a finite real number (Python or NumPy scalar), and
+        must not be a boolean. A
+        ``nan`` / ``inf``, a boolean or a non-numeric value returns a structured
         ``status="error"`` and leaves ``qvel`` untouched, rather than blowing up
         the integrator on the next step or raising past the tool-dispatch contract.
 

@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 
 from strands_robots.policies.base import Policy
+from strands_robots.utils import name_list_error, tcp_port_error
 
 from .client import Gr00tInferenceClient
 from .data_config import Gr00tDataConfig, load_data_config
@@ -356,7 +357,10 @@ class Gr00tPolicy(Policy):
     Args:
         data_config: Config name or :class:`Gr00tDataConfig`.
         host: Service host.
-        port: Service port.
+        port: Service port, an ``int`` in ``[1, 65535]``. Only read in
+            service mode; ``model_path`` selects local mode, which never
+            dials. A value outside the range is refused rather than
+            interpolated into ``tcp://<host>:<port>``.
         model_path: HF model ID or local path (triggers local mode).
         embodiment_tag: Embodiment tag string.
         device: ``"cuda"`` or ``"cpu"``.
@@ -435,6 +439,15 @@ class Gr00tPolicy(Policy):
             self._init_mappings()
         else:
             self._mode = "service"
+            # ``port`` addresses the inference service this client dials, so a
+            # value that cannot name one is refused here rather than
+            # interpolated into ``tcp://<host>:<port>``. ZMQ's ``connect`` is
+            # lazy, so an out-of-range or fractional port is accepted by the
+            # socket and only surfaces later as an inference timeout that
+            # implicates the server rather than the port. Local mode never
+            # dials, so the port is validated only on the branch that reads it.
+            if (port_error := tcp_port_error(port, "port", type(self).__name__)) is not None:
+                raise ValueError(port_error)
             logger.info("GR00T service mode, %s:%s", host, port)
             # Resolve api_token from env var if not provided as parameter
             resolved_token = api_token or os.environ.get("GROOT_API_TOKEN")
@@ -653,7 +666,25 @@ class Gr00tPolicy(Policy):
         return "groot"
 
     def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
-        """No-op.  Mappings handle key translation."""
+        """Validate the joint-name list; the keys themselves are unused.
+
+        Gr00t translates keys through its own mappings, so nothing is stored.
+        The shape is still checked, because the same call must reach the same
+        verdict on every provider - an operator who mis-types this parameter
+        should be told so here rather than have it depend on which policy
+        happens to be loaded.
+
+        Raises:
+            ValueError: If ``robot_state_keys`` is not an ordered list of
+                distinct non-blank names, per
+                :func:`~strands_robots.utils.name_list_error`. A single name
+                passed as a bare string is the mistake this catches: ``str`` is
+                iterable per character, so it would bind one joint per letter.
+        """
+        if robot_state_keys and (
+            error := name_list_error(robot_state_keys, "robot_state_keys", "set_robot_state_keys")
+        ):
+            raise ValueError(error)
 
     def reset(self, seed: int | None = None) -> None:
         """Per-episode reset.
@@ -668,7 +699,8 @@ class Gr00tPolicy(Policy):
         The standard ``gr00t.eval.run_gr00t_server`` registers a ``reset``
         endpoint that maps to ``policy.reset(options=...)`` (see
         ``server_client.py:94``). The default ``Gr00tPolicy.reset`` upstream
-        is a no-op; deployments that need per-episode RNG control should
+        is a no-op, so the forwarded seed does nothing unless the server is
+        patched. Deployments that need per-episode RNG control should
         start the server through the packaged determinism wrapper
         (:mod:`strands_robots.policies.groot.server_wrapper`), which the
         ``gr00t_inference`` container-lifecycle tool mounts for you when

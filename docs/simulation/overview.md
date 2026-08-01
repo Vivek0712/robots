@@ -108,6 +108,50 @@ Newton backend, so a rollout rig can be enumerated instead of guessed.
 | `get_energy` | - |
 | `get_sensor_data` | `sensor_name` (optional) |
 
+!!! note "Numeric domain of the state writers"
+    `set_joint_positions`, `set_joint_velocities` and the `apply_force`
+    vectors take finite real numbers - a python or NumPy scalar - and refuse a
+    boolean. `float(True)` is `1.0`, so a `True` would be written as 1 radian,
+    1 rad/s or 1 N and the call would report success; `nan` / `inf` are refused
+    because `mj_forward` propagates a `nan` across the whole kinematic state
+    and an `inf` velocity blows up the integrator. Each write is
+    all-or-nothing, so a refused value leaves `qpos` / `qvel` and every latched
+    wrench untouched. This is the same domain the scene-construction vectors
+    (`add_object`, `add_camera`) and [`send_action`](#actions) enforce - one
+    library, one answer to "is this a usable number".
+
+!!! note "The same domain applies to the world-configuration parameters"
+    `set_gravity` / `create_world(gravity=...)`, `set_timestep` /
+    `create_world(timestep=...)`, the `mass` on `set_body_properties` and
+    `add_object`, the `randomize` ranges and the `set_obs_noise` magnitudes all
+    refuse a boolean for the same reason, as do the vectors `raycast`,
+    `multi_raycast` and `set_geom_properties` take (a ray origin and direction, a
+    geom size and friction, an rgba colour).
+
+    Passing one is not a near miss. `set_gravity(True)` would have configured a
+    gravity of **+1 m/s^2, pointing up**, and `set_timestep(True)` a 1-second
+    integration step - each reported as `status="success"`. The check is on the
+    type, not the value: `1`, `1.0` and `numpy` scalars remain accepted
+    everywhere, so `set_timestep(1.0)` is still a legal (if unusual) request.
+
+    Both spellings are refused - a python `bool` and a `numpy.bool_`. The second
+    matters more in practice, because it is what a comparison such as
+    `gripper > 0.5` produces, and because `numpy.bool_` is not a `bool` subclass
+    an `isinstance(x, bool)` guard silently misses it.
+
+!!! note "Component count of a vector parameter"
+    Every vector parameter (`position`, `target`, `origin`, `force`, `torque`,
+    `point`, `gravity`, `direction`, `orientation`, `color`, `get_world_point`'s
+    `pixels`, and `send_action`'s ordered-vector form) is checked for its
+    component count before it is read, and a value that carries no readable
+    count is refused with a structured error like any other. That includes a
+    0-d NumPy array or torch tensor - `np.mean(...)`, `np.array(0.5)`, a
+    squeezed observation slice - which *declares* `__len__` and then raises
+    from it, so it is reported as "not a vector of N numbers" rather than
+    escaping as a bare `len() of unsized object`. Correctly sized NumPy arrays
+    are accepted throughout, so an observation slice can be passed straight
+    through.
+
 !!! tip "Discover the sim-state surface"
     `get_state` plus the checkpoint (`save_state` / `load_state`) and
     direct pose-setting (`set_joint_positions` / `set_joint_velocities`)
@@ -125,6 +169,8 @@ Newton backend, so a rollout rig can be enumerated instead of guessed.
 | ordered numeric vector (`list` / `tuple` / 1-D `numpy` array) | bound positionally to `robot_action_keys(robot_name)` (the robot's actuator keys) in declaration order - the same convention `replay_episode` uses |
 
 A vector lets a policy's raw action chunk drive the arm directly without first zipping it into a dict. It binds to `robot_action_keys` (not `robot_joint_names`) because those are the keys `send_action` resolves and the ordering the `LeRobotDataset` recorder writes the `action` column in; the two coincide unless a robot has passive/mimic joints or a tendon gripper. The vector length must match the robot's actuator count exactly; a mismatch (or a non-numeric / scalar / string `action`) returns a structured `status="error"` dict naming the actuator count and order, rather than crashing or silently truncating commands. Use a mapping to target a subset of actuators.
+
+Each action *value* must be a finite number, and must not be a boolean. `nan` / `inf` are refused because they are not clamped into the actuator's range - MuJoCo discards the step and resets every robot in the scene while reporting success. A `bool` (or `numpy.bool_`) is refused because `float(True)` is `1.0`, and each drive reads 1.0 in its own units: a 1-radian target on a joint-position drive, a full-travel command on a normalized or tendon drive (a `[0, 255]` tendon gripper reads it as fully open), and an out-of-range value that is silently clamped where `ctrlrange` excludes 1 - so the same `True` commands a different pose on every actuator. Send the command in the actuator's own units; for a binary gripper, its endpoint value rather than a flag. This is the domain the teleop wire validator already enforces on an input frame, and `InputReceiver` applies those frames through `send_action`.
 
 ## Policy
 
