@@ -29,18 +29,28 @@ import os
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Any, TypedDict
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy as np
 
 from strands_robots.simulation.base import SimEngine
 from strands_robots.simulation.isaac.config import IsaacConfig
+from strands_robots.simulation.isaac.joint_names import demangle_usd_joint_names, urdf_joint_names
 from strands_robots.simulation.isaac.recording import IsaacRecordingMixin
+from strands_robots.simulation.models import registered, registry_entry
+from strands_robots.simulation.terrain import validate_difficulty
 from strands_robots.utils import (
     camera_fov_error,
     coerce_pose_vector,
+    coerce_rgba,
+    coerce_size_vector,
+    entity_name_error,
+    name_list_error,
+    non_negative_whole_number_error,
     positive_count_error,
     positive_whole_number_error,
+    step_aborted_msg,
 )
 
 if TYPE_CHECKING:
@@ -458,6 +468,7 @@ class _RobotState:
         articulation: Any = None,
         actual_prim_path: str | None = None,
         data_config: str | None = None,
+        usd_to_urdf_joint_names: dict[str, str] | None = None,
     ):
         self.name = name
         self.prim_path = prim_path
@@ -467,6 +478,16 @@ class _RobotState:
         # Recorded as the LeRobotDataset ``robot_type`` so datasets collected
         # on Isaac carry the same embodiment metadata as MuJoCo/Newton ones.
         self.data_config = data_config
+        # USD-mangled DOF name -> URDF joint name, for robots loaded from a
+        # URDF whose joint names are not valid USD identifiers (e.g. the
+        # ``robotstudio_so101`` URDF's ``"1"``..``"6"``, imported as
+        # ``tn__1_``..``tn__6_``). ``joint_names`` above already carries the
+        # translated (URDF) vocabulary - see
+        # :mod:`strands_robots.simulation.isaac.joint_names` (#1900) - so
+        # this map is diagnostics-only: it correlates the public names with
+        # the prim names an on-stage USD walk would encounter. Empty when
+        # nothing was mangled.
+        self.usd_to_urdf_joint_names = dict(usd_to_urdf_joint_names or {})
         # The prim path the URDF importer / USD reference actually
         # placed the robot at, which can differ from ``prim_path`` when
         # the importer ignores the requested destination (Isaac Sim 4.5
@@ -727,6 +748,10 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             config.headless,
         )
 
+        # Construction complete - the finalizer may now release what we hold.
+        # See SimEngine._init_complete: this must be the final statement.
+        self._init_complete = True
+
     def _on_main_thread(self) -> bool:
         return threading.get_ident() == self._main_tid
 
@@ -859,6 +884,16 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         # doubly inert - there is no heightfield terrain for it to scale (a
         # non-None terrain is already rejected above) - so any != 1.0 value is
         # meaningless here; surface that instead of a status=success no-op.
+        # The ``difficulty`` domain is owned by ``validate_difficulty`` and shared
+        # with the MuJoCo backend, which honors the value: the same scale is
+        # refused identically on every backend rather than one accepting what
+        # another rejects. It runs before the ``float(difficulty)`` test below,
+        # which raises ``TypeError`` for ``None``/a list and ``ValueError`` for a
+        # non-numeric string - escaping this method's structured-error contract.
+        try:
+            validate_difficulty(difficulty)
+        except ValueError as exc:
+            return {"status": "error", "content": [{"text": str(exc)}]}
         if float(difficulty) != 1.0:
             return {
                 "status": "error",
@@ -888,59 +923,36 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         # up front and reject anything the backend cannot honour, rather than
         # applying a gravity the caller never asked for.
         if gravity is not None:
-            if isinstance(gravity, (list, tuple)):
-                if len(gravity) != 3:
-                    return {
-                        "status": "error",
-                        "content": [
-                            {
-                                "text": (
-                                    f"create_world: gravity vector must have 3 components [gx, gy, gz], "
-                                    f"got {len(gravity)}."
-                                )
-                            }
-                        ],
-                    }
-                try:
-                    gvec = [float(g) for g in gravity]
-                except (TypeError, ValueError):
-                    return {
-                        "status": "error",
-                        "content": [{"text": f"create_world: gravity components must be numbers, got {gravity!r}."}],
-                    }
-                if not all(np.isfinite(gvec)):
-                    return {
-                        "status": "error",
-                        "content": [{"text": f"create_world: gravity components must be finite, got {gravity!r}."}],
-                    }
-                if gvec[0] != 0.0 or gvec[1] != 0.0:
-                    return {
-                        "status": "error",
-                        "content": [
-                            {
-                                "text": (
-                                    f"create_world: the Isaac backend only supports Z-aligned gravity "
-                                    f"(its PhysicsContext.set_gravity takes a signed scalar); a non-Z-aligned "
-                                    f"vector like {gravity!r} cannot be honoured. Pass a scalar or a "
-                                    f"[0, 0, gz] vector, or use create_simulation(backend='mujoco') for "
-                                    f"arbitrary-direction gravity."
-                                )
-                            }
-                        ],
-                    }
-            elif isinstance(gravity, (int, float)):
-                if not np.isfinite(gravity):
-                    return {
-                        "status": "error",
-                        "content": [{"text": f"create_world: gravity must be finite, got {gravity!r}."}],
-                    }
-            else:
+            # Normalize through the shared domain first, so the component count,
+            # the numeric domain and the boolean refusal are the ones every
+            # other gravity surface applies. The local copy coerced a scalar
+            # with ``float()``, and bool is an int subclass, so
+            # ``create_world(gravity=True)`` configured a +1 m/s^2 gravity
+            # pointing *up*; it also keyed on ``isinstance(gravity, (list, tuple))``,
+            # so a NumPy vector - which the other backends accept - was refused
+            # as "not a scalar or vector". The Z-alignment constraint below is
+            # this backend's own and is applied to the normalized components.
+            components, gravity_error = self._normalize_gravity(gravity, "create_world")
+            if components is None:
+                return cast("dict[str, Any]", gravity_error)
+            if components[0] != 0.0 or components[1] != 0.0:
                 return {
                     "status": "error",
                     "content": [
-                        {"text": f"create_world: gravity must be a scalar or [gx, gy, gz] vector, got {gravity!r}."}
+                        {
+                            "text": (
+                                f"create_world: the Isaac backend only supports Z-aligned gravity "
+                                f"(its PhysicsContext.set_gravity takes a signed scalar); a non-Z-aligned "
+                                f"vector like {gravity!r} cannot be honoured. Pass a scalar or a "
+                                f"[0, 0, gz] vector, or use create_simulation(backend='mujoco') for "
+                                f"arbitrary-direction gravity."
+                            )
+                        }
                     ],
                 }
+            # Store the normalized components so what the result reports and
+            # what the physics context receives are the same value.
+            gravity = components
         with self._lock:
             if self._world_created:
                 return {
@@ -1193,23 +1205,99 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         -------
         dict
             Status dict.
+
+        Concurrency: main-thread affine. ``world.reset()`` drives Isaac's kit
+        runtime (``SimulationContext.stop()``/``play()``), which only pumps
+        updates on the thread that created ``SimulationApp``. Off that thread
+        the call is marshalled via :meth:`run_on_main` when
+        :meth:`run_pump_forever` is engaged, and raises ``RuntimeError``
+        (rather than blocking forever) when it is not. See
+        :meth:`_marshal_main_thread_affine`.
         """
         with self._lock:
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
 
-            if self._world is not None:
-                self._world.reset()
+        def _reset_impl() -> dict[str, Any]:
+            with self._lock:
+                # Re-checked under the lock: a pump-marshalled call may race a
+                # concurrent destroy() between the public check above and here.
+                if not self._world_created:
+                    return {"status": "error", "content": [{"text": "No world created."}]}
 
-            self._sim_time = 0.0
-            self._step_count = 0
+                if self._world is not None:
+                    self._world.reset()
+                    # ``world.reset()`` on the pip Isaac Sim 6.0.x wheels
+                    # invalidates the physics-tensor view the per-robot
+                    # ``SingleArticulation`` handles hold (the #1798
+                    # invalidate-on-stop family, articulation edition), so
+                    # without an explicit revive every post-reset
+                    # ``get_joint_positions()`` returns ``None`` and
+                    # ``get_observation`` degrades to its documented
+                    # silent-empty mode (#1895).
+                    self._revive_articulations_after_reset()
 
-            if env_ids is None:
-                msg = "Full reset complete."
-            else:
-                msg = f"Partial reset complete for {len(env_ids)} envs."
+                self._sim_time = 0.0
+                self._step_count = 0
 
-            return {"status": "success", "content": [{"text": msg}]}
+                if env_ids is None:
+                    msg = "Full reset complete."
+                else:
+                    msg = f"Partial reset complete for {len(env_ids)} envs."
+
+                return {"status": "success", "content": [{"text": msg}]}
+
+        return self._marshal_main_thread_affine("reset", _reset_impl)
+
+    def _revive_articulations_after_reset(self) -> None:
+        """Re-initialize robot articulation handles ``world.reset()`` killed.
+
+        On the pip Isaac Sim 6.0.x wheels (verified live on ``isaacsim``
+        6.0.0.1, 2026-08-03), ``world.reset()`` tears down and rebuilds the
+        physics-tensor simulation view, and the per-robot
+        ``SingleArticulation`` handles are left holding the torn-down view -
+        ``get_joint_positions()`` returns ``None`` and every joint read /
+        action apply after ANY reset silently degrades (#1895). This is the
+        articulation edition of the #1798 invalidate-on-stop family: #1798
+        fixed the scene-object path (``_stop_timeline_for_deferred_physics``
+        invalidates synchronously; :meth:`load_scene` rebuilds and re-inits),
+        this covers the wrapper handles our ``_RobotState`` bookkeeping owns.
+
+        Mirrors #1798's prevent-and-revive approach rather than catching the
+        downstream ``None``s: each registered robot's handle is probed
+        (``get_joint_positions() is not None``), and only a dead handle is
+        re-initialized against the fresh view - a probe-alive handle is left
+        untouched, so builds whose reset keeps handles live (e.g. binary
+        Isaac installs) pay one cheap read and nothing else.
+
+        Best-effort per robot, matching :meth:`load_scene`'s re-init error
+        tolerance: a robot without a handle (Phase-1 procedural / load stub)
+        is skipped, and a failed re-init is logged loudly because joint
+        observations for that robot WILL be empty afterwards.
+
+        Concurrency: caller holds ``self._lock`` (called from ``reset()``
+        only, after ``world.reset()`` completes).
+        """
+        for robot in self._robots.values():
+            if robot.articulation is None:
+                continue
+            try:
+                if robot.articulation.get_joint_positions() is not None:
+                    continue  # handle survived the reset; leave it alone
+            except (RuntimeError, ValueError, AttributeError, TypeError):
+                # A dead handle may raise instead of returning None on some
+                # SDK surfaces; either way it needs the re-init below.
+                pass
+            try:
+                robot.articulation.initialize(getattr(self._world, "physics_sim_view", None))
+            except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+                logger.warning(
+                    "reset: re-initializing articulation for robot %r after world.reset() "
+                    "failed (%s); joint observations for this robot will be EMPTY until "
+                    "the handle is re-initialized.",
+                    robot.name,
+                    e,
+                )
 
     def step(self, n_steps: int = 1) -> dict[str, Any]:
         """Advance simulation by n physics steps.
@@ -1217,13 +1305,35 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         Parameters
         ----------
         n_steps : int
-            Number of steps to take. Default 1.
+            Non-negative whole number of steps to take, on the shared
+            :func:`~strands_robots.utils.non_negative_whole_number_error` domain
+            every backend applies. Default 1, and ``0`` is an accepted no-op. A
+            NumPy or float count with an integral value is honored and coerced.
 
         Returns
         -------
         dict
-            Status dict with timing info.
+            Status dict with timing info. ``status`` is ``"error"`` when no
+            world exists, ``n_steps`` is outside that domain, or the world was
+            destroyed on a batch boundary mid-run - in which case the error
+            names the steps completed, since some were.
+
+        Concurrency: main-thread affine. ``world.step()`` drives Isaac's kit
+        runtime, which only pumps updates on the thread that created
+        ``SimulationApp``. Off that thread the batched loop is marshalled via
+        :meth:`run_on_main` when :meth:`run_pump_forever` is engaged, and
+        raises ``RuntimeError`` (rather than blocking forever) when it is not.
+        See :meth:`_marshal_main_thread_affine`.
         """
+        # Guarded before the lock is taken and before any world tick: a
+        # negative count made ``range()`` empty, so the call reported success
+        # having stepped nothing, and divided the elapsed wall time by that
+        # negative count to report a negative steps/sec rate. Every
+        # non-integral value reached ``range()`` and raised past this method's
+        # structured envelope.
+        if error := non_negative_whole_number_error(n_steps, "n_steps", "step"):
+            return {"status": "error", "content": [{"text": error}]}
+        n_steps = int(n_steps)
         with self._lock:
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
@@ -1231,12 +1341,40 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if self._world is None:
                 return {"status": "error", "content": [{"text": "World not initialized."}]}
 
+        # Nested (not a separate method) so the batching loop remains part of
+        # ``step``'s own body: the cross-backend batch-and-recheck contract is
+        # enforced structurally by scanning each concrete ``step`` for
+        # ``_STEPS_PER_BATCH`` and ``step_aborted_msg`` references, and a
+        # helper method would hide them from that scan.
+        def _step_impl() -> dict[str, Any]:
             t0 = time.perf_counter()
-
-            for _ in range(n_steps):
-                self._world.step(render=self._config.render_mode != "headless")
-                self._sim_time += self._config.physics_dt
-                self._step_count += 1
+            # Batched so the lock is released every ``_STEPS_PER_BATCH`` ticks.
+            # Previously the whole count ran under one acquisition, so a worker
+            # thread's ``get_state`` / ``get_observation`` - and the pump's own
+            # queue drain - blocked for the duration: measured, ``step(100_001)``
+            # called ``world.step`` 100_001 times inside a single hold, which at a
+            # ~2 ms tick is over three minutes with nothing able to interleave.
+            #
+            # The per-batch re-check is the other half of that release, not a
+            # separate concern: with the lock dropped between batches a concurrent
+            # ``destroy`` / ``cleanup`` becomes reachable mid-call, so each batch confirms
+            # the world it is about to advance still exists and aborts naming the
+            # steps completed rather than stepping a torn-down stage.
+            remaining = n_steps
+            while remaining > 0:
+                batch = min(remaining, self._STEPS_PER_BATCH)
+                with self._lock:
+                    if not self._world_created or self._world is None:
+                        return {
+                            "status": "error",
+                            "content": [{"text": step_aborted_msg(n_steps - remaining, n_steps)}],
+                        }
+                    render = self._config.render_mode != "headless"
+                    for _ in range(batch):
+                        self._world.step(render=render)
+                        self._sim_time += self._config.physics_dt
+                        self._step_count += 1
+                remaining -= batch
 
             elapsed = time.perf_counter() - t0
             steps_per_sec = n_steps / elapsed if elapsed > 0 else float("inf")
@@ -1254,6 +1392,8 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     }
                 ],
             }
+
+        return self._marshal_main_thread_affine("step", _step_impl)
 
     def get_state(self) -> dict[str, Any]:
         """Get full simulation state summary.
@@ -1315,7 +1455,13 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         Parameters
         ----------
         name : str
-            Robot identifier (also used for procedural lookup).
+            Robot identifier (also used for procedural lookup). Must be a
+            non-empty string with no NUL, on the shared
+            :func:`~strands_robots.utils.entity_name_error` domain the MuJoCo
+            and Newton backends' ``add_robot`` enforces, so a robot name one
+            backend refuses is refused by all three. This backend has no
+            "derive a label from the model" short form, so ``None`` / ``""``
+            are refused here rather than resolved to a generated label.
         urdf_path : str, optional
             Path to URDF file.
         mjcf_path : str, optional
@@ -1352,6 +1498,15 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             at a keyframe, or omit ``keyframe`` for the default zero-pose
             spawn.
 
+        Validation
+        ----------
+        ``position`` must be 3 finite numbers and ``orientation`` 4, on the
+        shared :func:`~strands_robots.utils.coerce_pose_vector` domain the
+        MuJoCo and Newton backends' ``add_robot`` enforce. The pose domain is
+        checked before the identity-only ``orientation`` reject, so a
+        wrong-length quaternion reports its real defect instead of being told
+        that base rotation is unsupported.
+
         Returns
         -------
         dict
@@ -1387,6 +1542,19 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     }
                 ],
             }
+        # Validate the pose vectors on the shared ``coerce_pose_vector`` domain the
+        # MuJoCo backend's ``add_robot`` and this backend's own ``add_camera`` already
+        # use, so a pose one backend refuses is refused by all of them - the
+        # invariant that helper documents. The ``position or [0.0, 0.0, 0.0]`` read
+        # this replaces tested the VECTOR: a NumPy array raised a bare
+        # ``ValueError: truth value of an array ... is ambiguous`` through the
+        # structured envelope, and an empty vector read as *omitted*.
+        position, _perr = coerce_pose_vector("add_robot", "position", position, 3)
+        if _perr is not None:
+            return {"status": "error", "content": [{"text": _perr}]}
+        orientation, _oerr = coerce_pose_vector("add_robot", "orientation", orientation, 4)
+        if _oerr is not None:
+            return {"status": "error", "content": [{"text": _oerr}]}
         # The default None means identity; only a non-identity quaternion is
         # rejected (parity with the keyframe/terrain guards -- reject an
         # unsupported request rather than silently dropping the rotation).
@@ -1412,6 +1580,28 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     "content": [{"text": "No world created. Call create_world() first."}],
                 }
 
+            # Refuse a name that cannot address the robot this call creates, on the
+            # shared ``entity_name_error`` domain the MuJoCo and Newton backends'
+            # ``add_robot`` already applies, so a name one backend refuses is
+            # refused by all three. Unlike the MuJoCo backend this one has no
+            # "derive a label from the model" short form - ``name`` IS the
+            # procedural lookup key - so every value goes through the domain.
+            #
+            # An unaddressable name is not merely cosmetic here, because the
+            # prim path is interpolated from it (``{stage}/Robots/{name}``) and
+            # ``remove_robot`` prunes the cleanup registry with
+            # ``p.startswith(prim_path)``: ``add_robot("")`` reported success at
+            # the path ``/World/Robots/``, which is the *container* scope for
+            # every robot, so a later ``remove_robot("")`` pruned EVERY robot's
+            # prim from ``_prim_registry`` - two live robots left with zero
+            # tracked prims to release at teardown. An int name registered the
+            # key ``7``, which the tool surface, where a name always arrives as a
+            # JSON string, can never address, and an unhashable name raised
+            # ``TypeError`` out of the duplicate-name test below, escaping the
+            # structured envelope this method documents as its failure channel.
+            if (name_err := entity_name_error("add_robot", "name", name)) is not None:
+                return {"status": "error", "content": [{"text": name_err}]}
+
             if name in self._robots:
                 return {
                     "status": "error",
@@ -1424,7 +1614,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     "content": [{"text": "Cannot add robots after replicate(). Call destroy() first."}],
                 }
 
-            pos = position or [0.0, 0.0, 0.0]
+            pos = [0.0, 0.0, 0.0] if position is None else position
             prim_path = f"{self._config.stage_path}/Robots/{name}"
 
             # Procedural lookup is a *fallback*: an explicit usd_path /
@@ -1570,6 +1760,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     articulation=articulation,
                     actual_prim_path=getattr(articulation, "_strands_actual_prim_path", None),
                     data_config=data_config,
+                    usd_to_urdf_joint_names=getattr(articulation, "_strands_usd_to_urdf_joint_names", None),
                 )
                 self._robots[name] = robot_state
 
@@ -1640,9 +1831,15 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         Parameters
         ----------
         name : str
-            Object identifier. Must be unique across the simulation; a
-            duplicate is rejected with a structured error envelope rather
-            than silently overwriting the existing prim.
+            Object identifier. Must be a non-empty string with no NUL, on the
+            shared :func:`~strands_robots.utils.entity_name_error` domain the
+            MuJoCo and Newton backends' ``add_object`` enforces, so an object
+            name one backend refuses is refused by all three - the prim path is
+            interpolated from it, and an entity registered under a name nothing
+            can resolve is unreachable through the very API that created it.
+            Must also be unique across the simulation; a duplicate is rejected
+            with a structured error envelope rather than silently overwriting
+            the existing prim.
         shape : str
             Shape type: ``"box"`` (default), ``"sphere"``, ``"capsule"``,
             ``"cylinder"``. ``"cuboid"`` is accepted as an alias for
@@ -1669,13 +1866,35 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             * ``capsule``:  ``[radius, height]`` (default ``[0.05, 0.10]``).
 
             Lists shorter than the convention fall back to defaults for
-            the missing trailing components.
+            the missing trailing components. Whether that fallback should
+            survive is the open half of #1858 - MuJoCo refuses a short
+            ``size`` outright - so it is unchanged here.
+
+            Must be a non-empty vector of finite numbers, on the shared
+            :func:`~strands_robots.utils.coerce_size_vector` domain the
+            MuJoCo and Newton backends' ``add_object`` enforce, so an extent
+            one backend refuses is refused by all three. A ``nan``/``inf``,
+            ``bool`` or non-numeric component is refused rather than reaching
+            the prim constructor, an empty vector is a component count rather
+            than an omission, and a scalar is refused by name instead of
+            raising ``TypeError: 'float' object is not iterable`` out of the
+            ``list()`` that used to coerce it. NumPy arrays are accepted and
+            normalized to plain floats, so a ``np.float64`` extent no longer
+            reaches the result ``json``.
         color : list[float], optional
-            RGB color ``[r, g, b]`` in ``[0, 1]``. RGBA lists (length 4)
-            are accepted; alpha is dropped (Isaac's primitive constructors
-            take RGB only). ``None`` -> default white.
+            ``[r, g, b]`` or ``[r, g, b, a]`` in 0..1 (an RGB triple is
+            completed with an opaque alpha; the Isaac shape wrappers take
+            RGB only). Any other component count is refused rather than
+            truncated, since applying only the leading components would
+            paint a colour that was not asked for. NumPy arrays are
+            accepted. ``None`` -> default white.
         mass : float
-            Mass in kg. Default 0.1. Ignored when ``is_static=True``.
+            Mass in kg for a dynamic object; a finite number > 0. Default
+            0.1. Ignored when ``is_static=True``, and not validated there
+            since nothing reads it. Unlike the Newton backend there is no
+            ``mass=0`` "make it static" spelling - ``0`` is refused with
+            ``is_static=True`` named as the remedy, which is the MuJoCo
+            contract this backend's docs otherwise mirror.
         is_static : bool
             If ``True``, the prim is constructed via ``Fixed{Cuboid,
             Sphere, Cylinder, Capsule}`` and stays pinned in space. If
@@ -1692,6 +1911,26 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             Visual material/texture spec. NOT supported by the Isaac backend
             yet; a non-``None`` value is rejected loudly rather than silently
             dropped (use the MuJoCo backend for matte/textured surfaces).
+
+        Validation
+        ----------
+        ``position`` must be 3 finite numbers and ``orientation`` 4 (a list,
+        tuple or NumPy array; NumPy scalar elements accepted, ``bool``
+        refused), on the shared
+        :func:`~strands_robots.utils.coerce_pose_vector` domain the MuJoCo and
+        Newton backends' ``add_object`` enforce, so a pose one backend refuses
+        is refused by all three. Omit a vector to take its default; an empty
+        vector is a wrong-length request rather than an omission.
+
+        ``mass`` must be a finite number > 0 for a dynamic object, on the shared
+        :meth:`~strands_robots.simulation.base.SimEngine._validate_mass` domain
+        the MuJoCo backend's ``add_object`` and ``set_body_properties`` enforce,
+        so a mass one backend refuses is refused by all three. It is checked
+        before the prim is constructed, because it used to be read *after* the
+        object was registered: ``float(mass)`` while assembling the result
+        raised for a non-number once the prim was already on the stage and in
+        ``_objects``, leaving the name permanently taken. A static object's mass
+        is never read, so it is not validated - the same scope MuJoCo uses.
 
         Returns
         -------
@@ -1734,6 +1973,19 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
 
+            # Refuse a name that cannot address the object this call creates, on
+            # the shared ``entity_name_error`` domain the MuJoCo and Newton
+            # backends' ``add_object`` already applies, so a name one backend
+            # refuses is refused by all three. The prim path is interpolated from
+            # the name (``{stage}/Objects/{name}``), so ``add_object("")``
+            # reported success at ``/World/Objects/`` - the container scope, not a
+            # child prim - and a non-string name keyed ``_objects`` with a value
+            # the tool surface can never send back. An unhashable name raised
+            # ``TypeError`` out of the duplicate-name test below rather than
+            # returning the structured error this method documents.
+            if (name_err := entity_name_error("add_object", "name", name)) is not None:
+                return {"status": "error", "content": [{"text": name_err}]}
+
             # Normalize shape aliases. ``"cuboid"`` is accepted as an
             # alias for ``"box"`` because it matches Isaac's underlying
             # ``DynamicCuboid`` / ``FixedCuboid`` class names and is the
@@ -1760,13 +2012,70 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             # Isaac's ``DynamicCuboid(scale=...)`` convention and the docs
             # vocabulary -- see issue #88). An explicit ``size`` always
             # wins over ``scale`` if both are passed.
+            # Validate the pose vectors on the shared ``coerce_pose_vector`` domain the
+            # MuJoCo backend's ``add_object`` and this backend's own ``add_camera`` already
+            # use, so a pose one backend refuses is refused by all of them - the
+            # invariant that helper documents. The ``list(x)`` coercion this
+            # replaces validated nothing: a wrong-length, ``nan``/``inf``, ``bool`` or
+            # non-numeric component was passed straight to the prim constructor, and a
+            # bare string was split per character into a 3-component "position".
+            position, _perr = coerce_pose_vector("add_object", "position", position, 3)
+            if _perr is not None:
+                return {"status": "error", "content": [{"text": _perr}]}
+            orientation, _oerr = coerce_pose_vector("add_object", "orientation", orientation, 4)
+            if _oerr is not None:
+                return {"status": "error", "content": [{"text": _oerr}]}
+            # Same shared domain for the colour, whose accepted counts the
+            # 4-component rgba row it ends up in defines. Forwarding it raw
+            # validated nothing and then TRUNCATED: ``_construct_shape_prim``
+            # writes ``list(color)[:3]``, so a 5-component colour was applied as
+            # its first 3 under a success result, ``"abcd"`` was split per
+            # character into the colour ``['a', 'b', 'c']``, and a scalar reached
+            # ``np.asarray`` before failing. Normalizing to 4 components here
+            # makes that ``[:3]`` read well-defined by construction.
+            color, _cerr = coerce_rgba("add_object", "color", color)
+            if _cerr is not None:
+                return {"status": "error", "content": [{"text": _cerr}]}
+            # Same idea for the mass, on the shared ``_validate_mass`` domain the
+            # MuJoCo backend applies to the same quantity. Position matters as
+            # much as the check: the only place the raw value was read was
+            # ``float(mass)`` while assembling the result, which is AFTER
+            # ``_construct_shape_prim``, ``scene.add``, the ``_prim_registry``
+            # append and the ``_objects`` entry. A non-number therefore raised
+            # past the envelope this method documents as its only failure
+            # channel with the prim already on the stage and the name already
+            # taken - so the obvious recovery, retrying under the same name with
+            # a usable mass, was refused as a duplicate. Checked here, a refused
+            # mass constructs nothing and leaves the name reusable.
+            if not is_static and (mass_err := self._validate_mass(mass, "add_object")) is not None:
+                return mass_err
             scale_alias = kwargs.pop("scale", None)
             if size is None and scale_alias is not None:
                 size = scale_alias
+            # The shape-independent half of the extent contract, on the shared
+            # ``coerce_size_vector`` domain the MuJoCo backend's ``add_object``
+            # composes with its own per-shape table. It runs AFTER the ``scale``
+            # alias is resolved, because the two spellings name one parameter and
+            # a domain only one of them enforced would be no domain at all. The
+            # ``list(size)`` below coerced without validating, exactly as the pose
+            # did before #1853: ``[nan, .1, .1]`` and ``[inf, .1, .1]`` reached the
+            # prim constructor verbatim, ``[True, .1, .1]`` passed ``True`` as an
+            # extent, ``[None, .1, .1]`` and ``[[0.1], .1, .1]`` passed a ``None``
+            # and a nested list, the bare string ``"abc"`` was SPLIT per character
+            # into a 3-component extent ``['a', 'b', 'c']``, ``[]`` was forwarded
+            # as a sizeless size, and a scalar ``0.5`` raised
+            # ``TypeError: 'float' object is not iterable`` out of that very
+            # ``list()`` call - past the envelope this method documents as its only
+            # failure channel. The per-shape component count, the short-vector
+            # fallback this method's ``size`` docstring promises and the positivity
+            # of a consumed extent are shape-dependent and stay with #1858.
+            size, _serr = coerce_size_vector("add_object", "size", size)
+            if _serr is not None:
+                return {"status": "error", "content": [{"text": _serr}]}
 
-            pos = list(position) if position is not None else [0.0, 0.0, 0.5]
-            orient = list(orientation) if orientation is not None else [1.0, 0.0, 0.0, 0.0]
-            size_in = list(size) if size is not None else None
+            pos = [0.0, 0.0, 0.5] if position is None else position
+            orient = [1.0, 0.0, 0.0, 0.0] if orientation is None else orientation
+            size_in = size
             prim_path = f"{self._config.stage_path}/Objects/{name}"
 
             try:
@@ -1840,12 +2149,18 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                 "mass": float(mass) if not is_static else 0.0,
                 "is_static": bool(is_static),
             }
+            # ``obj_info["mass"]``, not the caller's ``mass``: for a static object
+            # the raw value is documented as ignored and is never coerced, so
+            # formatting it with ``%.3f`` raised ``TypeError: must be real number``
+            # inside the logging call - only when INFO was enabled, which is why it
+            # sat latent. The resolved value is always a float and is the number
+            # this result reports, so the log and the payload cannot disagree.
             logger.info(
                 "Added object '%s' (shape=%s, pos=%s, mass=%.3f, static=%s)",
                 name,
                 shape,
                 pos,
-                mass,
+                obj_info["mass"],
                 is_static,
             )
             return {
@@ -2126,6 +2441,19 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         so per-episode reloads don't accumulate duplicate prims or hit the
         "object already exists" guard in :meth:`add_object`.
 
+        Timeline contract (#1820): realizing dynamic objects stops the
+        timeline per prim (#159); after rebuilding the physics view this
+        method restarts it (``world.play()``, which lands the state change
+        without integrating a physics tick), so on success the episode
+        integrates physics. No settle step runs here -- the objects sit
+        at MJCF *placeholder* poses until
+        ``LiberoAdapter._apply_object_pose_state`` teleports them to the
+        episode's init poses, and integrating from the placeholder
+        configuration explodes PhysX (coincident bodies at the robot
+        base). A failed or non-landing restart returns
+        ``{"status": "error"}`` rather than leaving the episode silently
+        frozen.
+
         Parameters
         ----------
         scene_path : str
@@ -2166,7 +2494,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             # reloads are idempotent (no duplicate prims / no "already exists").
             removed_any = False
             for prior_name in list(self._scene_objects):
-                if prior_name in self._objects:
+                if registered(self._objects, prior_name):
                     self.remove_object(prior_name)
                     removed_any = True
                 self._scene_objects.discard(prior_name)
@@ -2203,7 +2531,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             for obj in scene_objects:
                 # ``add_object`` rejects duplicate names; if a manually-added
                 # object shadows a scene object, skip it rather than abort.
-                if obj.name in self._objects:
+                if registered(self._objects, obj.name):
                     skipped.append({"name": obj.name, "reason": "name already in use"})
                     continue
                 result = self.add_object(
@@ -2289,6 +2617,77 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                             e,
                         )
 
+                # Restart the timeline (#1820). Every dynamic prim realized
+                # above stopped it (`_construct_shape_prim`, #159) and
+                # nothing else restarts it, so without this the ENTIRE
+                # episode runs on frozen physics: `SimulationContext.step`
+                # only integrates when `is_playing()` -- `world.step()`
+                # renders with stale joint reads, `send_action` targets a
+                # view that never integrates -- and every envelope still
+                # reports success, so the eval reads green with a
+                # motionless robot (measured: 5-episode groot evals at
+                # success_rate=0.00 with byte-similar videos).
+                #
+                # `world.play()` rather than `timeline.play()`: on 6.0.x a
+                # bare `timeline.play()` only QUEUES the state change, and
+                # the headless step path (`world.step(render=False)`) never
+                # runs the app update that would land it -- measured live
+                # (Isaac 6.0 / L4): `is_playing()` still False after
+                # play() + 5 world.steps, joints frozen. `world.play()` is
+                # play + `timeline.commit()` + one app update issued with
+                # `/app/player/playSimulations` DISABLED, so the state
+                # lands synchronously and, critically, NO physics
+                # integrates on the landing tick: the objects realized
+                # above still sit at their MJCF *placeholder* poses (LIBERO
+                # encodes real per-episode poses in BDDL init states, not
+                # in body attributes -- coincident bodies inside the robot
+                # base), and integrating even one tick from that
+                # configuration storms PhysX "Illegal BroadPhaseUpdateData
+                # - non-finite bounds" and NaNs the joint state. That is
+                # also why there is deliberately NO settle step here:
+                # `LiberoAdapter._apply_object_pose_state` teleports the
+                # objects to their episode init poses and owns the settle.
+                #
+                # Ordering: play comes AFTER the STOP-event flush +
+                # `initialize_physics()` + `articulation.initialize()`
+                # above -- the stop -> rebuild -> re-init -> play cycle was
+                # verified live (Isaac 6.0 / L4) to preserve articulation
+                # state, whereas playing before the flush lets the queued
+                # STOP handlers null the freshly-built handles.
+                #
+                # A failure is FATAL, not a warning: warn-and-continue here
+                # reproduces the exact silent-frozen-physics defect this
+                # block fixes (AGENTS.md: never warn-and-continue if the
+                # system will behave unexpectedly).
+                try:
+                    self._world.play()
+                except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+                    msg = (
+                        f"load_scene: restarting the timeline after realizing scene objects "
+                        f"failed ({type(e).__name__}: {e}). The timeline was stopped by the "
+                        f"dynamic-prim constructors (#159), so physics would stay FROZEN for "
+                        f"the whole episode while every action reports success (#1820). "
+                        f"Refusing to continue."
+                    )
+                    logger.error("IsaacSimulation.load_scene: %s", msg)
+                    return {"status": "error", "content": [{"text": msg}]}
+                # Verify the play actually landed. Best-effort import: no
+                # omni.timeline means no live Kit session (the CPU unit-test
+                # skeleton), where the #159 stop never ran either.
+                try:
+                    import omni.timeline  # type: ignore[import-not-found]
+                except ImportError:
+                    logger.debug("load_scene: omni.timeline unavailable; skipping timeline-playing verification")
+                else:
+                    if not omni.timeline.get_timeline_interface().is_playing():
+                        msg = (
+                            "load_scene: timeline still stopped after world.play() -- physics "
+                            "would stay FROZEN for the whole episode while every action "
+                            "reports success (#1820). Refusing to continue."
+                        )
+                        logger.error("IsaacSimulation.load_scene: %s", msg)
+                        return {"status": "error", "content": [{"text": msg}]}
+
             logger.info("IsaacSimulation.load_scene: %s", summary)
             return {
                 "status": "success",
@@ -2335,7 +2734,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             convention used by :meth:`get_observation` for unknown robots).
         """
         with self._lock:
-            if robot_name not in self._robots:
+            if not registered(self._robots, robot_name):
                 return []
             return list(self._robots[robot_name].joint_names)
 
@@ -2359,7 +2758,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             shape used by mutating methods on this class.
         """
         with self._lock:
-            if name not in self._robots:
+            if not registered(self._robots, name):
                 return {
                     "status": "error",
                     "content": [{"text": f"Robot '{name}' not found."}],
@@ -2401,7 +2800,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             bookkeeping that does not distinguish robots from objects.
         """
         with self._lock:
-            if name not in self._objects:
+            if not registered(self._objects, name):
                 return {
                     "status": "error",
                     "content": [{"text": f"Object '{name}' not found."}],
@@ -2494,7 +2893,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     )
                     return {}
 
-            if robot_name not in self._robots:
+            if not registered(self._robots, robot_name):
                 logger.warning(
                     "get_observation(robot_name=%r): unknown robot. Known: %s. Returning empty observation.",
                     robot_name,
@@ -2606,7 +3005,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             Standard ``{"status", "content": [{"text"}]}`` envelope.
         """
         with self._lock:
-            if robot_name not in self._robots:
+            if not registered(self._robots, robot_name):
                 return {
                     "status": "error",
                     "content": [{"text": f"Robot '{robot_name}' not found. Available: {sorted(self._robots)}"}],
@@ -2701,7 +3100,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                         "status": "error",
                         "content": [{"text": f"Specify robot_name; available robots: {sorted(self._robots)}"}],
                     }
-            if robot_name not in self._robots:
+            if not registered(self._robots, robot_name):
                 return {"status": "error", "content": [{"text": f"Robot '{robot_name}' not found."}]}
             try:
                 jac = self._link_jacobian(self._robots[robot_name], body_name)
@@ -2774,7 +3173,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
     def send_action(
         self,
-        action: dict[str, Any] | np.ndarray | list,
+        action: dict[str, Any] | Sequence[float],
         robot_name: str | None = None,
         n_substeps: int = 1,
     ) -> dict[str, Any]:
@@ -2788,10 +3187,32 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             in which case the dict is first converted by the controller
             (e.g. GR00T task-space delta-EEF keys to joint position
             targets) and the converted dict is what gets resolved.
+            Values are on the shared action-value domain
+            (:meth:`~strands_robots.simulation.base.SimEngine._coerce_action`)
+            every backend applies: a value must coerce to a finite scalar
+            number, a boolean is refused rather than written as a 1.0/0.0
+            target, and a single-element sequence -- the ``list[float]`` a 1-DoF
+            key carries under the ``Policy.get_actions`` contract -- is
+            unwrapped to its scalar. An ordered vector is bound positionally to
+            :meth:`robot_action_keys` and its width must match that list
+            exactly; a mismatch is refused rather than applied to whichever DOFs
+            it covers. The controller conversion above runs first, so it is the
+            controller's output that is checked.
         robot_name : str, optional
             Robot to control.
         n_substeps : int
-            Physics sub-steps after applying action. Default 1.
+            Physics sub-steps after applying action. Default 1. A positive whole
+            number, on the shared
+            :func:`~strands_robots.utils.positive_whole_number_error` domain
+            every backend applies: a NumPy or float count with an integral value
+            is honored and coerced, and a fractional, zero, negative,
+            non-finite, boolean or non-numeric count is refused. ``0`` is
+            refused rather than honored as "write but do not advance" -
+            :meth:`step` is the surface that advances a count of its own, and it
+            accepts ``0`` as a documented no-op. Note this backend's loop had no
+            floor at all, so pre-fix a ``0`` or a negative count applied the
+            targets and advanced nothing while reporting success - the opposite
+            of what MuJoCo and Newton did with the same call.
 
         Returns
         -------
@@ -2804,7 +3225,19 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             some keys don't name a joint on ``robot_name``, the ``content`` list
             carries a ``json`` block with ``unresolved_keys`` / ``applied`` so
             callers can self-correct -- mirroring the MuJoCo backend.
+            ``status`` is ``"error"`` when ``n_substeps`` is outside its domain,
+            and no joint target is applied when it is.
         """
+        # Guarded before the lock is taken and before any target is applied,
+        # mirroring this backend's ``step``: a refusal arriving after the write
+        # would leave the robot commanded and the world un-advanced. This
+        # backend's substep loop is a bare ``range(n_substeps)`` with no floor,
+        # so a fractional or non-numeric count raised ``TypeError`` past the
+        # structured envelope, and a zero or negative count reported success
+        # having advanced nothing.
+        if error := positive_whole_number_error(n_substeps, "n_substeps", "send_action"):
+            return {"status": "error", "content": [{"text": error}]}
+        n_substeps = int(n_substeps)
         with self._lock:
             if not self._world_created or self._world is None:
                 return {"status": "error", "content": [{"text": "No world created."}]}
@@ -2827,7 +3260,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                         ],
                     }
 
-            if robot_name not in self._robots:
+            if not registered(self._robots, robot_name):
                 return {"status": "error", "content": [{"text": f"Robot '{robot_name}' not found."}]}
 
             robot = self._robots[robot_name]
@@ -2840,7 +3273,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             # name-lookup path -- the raw path would drop every task-space
             # key and the robot would sit still while the eval reads green
             # (#1812).
-            controller = self._action_controllers.get(robot_name)
+            controller = registry_entry(self._action_controllers, robot_name)
             if controller is not None and isinstance(action, dict):
                 try:
                     action = controller.compute_joint_targets(action)
@@ -2856,34 +3289,47 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                         ],
                     }
 
-            # Convert action to array, tracking dict keys that don't name a
-            # joint so unresolved commands surface in the envelope rather than
-            # being silently dropped (parity with the MuJoCo backend).
-            unresolved: list[str] = []
-            action_array: np.ndarray
+            # Every value that reaches an actuator clears the shared
+            # action-value domain first (:meth:`SimEngine._coerce_action`),
+            # which is also what binds an ordered action *vector* positionally
+            # to ``robot_action_keys`` and refuses a width that does not match
+            # it. This backend hand-rolled its own conversion instead, so it
+            # wrote a boolean as a 1.0/0.0 target, wrote a non-finite target no
+            # solver can honor, applied a mismatched vector to whichever DOFs it
+            # happened to cover, and raised ``TypeError`` straight past this
+            # envelope for the single-element rows the
+            # ``Policy.get_actions -> list[dict]`` contract emits for a 1-DoF
+            # key. The coercion runs here rather than before the lock (where the
+            # MuJoCo and Newton backends call it) because the task-space
+            # controller above may rewrite the action and it is the controller's
+            # *output* that is applied; ``self._lock`` is an ``RLock``, so the
+            # ``robot_action_keys`` read inside the coercion re-enters safely.
+            action_map, coerce_error = self._coerce_action(action, robot_name)
+            if coerce_error is not None:
+                return coerce_error
+            assert action_map is not None  # narrow for mypy: no error implies a mapping
+
+            # Track keys that don't name a joint so unresolved commands surface
+            # in the envelope rather than being silently dropped (parity with
+            # the MuJoCo backend).
+            joint_set = set(robot.joint_names)
+            unresolved = [k for k in action_map if k not in joint_set]
             # ``joint_indices`` restricts an ``ArticulationAction`` to a subset
-            # of the articulation's DOFs; ``None`` addresses every joint. For a
-            # dict action we command ONLY the named joints and leave the rest at
-            # their current PD targets (parity with the MuJoCo/Newton backends).
-            # A full zero-filled ``joint_positions`` vector would instead drive
-            # every unnamed joint to 0.0 -- e.g. ``send_action({"gripper": 0.04})``
-            # would slam the whole arm to its home pose.
-            joint_indices: np.ndarray | None
-            if isinstance(action, dict):
-                joint_set = set(robot.joint_names)
-                unresolved = [k for k in action if k not in joint_set]
-                named = [i for i, jname in enumerate(robot.joint_names) if jname in action]
-                action_array = np.array(
-                    [float(action[robot.joint_names[i]]) for i in named],
-                    dtype=np.float32,
-                )
-                joint_indices = np.array(named, dtype=np.int32)
-            elif isinstance(action, np.ndarray):
-                action_array = action.astype(np.float32).flatten()
-                joint_indices = None
-            else:
-                action_array = np.array(action, dtype=np.float32)
-                joint_indices = None
+            # of the articulation's DOFs. Command ONLY the named joints and
+            # leave the rest at their current PD targets (parity with the
+            # MuJoCo/Newton backends). A full zero-filled ``joint_positions``
+            # vector would instead drive every unnamed joint to 0.0 -- e.g.
+            # ``send_action({"gripper": 0.04})`` would slam the whole arm to its
+            # home pose. A full-width vector action arrives here as a mapping
+            # over every joint, so the indices then address every DOF in
+            # articulation order - what the raw vector path expressed by passing
+            # ``None``.
+            named = [i for i, jname in enumerate(robot.joint_names) if jname in action_map]
+            action_array: np.ndarray = np.array(
+                [float(action_map[robot.joint_names[i]]) for i in named],
+                dtype=np.float32,
+            )
+            joint_indices: np.ndarray = np.array(named, dtype=np.int32)
 
             # Apply to articulation. Isaac Sim 6.0's articulation
             # (``isaacsim.core.prims.SingleArticulation``) drives PD position
@@ -2925,7 +3371,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                 self._step_count += 1
 
         if unresolved:
-            applied = [k for k in action if k not in unresolved]
+            applied = [k for k in action_map if k not in unresolved]
             return {
                 "status": "error",
                 "content": [
@@ -3088,7 +3534,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     {"text": f"Rendered (headless, no RTX): {w}x{h}"},
                 )
 
-            if camera_name not in self._cameras:
+            if not registered(self._cameras, camera_name):
                 # No camera configured - return blank. Caller probably
                 # forgot to call add_camera or typo'd the name.
                 return (
@@ -3240,7 +3686,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     "get_frame is unavailable in headless render mode (no RTX frames are produced); "
                     "use render_mode='rtx_realtime' or consume the envelope render() fallback."
                 )
-            if camera_name not in self._cameras:
+            if not registered(self._cameras, camera_name):
                 raise KeyError(f"Camera '{camera_name}' not found. Available: {sorted(self._cameras)}")
             cam = self._cameras[camera_name]
             if cam.handle is None:
@@ -3299,7 +3745,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         with self._lock:
             if not self._world_created:
                 raise RuntimeError("No world created. Call create_world first.")
-            if camera_name not in self._cameras:
+            if not registered(self._cameras, camera_name):
                 raise KeyError(f"Camera '{camera_name}' not found. Available: {sorted(self._cameras)}")
             cam = self._cameras[camera_name]
             if cam.handle is None:
@@ -3492,7 +3938,8 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         Parameters
         ----------
         name : str
-            Camera identifier. Default ``"default"``. Must be unique
+            Camera identifier. Default ``"default"``. Must be a non-empty
+            string with no NUL (see Validation below). Must also be unique
             across the simulation; a duplicate is rejected with a
             structured error envelope.
         position : list[float], optional
@@ -3519,6 +3966,12 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
         Validation
         ----------
+        ``name`` must be a non-empty string containing no NUL, on the shared
+        :func:`~strands_robots.utils.entity_name_error` domain - an empty name
+        is the routing token ``render`` maps to the free camera, so a camera
+        created under it could never be rendered from, and the camera's prim
+        path is interpolated from the name.
+
         ``position`` and ``target`` must each be 3 finite numbers (a list,
         tuple or NumPy array; NumPy scalar elements accepted, ``bool``
         refused), and must not be identical - a camera whose eye is its own
@@ -3532,6 +3985,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         Newton backends' ``add_camera`` enforces, on the shared
         :func:`~strands_robots.utils.coerce_pose_vector` /
         :func:`~strands_robots.utils.camera_fov_error` /
+        :func:`~strands_robots.utils.entity_name_error` /
         :func:`~strands_robots.utils.positive_count_error` domains, so a camera
         configuration one backend refuses is refused by all three. Invalid
         values are rejected here, before the stage is touched, rather than
@@ -3557,6 +4011,20 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         with self._lock:
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
+
+            # Refuse a name that cannot address the camera this call creates, on
+            # the shared ``entity_name_error`` domain the MuJoCo and Newton
+            # backends' ``add_camera`` already applies, so a name one backend
+            # refuses is refused by all three - the same invariant this method
+            # already honours for ``position`` / ``target`` / ``fov`` / ``width``
+            # / ``height`` below. An empty name is worse than unaddressable for a
+            # camera: ``render`` routes ``camera_name in (None, "", "default",
+            # "free")`` to the free camera by an explicit token check, so a
+            # camera created as ``""`` could never be rendered from, while the
+            # prim landed at ``/World/Cameras/`` - the container scope shared by
+            # every camera on the stage.
+            if (name_err := entity_name_error("add_camera", "name", name)) is not None:
+                return {"status": "error", "content": [{"text": name_err}]}
 
             # Validate the pose and the field of view on the shared domains the
             # MuJoCo and Newton backends' ``add_camera`` already applies, before
@@ -3732,7 +4200,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if the camera is unknown to ``_cameras``.
         """
         with self._lock:
-            if name not in self._cameras:
+            if not registered(self._cameras, name):
                 return {
                     "status": "error",
                     "content": [{"text": f"Camera '{name}' not found."}],
@@ -3859,6 +4327,14 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         # drops every captured frame.
         if error := _cameras_recording_option_error("start_cameras_recording", fps, max_frames_per_camera):
             return error
+        # ``cameras`` names an ordered list of DISTINCT camera names, so it is
+        # refused on the shared name-list domain before any filesystem or buffer work. Neither
+        # mistake this catches could be honored as written: a single name passed
+        # as a bare string is iterable per character, so it was read as one
+        # camera per letter, and a repeated name opened a second encoder on the one output
+        # path, so the artifact ledger reported two files where one exists.
+        if cameras and (text := name_list_error(cameras, "cameras", "start_cameras_recording")):
+            return {"status": "error", "content": [{"text": text}]}
 
         with self._lock:
             if not self._world_created:
@@ -3875,7 +4351,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             if cameras is None:
                 names = list(self._cameras.keys())
             else:
-                unresolved = [c for c in cameras if c not in self._cameras]
+                unresolved = [c for c in cameras if not registered(self._cameras, c)]
                 if unresolved:
                     return {
                         "status": "error",
@@ -4339,7 +4815,11 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         4. Extracts joint names from ``articulation.dof_names``,
            coercing ``None`` to ``[]`` so a URDF with no actuated
            joints surfaces as the documented empty-joint-list mode
-           rather than a ``TypeError`` on iteration.
+           rather than a ``TypeError`` on iteration, then translates
+           any USD-mangled name back to the URDF's own joint name via
+           :func:`strands_robots.simulation.isaac.joint_names.demangle_usd_joint_names`
+           (#1900) so the public joint vocabulary matches the MuJoCo
+           backend's for the same URDF.
         5. Returns ``(joint_names, articulation)`` -- same shape as
            ``_load_usd_robot`` so the ``add_robot`` URDF branch can
            reuse the same envelope shape.
@@ -4516,8 +4996,46 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         if position is not None and any(p != 0.0 for p in position):
             articulation.set_world_pose(position=np.asarray(position, dtype=float))
 
-        # Step 4-5: joint names + return.
+        # Step 4-5: joint names + return. The importer transcodes any URDF
+        # joint name that is not a valid USD identifier (a purely numeric
+        # name like the robotstudio_so101's "1" imports as "tn__1_"), and
+        # before #1900 that mangled form leaked through every public surface
+        # keyed by joint name - robot_joint_names, get_observation keys,
+        # send_action resolution - so the same URDF spoke different joint
+        # vocabularies on Isaac vs MuJoCo. Every articulation read/write is
+        # positional (index into dof_names order), so translating here, once,
+        # makes the whole backend speak the URDF names. The usd->urdf map is
+        # stashed as a sidecar (same pattern as _strands_actual_prim_path)
+        # for _RobotState diagnostics. Best-effort: a URDF the stdlib parse
+        # cannot re-read (the importer accepted it, so this is surface drift,
+        # not a bad file) keeps the importer's names - Isaac stays
+        # self-consistent, which is the pre-#1900 behaviour.
         joint_names = list(articulation.dof_names) if articulation.dof_names else []
+        usd_to_urdf: dict[str, str] = {}
+        try:
+            urdf_declared = urdf_joint_names(os.path.abspath(urdf_path))
+        except (OSError, ValueError) as e:
+            logger.warning(
+                "Could not re-parse %s for joint-name translation (%s); keeping the importer's joint names %s.",
+                urdf_path,
+                e,
+                joint_names,
+            )
+        else:
+            joint_names, usd_to_urdf = demangle_usd_joint_names(joint_names, urdf_declared)
+            if usd_to_urdf:
+                logger.info(
+                    "Translated %d USD-mangled joint names back to their URDF names: %s",
+                    len(usd_to_urdf),
+                    usd_to_urdf,
+                )
+        try:
+            articulation._strands_usd_to_urdf_joint_names = usd_to_urdf  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            # Same fallback as _strands_actual_prim_path above: the caller
+            # then records an empty map, and the public names still carry
+            # the translated vocabulary via the returned joint_names.
+            pass
 
         logger.info(
             "Loaded URDF robot at %s from %s (%d joints, articulation=initialized)",
@@ -4709,6 +5227,49 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             raise box["exc"]
         return box.get("result")
 
+    def _marshal_main_thread_affine(self, method_name: str, fn: Any) -> Any:
+        """Run ``fn`` on the SimulationApp-owning thread, or fail loudly.
+
+        ``reset`` / ``step`` drive Isaac's kit runtime (``world.reset()`` /
+        ``world.step()``), and kit only pumps updates on the thread that
+        created ``SimulationApp``. Called from a worker thread those entry
+        points do not error - they block **forever** waiting for a pump the
+        worker thread can never run. Observed shape (#1896): a Strands
+        ``Agent`` executed its tool on a worker thread, the tool ran
+        ``evaluate_benchmark`` -> ``reset()`` -> ``SimulationContext.stop()``,
+        and that call never returned because the main thread was itself
+        parked waiting on the tool future.
+
+        Three cases:
+
+        * On the owning thread: run ``fn`` inline - the headless / smoke
+          path is unchanged.
+        * Off it with :meth:`run_pump_forever` engaged: marshal through
+          :meth:`run_on_main` so the pump executes ``fn`` on the owning
+          thread (the same auto-marshal the recording facade uses for its
+          schema probe, see ``IsaacRecordingMixin._probe_recording_observation``).
+        * Off it with NO pump running: raise ``RuntimeError`` naming the
+          recipe. This is a raise, not a structured error dict, on purpose:
+          it is a caller threading-contract violation (some internal call
+          sites - e.g. the per-episode ``sim.reset()`` in the policy runner -
+          do not inspect the envelope, so a dict here would silently skip
+          the reset), and the alternative behavior is an indefinite,
+          signal-free deadlock.
+        """
+        if self._on_main_thread():
+            return fn()
+        if self._pump_running:
+            return self.run_on_main(fn)
+        raise RuntimeError(
+            f"IsaacSimulation.{method_name}() was called from a worker thread with no "
+            "main-thread pump running. Isaac Sim only pumps kit updates on the thread "
+            "that created SimulationApp, so this call would block forever. Either call "
+            "it from the owning thread, or have the owning thread run "
+            "`run_pump_forever(stop_event=...)` and submit the call from the worker via "
+            "`run_on_main(lambda: ...)` (see examples/libero/run_isaac_agent.py for the "
+            "agent-driven shape)."
+        )
+
     # --- joint targets / kinematic teleport --------------------------------
 
     def set_joint_positions(
@@ -4727,6 +5288,40 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         ``positions`` may be a ``dict`` keyed by joint name (only the
         listed joints are written; others retain their current value)
         or a list/array in the robot's joint order.
+
+        Validation
+        ----------
+        The write is all-or-nothing, on the same terms the MuJoCo backend's
+        :meth:`~strands_robots.simulation.mujoco.MuJoCoSimEngine.set_joint_positions`
+        already enforces, so the accepted domain does not depend on which engine
+        the caller is driving:
+
+        * the list form's length must equal the robot's joint count - a shorter
+          or longer vector is refused rather than resizing the articulation's
+          joint-position array, which would otherwise be handed to PhysX at the
+          wrong width;
+        * every ``dict`` key must name one of the robot's joints, and the mapping
+          must not be empty - an unresolvable name used to be skipped silently, so
+          a typo (or a name from the wrong robot) wrote nothing, or wrote only
+          part of the requested pose, while the caller was told the pose had been
+          applied;
+        * every value must be a finite, non-boolean real number, on the shared
+          :meth:`~strands_robots.simulation.base.SimEngine._coerce_joint_state_map`
+          domain. A ``nan`` / ``inf`` is refused rather than written into the
+          articulation, where PhysX surfaces it from a *later* step as an
+          "Illegal BroadPhaseUpdateData - non-finite bounds" error; a boolean is
+          refused because ``float(True)`` is a silent 1-radian target.
+
+        Validation runs synchronously, before the write is queued for the main
+        thread, so a rejected value is reported to the caller rather than raised
+        on the pump thread - where the queued-action handler swallows it after
+        this method has already answered ``status="success"``.
+
+        Returns
+        -------
+        dict
+            Standard ``{"status", "content"}`` envelope; ``error`` for an
+            unknown/uninitialized robot or a value outside the domain above.
         """
         with self._lock:
             if not self._world_created or not self._robots:
@@ -4735,26 +5330,188 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                 return {"status": "error", "content": [{"text": "'positions' is required."}]}
             if robot_name is None:
                 robot_name = next(iter(self._robots))
-            r = self._robots.get(robot_name)
+            r = registry_entry(self._robots, robot_name)
             if r is None or r.articulation is None:
                 return {"status": "error", "content": [{"text": f"Robot {robot_name!r} not initialized."}]}
 
+            joint_names = list(r.joint_names)
+            # Normalize both accepted shapes to a {joint name: value} mapping so
+            # one set of checks covers them. The list form binds positionally to
+            # the robot's joint order, so its length is part of the contract: a
+            # mismatched vector used to be written straight through, resizing the
+            # articulation's joint-position array instead of being refused.
+            if isinstance(positions, dict):
+                requested: dict[str, Any] = dict(positions)
+            elif isinstance(positions, (list, tuple, np.ndarray)):
+                ordered = list(positions)
+                if len(ordered) != len(joint_names):
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"set_joint_positions: list length {len(ordered)} does not match robot "
+                                    f"{robot_name!r} joint count {len(joint_names)}. Use a dict for partial updates."
+                                )
+                            }
+                        ],
+                    }
+                requested = dict(zip(joint_names, ordered, strict=True))
+            else:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "set_joint_positions: 'positions' must be a dict or list, "
+                                f"got {type(positions).__name__}"
+                            )
+                        }
+                    ],
+                }
+
+            # Resolve every name before any write, so a partially-resolvable
+            # mapping is refused rather than applied in part and reported as a
+            # complete pose.
+            if not requested:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "set_joint_positions: 'positions' is empty, so there is nothing to write. "
+                                "Pass at least one joint (dict form) or a full ordered vector (list form); "
+                                "use action='robot_joint_names' to see one robot's joints."
+                            )
+                        }
+                    ],
+                }
+            index_of = {jn: i for i, jn in enumerate(joint_names)}
+            unresolved = [jn for jn in requested if jn not in index_of]
+            if unresolved:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                f"set_joint_positions: unresolved 'positions' keys {unresolved} on robot "
+                                f"{robot_name!r}. Its joints are {joint_names}; "
+                                "use action='robot_joint_names' to list them."
+                            )
+                        }
+                    ],
+                }
+
+            coerced, err = self._coerce_joint_state_map(requested, "positions", "set_joint_positions")
+            if err:
+                return err
+            targets = {index_of[jn]: value for jn, value in coerced.items()}
+
             def _apply() -> None:
-                if isinstance(positions, dict):
-                    cur = list(r.articulation.get_joint_positions())
-                    idx = {jn: i for i, jn in enumerate(r.joint_names)}
-                    for jn, v in positions.items():
-                        if jn in idx:
-                            cur[idx[jn]] = float(v)
-                    r.articulation.set_joint_positions(np.array(cur, dtype=float))
-                else:
-                    r.articulation.set_joint_positions(np.array(positions, dtype=float))
+                cur = list(r.articulation.get_joint_positions())
+                for dof, value in targets.items():
+                    cur[dof] = value
+                r.articulation.set_joint_positions(np.array(cur, dtype=float))
 
             if self._on_main_thread():
                 _apply()
                 return {"status": "success", "content": [{"text": "Set joint positions (main)."}]}
             self._action_q.put(_apply)
             return {"status": "success", "content": [{"text": "Set joint positions (queued)."}]}
+
+    def set_robot_pose(
+        self,
+        robot_name: str | None = None,
+        position: list[float] | None = None,
+        orientation: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Teleport a robot's articulation base to ``(position, orientation)``.
+
+        The scene-alignment counterpart of :meth:`move_object` (#1820): on
+        the MuJoCo backend the robot is part of the scene MJCF, so its base
+        lands wherever the scene author placed it (LIBERO puts
+        ``robot0_base`` at ``(-0.66, 0, 0.912)``); on Isaac the robot is a
+        separately-loaded USD articulation spawned at the origin -- inside
+        the footprint of the scene's origin-anchored static fixtures.
+        ``LiberoAdapter._apply_object_pose_state`` reads the scene's robot
+        base pose and aligns the articulation through this method so live
+        physics doesn't start with the robot interpenetrating a fixture
+        (PhysX "Illegal BroadPhaseUpdateData - non-finite bounds").
+
+        Parameters
+        ----------
+        robot_name : str, optional
+            Robot to move. ``None`` resolves the single robot, mirroring
+            :meth:`send_action`; ambiguous with several robots.
+        position : list[float], optional
+            World position ``[x, y, z]``. ``None`` keeps the current one.
+        orientation : list[float], optional
+            World orientation quaternion ``[w, x, y, z]``. ``None`` keeps
+            the current one.
+
+        Validation
+        ----------
+        ``position`` must be 3 finite numbers and ``orientation`` 4, on the
+        shared :func:`~strands_robots.utils.coerce_pose_vector` domain. An
+        over-long vector is refused rather than truncated, and a ``nan`` /
+        ``inf`` component is refused rather than written into the articulation
+        transform.
+
+        Returns
+        -------
+        dict
+            Standard ``{"status", "content"}`` envelope; ``error`` for an
+            unknown/uninitialized robot or a failed pose write.
+        """
+        with self._lock:
+            if not self._world_created or not self._robots:
+                return {"status": "error", "content": [{"text": "No world/robot."}]}
+            if robot_name is None:
+                if len(self._robots) != 1:
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"set_robot_pose(robot_name=None) is ambiguous: {len(self._robots)} robots "
+                                    f"present ({sorted(self._robots)}). Pass robot_name explicitly."
+                                )
+                            }
+                        ],
+                    }
+                robot_name = next(iter(self._robots))
+            robot = registry_entry(self._robots, robot_name)
+            if robot is None or robot.articulation is None:
+                return {"status": "error", "content": [{"text": f"Robot {robot_name!r} not initialized."}]}
+            # Validate the pose vectors on the shared ``coerce_pose_vector`` domain the
+            # MuJoCo backend's ``set_robot_pose`` and this backend's own ``add_camera`` already
+            # use, so a pose one backend refuses is refused by all of them - the
+            # invariant that helper documents. The ``x[:3]`` / ``x[:4]`` slices this
+            # replace validated nothing and silently TRUNCATED an over-long vector, so a
+            # 5-component request was written as its first 3 under a success result. A
+            # short vector was passed through as-is, a ``nan``/``inf`` component wrote a
+            # degenerate transform, and testing the vector for truthiness read an empty
+            # one as *omitted* while raising on the NumPy array the Args advertise.
+            position, _perr = coerce_pose_vector("set_robot_pose", "position", position, 3)
+            if _perr is not None:
+                return {"status": "error", "content": [{"text": _perr}]}
+            orientation, _oerr = coerce_pose_vector("set_robot_pose", "orientation", orientation, 4)
+            if _oerr is not None:
+                return {"status": "error", "content": [{"text": _oerr}]}
+            moved_to = "same" if position is None else position
+            try:
+                pos = np.asarray(position, dtype=float) if position is not None else None
+                ori = np.asarray(orientation, dtype=float) if orientation is not None else None
+                robot.articulation.set_world_pose(position=pos, orientation=ori)
+            except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
+                return {
+                    "status": "error",
+                    "content": [{"text": f"set_robot_pose failed: {type(exc).__name__}: {exc}"}],
+                }
+            return {
+                "status": "success",
+                "content": [{"text": f"Robot {robot_name!r} base moved to {moved_to}."}],
+            }
 
     def move_object(
         self,
@@ -4768,13 +5525,36 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         teleport-grasp: while the cube is carried it is teleported into
         the closing gripper fingers every frame. Velocities are zeroed
         so a teleport doesn't fling a dynamic body.
+
+        Validation
+        ----------
+        ``position`` must be 3 finite numbers and ``orientation`` 4, on the
+        shared :func:`~strands_robots.utils.coerce_pose_vector` domain the
+        MuJoCo and Newton backends' ``move_object`` enforce. An over-long
+        vector is refused rather than truncated to its leading components, and
+        an omitted one leaves that component alone.
         """
-        obj = self._objects.get(name)
+        obj = registry_entry(self._objects, name)
         if obj is None or obj.handle is None:
             return {"status": "error", "content": [{"text": f"Object {name!r} not found."}]}
+        # Validate the pose vectors on the shared ``coerce_pose_vector`` domain the
+        # MuJoCo backend's ``move_object`` and this backend's own ``add_camera`` already
+        # use, so a pose one backend refuses is refused by all of them - the
+        # invariant that helper documents. The ``x[:3]`` / ``x[:4]`` slices this
+        # replace validated nothing and silently TRUNCATED an over-long vector, so a
+        # 5-component request was written as its first 3 under a success result. A
+        # short vector was passed through as-is, a ``nan``/``inf`` component wrote a
+        # degenerate transform, and testing the vector for truthiness read an empty
+        # one as *omitted* while raising on the NumPy array the Args advertise.
+        position, _perr = coerce_pose_vector("move_object", "position", position, 3)
+        if _perr is not None:
+            return {"status": "error", "content": [{"text": _perr}]}
+        orientation, _oerr = coerce_pose_vector("move_object", "orientation", orientation, 4)
+        if _oerr is not None:
+            return {"status": "error", "content": [{"text": _oerr}]}
         try:
-            pos = np.array(position[:3], dtype=float) if position else None
-            ori = np.array(orientation[:4], dtype=float) if orientation else None
+            pos = np.array(position, dtype=float) if position is not None else None
+            ori = np.array(orientation, dtype=float) if orientation is not None else None
             obj.handle.set_world_pose(position=pos, orientation=ori)
             if hasattr(obj.handle, "set_linear_velocity"):
                 obj.handle.set_linear_velocity(np.zeros(3))
@@ -4813,7 +5593,8 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     logger.debug("move_object USD xform write skipped", exc_info=True)
         except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
             return {"status": "error", "content": [{"text": f"move_object failed: {type(exc).__name__}: {exc}"}]}
-        return {"status": "success", "content": [{"text": f"'{name}' moved to {position or 'same'}."}]}
+        moved_to = "same" if position is None else position
+        return {"status": "success", "content": [{"text": f"'{name}' moved to {moved_to}."}]}
 
     def set_object_kinematic(self, name: str, kinematic: bool = True) -> dict[str, Any]:
         """Toggle an object's rigid body between KINEMATIC and dynamic.
@@ -4832,7 +5613,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         pose exactly. Restored to dynamic on release. Toggles
         ``UsdPhysics.RigidBodyAPI.kinematicEnabled`` on the prim; best-effort.
         """
-        obj = self._objects.get(name)
+        obj = registry_entry(self._objects, name)
         if obj is None:
             return {"status": "error", "content": [{"text": f"Object {name!r} not found."}]}
         # Prefer the wrapper's own setter if present.
@@ -4879,7 +5660,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         collider lets the gripper close cleanly around it; re-enabled
         on release.
         """
-        obj = self._objects.get(name)
+        obj = registry_entry(self._objects, name)
         if obj is None:
             return {"status": "error", "content": [{"text": f"Object {name!r} not found."}]}
         if obj.handle is not None:
@@ -4909,7 +5690,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
     def _object_position(self, name: str) -> list[float] | None:
         """Return the world-frame position of ``name`` (or ``None`` if missing)."""
-        obj = self._objects.get(name)
+        obj = registry_entry(self._objects, name)
         if obj is None or obj.handle is None:
             return None
         try:
@@ -4982,7 +5763,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
     def _get_body_state_impl(self, body_name: str) -> dict[str, Any]:
         """Resolve + read ``body_name``; runs on the main thread (or pump-less)."""
-        obj = self._objects.get(body_name)
+        obj = registry_entry(self._objects, body_name)
         if obj is not None and obj.handle is not None:
             state = self._object_body_state(obj)
             if state is not None:
@@ -5064,7 +5845,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     prim = p
             elif "/" in body_name:
                 robot_name, _, link_name = body_name.partition("/")
-                r = self._robots.get(robot_name)
+                r = registry_entry(self._robots, robot_name)
                 if r is not None and link_name:
                     prim = self._find_robot_link_prim(stage, r, link_name, Sdf, Usd, UsdGeom)
             else:
@@ -5146,7 +5927,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         """
         if robot_name is None:
             robot_name = next(iter(self._robots), None)
-        r = self._robots.get(robot_name) if robot_name else None
+        r = registry_entry(self._robots, robot_name)
         if r is None:
             return None
         try:
@@ -5281,7 +6062,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         if frame is None or not getattr(frame, "size", 0):
             return None
         img = np.asarray(frame)[:, :, :3].astype("uint8")
-        out = self._cam_out_size.get(cname)
+        out = registry_entry(self._cam_out_size, cname)
         if out is not None:
             ow, oh = out
             if img.shape[1] != ow or img.shape[0] != oh:
@@ -5435,13 +6216,14 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         """Release all resources.
 
         Callers must invoke this explicitly (or use the class as a context
-        manager). There is intentionally no ``__del__`` finalizer: at
-        interpreter shutdown the ``threading`` / ``logger`` / ``omni``
-        modules can already be partially torn down, and acquiring
-        ``self._lock`` from a finalizer is unsafe. Relying on GC for
-        Isaac Sim cleanup also leaks the ``World``/USD stage on the
-        common case where the GC scheduler defers the finalizer past
-        the SimulationApp shutdown.
+        manager). Do not rely on garbage collection: at interpreter shutdown
+        the ``threading`` / ``logger`` / ``omni`` modules can already be
+        partially torn down, acquiring ``self._lock`` from a finalizer is
+        unsafe, and a GC scheduler that defers the finalizer past the
+        ``SimulationApp`` shutdown leaks the ``World``/USD stage. The
+        inherited :meth:`~strands_robots.simulation.base.SimEngine.__del__`
+        is a best-effort last resort for a fully-constructed engine, not the
+        intended path.
         """
         if self._world_created:
             self.destroy()
@@ -5453,10 +6235,23 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         self.cleanup()
 
     def __repr__(self) -> str:
-        return (
-            f"IsaacSimulation("
-            f"num_envs={self._config.num_envs}, "
-            f"device={self._config.device!r}, "
-            f"headless={self._config.headless}, "
-            f"world={'created' if self._world_created else 'none'})"
-        )
+        """Describe this engine, without ever raising.
+
+        ``repr`` is what a traceback or a failing assertion renders, so it must
+        not be the thing that hides a failure. On an instance whose ``__init__``
+        never finished, reading ``self._config`` raises and the reader is shown
+        ``[AttributeError ... raised in repr()]`` naming an attribute that has
+        nothing to do with the failure under investigation. Report the
+        lifecycle fact that *is* relevant instead, and name no attribute so
+        nobody is sent chasing one.
+        """
+        try:
+            return (
+                f"IsaacSimulation("
+                f"num_envs={self._config.num_envs}, "
+                f"device={self._config.device!r}, "
+                f"headless={self._config.headless}, "
+                f"world={'created' if self._world_created else 'none'})"
+            )
+        except AttributeError:
+            return f"IsaacSimulation(partially constructed, id=0x{id(self):x})"

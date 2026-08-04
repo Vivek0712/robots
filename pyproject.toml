@@ -183,7 +183,16 @@ lerobot = [
     # marker. NOTE: torch/torchcodec ship as +cuXXX wheels resolved by
     # UV_TORCH_BACKEND; a plain `pip install` on Thor may need the matching CUDA
     # index -- see the README Installation section for the Thor/Jetson caveat.
-    "lerobot[feetech,dataset]>=0.6.0,<0.7.0",
+    #
+    # The floor is 0.6.1 rather than 0.6.0 because bucket streaming
+    # (`stream_dataset(repo_type="bucket")`) needs a StreamingLeRobotDataset
+    # that accepts `repo_type`, and 0.6.1 is the first release that does
+    # (0.6.0's constructor has no such parameter). Flooring here makes the
+    # flagship streaming path resolver-guaranteed instead of docs-guaranteed;
+    # `strands_robots.streaming_dataset.BUCKET_STREAMING_MIN_LEROBOT` carries
+    # the same version for the runtime guard that protects an environment with
+    # a pre-existing older lerobot.
+    "lerobot[feetech,dataset]>=0.6.1,<0.7.0",
 ]
 # Remote/offloaded inference via lerobot's native async-inference gRPC
 # transport (the `lerobot_async` policy provider, LerobotAsyncPolicy). Layers
@@ -193,7 +202,7 @@ lerobot = [
 # it here, so the gRPC/protobuf floor tracks lerobot.
 lerobot-async = [
     "strands-robots[lerobot]",
-    "lerobot[async]>=0.6.0,<0.7.0",
+    "lerobot[async]>=0.6.1,<0.7.0",
 ]
 # MolmoAct2 transformers-native VLA (e.g. allenai/MolmoAct2-SO100_101). The
 # MolmoAct2Policy ships in lerobot >= 0.6 (landed via lerobot PR #3604). Rather
@@ -202,11 +211,11 @@ lerobot-async = [
 # own ``[molmoact2]`` extra. That extra pulls lerobot[transformers-dep],
 # lerobot[peft-dep], lerobot[scipy-dep] at exactly the versions the MolmoAct2
 # modeling/processor code was built against, so the two stay in lock-step by
-# construction. The base ``strands-robots[lerobot]`` pin (>=0.6.0,<0.7.0) already
+# construction. The base ``strands-robots[lerobot]`` pin (>=0.6.1,<0.7.0) already
 # fixes the lerobot floor; ``lerobot[molmoact2]`` just adds the aux deps.
 molmoact2 = [
     "strands-robots[lerobot]",
-    "lerobot[molmoact2]>=0.6.0,<0.7.0",
+    "lerobot[molmoact2]>=0.6.1,<0.7.0",
 ]
 sim = [
     "robot_descriptions>=1.11.0,<2.0.0",
@@ -255,16 +264,21 @@ sim-newton = [
 # out-of-band Kit runtime).
 #
 # IMPORTANT: Isaac Sim itself is NOT installed by this extra. It is an Omniverse
-# Kit application provisioned out-of-band - via the NVIDIA Omniverse Launcher,
+# Kit application provisioned separately - via the runtime's own pip wheels
+# (`pip install 'isaacsim[all,extscache]==6.0.*' --extra-index-url
+# https://pypi.nvidia.com`, viable on Python 3.12; the `extscache` extra is
+# required, and see docs/simulation/isaac.md for the coverage-downgrade /
+# EULA / torch-bump caveats, #1803), the NVIDIA Omniverse Launcher,
 # Isaac Lab (`./isaaclab.sh -i`), or the NGC docker image
 # (`nvcr.io/nvidia/isaac-sim:6.0`; see
 # strands_robots/simulation/isaac/_install.py for the pinned image tag). Those
-# images/launchers ship a complete, bootable Kit (Python 3.12 interpreter + the
+# routes ship a complete, bootable Kit (Python 3.12 interpreter + the
 # full `isaacsim-*` / `isaacsim-extscache-*` extension set that `SimulationApp`
-# needs to boot). We do NOT pin `isaacsim` here: the PyPI `isaacsim[all]`
+# needs to boot). We still do NOT pin `isaacsim` here: the bare `isaacsim[all]`
 # metapackage is incomplete on its own (it omits the `isaacsim-extscache-*`
-# packages, so `SimulationApp` aborts resolving its extension graph), and every
-# other surface documents Isaac Sim as "installed separately".
+# packages, so `SimulationApp` aborts resolving its extension graph), it needs
+# the NVIDIA extra index, and its transitive pins (coverage==7.4.4, a
+# torch/torchvision bump) would degrade every non-Isaac install of this extra.
 #
 # This extra pulls ONLY the pip-installable Python helpers the backend uses
 # out-of-band from an Isaac Sim install:
@@ -521,6 +535,15 @@ select = [
     "F",     # pyflakes
     "I",     # isort
     "UP",    # pyupgrade
+    # Two flake8-bugbear codes, selected individually rather than as "B".
+    # They carry the no-op-statement capability that CodeQL's
+    # py/ineffectual-statement used to nominally provide before
+    # .github/codeql/codeql-config.yml filtered it (#1810): every one of that
+    # rule's 27 alerts was a `...` typing-construct body, which ruff exempts,
+    # so the rule reported only unavoidable idioms while the real bug class
+    # went unenforced by any merge-blocking check. Ruff is that check here.
+    "B015",  # useless comparison - `x == 1` as a statement, the real bug class
+    "B018",  # useless expression - a value computed and discarded
 ]
 ignore = [
     "E501",  # line too long - handled by formatter

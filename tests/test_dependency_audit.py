@@ -147,7 +147,7 @@ def test_direct_reference_check_ignores_extras_specifiers_and_markers(tmp_path):
 # marker that excluded linux aarch64, leaving Thor/Jetson with no video decoder).
 # lerobot 0.6 fixed those markers upstream: torch>=2.7,<2.12 with a
 # ``torchcodec>=0.11,<0.12`` aarch64 marker that pulls the ABI-matched torch 2.11
-# on every platform. Requiring lerobot >= 0.6.0 is therefore what lets those
+# on every platform. Requiring lerobot >= 0.6 is therefore what lets those
 # overrides be dropped: the codec/decoder stack now resolves ABI-consistently
 # (torch 2.11 + torchcodec 0.11.x + torchvision 0.26) on linux x86_64/aarch64 and
 # macOS arm64 with no strands override.
@@ -173,15 +173,27 @@ def _lerobot_extra_requirement() -> Requirement:
     raise AssertionError("no `lerobot` requirement found in the [lerobot] extra")
 
 
-def test_lerobot_extra_requires_at_least_0_6() -> None:
-    """The ``[lerobot]`` extra must floor lerobot at >= 0.6.0.
+def test_lerobot_extra_requires_at_least_0_6_1() -> None:
+    """The ``[lerobot]`` extra must floor lerobot at >= 0.6.1.
 
-    The 0.5.1-era torch/torchcodec overrides were removed because lerobot 0.6's
-    own markers resolve the decoder stack correctly; that only holds for
-    lerobot >= 0.6, so the floor must not regress below it.
+    Two coupled reasons, either of which alone requires the floor:
+
+    * The 0.5.1-era torch/torchcodec overrides were removed because lerobot
+      0.6's own markers resolve the decoder stack correctly; that only holds
+      for lerobot >= 0.6.
+    * Bucket streaming (``stream_dataset(repo_type="bucket")``) needs a
+      ``StreamingLeRobotDataset`` that accepts ``repo_type``, which 0.6.0 does
+      not and 0.6.1 does - so 0.6.0 must be *excluded*, not merely admitted.
     """
     req = _lerobot_extra_requirement()
-    assert Version("0.6.0") in req.specifier, f"lerobot floor must admit 0.6.0, got {req.specifier}"
+    # The declared lower BOUND, not membership of one version: a later raise
+    # (say >=0.6.2) must not fail a guard whose requirement it still satisfies.
+    lower = min(Version(s.version) for s in req.specifier if s.operator == ">=")
+    assert lower >= Version("0.6.1"), f"lerobot floor must be >= 0.6.1, got {req.specifier}"
+    assert Version("0.6.0") not in req.specifier, (
+        f"lerobot floor must exclude 0.6.0 (its StreamingLeRobotDataset takes no "
+        f"repo_type, so bucket streaming cannot be served), got {req.specifier}"
+    )
     assert Version("0.5.9") not in req.specifier, (
         f"lerobot floor must exclude 0.5.x (the overrides that compensated for "
         f"lerobot 0.5.1's decoder markers were removed), got {req.specifier}"
@@ -751,4 +763,52 @@ def test_declared_qp_backends_are_real_qpsolvers_extras() -> None:
     assert not unknown, (
         f"declared {_QP_FRONTEND} backend(s) {unknown} are not published extras of "
         f"{_QP_FRONTEND}; pip installs nothing for an unknown extra. Published: {sorted(published)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Environment audit: a downgraded `coverage` next to numba+robosuite (#1803).
+#
+# Installing Isaac Sim via the pip wheels (`isaacsim[all,extscache]`) silently
+# downgrades `coverage` to the 7.4.4 that `isaacsim-kernel` pins. numba's
+# tracer probe then fails, and the first *visible* symptom lands far from the
+# cause: robosuite's OSC controller import dies inside the LIBERO adapter with
+#     AttributeError: module 'coverage.types' has no attribute 'Tracer'
+# The adapter already classifies that clash and appends the remedy (#522,
+# #1803), but only once an eval reaches the import. This guard turns the red
+# herring into a named error at test-collection time instead: if this
+# environment has numba and robosuite installed alongside a `coverage` old
+# enough to trip the clash, fail loudly with the remedy.
+#
+# The floor is the adapter's single source of truth (#1805 measured it:
+# coverage 7.6.0 still names the protocol `TracerCore`; `Tracer` exists only
+# from 7.6.1 onward), so this audit and the runtime remedy can never disagree.
+from strands_robots.benchmarks.libero.adapter import _COVERAGE_TRACER_MIN_VERSION  # noqa: E402
+
+_COVERAGE_CLASH_FLOOR = Version(_COVERAGE_TRACER_MIN_VERSION)
+
+
+def test_environment_coverage_is_compatible_with_numba_robosuite() -> None:
+    """coverage<7.6.1 + numba + robosuite is a known-broken combination (#1803)."""
+    import importlib.metadata
+
+    versions: dict[str, str] = {}
+    for dist in ("coverage", "numba", "robosuite"):
+        try:
+            versions[dist] = importlib.metadata.version(dist)
+        except importlib.metadata.PackageNotFoundError:
+            pytest.skip(f"{dist} not installed; the numba/coverage clash cannot occur here")
+
+    installed = Version(versions["coverage"])
+    assert installed >= _COVERAGE_CLASH_FLOOR, (
+        f"coverage=={versions['coverage']} is installed alongside "
+        f"numba=={versions['numba']} and robosuite=={versions['robosuite']}: numba's "
+        "tracer probe fails on this coverage (AttributeError: module "
+        "'coverage.types' has no attribute 'Tracer'), which breaks robosuite's OSC "
+        "controller import inside the LIBERO adapter with a red-herring error far "
+        "from the cause. This is the collateral of a pip-installed Isaac Sim "
+        "(isaacsim-kernel pins coverage==7.4.4). Remedy: pip install "
+        f"'coverage>={_COVERAGE_TRACER_MIN_VERSION}' "
+        "(the resulting pip conflict warning against isaacsim-kernel is cosmetic - "
+        "coverage is kit test tooling, not a runtime dependency)."
     )

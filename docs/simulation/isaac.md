@@ -10,8 +10,9 @@ rendering run on the GPU through Isaac Sim.
 
 `strands-robots` has **no hard dependency** on Isaac Sim: the `sim-isaac` extra
 provides the pip-installable helpers, and `create_simulation("isaac")` resolves
-the **built-in** backend, exactly like `create_simulation("mujoco")`. Isaac Sim
-itself is a ~30 GB non-PyPI install you provision out-of-band (see below).
+the **built-in** backend, exactly like `create_simulation("mujoco")`. The Isaac
+Sim runtime itself (~30 GB) is provisioned separately - via its own pip wheels
+on Python 3.12, or out-of-band (see below).
 
 ## When to use it
 
@@ -29,11 +30,12 @@ Sim is a ~30 GB install and requires an NVIDIA GPU.
 
 ## Install
 
-Isaac Sim itself is **not on PyPI** - install it first, then the `sim-isaac`
-extra:
+Install the Isaac Sim runtime first, then the `sim-isaac` extra:
 
 ```bash
 # Step 1 - install Isaac Sim 6.0 (Python 3.12) via one of:
+#   - pip wheels (see caveats below):
+#       pip install 'isaacsim[all,extscache]==6.0.*' --extra-index-url https://pypi.nvidia.com
 #   - Omniverse Launcher -> Isaac Sim 6.0, OR
 #   - Isaac Lab: git clone IsaacLab && ./isaaclab.sh -i, OR
 #   - NGC Docker: docker pull nvcr.io/nvidia/isaac-sim:6.0
@@ -47,6 +49,53 @@ The `sim-isaac` extra lives in **`strands-robots`** (a peer of `sim-mujoco` and
 installed raises a `ValueError` whose message carries the exact install hint
 (`pip install 'strands-robots[sim-isaac]'`). Backend discovery is lazy, so
 MuJoCo-only users never pay the Isaac Sim import cost.
+
+### Installing Isaac Sim via pip - caveats
+
+Since the cp312 wheels shipped for Isaac Sim 6.0.x, the runtime itself is
+pip-installable on Python 3.12. The `extscache` extra is **required** - the
+bare `isaacsim[all]` metapackage omits the `isaacsim-extscache-*` packages, and
+`SimulationApp` aborts resolving its extension graph without them. The pip
+install also degrades an existing dev environment in ways pip only *warns*
+about, so run this exact sequence:
+
+```bash
+# 1. Install the Isaac Sim wheels (NVIDIA index required):
+pip install 'isaacsim[all,extscache]==6.0.*' --extra-index-url https://pypi.nvidia.com
+
+# 2. Repair the coverage downgrade (see below):
+pip install 'coverage>=7.6.1'
+
+# 3. Accept the EULA for non-interactive first import:
+export OMNI_KIT_ACCEPT_EULA=YES
+```
+
+Known collateral (observed with isaacsim 6.0.0.1 and 6.0.1.0):
+
+- **`coverage` downgrade breaks robosuite/LIBERO with a red-herring error.**
+  `isaacsim-kernel` pins `coverage==7.4.4`, silently downgrading modern
+  coverage. numba's tracer probe then fails, and the first visible symptom is
+  far from the cause - robosuite's OSC controller import dies inside the LIBERO
+  adapter with `module 'coverage.types' has no attribute 'Tracer'`. Verified
+  remedy: `pip install 'coverage>=7.6.1'` after the isaacsim install. The reverse
+  pip conflict warning (`isaacsim-kernel requires coverage==7.4.4`) is cosmetic:
+  coverage is test tooling for the kit, not a runtime dependency.
+- **torch stack bump vs lerobot pins.** The isaacsim install upgrades
+  `torch`/`torchvision` (and numpy/scipy/pyarrow), leaving pip conflict
+  warnings against lerobot's `torchvision` pin. Expect those warnings; they do
+  not by themselves indicate breakage. Validated combination as of 2026-07-31:
+  isaacsim 6.0.x with torch 2.11 / torchvision 0.26.0 alongside lerobot 0.5.1 -
+  GR00T-on-MuJoCo re-verified green post-install. The environment is outside
+  lerobot's declared support, so re-verify your own policy path after
+  installing.
+- **EULA prompt on first import.** Any non-interactive first import fails with
+  `Do you accept the EULA? ... EOF when reading a line` unless
+  `OMNI_KIT_ACCEPT_EULA=YES` is set.
+- **Exit code 134 after successful work.** Isaac Sim has a known atexit
+  segfault that makes otherwise-clean scripts exit 134 *after* completing
+  successfully. The drivers in this repo guard with `os._exit(...)` after
+  SimulationApp teardown (see `examples/libero/run_isaac.py`); user scripts
+  that boot SimulationApp should do the same.
 
 ## Usage
 
@@ -119,6 +168,38 @@ The Isaac backend reads three `STRANDS_ISAAC_*` variables (resolved when
 
 Because the joint-name and observation contract matches the MuJoCo backend,
 policies and observation mappings transfer unchanged between backends.
+
+The accepted *input* domain matches too, so a call one backend refuses is
+refused by all three. For the setup methods that means the pose vectors, an
+object's `color` and `mass`, the camera `fov` and the pixel dimensions - and the
+entity `name`: `add_robot`,
+`add_object` and `add_camera` each require a non-empty string containing no NUL.
+That matters more here than on MuJoCo because the name is interpolated into the
+USD prim path (`{stage_path}/Robots/{name}`), so an unaddressable name does not
+just produce an entity you cannot look up - `add_robot("")` resolved to
+`/World/Robots/`, the *container* scope for every robot, and `remove_robot`
+prunes its cleanup registry by that prefix. Unlike the MuJoCo backend there is
+no "derive a label from the model" short form: `name` is also the procedural
+lookup key, so `None` / `""` are refused rather than replaced with a generated
+label.
+
+The one deliberate difference in that list is `mass=0`. The Newton backend
+documents it as an alternative spelling of `is_static=True` and honours it, so it
+stays accepted there; this backend documents no such spelling, so a zero mass is
+refused with `is_static=True` named as the remedy - the MuJoCo contract these
+docs otherwise mirror. A static object's mass is read by nobody on any backend,
+so it is not validated there.
+
+Looking an entity *up* is the other half of that contract, and it answers rather
+than refuses: a name only *addresses* an entity here, so a name that cannot be a
+registry key is honestly absent. `remove_robot`, `remove_object`,
+`remove_camera`, `send_action`, `move_object`, `get_body_state` and the rest
+report it with the unknown-entity message they already had, `robot_joint_names`
+and `get_observation` keep answering empty, and `get_frame` /
+`get_camera_params` raise the `KeyError` their contract names. Previously the
+membership test itself raised `TypeError: unhashable type` for a list or dict
+name, so the miss escaped the envelope those methods document as their only
+failure channel - reachable with no entities registered at all.
 
 ## Fleet (IsaacLab-style) preview
 

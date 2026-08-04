@@ -160,10 +160,15 @@ sim.create_world(terrain="rough", difficulty=2.0)  # exaggerated ~16 cm bumps
 ```
 
 `difficulty=1.0` (the default) is the full-height terrain, byte-identical to
-omitting it; `<1` is gentler, `>1` harsher. It must be a finite value `> 0`,
-and it only applies with a `terrain` - setting `difficulty != 1.0` on a flat
-world (no `terrain`) is rejected with an error rather than silently having no
-effect. A locomotion curriculum ramps `difficulty` across resets to grow the
+omitting it; `<1` is gentler, `>1` harsher. It must be a finite *number*
+`> 0` - the same positive-real domain every other continuous knob accepts, so
+`0`, a negative value, `nan`/`inf`, a `bool` (`True` is not a scale, even
+though it is an `int` subclass) and a string (including a numeric one like
+`"0.5"`) are all refused with a structured error naming the parameter. Every
+backend reports through that one domain, so a scale one `create_world` refuses
+cannot be honored by another. It only applies with a `terrain` - setting
+`difficulty != 1.0` on a flat world (no `terrain`) is rejected with an error
+rather than silently having no effect. A locomotion curriculum ramps `difficulty` across resets to grow the
 terrain the policy must handle.
 
 A floating-base robot added to a terrain world (or reset in one) spawns
@@ -215,12 +220,50 @@ sim.add_object("crate", shape="box", size=[0.5])
 sim.add_object("crate", shape="box", size=[0.5, 0.5, 0.5])   # 50 cm crate
 ```
 
+Every component must also be a finite number, and **that** part of the domain is
+shared with the Newton and Isaac backends' `add_object` - word for word, not just
+verdict for verdict - so an extent one backend refuses is refused by all three
+with the same message. A `nan`/`inf`, boolean, `None` or otherwise non-numeric
+component is rejected by name rather than reaching the solver, a NumPy array is
+accepted and normalized to plain floats, and a value that is not a vector at all
+is refused instead of raising from whatever first tries to iterate it:
+
+```python
+sim.add_object("crate", shape="box", size=[float("nan"), 0.1, 0.1])
+# status=error: add_object: 'size' must contain finite numbers (no nan/inf),
+#               got [nan, 0.1, 0.1]
+sim.add_object("crate", shape="box", size=0.5)
+# status=error: add_object: 'size' must be a list/tuple of numbers, got 0.5
+sim.add_object("crate", shape="box", size=np.array([0.5, 0.5, 0.5]))   # accepted
+```
+
+An **empty** `size` is a component count, not an omission, so it is rejected
+rather than quietly taking the default extent - omit `size` (or pass `None`) to
+ask for the default. Here the three backends agree on the verdict but not on the
+wording, because MuJoCo reaches an empty vector through the per-shape count above
+and so names the count the shape needs:
+
+```python
+sim.add_object("crate", shape="box", size=[])
+# status=error: box needs 3 'size' component(s) [x, y, z] full edge lengths,
+#               got 0 (size=[]). ...
+```
+
+The per-shape counts in the table above remain MuJoCo's alone. Newton and Isaac
+accept a short `size` (Isaac documents completing the missing trailing components
+from defaults), and neither bounds a component to be positive, so a vector this
+backend refuses on either of those axes may still be accepted there. Converging
+the three is tracked in
+[#1858](https://github.com/strands-labs/robots/issues/1858).
+
 ## Object mass
 
 `mass` (kg) applies to dynamic objects and must be a finite number greater than
 zero - the same domain `set_body_properties(mass=...)` enforces when it writes
-the same body. A mass outside it is rejected up front, naming the parameter,
-instead of surfacing as a recompile failure:
+the same body, and the same one the Newton and Isaac backends' `add_object`
+applies, so a mass one backend refuses is refused by all three. A mass outside it
+is rejected up front, naming the parameter, instead of surfacing as a recompile
+failure:
 
 ```python
 sim.add_object("crate", shape="box", mass=0)
@@ -233,7 +276,10 @@ This matters beyond the one object: a body's mass divides every force acting on
 it, and the solver keeps a single state vector, so an infinite mass turns the
 whole world's `qpos`/`qvel` to `nan` on the next step - every other body
 included. `is_static=True` needs no mass (MuJoCo derives it from the geom's
-density), so `mass` is ignored there.
+density), so `mass` is ignored there - and not validated, on any backend, since
+nothing reads it. The Newton backend additionally documents `mass=0` as an
+alternative spelling of `is_static=True` and keeps accepting it; MuJoCo and Isaac
+refuse a zero mass and name that flag as the remedy.
 
 Whatever the reason for a rejection - mass, `size`, an unsupported `shape`, an
 unloadable mesh - the scene is rolled back to its previous compilable state and
@@ -338,16 +384,38 @@ sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "position": [0.4, 
 #               Accepted keys: name, op, pos.
 ```
 
-Every numeric field an op writes - `pos`, `quat`, `size`, `rgba` - must hold
-finite numbers, the same domain `add_object` / `add_camera` / `move_object` apply.
+Every numeric field an op writes is held to the domain the scene-construction
+calls apply to the same buffer:
+
+| field | accepted |
+| --- | --- |
+| `pos` | exactly 3 finite components |
+| `quat` | exactly 4 finite components |
+| `rgba` | 3 (RGB, completed with an opaque alpha) or 4 finite components |
+| `size` | finite components, in the count the geom's shape consumes |
+
 MuJoCo bakes a `nan`/`inf` component into the model without complaint, so an
 unchecked one reports success and only surfaces later as a poisoned physics
-state:
+state. A wrong component count is reported by the library rather than left to
+MuJoCo, which for the two attribute-assigning ops (`set_body_pos`,
+`set_body_quat`) dumps a C++ overload table naming neither the op nor the field:
 
 ```python
 sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "pos": [float("nan"), 0, 0.3]}])
 # status=error: set_body_pos: 'pos' must contain finite numbers (no nan/inf),
 #               got [nan, 0, 0.3]
+
+sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate", "pos": [0.4, 0.9]}])
+# status=error: set_body_pos: 'pos' must be a 3-element vector, got 2 ([0.4, 0.9])
+```
+
+A three-component `rgba` is the same RGB `add_object(color=...)` accepts, so the
+two surfaces that write `geom_rgba` agree on what a colour is:
+
+```python
+sim.patch_scene_mjcf([{"op": "add_geom", "body": "rig", "type": "box",
+                       "size": [0.1, 0.1, 0.1], "rgba": [0.9, 0.3, 0.1]}])
+# status=success - stored as [0.9, 0.3, 0.1, 1.0]
 ```
 
 The batch is atomic: if any op is rejected the world is rolled back to its

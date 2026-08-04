@@ -547,8 +547,9 @@ class LerobotTrainer(Trainer):
 
         Runs the shared input-safety gate, then checks a data source -
         exactly one of a local LeRobotDataset v3 ``dataset_root`` or a Hub
-        ``dataset_repo_id`` (for streaming) - an ``output_dir``, positive
-        ``steps``, single-node only (``num_nodes == 1``), a ``val_episodes``
+        ``dataset_repo_id`` (for streaming) - an ``output_dir``, a usable run
+        size (``steps`` / ``global_batch_size``), single-node only
+        (``num_nodes == 1``), a ``val_episodes``
         split below the dataset total, and that ``lerobot.scripts.lerobot_train``
         is importable. ``extra['reward_model']`` switches to reward-model
         preflight; otherwise the default policy path is checked. Returns the
@@ -592,8 +593,7 @@ class LerobotTrainer(Trainer):
         else:
             problems.extend(self._validate_policy(spec))
 
-        if spec.steps <= 0:
-            problems.append(f"steps must be > 0, got {spec.steps}")
+        problems.extend(self._run_size_problems(spec))
 
         if spec.num_nodes > 1:
             problems.append(
@@ -1050,6 +1050,26 @@ class LerobotTrainer(Trainer):
             reward_cfg = make_reward_model_config(rtype, **reward_kwargs)
         except TypeError as e:
             raise ValueError(f"reward_model type '{rtype}' rejected field(s) {sorted(reward_kwargs)}: {e}") from e
+        except OSError as e:
+            # A reward config may derive a field from a pretrained asset inside
+            # its own __post_init__ (robometer reads its backbone's config and
+            # tokenizer to size ``vlm_config``), so merely CONSTRUCTING it can
+            # need a download. Every huggingface_hub failure class for that is
+            # an OSError subclass (LocalEntryNotFoundError, HfHubHTTPError,
+            # GatedRepoError, OfflineModeIsEnabled), and transformers re-raises
+            # a plain OSError, so this is the narrowest superset that covers
+            # "the asset could not be obtained" without swallowing the
+            # ValueErrors a config raises for a bad field value - those are
+            # already actionable and name the field.
+            raise ValueError(
+                f"reward_model type '{rtype}' could not be constructed: building its config "
+                f"needed a pretrained asset this host could not obtain ({e}). The spec itself "
+                f"is fine - validate() cannot reach the network to see this. Either make the "
+                f"asset available (a warm Hugging Face cache, or network access with "
+                f"HF_HUB_OFFLINE unset), or pass the field the config derives from it in "
+                f"extra['reward_model'] so its constructor fetches nothing. Fields this type "
+                f"accepts: {', '.join(sorted(friendly))}."
+            ) from e
         if hasattr(reward_cfg, "push_to_hub"):
             reward_cfg.push_to_hub = False
         if spec.base_model and hasattr(reward_cfg, "pretrained_path"):

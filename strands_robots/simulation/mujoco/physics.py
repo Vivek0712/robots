@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
+from strands_robots.simulation.base import _BOOLEAN_STATE_REASON
 from strands_robots.simulation.mujoco.backend import (
     _NO_WORLD_MSG,
     _ensure_mujoco,
@@ -33,6 +34,7 @@ from strands_robots.simulation.mujoco.scene_ops import (
     persist_geom_properties,
     refresh_body_inertial_from_geometry,
 )
+from strands_robots.utils import BOOLEAN_VECTOR_REASON, coerce_rgba, is_boolean
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,22 @@ def _coerce_finite_vector(
         }
     out: list[float] = []
     for elem in seq:
+        # Before float(), which cannot tell a boolean apart afterwards: bool is
+        # an int subclass and numpy.bool_ coerces the same way, so both arrived
+        # as a silent 1.0/0.0 component under status="success". This is the one
+        # chokepoint for every vector the runtime writers take - a raycast
+        # origin and direction, a geom size and friction, an rgba colour, and
+        # each ray of a multi_raycast batch - so the gate belongs here rather
+        # than at the seven call sites.
+        if is_boolean(elem):
+            return None, {
+                "status": "error",
+                "content": [
+                    {
+                        "text": f"{method}: '{name}' elements must be numbers, not a bool (got {values!r}). {BOOLEAN_VECTOR_REASON}"
+                    }
+                ],
+            }
         try:
             f = float(elem)
         except (TypeError, ValueError):
@@ -125,24 +143,15 @@ def _coerce_finite_vector(
     return out, None
 
 
-# A MuJoCo geom stores its colour as a 4-component ``rgba`` row. Alpha is the
-# only component with a meaningful default (opaque), so an RGB triple can be
-# completed without inventing a colour, while any other count cannot.
-_RGBA_ACCEPTED_LENGTHS: tuple[int, ...] = (3, 4)
-_RGBA_LAYOUT = "RGB, or RGBA with alpha"
-
-
 def _coerce_rgba(color: Any, method: str, name: str = "color") -> tuple[list[float] | None, dict[str, Any] | None]:
     """Coerce a caller-supplied colour to the 4 components a geom's rgba stores.
 
-    Single source of the backend's colour contract, shared by the scene creator
-    (``add_object``) and the runtime mutator (``set_geom_properties``) so their
-    accepted domains cannot diverge: 3 components are read as RGB and completed
-    with an opaque alpha -- the one component MuJoCo defines a default for -- 4
-    are read as RGBA verbatim, and any other count is rejected because it can
-    only be applied by fabricating or discarding components the caller did not
-    ask about. An empty vector is rejected for the same reason: substituting the
-    backend default paints a colour nobody requested under a success result.
+    Envelope binding over :func:`strands_robots.utils.coerce_rgba`, which is the
+    single definition of the colour contract for every backend. This wrapper
+    exists only to report the shared reason in the structured-error shape the
+    MuJoCo scene creator (``add_object``) and runtime mutator
+    (``set_geom_properties``) return, so those two agreed domains stay in step
+    with Newton's and Isaac's rather than being a second copy of the rule.
 
     Args:
         color: The caller's colour sequence (list / tuple / NumPy array).
@@ -153,66 +162,10 @@ def _coerce_rgba(color: Any, method: str, name: str = "color") -> tuple[list[flo
         ``(rgba, None)`` with exactly 4 finite floats, or ``(None, error_dict)``
         matching the structured-error tool contract.
     """
-    floats, err = _coerce_finite_vector(
-        color,
-        name,
-        method,
-        accepted_lengths=_RGBA_ACCEPTED_LENGTHS,
-        layout=_RGBA_LAYOUT,
-    )
-    if floats is None:
-        return None, err
-    return (floats if len(floats) == 4 else [*floats, 1.0]), None
-
-
-def _coerce_finite_joint_map(
-    values: dict[str, Any],
-    name: str,
-    method: str,
-) -> tuple[dict[str, float], dict[str, Any] | None]:
-    """Coerce a ``{joint_name: value}`` map to finite floats before any write.
-
-    Each value must be a real number (Python or NumPy scalar) and finite. A
-    non-numeric value would otherwise raise ``ValueError`` from ``float(value)``
-    past the structured-error dispatch contract, and ``nan`` / ``inf`` would
-    slip straight into ``data.qpos`` / ``data.qvel`` -- ``mj_forward`` then
-    propagates the ``nan`` across the whole kinematic state (or an ``inf``
-    velocity blows up the integrator) while the tool still reports
-    ``status="success"``. Validating up front keeps the write atomic: an invalid
-    value leaves the model untouched.
-
-    Args:
-        values: The ``{joint_name: value}`` mapping to validate.
-        name: Parameter name (``"positions"`` / ``"velocities"``), used in error text.
-        method: Calling method name, used in error text.
-
-    Returns:
-        ``(coerced, None)`` on success, or ``({}, error_dict)`` on the first
-        invalid value -- matching the structured-error tool contract so the
-        caller never raises past dispatch.
-    """
-    out: dict[str, float] = {}
-    for jnt_name, value in values.items():
-        try:
-            f = float(value)
-        except (TypeError, ValueError):
-            return {}, {
-                "status": "error",
-                "content": [
-                    {"text": f"{method}: '{name}' value for joint '{jnt_name}' must be a number, got {value!r}"}
-                ],
-            }
-        if not math.isfinite(f):
-            return {}, {
-                "status": "error",
-                "content": [
-                    {
-                        "text": f"{method}: '{name}' value for joint '{jnt_name}' must be finite (no nan/inf), got {value!r}"
-                    }
-                ],
-            }
-        out[jnt_name] = f
-    return out, None
+    rgba, reason = coerce_rgba(method, name, color)
+    if reason is not None:
+        return None, {"status": "error", "content": [{"text": reason}]}
+    return rgba, None
 
 
 # A ray batch is a sequence of 3-component direction vectors. Spelling it out in
@@ -524,6 +477,11 @@ class PhysicsMixin:
         def _validate_mass(self, mass: Any, method: str, param: str = "mass") -> dict[str, Any] | None:
             """Reject a body mass the physics engine cannot honor."""
 
+        def _coerce_joint_state_map(
+            self, values: dict[str, Any], name: str, method: str
+        ) -> tuple[dict[str, float], dict[str, Any] | None]:
+            """Coerce a joint-state map to finite floats before any write."""
+
     # State Checkpointing
 
     def save_state(self, name: str = "default") -> dict[str, Any]:
@@ -682,7 +640,9 @@ class PhysicsMixin:
         ``reset()`` clears every latched wrench in the world.
 
         Each vector may be a list, a tuple or a NumPy array (a computed wrench
-        is an array), and every element must be a finite real number.
+        is an array), and every element must be a finite real number. A boolean
+        element (python or ``numpy.bool_``) is refused rather than applied as
+        ``1.0`` N - see :data:`_BOOLEAN_STATE_REASON`.
 
         Args:
             body_name: Target body name.
@@ -725,9 +685,21 @@ class PhysicsMixin:
                 # inside np.array(dtype=float64) - escaping the structured-error
                 # contract - and nan/inf or nested lists slip silently into
                 # mj_applyFT, injecting bad state into the physics buffer.
-                # bool is intentionally accepted (subclass of int -> finite);
-                # rejecting it is out of scope for numeric-element validation.
+                # A bool element is refused rather than accepted as finite. The
+                # earlier note here deferred it as "out of scope for numeric-element
+                # validation"; that scope note is what #1838 revisited, because
+                # float(True) is 1.0 and a True force component silently applies
+                # 1 N along that axis while the call reports success.
                 for _elem in _vec:
+                    if is_boolean(_elem):
+                        return {
+                            "status": "error",
+                            "content": [
+                                {
+                                    "text": f"apply_force: '{_name}' elements must be numbers, not a bool (got {_vec!r}). {_BOOLEAN_STATE_REASON}"
+                                }
+                            ],
+                        }
                     try:
                         _f = float(_elem)
                     except (TypeError, ValueError):
@@ -1372,8 +1344,9 @@ class PhysicsMixin:
           joint count (when ``robot_name`` is given, that robot's joints; otherwise the
           world must contain exactly one robot, or the call errors).
 
-        Every value must be a finite real number (Python or NumPy scalar). A
-        ``nan`` / ``inf`` or a non-numeric value returns a structured
+        Every value must be a finite real number (Python or NumPy scalar), and
+        must not be a boolean. A
+        ``nan`` / ``inf``, a boolean or a non-numeric value returns a structured
         ``status="error"`` and leaves ``qpos`` untouched, rather than corrupting
         the kinematic state (``mj_forward`` propagates a ``nan`` everywhere) or
         raising past the tool-dispatch contract.
@@ -1460,7 +1433,7 @@ class PhysicsMixin:
         # this a non-numeric entry raises ValueError past the structured-error
         # contract, and a nan/inf lands in data.qpos where mj_forward propagates
         # it across the whole kinematic state while the tool still reports success.
-        positions, err = _coerce_finite_joint_map(positions, "positions", "set_joint_positions")
+        positions, err = self._coerce_joint_state_map(positions, "positions", "set_joint_positions")
         if err:
             return err
 
@@ -1491,8 +1464,9 @@ class PhysicsMixin:
         Writes to qvel. Useful for initializing dynamics. Accepts dict or list
         (see set_joint_positions for list semantics).
 
-        Every value must be a finite real number (Python or NumPy scalar). A
-        ``nan`` / ``inf`` or a non-numeric value returns a structured
+        Every value must be a finite real number (Python or NumPy scalar), and
+        must not be a boolean. A
+        ``nan`` / ``inf``, a boolean or a non-numeric value returns a structured
         ``status="error"`` and leaves ``qvel`` untouched, rather than blowing up
         the integrator on the next step or raising past the tool-dispatch contract.
 
@@ -1569,7 +1543,7 @@ class PhysicsMixin:
         # Validate every value is a finite number before any qvel write (see
         # set_joint_positions): a nan/inf velocity blows up the integrator on the
         # next step and a non-numeric entry escapes the structured-error contract.
-        velocities, err = _coerce_finite_joint_map(velocities, "velocities", "set_joint_velocities")
+        velocities, err = self._coerce_joint_state_map(velocities, "velocities", "set_joint_velocities")
         if err:
             return err
 

@@ -12,7 +12,7 @@ sim.start_recording(repo_id="user/my_dataset", task="pick up the cube", fps=50)
 sim.run_policy(robot_name="so100", instruction="pick up the cube",
                policy_provider="mock", duration=10.0)
 sim.stop_recording()
-# LeRobot v3 dataset written to ~/.strands_robots/datasets/
+# LeRobot v3 dataset written to $HF_LEROBOT_HOME/user/my_dataset
 ```
 
 `start_recording` requires `[lerobot]`. Without it, use `start_cameras_recording` for plain MP4.
@@ -105,11 +105,40 @@ warning is logged when the implicit `default` overview camera is swept in
 alongside your real sensor cameras, so the stray view is never recorded
 silently.
 
+`cameras=` is a list of **distinct** camera names, and every surface that accepts
+one - `start_recording`, `render_all`, and the plain-MP4
+`start_cameras_recording` / `start_cameras_recording_synchronous` - enforces that
+shape up front. Two mistakes are refused rather than guessed at, because neither
+can be honored as written:
+
+- **A single name passed as a bare string.** `cameras="wrist"` is iterable per
+  character, so it would be read as five cameras, one per letter. Wrap it in a
+  list: `cameras=["wrist"]`.
+- **A repeated name.** `cameras=["wrist", "wrist"]` cannot mean one camera and
+  cannot mean two. In a dataset schema it collapses to a single column, so the
+  recording declares fewer views than were asked for; in `render_all` it renders
+  the same view twice; and in a plain-MP4 recording it opens a second encoder on
+  the one output path, so the camera is rendered and appended twice per capture
+  tick and the artifact ledger reports two files where one exists.
+
+A `Mapping` is refused for the same reason - it is iterable over its keys, so its
+values would be silently discarded. `cameras=None` keeps its "every camera"
+meaning.
+
+
 ### Where the dataset is written (`root` / `overwrite`)
 
-`root` is the on-disk directory for the dataset (defaults to the LeRobot cache
-under `repo_id` when omitted). Passing an existing **empty** directory - for
-example one returned by `tempfile.mkdtemp()` - is accepted and recorded into:
+`root` is the on-disk directory for the dataset, used verbatim. When omitted,
+the directory is derived from `repo_id`: an `owner/name` id records into
+`$HF_LEROBOT_HOME/{repo_id}` (default `~/.cache/huggingface/lerobot`), and a
+`repo_id` that is itself a path is taken as the directory. The home is read from
+LeRobot's own `HF_LEROBOT_HOME` constant, so exporting it moves both the
+recording and where `LeRobotDataset` later reads it back from -
+`resolve_dataset_dir` is the one owner of those rules and every backend's
+`start_recording` applies it.
+
+Passing an existing **empty** directory - for example one returned by
+`tempfile.mkdtemp()` - is accepted and recorded into:
 
 ```python
 import tempfile
@@ -395,7 +424,7 @@ recorder = DatasetRecorder.create(
     camera_keys=["default"],
     joint_names=["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"],
     task="pick up the red cube",
-    # root=None → ~/.strands_robots/datasets/
+    # root=None → $HF_LEROBOT_HOME/user/my_dataset
     # vcodec="h264", streaming_encoding=True, image_writer_threads=4
 )
 
@@ -414,6 +443,35 @@ recorder.add_frame(observation, action)
 recorder.save_episode()
 recorder.finalize()
 ```
+
+### Schema column names must be distinct
+
+`camera_keys`, `joint_names` and `action_names` each declare the recorded
+dataset's **column names**, so each must be a list of distinct, non-blank names.
+`create()` refuses anything else before it touches the on-disk target, so a
+refused `overwrite=True` call leaves an existing dataset intact:
+
+```python
+DatasetRecorder.create(repo_id="user/d", joint_names="gripper")     # ValueError
+DatasetRecorder.create(repo_id="user/d", camera_keys=["front", "front"])  # ValueError
+```
+
+Both mistakes used to be accepted and only surfaced in the recorded data:
+
+- A single name passed as a **bare string** is iterable per character, so
+  `joint_names="gripper"` declared seven columns (`g`, `r`, `i`, `p`, `p`, `e`,
+  `r`). `add_frame` reads each declared name out of the observation, and none of
+  those names is in it, so every column recorded `0.0` for the whole episode -
+  `create()`, `add_frame()`, `save_episode()` and `finalize()` all succeeded.
+  Wrap a single name in a list: `joint_names=["gripper"]`.
+- A **repeated** name collapses where it keys a dict and doubles where it indexes
+  a position. `camera_keys=["front", "front"]` declared one camera column for the
+  two the caller asked for; `joint_names=["j1", "j2", "j2"]` recorded `j2` twice
+  and the joint the caller meant not at all.
+
+`None` and `[]` still mean "not supplied" - the schema is then derived from
+`robot_features` / `action_features`, or from `joint_names` for the action
+columns.
 
 ### Re-recording into an existing `repo_id`
 
@@ -566,9 +624,11 @@ least one non-video key, otherwise `open()` raises `ValueError` rather than
 silently streaming video anyway).
 
 One kwarg is **not** tolerant-forwarded because its absence changes semantics:
-`repo_type="bucket"` requires `lerobot>=0.6.1` — on older versions `open()`
-raises `RuntimeError` instead of silently streaming from the versioned dataset
-namespace (a different storage system).
+`repo_type="bucket"` requires `lerobot>=0.6.1`, which the `[lerobot]` extra
+floors — so a resolver-conformant install always has it. On an environment
+carrying an older lerobot, `open()` raises `RuntimeError` naming the upgrade
+instead of silently streaming from the versioned dataset namespace (a different
+storage system).
 
 For **training**, the upstream trainer uses the same engine:
 

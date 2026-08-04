@@ -113,7 +113,12 @@ from strands_robots.utils import (
     coerce_pose_vector,
     entity_name_error,
     finite_vector_error,
+    non_negative_whole_number_error,
     pose_vector_error,
+    positive_whole_number_error,
+    reserved_camera_name_error,
+    sequence_length,
+    step_aborted_msg,
 )
 
 if TYPE_CHECKING:
@@ -362,6 +367,10 @@ class MuJoCoSimEngine(
         self._mj = _ensure_mujoco()
         logger.info("MuJoCo simulation tool '%s' initialized", tool_name)
 
+        # Construction complete - the finalizer may now release what we hold.
+        # See SimEngine._init_complete: this must be the final statement.
+        self._init_complete = True
+
     # Public Properties - read-only introspection.
     # WARNING: callers MUST NOT mutate the returned objects without holding
     # self._lock. Prefer using action methods which serialize automatically.
@@ -444,15 +453,44 @@ class MuJoCoSimEngine(
         from the agent's dispatch thread and a PolicyRunner worker are
         serialized here.
 
+        Args:
+            action: Actuator command, as a mapping or an ordered vector.
+            robot_name: Robot to actuate. ``None`` resolves to the single robot
+                when exactly one exists.
+            n_substeps: Positive whole number of physics steps to advance after
+                writing the targets, on the shared
+                :func:`~strands_robots.utils.positive_whole_number_error` domain
+                every backend applies. A NumPy or float count with an integral
+                value is honored and coerced; a fractional, zero, negative,
+                non-finite, boolean or non-numeric count is refused. ``0`` is
+                refused rather than honored as "write but do not advance" -
+                :meth:`step` is the surface that advances a count of its own,
+                and it accepts ``0`` as a documented no-op.
+
         Returns:
             Dict with ``status`` ("success" or "error") and ``content``.
             When some action keys could not be resolved to actuators/joints,
             the ``content`` list includes a ``json`` block with an
             ``unresolved_keys`` list (and ``applied``) so callers can
-            self-correct instead of silently losing commands.
+            self-correct instead of silently losing commands. ``status`` is
+            ``"error"`` when ``n_substeps`` is outside that domain, and nothing
+            is written when it is.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
+        # Refused before a single ctrl value is written, because a refusal that
+        # arrived after the write would leave the robot commanded and the world
+        # un-advanced - the one state this surface must never report an error
+        # from. ``_apply_sim_action`` floors its loop at ``max(1, n_substeps)``
+        # but adds the raw count to ``step_count``, so pre-fix a ``0`` ran one
+        # ``mj_step`` and recorded none, a ``-5`` ran one and moved the counter
+        # *backwards*, and a ``nan`` ran one and made ``step_count`` ``nan`` for
+        # the rest of the world's life. A fractional or non-numeric count
+        # reached ``range()`` and raised ``TypeError`` straight past this
+        # method's structured envelope, after the write.
+        if error := positive_whole_number_error(n_substeps, "n_substeps", "send_action"):
+            return {"status": "error", "content": [{"text": error}]}
+        n_substeps = int(n_substeps)
         if robot_name is None:
             if not self._world.robots:
                 return {"status": "error", "content": [{"text": "No robots in the world."}]}
@@ -797,19 +835,29 @@ class MuJoCoSimEngine(
         error names the op, the unrecognised key, a close match where one
         exists, and the keys that op accepts.
 
-        Every numeric field an op writes - ``pos``, ``quat``, ``size``,
-        ``rgba`` - must hold finite numbers. MuJoCo bakes a ``nan``/``inf``
-        component into the model without complaint, so an unchecked one is
-        accepted and only surfaces as a poisoned physics state several
-        successful calls later::
+        Every numeric field an op writes is held to the domain the
+        scene-construction calls apply to the same buffer: a ``pos`` of exactly
+        3 finite components, a ``quat`` of 4, a ``rgba`` of 3 (read as RGB and
+        completed with an opaque alpha, exactly as ``add_object(color=...)``
+        does) or 4, and a ``size`` of finite components in the count its shape
+        consumes. MuJoCo bakes a ``nan``/``inf`` component into the model
+        without complaint, so an unchecked one is accepted and only surfaces as
+        a poisoned physics state several successful calls later::
 
             sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate",
                                    "pos": [float("nan"), 0, 0.3]}])
             # status=error: set_body_pos: 'pos' must contain finite numbers
             #               (no nan/inf), got [nan, 0, 0.3]
 
-        This is the same domain ``add_object``, ``add_camera`` and
-        ``move_object`` apply to those fields.
+            sim.patch_scene_mjcf([{"op": "set_body_pos", "name": "crate",
+                                   "pos": [0.4, 0.9]}])
+            # status=error: set_body_pos: 'pos' must be a 3-element vector,
+            #               got 2 ([0.4, 0.9])
+
+        The width matters as much as the components: these two ops assign the
+        field as a spec attribute rather than passing it as a constructor
+        keyword, and MuJoCo reports a mismatch there by dumping a C++ overload
+        table that names neither the op nor the field.
 
         The whole batch is applied, then the spec is recompiled once. If any
         op fails, the batch is rejected and the world is rolled back to its
@@ -3048,11 +3096,20 @@ class MuJoCoSimEngine(
         mount points before placing a camera; robot bodies are namespaced
         ``<robot>/<body>`` (e.g. ``so101/gripper`` is the SO101 wrist mount).
 
-        Validation: ``name`` must be a non-empty ``str`` containing no NUL -
-        ``render``/``get_frame`` route ``camera_name`` in ``(None, "",
-        "default", "free")`` to the free camera, so a camera registered under
-        ``""`` could never be rendered from, and a non-string name is not
-        addressable through the agent-tool surface. ``position`` and ``target``
+        Validation: ``name`` must be a non-empty ``str`` containing no NUL, and
+        must not be one of the free-camera routing tokens
+        (:data:`~strands_robots.utils.FREE_CAMERA_TOKENS` - ``None``, ``""``,
+        ``"default"``, ``"free"``). ``render``/``render_depth``/``get_frame``
+        resolve every one of them to the free camera by an explicit token check,
+        so a camera created under any of them could never be rendered from even
+        though it is registered, compiled into the model and listed by
+        ``list_cameras``; a non-string name is additionally not addressable
+        through the agent-tool surface. This is the same set the Newton backend's
+        ``add_camera`` refuses, on the shared
+        :func:`~strands_robots.utils.reserved_camera_name_error` domain, because
+        that backend routes the same tokens. The Isaac backend does not route
+        them - its ``get_frame`` looks the name up directly - so ``"default"``
+        there is an ordinary camera name and stays accepted. ``position`` and ``target``
         must each be 3 finite numbers (a list, tuple or NumPy array; NumPy
         scalar elements accepted). Omit a vector to take its default - an empty
         vector is a wrong-length request and is rejected rather than silently
@@ -3078,6 +3135,26 @@ class MuJoCoSimEngine(
         # ``add_object`` - that test is partial for an unhashable name.
         if (name_err := entity_name_error("add_camera", "name", name)) is not None:
             return {"status": "error", "content": [{"text": name_err}]}
+
+        # Refuse a name this backend's own render entry points resolve past. The
+        # three of them (``render`` / ``render_depth`` / ``get_frame``) select the
+        # free camera for every ``FREE_CAMERA_TOKENS`` member by an explicit token
+        # check, so claiming one produced a camera that is registered, compiled
+        # into the model and offered by ``list_cameras`` - and that every render
+        # of silently answers with the free view instead, under a success result.
+        # ``entity_name_error`` above covers only the two falsy tokens, which is
+        # why this is a second guard rather than a widening of that domain: the
+        # other two are perfectly addressable *names* that this backend alone
+        # cannot address as *cameras*.
+        #
+        # It precedes the duplicate-name test because that test answered for
+        # ``"default"`` and answered misleadingly: ``create_world`` registers the
+        # built-in free view under that name, so the refusal was "already exists.
+        # Remove it first." - and following that prescription succeeded, leaving
+        # the scene with an unreachable camera where the advertised free-view
+        # alias had been.
+        if (reserved_err := reserved_camera_name_error("add_camera", "name", name)) is not None:
+            return {"status": "error", "content": [{"text": reserved_err}]}
 
         # Validate position / target shape before we bake them into XML.
         # Membership, not truthiness: ``position or <default>`` raised a bare
@@ -3233,33 +3310,42 @@ class MuJoCoSimEngine(
 
     # Simulation Control
 
-    _MAX_STEPS_PER_CALL = 100_000  # Hard ceiling to prevent unbounded lock hold.
-    _STEPS_PER_BATCH = 1000  # Release lock every N steps for cancellation.
+    # Ceiling on the total steps one call may request. Distinct from the
+    # inherited ``SimEngine._STEPS_PER_BATCH`` granularity, which bounds how
+    # long the lock is held: this bounds how much work is accepted at all, and
+    # its value is MuJoCo's own because a per-step cost is. Isaac and Newton
+    # have no equivalent - see #1871 and the note on ``_STEPS_PER_BATCH``.
+    _MAX_STEPS_PER_CALL = 100_000
 
     def step(self, n_steps: int = 1) -> dict[str, Any]:
         """Advance the simulation by ``n_steps`` physics steps.
 
         Args:
-            n_steps: Non-negative step count (``0`` is an accepted no-op).
+            n_steps: Non-negative whole step count (``0`` is an accepted no-op),
+                on the shared
+                :func:`~strands_robots.utils.non_negative_whole_number_error`
+                domain every backend applies. A NumPy or float count with an
+                integral value is honored and coerced; a fractional, negative,
+                non-finite, boolean or non-numeric count is refused.
 
         Returns:
             A ``{status, content}`` tool result reporting the elapsed sim time
             and total step count. ``status`` is ``"error"`` when no world
-            exists or ``n_steps`` is negative / not an integer.
+            exists, ``n_steps`` is outside that domain, the count exceeds
+            :attr:`_MAX_STEPS_PER_CALL`, or the world was destroyed on a batch
+            boundary mid-run - in which case the error names the steps
+            completed, since some were.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
-        # reject negative, accept zero as no-op
-        if not isinstance(n_steps, int):
-            try:
-                n_steps = int(n_steps)
-            except (TypeError, ValueError):
-                return {
-                    "status": "error",
-                    "content": [{"text": f"step: n_steps must be an integer, got {type(n_steps).__name__}"}],
-                }
-        if n_steps < 0:
-            return {"status": "error", "content": [{"text": f"step: n_steps must be >= 0, got {n_steps}"}]}
+        # Refuse before coercing: ``int()`` alone truncates a fractional count
+        # to a different number of steps under a success result, reads a
+        # boolean as one step, and raises ``OverflowError`` on ``inf`` - which
+        # the previous ``except (TypeError, ValueError)`` did not catch, so an
+        # infinite count escaped this method's structured envelope entirely.
+        if error := non_negative_whole_number_error(n_steps, "n_steps", "step"):
+            return {"status": "error", "content": [{"text": error}]}
+        n_steps = int(n_steps)
         if n_steps == 0:
             return {
                 "status": "success",
@@ -3287,6 +3373,19 @@ class MuJoCoSimEngine(
         while remaining > 0:
             batch = min(remaining, self._STEPS_PER_BATCH)
             with self._lock:
+                # Re-checked per batch, not once before the loop: releasing the
+                # lock is exactly what lets ``cleanup`` win its bounded
+                # world-handoff acquire (GH #116) in the gap between two
+                # batches, after which ``self._world._model`` raised
+                # ``AttributeError`` past this method's structured envelope
+                # having already advanced part of the count. Same pairing as
+                # ``_primitive_abort_reason``, whose loops release the lock on
+                # this schedule for the same reason.
+                if self._world is None or self._world._model is None or self._world._data is None:
+                    return {
+                        "status": "error",
+                        "content": [{"text": step_aborted_msg(n_steps - remaining, n_steps)}],
+                    }
                 for _ in range(batch):
                     mj.mj_step(self._world._model, self._world._data)
                     if has_kinematic_attachments:
@@ -4745,16 +4844,21 @@ class MuJoCoSimEngine(
             if val is None:
                 continue
             expected_len = " or ".join(str(n) for n in accepted_lens)
-            if not hasattr(val, "__len__"):
+            n_components = sequence_length(val)
+            if n_components is None:
                 return None, {
                     "status": "error",
                     "content": [{"text": f"Parameter '{vparam}' must be a list of {expected_len} numbers."}],
                 }
-            if len(val) not in accepted_lens:
+            if n_components not in accepted_lens:
                 return None, {
                     "status": "error",
                     "content": [
-                        {"text": (f"Parameter '{vparam}' must be a list of {expected_len} numbers, got {len(val)}.")}
+                        {
+                            "text": (
+                                f"Parameter '{vparam}' must be a list of {expected_len} numbers, got {n_components}."
+                            )
+                        }
                     ],
                 }
             for i, component in enumerate(val):
@@ -4933,7 +5037,9 @@ class MuJoCoSimEngine(
 
     # Bounded wait for the world-handoff lock (seconds). A motion primitive
     # holds ``self._lock`` only for one control tick (a few physics substeps,
-    # sub-millisecond), so this ceiling is generous; it exists so cleanup can
+    # sub-millisecond); the longest holder is ``step``, bounded by
+    # ``_STEPS_PER_BATCH`` ``mj_step`` calls per acquisition rather than by the
+    # whole requested count. So this ceiling is generous; it exists so cleanup can
     # never hang the host process on a wedged lock holder - the same tradeoff
     # ``_DEFAULT_POLICY_STOP_TIMEOUT`` makes for a wedged policy worker.
     _WORLD_HANDOFF_LOCK_TIMEOUT = 5.0
@@ -5101,12 +5207,6 @@ class MuJoCoSimEngine(
 
     def __exit__(self, *exc: object) -> None:
         self.cleanup()
-
-    def __del__(self) -> None:
-        try:
-            self.cleanup()
-        except Exception:
-            pass
 
 
 # Backward-compatible aliases (PR #85 shipped as ``Simulation``)

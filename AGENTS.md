@@ -93,6 +93,56 @@ hatch run format            # ruff check --fix, ruff format
    request reached `APPROVED` / `SUCCESS` / `CLEAN` having appended to the log.
 4. All tests must pass, lint must be clean
 5. Open PR from your fork, address all review comments
+
+   **Check whether you are already the thread's last author before replying.**
+   "Address all review comments" is a per-*concern* obligation, not a
+   per-*cycle* one, and an agent that rebuilds its context each run cannot tell
+   those apart from the thread alone. On #1899 a single thread collected **12
+   consecutive author replies** between 21:46 and 01:30, every one of them
+   announcing the same commit (`35ee25d2`):
+
+   | reply | posted (UTC) | thread state when posted |
+   |---|---|---|
+   | 1st | 21:46 | open, question unanswered |
+   | 2nd | 21:52 | resolved *by this reply* |
+   | 3rd - 12th | 22:28 - 01:30 | `isResolved: true`, `isOutdated: true` |
+
+   The branch's last push was 22:37, so every reply from the 3rd on described
+   work that was already complete and already announced twice - and they were
+   still arriving hourly after the PR was green and waiting on nothing but a
+   reviewer.
+
+   The loop is self-feeding, which is why it does not decay on its own:
+   replying makes the thread the most recently active thing on the PR, so it is
+   the first thing the next cycle reads, and an agent's own prior reply is
+   indistinguishable from context it has not yet acted on. The reviewer's
+   question is still sitting there verbatim in the serialised thread. Nothing
+   in the payload says "answered".
+
+   So gate on authorship and state, not on whether a question is present:
+
+   - Thread's last non-bot comment is **yours** -> do not reply. You have
+     already said it. If there is code to push, push it; the push is the
+     message.
+   - Thread is **`isResolved` or `isOutdated`** -> do not reply. Resolution is
+     terminal. Reopening it to restate a landed fix reads as noise, not
+     diligence.
+   - Last comment is **someone else's** and your existing replies do not answer
+     it -> reply once, then resolve.
+
+   The authorship check is the cheap one, and it would have prevented ten of
+   those twelve comments on its own: no semantic comparison, just the author of
+   the last comment. Both `isResolved` and the comment authors are already in
+   the context payload - they were fetched and not read.
+
+   What makes this worth writing down is that the previous rule was *satisfied*
+   by all twelve. "Address all review comments", and "reply when a thread asks
+   a direct question", are both still true of a thread you have already
+   answered, because answering does not remove the question. The cost lands on
+   the next reader: the signal that the thread was settled at 21:52 is buried
+   under ten paragraphs restating it, and a reviewer must scroll all of them to
+   learn nothing changed. Same shape as #1919 - the policy was not wrong, it
+   was silent on a case that recurs every scheduled cycle.
 6. Track follow-up items as issues on the [project board](https://github.com/orgs/strands-labs/projects/2)
 
    **Read the board with `PAT_TOKEN`, not the Actions `GITHUB_TOKEN`.** An
@@ -155,9 +205,170 @@ hatch run format            # ruff check --fix, ruff format
      manual bisect, and an intermediate commit's green is not available to lean
      on. Do not read the intermediate `FAILURE`s as the culprit; they are the
      batching, not a defect.
+   - *And when `main` itself is red, a re-run cannot clear the PRs it blocked.*
+     `pr-and-push.yml` checks out the PR **head commit**, not
+     `refs/pull/N/merge` - the job log reads `HEAD is now at <branch head>` - so
+     a branch's green is a statement about the branch's own tree, which is the
+     reason `Detect an untested overlap with the base branch` has to exist as a
+     separate check. It follows that a fix landing on `main` is invisible to the
+     branch until the branch absorbs it, and
+     `POST /actions/runs/{id}/rerun-failed-jobs` re-uses the head SHA the run
+     recorded, so re-running changes nothing. Measured on #1824, which fixed the
+     three `test_deferred_physics_and_warmup.py` failures open as #1823: #1827
+     and #1829, both re-run after #1824 was on `main`, reported the same single
+     failure (`1 failed, 6287 passed` and `1 failed, 6277 passed`). Merge `main`
+     into the branch and push; there is no cheaper route.
+
+     **That push is free when the merge is conflict-free.** The intuition that
+     it costs the approval is wrong, and the difference is measurable before you
+     push. Two pushes onto #1821, both merges of `main` into an approved branch:
+
+     | push | `git show --cc` | PR diff vs merge base | approval |
+     |---|---|---|---|
+     | `b365d60`, resolved a conflict | 82 lines | changed | dismissed 45s later |
+     | `79cbdad`, clean base merge | 0 lines | identical, `4 files, +158/-7` | survived, still `APPROVED` |
+
+     Dismissal keys on the **PR's own diff**, not on the head SHA changing: a
+     merge that only brings the base forward leaves the diff a reviewer read
+     byte-identical, and nothing is dismissed. A conflict resolution is new,
+     unreviewed text - a combined diff is exactly the text belonging to neither
+     parent - and that is what costs a round. So refreshing an approved branch
+     over a fixed `main` is cheap, and the expensive case is the one worth
+     avoiding structurally, which is what step 3's fragment rule already does for
+     the file every branch used to conflict on.
+
+     Two consequences remain. Merge the fix for a red `main` ahead of the queue
+     rather than alongside it: while it is red nothing on top of it can merge at
+     all, whatever its own state. And do not push the refresh onto a
+     **contributor's** branch - that is the `require_last_push_approval` identity
+     problem below, which is independent of dismissal and does not care that the
+     merge was clean. Ask the contributor to absorb `main` so they stay the last
+     pusher; #1827 was left alone for that reason.
+   - *And that the mutation named the object you meant.* A mutation
+     names its subject by node ID and by nothing else - `createIssue` takes a
+     `repositoryId`, not an owner and a name - so a well-formed ID that is wrong
+     does not fail. It succeeds against whatever object it *does* name. Filing
+     an issue for this repository with a `repositoryId` carried over from an
+     earlier response rather than queried - `R_kgDOD1WOFw` for `R_kgDORUMiZg` -
+     created issue #1 in an unrelated third-party repository and returned
+     success. The only clue was the `url` in the response, and there is no undo:
+     `deleteIssue` needs admin on the *target*, so the stray issue could only be
+     closed as `NOT_PLANNED` with an apology. See #1916.
+
+     **A node ID is not opaque, which is what makes this checkable before the
+     write.** It is `<TypePrefix>_<urlsafe-base64(msgpack array)>`, where a
+     repository is `[0, databaseId]` and anything a repository owns is
+     `[0, repository databaseId, own databaseId]` - so the type and the target
+     repository are both readable with no network call:
+
+     | node ID | decodes to | target |
+     |---|---|---|
+     | `R_kgDORUMiZg` | `[0, 1162027622]` | this repository |
+     | `R_kgDOD1WOFw` | `[0, 257265175]` | the stray one |
+     | `PR_kwDOD1WOF87DdSjQ` | `[0, 257265175, 3279235280]` | **the same stray one** |
+
+     That third row is the finding. All three guessed IDs in that run carried
+     one wrong repository, so a single stale value contaminated every mutation,
+     and the two that failed did so only because their own databaseId happened
+     not to exist there - `Could not resolve to a node`. Failing closed was luck
+     about the guess, not a property of the API, and the guess that got lucky the
+     other way is the one that wrote.
+
+     So resolve every ID from a query in the same run whose owner and name are
+     written out literally; check the prefix against the parameter, since a
+     `PR_...` handed to a `repositoryId` is wrong by type alone; and read the
+     `url` in the response back before treating the write as done.
+     `tests/test_graphql_node_id_targeting.py` decodes this repository's own node
+     IDs against the `databaseId`s the API publishes beside them, so the claim
+     that the check is available offline fails loudly rather than quietly if the
+     envelope ever changes.
    And before merging, `reviewDecision: APPROVED` alone is not the gate: poll
-   `statusCheckRollup.state == SUCCESS` and `mergeStateStatus == CLEAN`
+   the **required** contexts' own conclusions and `mergeStateStatus == CLEAN`
    together, since `reviewDecision` flips before the checks finish.
+
+   Read the required set rather than the rollup, because they are not the same
+   question and the rollup is the stricter one. `statusCheckRollup.state ==
+   SUCCESS` is *not* a merge requirement: the `default` ruleset lists exactly one
+   required check,
+
+   ```
+   GET /repos/{owner}/{repo}/rulesets/{id}  ->  required_status_checks
+                                                = ["call-test-lint / Test and Lint"]
+   ```
+
+   so every other context - `CodeQL`, `dependency-review`, `Detect Breaking
+   Changes` - is advisory, and any one of them non-`SUCCESS` drags the rollup to
+   `FAILURE` or `NEUTRAL` while the PR remains perfectly mergeable. #1879, #1880
+   and #1881 were each merged at rollup `FAILURE`/`NEUTRAL` with
+   `mergeStateStatus` `CLEAN`. `mergeStateStatus` is the field that already
+   accounts for the required set, which is why it is the one to trust:
+   `BLOCKED` while the required check runs, then `UNSTABLE` - mergeable, with an
+   advisory context red - or `CLEAN`.
+
+   That trust has a reader attached to it, which the sentence above does not say.
+   `mergeStateStatus` answers *can the viewer merge this pull request*, so it is
+   scoped to the token that asks - and on a pull request editing
+   `.github/workflows/**` the Actions `GITHUB_TOKEN` can never read anything but
+   `BLOCKED`, because an installation token is refused writes to workflow files
+   and therefore genuinely cannot perform that merge. **Read the gate with
+   `PAT_TOKEN`.** A control pair, both approved with no unresolved thread and
+   `call-test-lint` `SUCCESS`, read minutes apart:
+
+   | PR | edits `.github/workflows/**` | `GITHUB_TOKEN` | `PAT_TOKEN` | truth |
+   |---|---|---|---|---|
+   | #1915 | yes (`pr-and-push.yml`) | `BLOCKED` | `CLEAN` | merged clean, `f4dfde6` |
+   | #1902 | no | `CLEAN` | `CLEAN` | merged clean, `6cf0470` |
+
+   The mechanism isolates to one variable - same token, same scratch branch, same
+   instant, via `PUT /repos/{owner}/{repo}/contents/{path}`:
+
+   ```
+   zz_probe.txt                    GITHUB_TOKEN -> created
+   .github/workflows/zz_probe.yml  GITHUB_TOKEN -> Resource not accessible by integration
+   .github/workflows/zz_probe.yml  PAT_TOKEN    -> created
+   ```
+
+   So a `BLOCKED` read that way is neither a bug nor staleness; it is the honest
+   answer to the question the field asks. Staleness is separately ruled out:
+   `mergeable_state` on #1899 and #1035 reads `unknown` first and the settled
+   value second **for both tokens identically**, so the lazy first read is
+   per-PR, not per-viewer. `mergeable` agrees across tokens throughout - a text
+   conflict is viewer-independent, and only mergeability-*by-you* is not.
+
+   What makes this expensive is that the wrong answer is indistinguishable from a
+   right one. On a genuinely blocked PR both tokens read `blocked`, so their
+   agreement proves nothing, and the Actions token's answer on a
+   workflow-touching PR is always blocked-or-unknown. No reading of the field
+   separates the two cases. The agent then polls the gate exactly as documented,
+   correctly declines to merge, and reports the PR as waiting on a reviewer -
+   which is the presentation #1905 records for a different cause, and which had
+   stood in eight consecutive scheduled scan summaries as "reviewer bandwidth is
+   the sole constraint". It bites CI and process pull requests specifically,
+   because those are the ones carrying workflow edits. See #1917.
+
+   This is worth the words because the failure mode is silent and expensive in the
+   opposite direction from the usual one. Treating an advisory red as a merge
+   blocker does not look like a mistake; it looks like diligence, and it costs a
+   round of real changes to a PR that was ready. #1879 spent a round removing a
+   `__float__` from a test fixture to clear a `CodeQL` finding that never gated
+   anything. Worse, the finding was not even attributable to that PR: alert #846
+   (`py/non-iterable-in-for-loop`) had been open on `main` since the day before and
+   was reported as "new in code changed by this pull request" only because the
+   branch added lines above it and CodeQL's baseline matching is positional. When
+   an advisory finding appears, check its `created_at` and whether it is open on
+   `refs/heads/main` before assuming the branch introduced it:
+
+   ```
+   GET /repos/{owner}/{repo}/code-scanning/alerts?ref=refs/heads/main&state=open
+   ```
+
+   That endpoint needs `PAT_TOKEN` - the Actions `GITHUB_TOKEN` gets `403 Resource
+   not accessible by integration` - and the annotation on the failing check run
+   (`GET /check-runs/{id}/annotations`) reports the line as it falls in the
+   *branch*, so the number will not match `main`. A genuine pre-existing alert is
+   still worth fixing, but as its own tracked change on `main` rather than as an
+   unplanned round on whatever PR happened to shift its line: #846 was closed that
+   way by #1881, which was also the fix for #1878.
 
    Those three together are still not sufficient. They are all evaluated against
    the base the branch was tested on, so none of them can see a **semantic**
@@ -231,12 +442,14 @@ hatch run format            # ruff check --fix, ruff format
    #1035 is the control - same author, same fork, same `strands_robots/mesh/`
    files, one approval from the same account post-dating its head commit,
    threads clear, checks green, and no CODEOWNERS file in the tree to make
-   `require_code_owner_review` bite. It differs in exactly one input, and reads
-   `APPROVED`:
+   `require_code_owner_review` bite. It differed in exactly one input, and read
+   `APPROVED` - until a later push moved that one input and took it into the
+   blocked row as well:
 
    | PR | commit author | `triggering_actor` | approver | `reviewDecision` |
    |---|---|---|---|---|
-   | #1035 | the contributor | the contributor | the maintainer | `APPROVED` |
+   | #1035 at `2be59dad` | the contributor | the contributor | the maintainer | `APPROVED` |
+   | #1035 at `8d6a4c42` | the maintainer | the maintainer | the maintainer | `REVIEW_REQUIRED` |
    | #1722 | `strands-robots` | the maintainer | the maintainer | `REVIEW_REQUIRED` |
 
    So **pushing a fix to a contributor's branch consumes the approval of
@@ -248,6 +461,65 @@ hatch run format            # ruff check --fix, ruff format
    pusher; when the agent must push, that PR now requires a second approver,
    and saying so is the difference between a one-line request and a branch that
    never merges.
+
+   **#1035 later crossed into the second row, which makes it the whole rule
+   observed twice on one pull request.** CI triage on it correctly diagnosed a
+   stale merge base and prescribed `git merge upstream/main`; the refresh was then
+   *executed with the maintainer's token* rather than requested from the
+   contributor, so `8d6a4c42` - `Merge branch 'main' into
+   feat/ackermann-ros-robot`, authored and committed by the maintainer - became
+   the head. The prescription was right; the hand that applied it was not.
+
+   That case also pulls apart the two costs a push can carry, which the
+   conflict-free result above makes easy to read as one. The merge was clean:
+   `git show --cc` is **0 lines**, and the PR's own diff is unchanged at
+   `7 files, +900/-26`. So by the #1821 table it cost no dismissal, and the
+   pre-existing review is indeed **still `APPROVED`**, not `DISMISSED`.
+   `reviewDecision` is nonetheless `REVIEW_REQUIRED`, and a second approval from
+   that same account - on that exact head, every check `SUCCESS` - does not move
+   it. Two rules, keyed on two different things:
+
+   - `dismiss_stale_reviews_on_push` keys on the **PR's own diff**: a clean base
+     merge is free.
+   - `require_last_push_approval` keys on the **pusher's identity**: a clean base
+     merge is not free, and re-approving from that identity cannot help.
+
+   So "refreshing an approved branch over a fixed `main` is cheap" is scoped to
+   dismissal alone. On your own branch it is cheap outright; on a contributor's
+   branch it converts a pull request one maintainer could merge into one that
+   needs a second, with nothing in the PR's own fields saying so. #1035 is in that
+   state now, and needs an approver who is not the account that pushed
+   `8d6a4c42`.
+
+   Do not try to settle this from the commit metadata, which misleads in both
+   directions. #1722's author and committer are `strands-robots`, an identity
+   distinct from the approver, which reads as the rule being satisfied when it is
+   not; #1035's head names the maintainer outright. Same `REVIEW_REQUIRED`,
+   opposite metadata. Only `triggering_actor` is load-bearing.
+
+   All of the above was documented here and enforced by nothing, which is the
+   same shape as the changelog rule in step 3 before #1784. It is now surfaced by
+   `.github/workflows/last-push-approval.yml`, which names the pusher and the
+   approvers on every review event and fails when they are the same single
+   account. The point of automating it is not that the check is clever - it is
+   that the state it reports is *invisible*: `REVIEW_REQUIRED` / `BLOCKED` is
+   byte for byte what an unreviewed pull request looks like, so the two are
+   indistinguishable in every field a sweep reads and they need opposite actions.
+   Verified against six pull requests, three outcomes, no false positive:
+
+   | pull request | pushed by | approved by | outcome |
+   |---|---|---|---|
+   | #1722, #1035 | the maintainer | the maintainer | `pusher-only-approval` |
+   | #1894, #1920 | either | a second account | `satisfied` |
+   | #1899, #1901 | the author | nobody yet | `awaiting-first-review` |
+
+   `awaiting-first-review` is a pass on purpose. It is the ordinary state of an
+   open pull request and is already visible, so making it red would put a red X
+   on every branch in the repository and the finding would stop meaning
+   anything. Unlike the overlap check in step 8 this one is **not** self-clearing
+   - its remedy is a second human, and no work the author does turns it green -
+   so it reports and is deliberately absent from the required set. A gate a
+   branch cannot clear by doing anything is a report, whatever it is wired to.
 
    The general rule behind all three: **a decision recorded only in a PR or
    issue comment is not durable** - the next contributor will not read the same
@@ -388,9 +660,112 @@ Corrections from code review that apply to all future contributions:
   network exposure.
 
 ### CI Security Baseline
-- **CodeQL findings are not PR-blocking but ARE actionable** - check the Security
-  tab after pushing to a branch. False-positives get dismissed with a reason;
-  real findings get fixed.
+- **A CodeQL alert gates the merge; the CodeQL *check* does not.** These are two
+  objects and only one of them is advisory. The `CodeQL` context is not in the
+  required set (above), so it can sit at `NEUTRAL` indefinitely without blocking
+  anything - but the alert also opens a `github-advanced-security` **review
+  thread**, and the `default` ruleset sets
+  `required_review_thread_resolution: true`, so the merge waits on that thread
+  whatever the alert's severity. This file used to assert the opposite - that a
+  finding does not block a pull request - which is the half that is false and the
+  sentence #1810 was filed about; `.github/workflows/codeql.yml` carries the
+  corrected wording and `tests/test_codeql_query_filters.py` pins it for both
+  files. #1890 measured both halves at once: required check `SUCCESS`, `CodeQL`
+  `NEUTRAL`, `APPROVED` - and it sat for 53 minutes on one unresolved
+  note-severity thread, then merged 8 seconds after that thread was resolved.
+- **Clearing an alert has three tools and they are not interchangeable.**
+  - *Fix it.* The default for anything under `strands_robots/`, and the only
+    option for a real finding.
+  - *Dismiss it with a reason* when the flagged construct is deliberate and
+    test-only: the Security tab, or `PATCH /code-scanning/alerts/{n}` with
+    `dismissed_reason` and `dismissed_comment`. That comment is capped at **280
+    characters** and the endpoint needs `PAT_TOKEN`, so the argument goes in the
+    review thread and the dismissal points at it. This is the usual answer for a
+    hostile fixture, and it is a repeat: alert 590 (`_HostileRobot.__getattr__`)
+    and alert 852 (`GetItemOnly.__getitem__`, #1890) are the same rule,
+    `py/unexpected-raise-in-special-method`, dismissed for the same reason. Then
+    resolve the thread with a reply carrying the reasoning - dismissing alone
+    leaves the gate closed.
+  - *Filter the rule* in `.github/codeql/codeql-config.yml` only when **every**
+    instance in the tree is an idiom the codebase is obliged to use. The set is
+    two, `tests/test_codeql_query_filters.py` pins it, and appending a rule id is
+    otherwise the cheapest way to clear any alert - which is how a filter file
+    ends up quietly opting out of the whole suite.
+
+  Rewriting the flagged code to satisfy the query is the tempting fourth option
+  and the one that costs: #1879 spent a round removing a `__float__` from a test
+  fixture for a finding that gated nothing. It can also destroy the measurement
+  the code exists for. On #1890 the query asked for a `LookupError`; the one it
+  names first, `IndexError`, is what CPython's `seqiter` *clears* to terminate
+  legacy-protocol iteration, so taking the suggestion would have left the fixture
+  raising nothing and the test asserting nothing, still green.
+- **One alert class clears under none of the three, and the question that settles
+  it is which thread you marshal onto.** `py/catch-base-exception` never fires on
+  cleanup-and-reraise: the query accepts a handler that re-raises *lexically*, and
+  six of the tree's seven `except BaseException` handlers do, so they have never
+  been flagged.
+
+  | handler | ends in | flagged |
+  |---|---|---|
+  | `robot.py:368` | `sim.destroy()`, bare `raise` | no |
+  | `policies/persistent.py:193` | `handoff.abandon()`, bare `raise` | no |
+  | `simulation/safe_output.py:185` | `os.unlink(tmp)`, bare `raise` | no |
+  | `hardware_robot.py:1865` | `self._release_task()`, bare `raise` | no |
+  | `tests/policies/lerobot_local/test_list_policy_types.py:70` | `raise AssertionError(...) from exc` | no |
+  | `tests/policies/lerobot_local/test_vla_jepa.py:164` | `raise AssertionError(...) from exc` | no |
+  | `simulation/isaac/simulation.py:5125` | `box["exc"] = exc`, no lexical raise | **yes** |
+
+  The rule's entire alert surface here is therefore one construct: a
+  **cross-thread exception-marshal box**, which parks the exception for *another*
+  thread to re-raise, where the query cannot follow the control flow.
+
+  Narrowing it to `Exception` is not the safe default it looks like, and the worst
+  case is silent. What the *caller* thread observes:
+
+  | raised on the worker | `except BaseException` | `except Exception` |
+  |---|---|---|
+  | `RuntimeError` | `RuntimeError` | `RuntimeError` |
+  | `SystemExit` | `SystemExit` | **`None`, no traceback at all** |
+  | `KeyboardInterrupt` | `KeyboardInterrupt` | `None`, plus unhandled-exception noise |
+
+  Both escapes reach `threading.excepthook`, whose default ignores `SystemExit`
+  specifically - so that one writes nothing at all to stderr, where an escaping
+  `RuntimeError` prints a full traceback. Narrowing therefore does not relocate
+  the exception, it deletes it silently, and the caller re-raises nothing. That is
+  the no-silent-defaults rule, reached from an exception clause.
+
+  So decide by direction, because the box is obliged in one and avoidable in the
+  other:
+
+  - *Marshalling onto an existing foreign thread* - `IsaacSimulation.run_on_main`
+    handing a job to the thread that owns the Kit pump. `concurrent.futures`
+    cannot target an already-running foreign thread, so the hand-rolled box is
+    the only implementation there is. Obliged: dismiss with a reason and resolve
+    the thread pointing at it, per the bullet above.
+  - *Marshalling off a new thread you create* - running an agent off-main, or a
+    test helper that calls into a worker. `concurrent.futures` **is** that
+    pattern, and the `except BaseException` then belongs to CPython
+    (`concurrent/futures/thread.py`, `_WorkItem.run`) rather than to this tree.
+    `Future.result()` re-raises `RuntimeError`, `SystemExit` and
+    `KeyboardInterrupt` with object *identity* preserved (`got is exc` for all
+    three), so delegating is strictly better than the box rather than merely
+    quieter. Not obliged: delegate, and the handler, the alert and the blocking
+    review thread go at once.
+
+  Do not reach for the filter. Its test is that *every* instance is an obliged
+  idiom, and the second bullet is a standing counter-example, so this rule id
+  must keep failing the two-id set `tests/test_codeql_query_filters.py` pins.
+
+  What makes the class worth naming is that both answers are live right now and
+  nothing else records why they differ. Alert #691 - `run_on_main`'s box at
+  `simulation/isaac/simulation.py:5125` - has been open on `refs/heads/main` since
+  2026-07-07 at note severity, gating nothing, carrying only a
+  `# noqa: BLE001` that CodeQL does not read. Alerts #853 and #854 are the same
+  idiom raised on a branch, one of them in that same file, and each opened a
+  review thread, so under `required_review_thread_resolution` they gate the
+  merge. Identical construct, opposite consequence, separated only by having
+  arrived on a branch - and two rounds were spent arguing the idiom rather than
+  applying the second bullet. See #1919.
 - **Dependency Review hard-fails on high/critical CVEs in new deps.** If a PR
   needs a dep with a known critical CVE, the conversation is "do we need this
   dep" not "let's bypass the check."
