@@ -17,8 +17,11 @@ Thread safety:
     - ``step()`` must not run concurrently with ``add_robot()``
 
 Environment variables:
-    - STRANDS_ISAAC_HEADLESS: Override headless mode (true/false)
-    - STRANDS_ISAAC_RTX_PATHTRACING: Enable RTX pathtracing (true/false)
+    - STRANDS_ISAAC_HEADLESS: Override headless mode. On (1/true/yes/on) forces
+      headless, off (0/false/no/off) forces windowed, unset or empty keeps the
+      ``IsaacConfig`` field, and any other spelling is refused
+    - STRANDS_ISAAC_RTX_PATHTRACING: Enable RTX pathtracing, same vocabulary;
+      its off side leaves ``render_mode`` alone rather than selecting a mode
     - STRANDS_ISAAC_NUCLEUS_URL: Override Nucleus asset server URL
 """
 
@@ -34,7 +37,7 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy as np
 
-from strands_robots.simulation.base import SimEngine
+from strands_robots.simulation.base import SimEngine, unknown_kwargs_error
 from strands_robots.simulation.isaac.config import IsaacConfig
 from strands_robots.simulation.isaac.joint_names import demangle_usd_joint_names, urdf_joint_names
 from strands_robots.simulation.isaac.recording import IsaacRecordingMixin
@@ -48,6 +51,7 @@ from strands_robots.utils import (
     entity_name_error,
     name_list_error,
     non_negative_whole_number_error,
+    partial_construction_repr,
     positive_count_error,
     positive_whole_number_error,
     step_aborted_msg,
@@ -63,7 +67,8 @@ logger = logging.getLogger(__name__)
 # width and upscales. Below ~300 px internal resolution DLSS falls back
 # to a temporal-accumulation path that smears a moving arm into a
 # translucent "ghost" (long-standing front/oblique-view bug seen during
-# the SO-101 cuRobo example's GPU validation -- see issue #69 / PR #68).
+# the SO-101 cuRobo example's GPU validation -- see robots-sim#69 /
+# robots-sim#68).
 # Rendering at >= 640 px wide keeps the DLSS internal resolution above
 # that threshold so every frame is crisp on its own; captured frames
 # are downscaled to the caller's requested size before return.
@@ -232,6 +237,26 @@ class SimulationAppLaunchConfig(TypedDict, total=False):
 # throughout the docs; it normalizes to the canonical ``"box"`` (see #88).
 # A unit test pins this mapping so docs and code can't drift apart again.
 _SHAPE_ALIASES: dict[str, str] = {"cuboid": "box"}
+
+# Every keyword :meth:`IsaacSimulation.add_object` honors, including the one it
+# reads out of its own ``**kwargs`` (``scale``, the ``size`` alias). Doubles as
+# the "Valid:" hint in the unknown-keyword refusal, so it lists the declared
+# parameters too rather than only the residual-key vocabulary. A unit test pins
+# it against the live signature so a parameter added to ``add_object`` cannot
+# start being reported as unknown.
+_ADD_OBJECT_PARAMS: tuple[str, ...] = (
+    "color",
+    "is_static",
+    "mass",
+    "material",
+    "mesh_path",
+    "name",
+    "orientation",
+    "position",
+    "scale",
+    "shape",
+    "size",
+)
 
 
 def _rgb_png_block(rgb: np.ndarray) -> dict[str, Any] | None:
@@ -613,7 +638,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         # instead of producing a default-config sim with no warning.
         #
         # A small allow-list of legacy kwargs from the example-local
-        # adapter retired by issue #69 is accepted for backward compat
+        # adapter retired by robots-sim#69 is accepted for backward compat
         # with callers that still pass them via
         # ``create_simulation("isaac", tool_name=..., default_timestep=...)``.
         # They are stored on the instance (not on ``IsaacConfig``) so the
@@ -710,7 +735,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         # cache, and worker-thread actions are enqueued for the pump to
         # apply. ``_main_tid`` identifies the owning thread; when called
         # ON it we run inline (no queue), so the headless smoke-test path
-        # is unchanged. See issue #69 for the consolidation rationale.
+        # is unchanged. See robots-sim#69 for the consolidation rationale.
         self._main_tid = threading.get_ident()
         self._action_q: queue.Queue = queue.Queue()
         self._main_jobs: queue.Queue = queue.Queue()
@@ -1911,6 +1936,10 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             Visual material/texture spec. NOT supported by the Isaac backend
             yet; a non-``None`` value is rejected loudly rather than silently
             dropped (use the MuJoCo backend for matte/textured surfaces).
+        **kwargs
+            ``scale`` (the ``size`` alias documented above) is the only
+            keyword read here. Any other keyword is refused rather than
+            dropped -- see Validation below.
 
         Validation
         ----------
@@ -1932,6 +1961,18 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         ``_objects``, leaving the name permanently taken. A static object's mass
         is never read, so it is not validated - the same scope MuJoCo uses.
 
+        A keyword this method does not honor is refused by name on the shared
+        :func:`~strands_robots.simulation.base.unknown_kwargs_error` contract the
+        MuJoCo and Newton backends' discarding ``**kwargs`` sinks (``randomize``,
+        ``set_obs_noise``) already apply, so a caller mistake reports the same way
+        on every backend. Both sibling ``add_object`` implementations declare the
+        same ten parameters with no ``**kwargs`` at all, so Python refuses an
+        unknown keyword there with a ``TypeError``; here the keys reached a sink
+        that read ``scale`` and discarded the rest, turning ``heigth=0.3`` or
+        ``colour=[1, 0, 0]`` into a silent no-op reported as success. The check
+        runs before anything else so a refused call constructs no prim, takes no
+        lock and leaves the name reusable.
+
         Returns
         -------
         dict
@@ -1941,6 +1982,19 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             ``mass``, and ``is_static`` so an agent can confirm what
             actually landed on the stage without re-querying.
         """
+        # ``**kwargs`` exists for one keyword - the documented ``scale`` alias
+        # read below - and every other residual key used to be dropped. That
+        # made a misspelled or invented parameter a successful no-op on the
+        # backend's most-used scene surface: ``add_object(name="crate",
+        # heigth=0.3)`` returned ``status="success"`` having compiled the
+        # default extents, while the sibling backends' ``add_object`` - which
+        # declare the same ten parameters and no ``**kwargs`` - refuse the same
+        # call with a ``TypeError``. The action dispatcher deliberately skips
+        # its own unknown-key check for a ``**kwargs`` method and delegates it
+        # to the method (see ``_validate_and_build_kwargs``), so this is the
+        # only place it can run.
+        if err := unknown_kwargs_error("add_object", kwargs, _ADD_OBJECT_PARAMS):
+            return err
         if material is not None:
             return {
                 "status": "error",
@@ -1989,7 +2043,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             # Normalize shape aliases. ``"cuboid"`` is accepted as an
             # alias for ``"box"`` because it matches Isaac's underlying
             # ``DynamicCuboid`` / ``FixedCuboid`` class names and is the
-            # vocabulary used throughout the docs (see issue #88). The
+            # vocabulary used throughout the docs (see robots-sim#88). The
             # canonical name stored / reported is ``"box"``.
             shape = _SHAPE_ALIASES.get(shape, shape)
 
@@ -2010,7 +2064,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
             # ``scale`` is accepted as an alias for ``size`` (matches
             # Isaac's ``DynamicCuboid(scale=...)`` convention and the docs
-            # vocabulary -- see issue #88). An explicit ``size`` always
+            # vocabulary -- see robots-sim#88). An explicit ``size`` always
             # wins over ``scale`` if both are passed.
             # Validate the pose vectors on the shared ``coerce_pose_vector`` domain the
             # MuJoCo backend's ``add_object`` and this backend's own ``add_camera`` already
@@ -2117,7 +2171,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                 # sim view) before constructing dynamic prims, so the
                 # eager query never runs. That keeps this clause free of a
                 # bare ``except Exception`` (forbidden by the
-                # exception-hygiene pin, PR #31).
+                # exception-hygiene pin, robots-sim#31).
                 logger.error(
                     "Failed to add object '%s' (shape=%s, static=%s): %s",
                     name,
@@ -2200,11 +2254,12 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         which is fatal for :meth:`load_scene` -- it builds a LIBERO
         task's movable objects as ``Dynamic*`` prims after the world has
         already been initialised (see
-        `#159 <https://github.com/strands-labs/robots-sim/issues/159>`_).
+        `robots-sim#159
+        <https://github.com/strands-labs/robots-sim/issues/159>`_).
 
         We *prevent* the failure rather than catching it: a bare
         ``except Exception`` is forbidden in this module by the
-        exception-hygiene pin (PR #31), and ``omni.physics.tensors``
+        exception-hygiene pin (robots-sim#31), and ``omni.physics.tensors``
         raises exactly that bare type. Before constructing any
         ``Dynamic*`` prim we stop the timeline, which clears the
         physics-tensor view so ``RigidPrim.__init__`` skips its eager
@@ -2215,10 +2270,10 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
 
         The stop is *unconditional* for dynamic prims rather than gated on
         a ``SimulationManager.get_physics_sim_view()`` probe. The earlier
-        probe-gated guard (PR #161) was a no-op on the actual ``#159``
-        ``load_scene`` path: in a real Isaac 6.0 run the probe reported no
-        live view while ``RigidPrim.__init__`` still issued the eager
-        velocity query and crashed -- the probe checks a *different*
+        probe-gated guard (robots-sim#161) was a no-op on the actual
+        ``robots-sim#159`` ``load_scene`` path: in a real Isaac 6.0 run the
+        probe reported no live view while ``RigidPrim.__init__`` still issued
+        the eager velocity query and crashed -- the probe checks a *different*
         tensor-view handle than the one ``RigidPrim`` keys off, so the two
         fell out of sync. ``timeline.stop()`` is idempotent (a no-op when
         the timeline is already stopped, the common scene-build case), so
@@ -2417,8 +2472,9 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         each task's scene. This Isaac override translates the same
         robosuite-compiled MJCF into Isaac stage prims so the LIBERO eval
         runs end-to-end on the Isaac backend (closes the substantive
-        LIBERO-on-Isaac gap that PR #117 deferred with a fail-fast stub --
-        see `#129 <https://github.com/strands-labs/robots-sim/issues/129>`_).
+        LIBERO-on-Isaac gap that robots-sim#117 deferred with a fail-fast
+        stub -- see `robots-sim#129
+        <https://github.com/strands-labs/robots-sim/issues/129>`_).
 
         Translation layer (BDDL/MJCF -> USD):
             * The ``scene_path`` is a robosuite-compiled LIBERO MJCF XML
@@ -3421,7 +3477,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
           Happens when the camera was added before the
           ``add_camera`` Phase-2 wiring landed (or when the camera
           construction failed but bookkeeping was still seeded -- not
-          possible after PR #61, but kept as a defensive fallback).
+          possible after robots-sim#61, but kept as a defensive fallback).
         * ``Rendered (RTX <render_mode>)`` -- Phase-2 path: real
           frames pulled from the Camera handle. ``rgb`` / ``depth``
           are the actual array shapes returned by Isaac (matching
@@ -3592,7 +3648,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                     # Camera was constructed without the depth annotator
                     # (Isaac Sim ships rgba on by default but depth is
                     # opt-in via ``Camera.add_distance_to_image_plane_to_frame()``;
-                    # PR #61's add_camera enables it post-initialize, but
+                    # robots-sim#61's add_camera enables it post-initialize, but
                     # an older sim or a manually-attached Phase-1 camera
                     # state may not). Surface a zero-depth array sized to
                     # rgb so callers see a stable shape, plus a WARNING
@@ -4601,7 +4657,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
         # is opt-in via this method; without it, ``camera.get_depth()``
         # returns ``None`` with a "Annotator 'distance_to_image_plane'
         # not found" warning -- which then crashes downstream
-        # ``np.asarray`` calls in ``render()``. Caught during PR #61
+        # ``np.asarray`` calls in ``render()``. Caught during robots-sim#61
         # GPU validation against the Isaac Sim 4.5 docker image.
         # ``add_distance_to_image_plane_to_frame`` is idempotent on
         # repeat calls so this is safe even if the camera has already
@@ -4612,7 +4668,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
             # Older Isaac Sim builds expose this under a different name
             # (``add_depth_to_frame``). Try the fallback before giving
             # up; downstream ``get_depth`` will still return ``None``
-            # but ``render()``'s defensive None-handling (PR #62) will
+            # but ``render()``'s defensive None-handling (robots-sim#62) will
             # cover it.
             try:
                 camera.add_depth_to_frame()
@@ -5048,7 +5104,7 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
     # --- SimEngine: extra helpers for the SO-101 cuRobo example -------------
     #
     # These methods migrated in from the example-local Isaac adapter
-    # (``examples/so101_curobo/isaac/simulation.py``) when issue #69
+    # (``examples/so101_curobo/isaac/simulation.py``) when robots-sim#69
     # consolidated it into this library backend. They cover three
     # concerns the headless ``SimEngine`` core doesn't:
     #
@@ -6254,4 +6310,4 @@ class IsaacSimulation(IsaacRecordingMixin, SimEngine):
                 f"world={'created' if self._world_created else 'none'})"
             )
         except AttributeError:
-            return f"IsaacSimulation(partially constructed, id=0x{id(self):x})"
+            return partial_construction_repr(self)

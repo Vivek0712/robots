@@ -806,9 +806,13 @@ def positive_whole_number_error(value: Any, param: str, context: str) -> str | N
     documented policy, on the grounds that a per-call ceiling belongs to the
     consumer - and for its one caller that holds, because MuJoCo's
     ``_MAX_STEPS_PER_CALL`` is exactly such a ceiling and refuses an outsized
-    step count with a reason of its own. No consumer of *this* domain owns one.
+    step count with a reason of its own. Exactly one consumer of *this* domain
+    owns such a ceiling: :func:`coerce_zmq_timeout_ms` composes this guard and
+    then applies :data:`MAX_ZMQ_TIMEOUT_MS`, because a ZMQ send/receive timeout
+    is stored as a C ``int`` and this domain accepts ``2**31``.
     Its callers are ``fps``, ``width``, ``height``, ``max_frames``, the mesh
-    robots' ``drive(count=...)`` and ``send_action(n_substeps=)``. Two of those
+    robots' ``drive(count=...)``, ``send_action(n_substeps=)`` and the ZMQ
+    clients' ``timeout_ms``. Two of those
     repeat work that nothing bounds: ``drive`` repeats an actuation command, so
     an unbounded count is an unbounded actuation loop against a physical robot
     rather than a slow call, and ``n_substeps`` is a physics-step count that
@@ -1015,7 +1019,7 @@ def step_aborted_msg(completed: int, requested: int, *, context: str = "step") -
 def positive_count_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable positive integer count.
 
-    Shared domain for two families of discrete quantity:
+    Shared domain for three families of discrete quantity:
 
     * The knobs that count iterations of a control or rollout loop - the
       simulation's ``n_episodes`` / ``max_steps`` / ``control_substeps`` /
@@ -1028,6 +1032,11 @@ def positive_count_error(value: Any, param: str, context: str) -> str | None:
       buffer), but the floor itself must not differ between them: the same
       camera configuration cannot be refused on one backend and accepted on
       another.
+    * A bound on a slice of a token sequence - the ``tokenizer_max_length`` a
+      VLA provider hands a HuggingFace tokenizer as ``max_length`` alongside
+      ``truncation=True``. The tokenizer takes it as a slice bound over the
+      encoded instruction, so a count below one silently produces an EMPTY
+      prompt rather than an error.
 
     It lives here rather than beside one of its callers because those callers
     sit in different layers (:mod:`strands_robots.hardware_robot` must not
@@ -1070,8 +1079,14 @@ def tcp_port_error(value: Any, param: str, context: str) -> str | None:
     Shared domain for every caller-supplied port number: the agent tools that
     reach a service over TCP (``use_rosbridge``'s WebSocket,
     ``gr00t_inference``'s inference service), the mesh bridges that construct
-    one, and the policy providers that dial one (``groot``, ``moveit2``,
-    ``cosmos3``, ``lerobot_async``). A port is an index into the 16-bit TCP port
+    one, the policy providers that dial one (``groot``, ``moveit2``,
+    ``cosmos3``, ``lerobot_async``, ``vera``), the Device Connect drivers
+    that address a device daemon
+    (:class:`~strands_robots.device_connect.reachy_mini_driver.ReachyMiniDriver`'s
+    ``api_port``), and the simulation backends that bind one
+    (:meth:`~strands_robots.simulation.newton.simulation.NewtonSimEngine.open_viewer`'s
+    ``port`` for the viser dashboard). A port is an index into the
+    16-bit TCP port
     space, so only an ``int`` in ``[1, 65535]`` names one: ``0`` asks the kernel
     for an ephemeral port rather than naming a port, and a value outside the
     range has nothing to bind or connect to.
@@ -1111,21 +1126,40 @@ def tcp_port_error(value: Any, param: str, context: str) -> str | None:
 def non_negative_count_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable non-negative integer count.
 
-    Shared domain for a discrete count whose ``0`` is a first-class value rather
-    than a degenerate one - the number of control steps a loop executes while an
-    inference request is in flight
-    (:attr:`~strands_robots.policies.base.Policy.rtc_observed_delay_steps`).
-    That count is exactly ``0`` in the dominant case: a synchronous eval loop
-    pauses the world during inference, so no step elapses. Refusing ``0`` here
-    would therefore reject the common configuration, which is why this is a
-    separate domain rather than a caller of :func:`positive_count_error`.
+    Shared domain for two families of discrete quantity whose ``0`` is a
+    first-class value rather than a degenerate one:
 
-    In every other respect it mirrors :func:`positive_count_error`: the value is
-    consumed as an offset into an action chunk, so only a true ``int`` can be
-    honored (an integral float raises ``TypeError`` at the slice rather than
-    being coerced), and ``bool`` is rejected explicitly because as an ``int``
-    subclass a bare ``value < 0`` test lets ``True`` through as a silent count
-    of one.
+    * The number of control steps a loop executes while an inference request is
+      in flight
+      (:attr:`~strands_robots.policies.base.Policy.rtc_observed_delay_steps`).
+      That count is exactly ``0`` in the dominant case: a synchronous eval loop
+      pauses the world during inference, so no step elapses.
+    * A reproducibility seed
+      (:attr:`~strands_robots.training.base.TrainSpec.seed`), where ``0`` is
+      simply a seed. Its appliers disagree about everything outside this domain:
+      ``torch.manual_seed`` reduces a negative seed modulo ``2**64`` (so ``-1``
+      silently becomes ``2**64 - 1`` and collides with a seed a caller could
+      have named), while NumPy's legacy seeder refuses a negative or a float.
+    * The episode counts of the dataset-integrity gate
+      (:func:`strands_robots.verify_dataset.verify_dataset`'s ``expected`` and
+      ``min_frames``, and the sim facade's
+      :meth:`~strands_robots.simulation.base.SimEngine.verify_dataset_episodes`).
+      ``expected=0`` asks that a dataset be empty and ``min_frames=0`` skips the
+      per-episode length check, so ``0`` selects a mode there rather than
+      degenerating one. A value outside the domain cannot: the length check runs
+      only for a threshold above zero, so a negative or non-finite one disables
+      the check instead of failing it.
+
+    Refusing ``0`` would reject the common configuration for both, which is why
+    this is a separate domain rather than a caller of
+    :func:`positive_count_error`.
+
+    In every other respect it mirrors :func:`positive_count_error`: only a true
+    ``int`` can be honored - an integral float raises ``TypeError`` at an action
+    chunk's slice, and ``numpy.random.seed(3.0)`` raises the same class of cast
+    error rather than being coerced - and ``bool`` is rejected explicitly because
+    as an ``int`` subclass a bare ``value < 0`` test lets ``True`` through as a
+    silent count, or a silent seed, of one.
 
     Args:
         value: The caller-supplied value.
@@ -1139,6 +1173,157 @@ def non_negative_count_error(value: Any, param: str, context: str) -> str | None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return f"{context}: {param} must be a non-negative integer, got {_refusal_repr(value)}."
     return None
+
+
+#: Highest DDS domain id whose RTPS discovery ports fit the 16-bit port space.
+#:
+#: RTPS derives every discovery port from the domain id (RTPS 2.2 sec. 9.6.1.1):
+#: ``PB + DG * domain_id + d0`` for the SPDP multicast port and
+#: ``PB + DG * domain_id + d1 + PG * participant_id`` for the unicast one. With
+#: the standard values (``PB=7400``, ``DG=250``, ``d0=0``, ``d1=10``,
+#: ``PG=2``) domain 232 lands on ports 65400/65410 and domain 233 lands on
+#: 65650 - past the end of the port space, so there is nothing to bind. The
+#: bound is the protocol's, not a policy choice.
+MAX_DDS_DOMAIN_ID = 232
+
+
+def dds_domain_id_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` cannot name a DDS domain.
+
+    Shared domain for every caller-supplied ROS 2 / DDS domain id: the hardware
+    ``Robot``'s ``ros2_domain``, a simulation backend's ``ros2_domain``, and the
+    ``domain_id`` the rclpy telemetry bridge
+    (:class:`~strands_robots.ros_telemetry.RosTelemetryBridge`) and the pure-RTPS
+    bridge (:class:`~strands_robots.hardware_rtps_bridge.HardwareRtpsBridge`)
+    publish on. A domain id indexes the RTPS port map, so only an ``int`` in
+    ``[0, MAX_DDS_DOMAIN_ID]`` names one - see :data:`MAX_DDS_DOMAIN_ID` for the
+    arithmetic that fixes the ceiling.
+
+    The rclpy bridge makes the range load-bearing at the boundary rather than at
+    the participant: it pins the domain by writing ``ROS_DOMAIN_ID`` into the
+    process environment, and that write happens before ``rclpy`` is even
+    imported. So a value outside the range is not refused by the transport - it
+    is published to the whole process, where it outlives the call that set it
+    and steers every later participant (and every subprocess that inherits the
+    environment) at a domain nothing can be reached on.
+
+    It lives here rather than beside one of its callers for the same reason
+    :func:`tcp_port_error` does: those callers sit in different layers
+    (:mod:`strands_robots.hardware_robot`, :mod:`strands_robots.simulation` and
+    the two bridge modules) and the accepted domain must not diverge between
+    them - the same domain id cannot be refused by the rclpy bridge and accepted
+    by the RTPS one, when the two exist to advertise the same topics.
+
+    ``bool`` is rejected explicitly. It is an ``int`` subclass, so a bare
+    ``0 <= value <= 232`` test lets ``True`` through as a silent domain 1 and
+    ``False`` through as domain 0 - a domain the caller never named.
+
+    Args:
+        value: The caller-supplied value.
+        param: The parameter name it came from, used in the message.
+        context: Message prefix identifying the surface that received it,
+            usually the class name for a constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_DDS_DOMAIN_ID:
+        return f"{context}: invalid {param}: {_refusal_repr(value)} (expected 0-{MAX_DDS_DOMAIN_ID})"
+    return None
+
+
+MAX_ZMQ_TIMEOUT_MS = 2**31 - 1
+
+
+def coerce_zmq_timeout_ms(method: str, param_name: str, value: Any) -> tuple[int | None, str | None]:
+    """Read ``value`` as a ZMQ send/receive timeout in milliseconds.
+
+    Shared domain for the ``timeout_ms`` of both ZMQ REQ inference clients -
+    :class:`~strands_robots.policies.groot.client.Gr00tInferenceClient` and
+    :class:`~strands_robots.policies.moveit2.client.MoveIt2InferenceClient` -
+    which each hand it to ``setsockopt(RCVTIMEO)`` and ``setsockopt(SNDTIMEO)``
+    on the socket they dial their sidecar with. It is the third remote-inference
+    transport, and it is spelled differently from the WebSocket and gRPC pair's
+    ``connect_timeout`` / ``request_timeout`` (#1984), which is why it was
+    missed when those were settled: same concern, different parameter name.
+
+    Returns the value **coerced to** ``int``, which is load-bearing rather than
+    tidiness. ``setsockopt`` takes a C ``int`` and refuses every other spelling
+    of the same budget, so ``15000.0`` read out of a JSON config and
+    ``np.int64(15000)`` read out of a config array both raise
+    ``TypeError: expected int`` from inside ``pyzmq`` - naming no parameter -
+    even though each names a perfectly usable budget. The sibling transports
+    accept those spellings, so coercing here is what keeps one budget from
+    being usable on two transports and unusable on the third.
+
+    Only a positive whole number can be honored, and the floor is where the
+    damage is. A ``0`` timeout is ZMQ's "return immediately" spelling, so every
+    request raises ``zmq.Again`` regardless of whether a sidecar is listening -
+    and both clients' ``ping()`` catch every exception and return ``False``, so
+    a running, reachable server is reported as unreachable with the reason at
+    ``logger.debug`` only. ``False`` is the same value arriving by a different
+    route, and ``True`` is a silent 1 ms budget whose verdict depends on how
+    long the peer takes to answer, so it fails on one client and passes on the
+    other against the same sidecar.
+
+    **The ceiling is the transport's, not a policy choice.** ``RCVTIMEO`` is
+    stored as a C ``int``, so :data:`MAX_ZMQ_TIMEOUT_MS` - ``2**31 - 1`` ms,
+    close to 24.9 days - is the largest budget ZMQ will accept; one millisecond
+    more raises ``OverflowError: value too large to convert to int``. This is
+    why :func:`positive_whole_number_error` cannot be applied on its own: that
+    domain accepts ``2**31`` as a positive whole number inside the float64
+    range, and the transport then refuses it with a message naming nothing.
+
+    ``-1`` is refused, and it is the one value that deserves the reason stated.
+    ZMQ documents it as "block forever", so unlike the ``inf`` of the sibling
+    transports it *is* honored - which is what makes it dangerous rather than
+    merely useless. It reinstates on the request path exactly the hang that
+    ``LINGER = 0``, set two lines below in the same ``_init_socket``, exists to
+    prevent on teardown: a request to an unreachable sidecar never returns, and
+    ``ping()`` - whose whole contract is to answer ``True`` or ``False`` about
+    connectivity - can then never answer at all. Neither client documents ``-1``
+    as a spelling, and an unbounded wait on a robot control path wants its own
+    parameter and its own decision rather than arriving as a negative
+    millisecond count. A premise test pins ZMQ's treatment of it, so this
+    reopens loudly if that changes.
+
+    Args:
+        method: Message prefix identifying the surface that received the value,
+            usually the class name for a constructor parameter.
+        param_name: The parameter name it came from, used in the message.
+        value: The caller-supplied value.
+
+    Returns:
+        ``(timeout_ms, None)`` with ``timeout_ms`` an ``int`` when the value is
+        usable, or ``(None, reason)`` when it is not.
+    """
+    if (reason := positive_whole_number_error(value, param_name, method)) is not None:
+        return None, reason
+    # Read once, and compare the number this function produced rather than the
+    # caller's value a second time. The first spelling of this validated with
+    # the guard and then read ``value`` twice more - ``float(value)`` for the
+    # range and ``int(value)`` for the result - which is the escape #1906 closed
+    # for the vector guards: independent reads are not obliged to agree, so the
+    # magnitude a refusal quoted need not have been the magnitude the ceiling
+    # examined, and a ``numbers.Real`` whose second ``__float__`` refuses raised
+    # straight out of a function whose contract is to answer with text. This
+    # module carries that as a scanned invariant - no function in it may reach a
+    # ``float()`` that no ``try`` protects - and the second read was exactly such
+    # a conversion, so this is the invariant's verdict and not a style
+    # preference.
+    #
+    # ``int`` is exact for every value that reaches here and needs no ``try``:
+    # the guard established a ``numbers.Real`` whose ``float()`` succeeded, is
+    # finite and is integral, so no rounding is possible, and the arbitrary
+    # precision of ``int`` means an integral ``1e300`` converts rather than
+    # overflowing and is then refused by the ceiling below.
+    timeout_ms = int(value)
+    if timeout_ms > MAX_ZMQ_TIMEOUT_MS:
+        return None, (
+            f"{method}: {param_name} must be at most {MAX_ZMQ_TIMEOUT_MS} ms "
+            f"(the largest send/receive timeout ZMQ can store), got {_refusal_repr(value)}."
+        )
+    return timeout_ms, None
 
 
 def _read_name_list(value: object, param: str, context: str) -> tuple[list[Any], str | None]:
@@ -2137,3 +2322,89 @@ def validation_split_error(val_episodes: int, total_tasks: Any, context: str) ->
         "e.g. extra_flags={'dataset.eval_split': 0.1, 'eval_steps': 1000}, and "
         "the split will hold out a tenth of each task."
     )
+
+
+def boolean_flag_error(value: Any, param: str, context: str) -> str | None:
+    """Return an error message unless *value* is a python or numpy boolean.
+
+    The domain for a flag whose two values select two *postures* rather than
+    scaling a quantity: an IoT policy that grants a capability or withholds it
+    (:func:`~strands_robots.mesh.iot.provision.provision_robot`'s
+    ``allow_estop_publish``), a confirmation gate in front of a destructive
+    action, or a preview mode
+    (:func:`~strands_robots.mesh.iot.bootstrap.bootstrap_account`'s ``confirm``,
+    ``dry_run`` and ``force_update``).
+
+    Reading such a flag by truthiness is what this refuses. Every non-empty
+    string is truthy, so ``"false"``, ``"no"``, ``"off"`` and ``"0"`` - the
+    spellings an operator reaches for when opting out - select the *permissive*
+    posture: a security opt-out that fails open, and a confirmation gate that
+    confirms. A non-zero number and ``math.nan`` read the same way, and ``None``
+    or ``[]`` silently take the other branch without ever being a declared
+    spelling of it.
+
+    There is no vocabulary to parse as a fallback either. A flag arrives already
+    typed, unlike an environment variable whose only shape is a string, so the
+    honest answer is to check it. Parsing would only move which spellings invert:
+    ``"on"``, ``"enabled"`` and ``"y"`` are absent from every such vocabulary in
+    this package, and each would then resolve to the *restrictive* posture while
+    reading as an opt-in.
+
+    It lives here rather than beside one of its callers because the flags sit in
+    more than one module, and the accepted domain must not diverge: a spelling
+    one provisioning entry point refuses cannot be honoured by the next. It is
+    also the inverse of the numeric domains above - those reject a boolean
+    through :func:`is_boolean` because ``bool`` is an ``int`` subclass that would
+    pass as a silent ``1``, while this one requires the boolean they turn away.
+
+    Distinct from
+    :func:`~strands_robots.device_connect.resolve_allow_insecure`, which answers
+    a related question and is not a caller of this: it resolves one setting from
+    two sources, so its domain is ``bool | None`` - ``None`` is the documented
+    spelling for *fall through to the environment variable* - and its refusal
+    names that variable's own opt-in vocabulary. This domain has one source and
+    no such sentinel, so it refuses ``None`` along with every other non-boolean.
+
+    Args:
+        value: The flag as supplied.
+        param: Parameter name, for the message.
+        context: Caller label the message is prefixed with.
+
+    Returns:
+        The error text, or None when *value* is a boolean and can be honoured.
+    """
+    if is_boolean(value):
+        return None
+    return (
+        f"{context}: {param} must be a boolean, got {_refusal_repr(value)}. "
+        "It selects a posture rather than scaling a quantity, so it is checked "
+        "rather than parsed - a truthy spelling of off, such as 'false', would "
+        "otherwise select the opposite posture from the one it reads as."
+    )
+
+
+def partial_construction_repr(obj: object) -> str:
+    """Describe an object whose ``__init__`` did not finish, naming no attribute.
+
+    ``repr`` is what a traceback, a debugger and a failing assertion render, so
+    it must not be the thing that hides a failure. A class that validates its
+    own arguments raises before it assigns the attributes its ``__repr__``
+    reads, and the raising frame keeps that half-built instance alive - so
+    rendering it reports ``[AttributeError ... raised in repr()]`` naming an
+    attribute that has nothing to do with the refusal under investigation.
+    Returning this instead reports the lifecycle fact that *is* relevant, and
+    deliberately names no attribute so nobody is sent chasing one.
+
+    The wording lives here rather than beside any one caller because those
+    callers sit in different layers - the ROS 2 / rosbridge / RTPS transport
+    bridges, the teleop input streams, the dataset recorder, the peer registry
+    and the simulation engines - and the phrase a reader learns to recognise in
+    a traceback must not diverge between them.
+
+    Args:
+        obj: The partially constructed object being rendered.
+
+    Returns:
+        ``"<ClassName>(partially constructed, id=0x...)"``.
+    """
+    return f"{type(obj).__name__}(partially constructed, id=0x{id(obj):x})"

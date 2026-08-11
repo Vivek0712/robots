@@ -766,7 +766,17 @@ def inject_camera_into_scene(world: SimWorld, cam: SimCamera) -> bool:
 
 
 def eject_body_from_scene(world: SimWorld, body_name: str) -> bool:
-    """Remove a body (by short name) and recompile."""
+    """Remove a body (by short name) and recompile.
+
+    A camera mounted on that body (``SimCamera.parent_body == body_name``) goes
+    with it. The recompile drops the camera element -- it is a child of the body
+    being deleted -- so a surviving registry entry would advertise a camera no
+    consumer can resolve: ``list_cameras`` offers it while ``render`` refuses it
+    as unknown and names it in the same breath as an available alternative. Such
+    entries are dropped with a warning naming the camera and its parent, the same
+    treatment :func:`eject_robot_from_scene` gives a camera whose parent belonged
+    to the robot being removed.
+    """
     spec = _get_spec(world)
     if spec is None or world._model is None:
         logger.error("eject_body: no spec or model in world")
@@ -778,12 +788,87 @@ def eject_body_from_scene(world: SimWorld, body_name: str) -> bool:
         # (caller has already popped the Python-side dict entry).
         return True
 
+    # Cameras mounted on this body lose the frame their pose is expressed in.
+    # The recompile below drops the camera element with its parent, so the
+    # registry entry has to go too: a stale entry lingers and confuses
+    # observation code, which is the same reason eject_robot_from_scene drops
+    # the cameras of the robot it is ejecting. Keyed by registry name, not
+    # ``cam.name``, because a URDF-discovered camera stores its namespaced
+    # MuJoCo name there.
+    for cam_key in [key for key, cam in world.cameras.items() if cam.parent_body == body_name]:
+        logger.warning(
+            "eject_body: dropping camera %r - it was mounted on the removed body %r.",
+            cam_key,
+            body_name,
+        )
+        del world.cameras[cam_key]
+
     # Objects added at runtime register a mesh asset named f"mesh_{name}".
     # Delete it too so the name is fully reusable and unused assets do not
     # accumulate across remove/re-add cycles (safe no-op for primitives).
     SpecBuilder.remove_mesh(spec, f"mesh_{body_name}")
 
     return _recompile_preserving_state(world, spec)
+
+
+def eject_camera_from_scene(world: SimWorld, mj_name: str) -> bool:
+    """Remove a camera element from the scene spec and recompile in place.
+
+    The inverse of :func:`inject_camera_into_scene`, and it needs the same way
+    back. ``SpecBuilder.remove_camera`` mutates the live spec before the
+    recompile that validates the result, and a refused ``spec.recompile`` leaves
+    ``world._model`` untouched -- so with no rollback the spec stops declaring
+    the camera while the compiled model still has it. Consumers then disagree
+    about whether the camera exists: ``render`` and ``get_camera_params``
+    resolve it from the model and succeed, while the delete lands later, applied
+    by whichever unrelated mutation next recompiles successfully. Restoring the
+    pre-delete spec keeps a refused removal costing exactly the removal that was
+    refused.
+
+    The rollback reinstalls a snapshot taken before the delete
+    (:func:`_snapshot_spec`) rather than re-adding the camera from its
+    ``SimCamera`` registry entry: a camera discovered inside a robot's URDF can
+    carry element attributes that entry does not model, so re-adding it would
+    restore a different camera. A caller that cannot snapshot refuses the
+    removal rather than proceeding with no way back.
+
+    Args:
+        world: The scene to mutate.
+        mj_name: The camera's name in the MjSpec -- namespaced for a camera
+            discovered inside a robot's URDF, otherwise the registry name.
+
+    Returns:
+        ``True`` when the camera is gone from the spec and the recompiled model
+        is installed, or when the spec never declared it (nothing to eject).
+        ``False`` when there is no spec, the snapshot failed, or the recompile
+        was refused; in the last two cases the scene is left as it was found.
+    """
+    spec = _get_spec(world)
+    if spec is None or world._model is None:
+        logger.error("eject_camera: no spec or model in world")
+        return False
+
+    # Snapshot BEFORE mutating. Without a way back the removal is refused here,
+    # while the scene is still exactly as it was found.
+    backup_spec = _snapshot_spec(spec, context=f"eject_camera {mj_name!r}")
+    if backup_spec is None:
+        return False
+
+    if not SpecBuilder.remove_camera(spec, mj_name):
+        # Nothing was mutated, so there is nothing to roll back. Mirrors
+        # :func:`eject_body_from_scene`: the spec already agrees with where the
+        # caller's registry is heading, so the removal is not an error.
+        logger.warning("Camera '%s' not found in spec - nothing ejected", mj_name)
+        return True
+
+    if _recompile_preserving_state(world, spec):
+        return True
+
+    # The delete landed in the spec but the model it produced was refused, so
+    # the spec is now missing a camera the live model still has. Put the
+    # pre-delete spec back.
+    world._backend_state["spec"] = backup_spec
+    return False
 
 
 def reposition_body_in_scene(
@@ -1099,6 +1184,14 @@ def remove_equality_constraint(world: SimWorld, name: str) -> bool:
 
     Returns ``False`` (logged) when the constraint is missing or the recompile
     fails, so callers can surface a clean error instead of a silent no-op.
+
+    On recompile failure the deletion is rolled back from a pre-delete
+    snapshot, mirroring the way :func:`add_weld_constraint` deletes the
+    equality it had just added. Without that restore a refused recompile leaves
+    the constraint gone from the live spec while the compiled model still holds
+    it, so the caller is told the removal failed, the identical retry is then
+    refused as "not found", and the next unrelated scene mutation recompiles
+    the spec and silently drops the constraint the caller was told still stood.
     """
     spec = _get_spec(world)
     if spec is None or world._model is None:
@@ -1106,8 +1199,17 @@ def remove_equality_constraint(world: SimWorld, name: str) -> bool:
         return False
     for eq in spec.equalities:
         if eq.name == name:
+            # Snapshot before the delete, and only once the constraint is known
+            # to exist: a lookup that finds nothing mutates nothing and so needs
+            # no way back.
+            backup_spec = _snapshot_spec(spec, context="remove_equality_constraint")
+            if backup_spec is None:
+                return False
             spec.delete(eq)
-            return _recompile_preserving_state(world, spec)
+            if not _recompile_preserving_state(world, spec):
+                world._backend_state["spec"] = backup_spec
+                return False
+            return True
     logger.warning("Equality constraint '%s' not found in spec - nothing removed", name)
     return False
 

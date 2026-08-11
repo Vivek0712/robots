@@ -75,10 +75,118 @@ hatch run format            # ruff check --fix, ruff format
 8. **Integration tests required** - each policy needs `tests_integ/` tests with real inference
 9. **Test behavior, not implementation** - assert on outputs, not internal state
 10. **No dead code** - if it's not called and not part of base class, delete it
+11. **A value-domain guard becomes shared when it has a second caller** - the guards
+    in `strands_robots/utils.py` (`positive_finite_number_error` and friends) exist so
+    the refusal for a rate, a count or a name is identical everywhere rather than
+    merely equivalent in verdict, and each one has between 5 and 123 call sites. Do
+    not add one for a single field. Keep the rule local to the config that needs it,
+    state the domain in that field's docstring, and lift it into `utils.py` when a
+    second caller appears - two copies are the evidence that a shared name is the
+    right one, and one caller is evidence of nothing. #2008 asked this for a path
+    field and the answer was local: the only other `if not self.<path field>` in the
+    tree (`training/_inproc.py`) is a branch that skips logging, not a validation.
+
+12. **A security floor on a transitive package is a constraint, not an override** -
+    a package that arrives only through another dependency has no version declared
+    anywhere, so the resolver's choice is what stands between the dependency graph
+    and a HIGH advisory. State the floor in `[tool.uv] constraint-dependencies`,
+    at the first version clearing the advisory rather than the version currently
+    resolved, and name the GHSA id in a comment beside it. Use a constraint and
+    not an override: measured on this manifest, `gymnasium>=1.1.1` as a constraint
+    fails `uv lock` and names the `[vera-sim]` extra's contradicting
+    `gymnasium==0.29.1`, while the same floor as an override resolves silently and
+    discards that requirement - so an override hides exactly the signal a security
+    floor exists to raise. `[project]` is the wrong home while the package stays
+    transitive; move the bound there if it ever becomes direct. Pinned by
+    tests/test_dependency_audit.py.
+
+13. **Every parameter an agent tool exposes needs its own `Args:` entry** - a
+    `@tool` function's input schema is derived from its docstring by
+    `docstring_parser`, and the decorator substitutes the placeholder
+    `"Parameter <name>"` for any parameter it cannot find there. The model
+    driving the tool reads that schema and nothing else, so a placeholder makes
+    the parameter undiscoverable however carefully the source explains it.
+    Three spellings produce one, and the last two read as documentation in the
+    source, which is what makes the loss silent: the entry is absent; the entry
+    sits under a section header other than `Args:`, which the parser discards
+    entirely (prose reaches the tool description only when it appears *before*
+    `Args:`); or one entry names several parameters at once (`a / b: ...`),
+    which is read as a single parameter literally named `"a / b"` and therefore
+    describes neither. Pinned by
+    tests/tools/test_agent_tool_parameter_descriptions.py.
+14. **`__repr__` must not raise** - it is what a traceback, a debugger and a
+    failing assertion render, so it must not be the thing that hides a failure.
+    A class that validates its own arguments raises before it assigns the
+    attributes its `__repr__` reads, and the raising frame keeps that half-built
+    instance alive: rendering it reports `[AttributeError ... raised in repr()]`
+    naming an attribute that has nothing to do with the refusal under
+    investigation. Wrap the body in `try` / `except AttributeError` and return
+    `strands_robots.utils.partial_construction_repr(self)`, which reports the
+    lifecycle fact and deliberately names no attribute so nobody is sent
+    chasing one. That helper owns the wording, so the phrase a reader learns to
+    recognise cannot diverge between layers. Pinned by
+    tests/test_repr_survives_partial_construction.py.
 
 ## PR Workflow
 
-1. Create feature branch from `main`
+1. Create the feature branch **on your fork**. Branch creation in the base
+   repository is refused for every account, `ADMIN` included: the `default`
+   ruleset's conditions are `ref_name.include: ["~ALL"]` rather than the default
+   branch alone, and its rules include `creation` with `bypass_actors: []`, so
+   `git push <base> HEAD:refs/heads/<new>` comes back as a `repository rule
+   violation` that does not name the rule.
+
+   That message is indistinguishable from the two failure modes this file does
+   describe - a token missing a permission, and the `.github/workflows/**` write
+   refusal that makes an installation token read `BLOCKED` (step 8) - and both of
+   those are answered by retrying with a wider token, which is why that is the
+   natural next move and why it cannot work here. A ruleset bypass is granted per
+   ruleset, so no role implies one, and there is no classic branch protection to
+   be exempt from (`GET /repos/{owner}/{repo}/branches/main/protection` -> 404).
+   Read the rule back rather than widening the token:
+
+   ```
+   GET /repos/{owner}/{repo}/rulesets/{id}
+     conditions.ref_name.include  = ["~ALL"]        # not just the default branch
+     rules[].type                 contains "creation"
+     bypass_actors                = []              # so no account clears it
+   ```
+
+   Push the branch to your fork and open the pull request cross-repo:
+   `createPullRequest` takes the base repository as `repositoryId` and the fork
+   as a separate `headRepositoryId`. Step 5 already says "from your fork"; step 1
+   is where that stops being a preference.
+
+   Before you start, check that no open pull request already claims the issue:
+
+   ```
+   python3 scripts/check_duplicate_claim.py --repo strands-labs/robots --issue <N>
+   ```
+
+   Name the repository rather than leaving it to be inferred. `$GITHUB_REPOSITORY`
+   is where the command is *running*, which for a scheduled agent need not be a
+   checkout of this one, and an intake check that reads a different repository's
+   open pull requests reports `unique-claim` and exits `0` -- a wrong answer shaped
+   exactly like the right one, and one an issue number alone gives the script no way
+   to detect afterwards. Intake mode refuses an inferred repository for that reason;
+   the `--pr` mode keeps the default, because a workflow reviewing a pull request
+   runs where that pull request lives.
+
+   A duplicate claim is invisible to every other check here, because they all read
+   one pull request at a time and this is a property of the *set* of open ones. It
+   is an intake failure rather than a drift: measured over the last 100 pull
+   requests, three pairs claimed one issue each and **all three opened inside one
+   ~35-minute window**. Three of the six were abandoned and every one of those had
+   already been **approved**, so what a duplicate spends is a review approval on a
+   change that could never ship - and review is the scarcest resource here (#1905).
+   Two of the three pairs also carried a real `git merge-tree` content conflict, so
+   they could not both have landed.
+
+   One query, reading the same `closingIssuesReferences` field the closing-keyword
+   gate reads. Asking it here prevents the authoring rather than capping it, which
+   is why it belongs at step 1 and not at review. If a competing implementation is
+   wanted on purpose, exactly one should claim the close and the other should
+   cross-reference (`per #N`, `towards #N`) instead.
 2. Make changes, run `hatch run format && hatch run lint && hatch run test`
 3. Record the change as a news fragment: `changelog.d/<pr-number>-<slug>.md`
    (see [`changelog.d/README.md`](changelog.d/README.md)). **Never append to
@@ -143,6 +251,49 @@ hatch run format            # ruff check --fix, ruff format
    under ten paragraphs restating it, and a reviewer must scroll all of them to
    learn nothing changed. Same shape as #1919 - the policy was not wrong, it
    was silent on a case that recurs every scheduled cycle.
+   **Ask the intake question again before the first push.** Step 1's
+   duplicate-claim read is a claim about minute 0, and authoring a tested change
+   takes longer than the window in which a collision becomes observable. Every
+   pair #2017 measured opened inside one ~35-minute span, and the cycle that
+   shipped #2030 re-read its own gate ~40 minutes after intake to find the issue
+   already claimed, approved and merged.
+
+   Two reads, because neither the command nor the branch answers this alone:
+
+   - *Unpushed work claiming an issue.* Re-run step 1's command, and read the
+     issue's own `state` and `stateReason`. The command reads
+     `repository.pullRequests(states: OPEN)`, so it can see a rival only while
+     that rival is open: #2030 opened 07:24:45 and merged 07:43:54 closing
+     #2029, and the same command run at 07:56 reported `unique-claim` with exit
+     `0` over four compared pull requests -- while #2029 was `CLOSED` /
+     `COMPLETED` with #2030 recorded as its closer. That is a 19-minute
+     observability window inside a ~40-minute authoring one, and the answer
+     outside it is the reassuring one. The issue's state is the signal that
+     stays true; the command is the one that names the rival, which is why both
+     are worth asking.
+
+   - *A review-round push on an existing pull request.* Read
+     `pullRequest { state mergedAt }`. Comparing the branch against the sha you
+     recorded at the start catches a sibling push, but a squash merge writes a
+     new commit onto the base and never moves the head ref, so the comparison
+     cannot observe it. On #2015 that cost a round: merged 23:13:13 with
+     `headRefOid ea5e3ff8`, `mergeCommit 1026088`, and a round pushed a minute
+     earlier left the fork branch at `e7ab4d5b` -- which is not an ancestor of
+     `main`. The comparison passed, the push succeeded, and the content was
+     orphaned on the fork; the recovery was a second pull request (#2018).
+
+   The same read carries `reviewThreads`, so ask for them there rather than
+   separately -- an unresolved thread is also only unresolved as of the read. On
+   #2028 a thread arrived at 06:18:56, 16 minutes after the commit pushed at
+   06:02:32, so a run that read threads when it pushed could not have seen it.
+
+   Guidance rather than a check, by necessity: the collision is between an
+   unpushed local tree and a remote pull request, which no workflow can see. The
+   `scripts/` gate deliberately says nothing about whether an issue is closed --
+   refusing a pull request for that would accuse correct work whose issue
+   someone else closed first -- and that is the same mode split as its `--repo`
+   default. What is decisive for unpushed work is not what a review check should
+   refuse.
 6. Track follow-up items as issues on the [project board](https://github.com/orgs/strands-labs/projects/2)
 
    **Read the board with `PAT_TOKEN`, not the Actions `GITHUB_TOKEN`.** An
@@ -167,6 +318,38 @@ hatch run format            # ruff check --fix, ruff format
    trace - until a `Status` written on the strength of it silently overwrites a
    value that was never read. Read a field before you set it, and treat an
    empty project read as unknown rather than as absent.
+   **A closing keyword in a PR *title* links nothing.** GitHub parses closing
+   keywords from the body and from commit messages, never from the title. A title
+   ending `... (closes #1891)` therefore leaves that issue open on merge, and
+   nothing on either side says the claim was dropped: a bare cross-reference
+   renders identically to the start of a closing link, and the field that would
+   contradict the title is one nobody opens. Measured over the last 100 pull
+   requests here - 29 titles carry a keyword before an issue number, 27 also
+   linked the issue, and two did not:
+
+   | pull request | title claims | links | what it cost |
+   |---|---|---|---|
+   | #1894 | `closes #1891` | none | #1891 was still open two days after the merge |
+   | #1923 | `closes #1912` | none | #1912 had to be closed by hand |
+
+   So put the keyword in the **body** - a line reading `Closes #N` - and leave the
+   title free to describe the change. This is now surfaced by
+   `.github/workflows/closing-reference.yml`, the same documented-and-enforced-by-
+   nothing shape as the changelog rule in step 3 before #1784.
+
+   It deliberately does **not** scan the body for the keyword, because that
+   implementation passes the incident it was written for: #1894's body *does* say
+   `closes #1891` - inside a code span, which GitHub does not link - so a text
+   scan and GitHub disagree on exactly the pull request that matters. The gate
+   compares the title against `closingIssuesReferences`, which is the link set
+   itself. Two consequences worth knowing when you write a description: a keyword
+   in a code span or a fenced block links nothing, and one keyword governs one
+   number, so `fixes #12 and #13` closes only #12.
+
+   The gate is self-clearing - editing the description creates the link and the
+   check re-runs on `edited` - and it says nothing about a pull request that
+   claims nothing anywhere. Whether every change must trace to an issue is the
+   separate question #1961 raises, where the board-coverage half of this lives.
 7. Squash merge into `main`
 8. **Verify a PR's state by reading it back - before and after you change it.**
    Neither direction can be inferred:
@@ -255,33 +438,156 @@ hatch run format            # ruff check --fix, ruff format
      `deleteIssue` needs admin on the *target*, so the stray issue could only be
      closed as `NOT_PLANNED` with an apology. See #1916.
 
-     **A node ID is not opaque, which is what makes this checkable before the
-     write.** It is `<TypePrefix>_<urlsafe-base64(msgpack array)>`, where a
-     repository is `[0, databaseId]` and anything a repository owns is
-     `[0, repository databaseId, own databaseId]` - so the type and the target
-     repository are both readable with no network call:
+     **A node ID is not opaque, which makes one direction of this checkable
+     before the write.** It is `<TypePrefix>_<urlsafe-base64(msgpack array)>`,
+     where a repository is `[0, databaseId]` and anything a repository owns is
+     `[0, repository databaseId, own databaseId]`, so a decode costs no network
+     call:
 
-     | node ID | decodes to | target |
+     | node ID | decodes to | resolves to |
      |---|---|---|
      | `R_kgDORUMiZg` | `[0, 1162027622]` | this repository |
-     | `R_kgDOD1WOFw` | `[0, 257265175]` | the stray one |
-     | `PR_kwDOD1WOF87DdSjQ` | `[0, 257265175, 3279235280]` | **the same stray one** |
+     | `R_kgDOD1WOFw` | `[0, 257265175]` | the #1916 stray |
+     | `PR_kwDOD1WOF87DdSjQ` | `[0, 257265175, 3279235280]` | **the same stray** |
+     | `PR_kwDORUMiZs7Kw3fA` | `[0, 1162027622, 3401807808]` | **`uutils/coreutils#11342`** |
 
-     That third row is the finding. All three guessed IDs in that run carried
-     one wrong repository, so a single stale value contaminated every mutation,
-     and the two that failed did so only because their own databaseId happened
-     not to exist there - `Could not resolve to a node`. Failing closed was luck
-     about the guess, not a property of the API, and the guess that got lucky the
-     other way is the one that wrote.
+     The third row is why #1916's three guessed IDs all failed the same way: one
+     stale value contaminated every mutation, and the two that failed did so only
+     because their own databaseId happened not to exist there - `Could not
+     resolve to a node`. Failing closed was luck about the guess, not a property
+     of the API, and the guess that got lucky the other way is the one that wrote.
 
-     So resolve every ID from a query in the same run whose owner and name are
-     written out literally; check the prefix against the parameter, since a
+     **The fourth row is why a decode is a reject and never a pass.** That ID
+     carries *this* repository's databaseId in its middle field and resolves to a
+     merged pull request in `uutils/coreutils`, whose own repository databaseId is
+     `11847500`. GitHub routes on the third field - the object's own id - and
+     neither validates nor uses the middle one, so a `mergePullRequest` against it
+     was aimed at a stranger's pull request and was stopped by permissions rather
+     than by the check. It also shares 14 of its 19 characters with the correct ID
+     for #2006 (`PR_kwDORUMiZs78G3VE`), so eyeballing it against a known-good ID
+     for the same repository is the same unsound test done less precisely. See
+     #2007.
+
+     So the decode has exactly one sound use: a middle field naming another
+     repository is proof of a wrong ID, and a middle field naming this one proves
+     nothing at all. **The rule is the one with no decode in it** - resolve every
+     ID from a query in the same run whose owner and name are written out
+     literally, preferring the response of the query that named the object by
+     `owner`/`name`/`number`; check the prefix against the parameter, since a
      `PR_...` handed to a `repositoryId` is wrong by type alone; and read the
-     `url` in the response back before treating the write as done.
-     `tests/test_graphql_node_id_targeting.py` decodes this repository's own node
-     IDs against the `databaseId`s the API publishes beside them, so the claim
-     that the check is available offline fails loudly rather than quietly if the
-     envelope ever changes.
+     `url` in the response back before treating the write as done. Only a
+     mutation takes a bare ID - a query names its subject by
+     `owner`/`name`/`number`, so it cannot address the wrong repository at all.
+     That is why no read has ever been implicated, and why the rule costs one
+     round trip and binds only where something changes.
+
+     **Weight it by reversibility rather than by correctness**, because the two
+     directions are not symmetric. A refused `mergePullRequest` leaves nothing
+     behind; a `createIssue` against a wrong ID succeeds and cannot be undone by
+     the account that made it, since `deleteIssue` needs admin on the target and a
+     stray write by definition lands where you have none. It has now happened
+     twice: the second was `Ali111q/todo#1` at 16:23 UTC on 2026-08-07, twenty
+     minutes after #2007 was filed, from a `repositoryId` whose repository field
+     reads `1060491130` and not this repository's `1162027622` - the one
+     direction a decode does catch. So `createIssue`,
+     `addComment` and `updateIssue` earn the read-back more than the merge that
+     prompted the rule, not less. If one has already landed, the remedy is not
+     deletion: retitle it to mark it opened in error, replace the body with an
+     explanation, close it, and do not open a replacement in the same repository -
+     which is what `Ali111q/todo#1` now records, its own body noting that deletion
+     was refused.
+     `tests/test_graphql_node_id_targeting.py` decodes both shapes against the
+     `databaseId`s the API publishes beside them, so neither the envelope changing
+     nor the reject-only limit softening back into a pass goes unnoticed.
+   - *And that the repository still accepts writes at all.* Archiving is
+     invisible in every field a sweep already reads. `strands-labs/robots-sim`
+     was archived at 01:33 UTC on 2026-08-06, between one scheduled cycle and
+     the next, and a scan taken minutes afterwards returned its open pull
+     request and its four open issues completely normally, next to
+     `viewerPermission: ADMIN`. Nothing in that payload distinguishes it from a
+     live repository. The first and only signal was the mutation:
+
+     ```
+     createIssue  ->  Repository was archived so is read-only
+     ```
+
+     `viewerPermission` is the field that misleads, and it keeps reporting
+     `ADMIN` afterwards because the permission is genuine - the repository is
+     what changed, not the grant. So it is not a stale or buggy read, and no
+     amount of re-reading it helps; it answers a different question than the one
+     being asked.
+
+     What it costs is the whole run rather than a retry, because the refusal
+     arrives at the *end*: an archived repository accepts no branch, no issue and
+     no pull request, so a clone, a branch, a three-file fix, a regression pin
+     verified to fail on pre-fix code, and a clean `black`/`isort`/`flake8` run
+     were all completed before anything reported a problem, and none of it could
+     land. A fork's branch still pushes, which makes it worse rather than better
+     - the pull request it would open is the step that is refused. Ask for the
+     one field on a query already being made, before the work and not after it:
+
+     ```
+     repository(owner: ..., name: ...) { isArchived viewerPermission }
+     ```
+
+     Two consequences beyond the read. An archived repository is terminal, so
+     treat `strands-labs/robots-sim` as closed for good: epic robots-sim#167
+     completed, and any remaining cross-repo item naming it - the
+     `robots-sim MIGRATION.md` half of #1274 - can now only be satisfied or
+     closed on this side. And a defect found in a repository that is already
+     archived is not automatically worth fixing anywhere: the deprecation notice
+     there names an undeclared upstream extra, which is the exact hazard
+     `tests/test_dependency_audit.py` guards here, but robots-sim never cut a
+     release carrying it - its latest tag predates the notice - so it reached no
+     installer and the correct action was to drop the fix rather than relocate
+     it. Check what actually shipped before deciding an archived finding needs a
+     home.
+   - *And that the field naming the review decision is present at all.*
+     `reviewDecision` has a third reading beyond `APPROVED` and
+     `REVIEW_REQUIRED`: **`null`** - and it does not mean what an absent value
+     suggests. #1974 sat at `mergeStateStatus` `BLOCKED` carrying a current
+     `APPROVED` review that post-dated its head commit, the required check
+     `SUCCESS`, `require_last_push_approval` satisfied, and `reviewDecision`
+     `null`. Resolving its one unresolved thread moved both fields at once:
+
+     | field | one unresolved thread | after `resolveReviewThread` |
+     |---|---|---|
+     | `mergeStateStatus` | `BLOCKED` | `CLEAN` |
+     | `reviewDecision` | `null` | `APPROVED` |
+
+     The gate behind it is already in this file: the `default` ruleset sets
+     `required_review_thread_resolution: true`, and #1890 measured a merge
+     landing 8 seconds after its last thread was resolved. What #1974 adds is
+     the *signature*, and it is the one value that misreads in the reassuring
+     direction - `REVIEW_REQUIRED` at least says a review is owed, whereas
+     `null` reads as "no review requirement applies here" rather than "one
+     resolve from merging". It is not a recompute lag: that approval was more
+     than twenty minutes old when the field was read as `null`. The two also
+     need opposite actions - the `REVIEW_REQUIRED` case above needs a second
+     account, this one needs no review at all. The distinguishing read is the
+     threads, not the decision:
+
+     ```graphql
+     reviewThreads(first: 50) { nodes { id isResolved isOutdated } }
+     ```
+
+     `isOutdated: true` on an unresolved thread is the common form, and it is a
+     prompt rather than reassurance: the diff moved on, so the request has
+     usually already been satisfied by a later commit and only the resolve is
+     outstanding. #1974's was addressed by the commit before its head, and the
+     approving review said so, and it still held the merge.
+
+     **`resolveReviewThread` needs `PAT_TOKEN`.** Under the Actions
+     `GITHUB_TOKEN` it returns `Resource not accessible by integration` - the
+     same refusal shape as the board reads in step 6. Resolving is often the
+     entire remaining distance to a merge, so a sweep holding only an
+     installation token cannot finish the job it has correctly diagnosed.
+
+     Resolve rather than push. A push clears nothing here and costs the approval
+     twice: `dismiss_stale_reviews_on_push` drops it, and
+     `require_last_push_approval` then disqualifies the pushing account from
+     re-supplying it, turning a one-approval merge into one that needs a second
+     reviewer.
    And before merging, `reviewDecision: APPROVED` alone is not the gate: poll
    the **required** contexts' own conclusions and `mergeStateStatus == CLEAN`
    together, since `reviewDecision` flips before the checks finish.
@@ -346,6 +652,54 @@ hatch run format            # ruff check --fix, ruff format
    the sole constraint". It bites CI and process pull requests specifically,
    because those are the ones carrying workflow edits. See #1917.
 
+   A third cause of that same presentation needs no workflow edit, and no second
+   token to see. The `mergeStateStatus` values above - `BLOCKED` while the required
+   check runs, then `UNSTABLE` or `CLEAN` - assume the required check runs. A head
+   commit created through the API under the Actions `GITHUB_TOKEN`
+   (`createCommitOnBranch`, or `PUT /repos/{owner}/{repo}/contents/{path}`) spawns
+   **no check suite at all**, because GitHub suppresses workflow triggers for events
+   it attributes to that token so that a workflow cannot re-trigger itself. Nothing
+   ever reports `call-test-lint / Test and Lint`, so the required set is never
+   satisfied and `BLOCKED` is terminal rather than transient.
+
+   It is legible in one field, and only as an absence:
+
+   ```
+   commits(last: 1) { nodes { commit { checkSuites { totalCount } } } }   ->  0
+   ```
+
+   Zero suites, not a red one. On #1987 every commit pushed from a clone carried
+   10-13 suites and the one written through the API carried none, same branch, same
+   day:
+
+   | head | committer | `checkSuites.totalCount` |
+   |---|---|---|
+   | `b10f4dce` | `./c²` (clone) | 13 |
+   | `a3f3e3f6` | `cagataycali` (API) | 0 |
+
+   At `a3f3e3f6` that PR satisfied every gate this file tells you to read -
+   `APPROVED` by an account other than the pusher, `MERGEABLE`, no unresolved
+   thread - while `statusCheckRollup` read `null` and `mergeStateStatus` read
+   `BLOCKED`. That payload is indistinguishable from a required check still
+   queued, so it was reported as waiting on CI for two consecutive scheduled
+   cycles.
+
+   **Reopen it; do not re-push it.** `pr-and-push.yml` takes the default
+   `pull_request` types, so `reopened` recomputes the *unchanged* head sha: no
+   commit, therefore no push, therefore neither `dismiss_stale_reviews_on_push` nor
+   a new last pusher, and the approval survives. Re-pushing the same tree with
+   `PAT_TOKEN` triggers too, but pays a re-approval round that reviews no changed
+   behaviour - and re-running is not on the table, since `totalCount` is `0` so
+   there is no suite to re-run and the workflow has no `workflow_dispatch`.
+
+   **The flip needs `PAT_TOKEN` as well.** A close/reopen attributed to the Actions
+   token is suppressed for the same reason the commit was, so the remedy applied
+   with the wrong token is a silent no-op that looks like the diagnosis was wrong.
+   Read `timelineItems(itemTypes: [CLOSED_EVENT, REOPENED_EVENT])` first, as this
+   step already requires: #1987 had none and cleared on a single flip - same head,
+   still `APPROVED`, nine suites queued including the required one. #1988 has the
+   full account.
+
    This is worth the words because the failure mode is silent and expensive in the
    opposite direction from the usual one. Treating an advisory red as a merge
    blocker does not look like a mistake; it looks like diligence, and it costs a
@@ -386,6 +740,64 @@ hatch run format            # ruff check --fix, ruff format
    about meaning. This is cheap: the check that would have caught the above was
    one `pytest` invocation on two files.
 
+   **One field says whether a composition exists at all, and the overlap read
+   does not.** File overlap says two pull requests touched the same file; it does
+   not say either one landed outside the other's ancestry, which is the thing
+   that makes a pair of changes never compiled together:
+
+   ```
+   GET /repos/{owner}/{repo}/compare/main...{head_owner}:{head_repo}:{head_branch}
+     ->  .behind_by
+   ```
+
+   **Qualify the head with its owner and repository.** Step 1 mandates that the
+   branch live on a fork, and an unqualified fork ref does not resolve in the base
+   repository, so the form a reader reaches for `404`s on every pull request here -
+   same head, same instant:
+
+   | ref | result |
+   |---|---|
+   | `main...feat/ackermann-ros-robot` | `404 Not Found` |
+   | `main...Vivek0712:robots:feat/ackermann-ros-robot` | `diverged  ahead_by=11  behind_by=116` |
+
+   Resolve the three parts from `pullRequest { headRepository { nameWithOwner } }`
+   and `headRefName` rather than assuming them. The qualified form is also correct
+   for a branch in the base repository - `main...strands-labs:robots:main` ->
+   `identical` - so there is one form to remember rather than a choice to make.
+
+   `behind_by: 0` means the head already contains every commit on `main`, so the
+   tree CI tested **is** the merge result. The two cases separate exactly, each
+   compared against `main` as it stood when that pull request merged:
+
+   | branch | `compare/<main then>...<head>` | composition |
+   |---|---|---|
+   | #1763, which broke `main` | `diverged  ahead_by=2  behind_by=1` | owed |
+   | #2012, which raised the same alarm | `ahead  ahead_by=3  behind_by=0` | none exists |
+
+   #2012 edited `strands_robots/policies/vera/provider.py`, which #1992 had
+   touched earlier the same day, so it met the trigger condition verbatim - but
+   #1992 sat 13 commits back in the branch's own ancestry
+   (`compare/<#1992 squash>...<head>` -> `ahead  behind_by=0`) rather than
+   landing beside it. Following the rule as written would have spent a clone and
+   two suite runs to rediscover that, and it would not have looked like a
+   mistake; it would have looked like diligence.
+
+   Read the field in the same direction as the decode rule below. **A
+   `behind_by` of `0` proves nothing needs composing, and a `behind_by` above
+   zero does not prove a conflict exists** - it is the precondition that makes
+   the overlap heuristic worth spending a run on, since a semantic conflict need
+   not share a file at all. Two properties make it safe to lean on. The counts
+   are totals rather than page counts, so distance does not weaken them:
+   `compare/v0.4.1...5757c1a2` reports `ahead_by=877` beside a `commits` array
+   truncated to 250, and the reverse direction reports `behind_by=877` beside an
+   **empty** one, so deriving the answer from `commits` is itself a false safe.
+   And a head that cannot be compared is not a `0`: run the composition. That
+   case is narrower than a `404`, which has two causes wanting opposite actions -
+   an unqualified fork ref is a query to re-issue, while only a head sha that is
+   genuinely gone (a force-push, a deleted fork) is uncomparable - and the status
+   code does not separate them. Qualify first, then read a `404` on the
+   *qualified* form as the uncomparable one.
+
    Read that run as a **delta, not an absolute**. The environment you verify in
    is almost never the one CI uses, and a partial one fails tests for reasons
    that have nothing to do with the merge. Composing #1786 and #1804 - both
@@ -408,6 +820,41 @@ hatch run format            # ruff check --fix, ruff format
    ties your local run to `main`; and on a batch, where only the tip's
    `call-test-lint` survives the concurrency group above, it is the sole evidence
    the intermediate commits were ever compiled together.
+
+   **Comparing the two commits' tree shas is the same claim without the clone,
+   and a stronger one.** That `git diff` needs the local composition to still
+   exist, and it is path-scoped, so a change under `changelog.d/`,
+   `pyproject.toml` or a workflow is invisible to it:
+
+   ```
+   GET /repos/{owner}/{repo}/commits/{sha}  ->  .commit.tree.sha
+
+   0fcdd015cb3f  tree=e174201b7ccf...   # #2012 head, call-test-lint SUCCESS
+   763305edf1d4  tree=e174201b7ccf...   # its squash on `main`
+   ```
+
+   Equal trees say the bytes CI went green on are the bytes on `main` - the whole
+   tree rather than two prefixes - and each commit in a batch can be checked that
+   way without a suite, which is what the batching case above otherwise has no
+   evidence for.
+
+   **That equivalence is scoped to `behind_by == 0`, and it is the field above
+   that says so.** When the branch is behind, the squash tree necessarily
+   incorporates the intervening commits, so the trees differ for a perfectly
+   correct merge. The control and the counterexample:
+
+   | pull request | `behind_by` | head tree | squash tree |
+   |---|---|---|---|
+   | #2012 | `0` | `e174201b7ccf` | `e174201b7ccf` |
+   | #2024 | `1` | `4af91f210d09` | `8b3e7e8a3434` |
+
+   #2024's `main` went green on all four checks afterwards, so the inequality was
+   not drift. Read unequal trees as a question rather than a verdict: at
+   `behind_by: 0` they are the evidence this paragraph claims, and above zero the
+   check does not apply at all, leaving the path-scoped `git diff` against the
+   local composition as the only form that does. An unqualified "equal trees or
+   else" invites reading a correct merge as a broken one, which is the same
+   expensive-in-the-diligent-direction shape as the advisory-`CodeQL` case above.
 
    Fixing forward beats reverting here - the two production changes were both
    correct, and only an assertion and its justification were stale. Prefer a
@@ -500,8 +947,16 @@ hatch run format            # ruff check --fix, ruff format
    All of the above was documented here and enforced by nothing, which is the
    same shape as the changelog rule in step 3 before #1784. It is now surfaced by
    `.github/workflows/last-push-approval.yml`, which names the pusher and the
-   approvers on every review event and fails when they are the same single
-   account. The point of automating it is not that the check is clever - it is
+   approvers on every review event and reports when they are the same single
+   account. It **reports** rather than fails: a finding leaves the job green and
+   lands in the step summary and in a `Needs an approver who did not push the
+   head` annotation, because a red X drags `statusCheckRollup.state` to
+   `FAILURE`, where it cannot be told apart from the branch's own tests failing -
+   measured on #1722, whose rollup read `FAILURE` with every required context
+   `SUCCESS` and this check as the only non-`SUCCESS` context, and misread as a
+   broken diff four times. Red on that job now means the check itself could not
+   compute an answer. The check row is named `Report the last-push-approval
+   state` for the same reason: green must not assert the absence of a finding. The point of automating it is not that the check is clever - it is
    that the state it reports is *invisible*: `REVIEW_REQUIRED` / `BLOCKED` is
    byte for byte what an unreviewed pull request looks like, so the two are
    indistinguishable in every field a sweep reads and they need opposite actions.
@@ -520,6 +975,45 @@ hatch run format            # ruff check --fix, ruff format
    - its remedy is a second human, and no work the author does turns it green -
    so it reports and is deliberately absent from the required set. A gate a
    branch cannot clear by doing anything is a report, whatever it is wired to.
+
+   **Automating it is not the same as covering the population, and the gap is
+   silent in the same direction as the bug.** That workflow fires on
+   `pull_request` and `pull_request_review`, so it can only evaluate a pull
+   request that has had one of those *since it landed* - and the pull requests
+   this is written for are the ones that have not. #1035's head was pushed
+   2026-08-01 and approved 51 minutes later, both before the workflow existed on
+   2026-08-04, so `Report the last-push-approval state` (then named `Detect an
+   approval the last pusher cannot supply`) is absent from the 11 check runs on
+   that head, while every other check is present. So
+   the check read `SUCCESS` on pull requests that did not have the condition and
+   said nothing at all about the two that did.
+
+   The verdict was never the problem. Run directly, the same script answers
+   immediately, and did before this was noticed:
+
+   ```
+   python3 scripts/check_last_push_approval.py --repo strands-labs/robots --pr 1035
+     -> Outcome: pusher-only-approval, pushed by cagataycali, exit 1
+   ```
+
+   #1905 attributes the silence to the workflow's base-branch guard instead.
+   That is worth correcting rather than leaving, because it points at a fix that
+   would change nothing: the guard checks out the **base**, `main` carries the
+   script, so the guard passes and the script would run. What was missing was a
+   caller, which is now `--all-open`:
+
+   ```
+   python3 scripts/check_last_push_approval.py --repo <owner/name> --all-open
+   ```
+
+   Run that when reporting repository health. A sweep that reads only
+   `reviewDecision` and `mergeStateStatus` cannot tell
+   `awaiting-first-review` from `pusher-only-approval` - both are
+   `REVIEW_REQUIRED` / `BLOCKED` - and reporting the second as the first is
+   exactly how "reviewer bandwidth is the sole constraint" stood for eight
+   consecutive scans over two permanently unmergeable pull requests. Exit 1
+   means at least one open pull request needs an approver who is not its pusher,
+   and no amount of reviewer time supplies one.
 
    The general rule behind all three: **a decision recorded only in a PR or
    issue comment is not durable** - the next contributor will not read the same

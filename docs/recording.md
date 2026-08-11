@@ -152,6 +152,19 @@ When `root` already contains a LeRobotDataset (a `meta/` directory),
 LeRobotDataset, and is **not empty** is left untouched and reported as an error
 rather than clobbered - pass `overwrite=True` or choose a new/empty `root`.
 
+`overwrite` and `push_to_hub` select a **posture**, so both must be booleans and
+are checked before anything is created, resumed, wiped or published. Neither is
+read by truthiness: every non-empty string is truthy, so `overwrite="false"` -
+the spelling an operator reaches for when opting out - used to reach the wipe
+branch and delete the dataset it was meant to append to, and
+`push_to_hub="false"` used to publish it at `stop_recording`. Both now report the
+flag instead:
+
+```python
+sim.start_recording(repo_id="user/my_dataset", root=root, fps=30, overwrite="false")
+# -> error: "start_recording: overwrite must be a boolean, got 'false'. ..."
+```
+
 A resume inherits the existing dataset's schema, so `fps` must match the rate it
 was created at - a resume cannot change it. Requesting a different rate is
 refused, naming the on-disk value, rather than appending frames timestamped on
@@ -340,6 +353,17 @@ never written. It resolves each camera's MP4 from `meta/info.json`'s
 `strands_robots.verify_dataset.verify_dataset(root, expected=None, min_frames=1, check_videos=True)`,
 which returns the same report dict.
 
+`--expected` and `--min-frames` are both non-negative integers, and each has a
+meaningful `0`: `--expected 0` asks that a dataset be empty, and `--min-frames 0`
+skips the per-episode length check (useful when the writer omits the `length`
+column). Anything else - a negative threshold, a fraction, a non-finite value -
+is reported as a problem and exits non-zero, rather than being applied. That
+matters for `--min-frames` specifically: the length check runs only when the
+threshold is above zero, so a value that is not a usable count would otherwise
+switch the check off and certify a dataset holding a zero-length episode. The
+same domain backs `verify_dataset_episodes(expected=...)`, so neither surface
+accepts an episode count the other refuses.
+
 `verify-dataset` always produces a report - it never crashes on the corruption
 it exists to flag. A corrupt or foreign `meta/episodes` parquet, a non-v3
 `video_path` template, or a truncated / unreadable MP4 is reported as a problem
@@ -379,6 +403,23 @@ clamped it to 1 fps, ffmpeg substituted its own default) or no file at all, with
 the output path still returned. `encode_clip` also raises `RuntimeError` when the
 encoder wrote no clip despite accepting the frames, so a returned path always
 names a clip that exists.
+
+`encode_clip`'s `quality` is a finite number in `[1, 10]` (higher is better), and
+that domain holds for both containers even though only the MP4 writer reads the
+value - so one call does not become valid by changing the output extension. The
+bound is the encoder's own: `0` is refused despite older documentation offering
+`0-10`, and `True` is refused rather than acting as a silent quality of `1`, the
+lowest offered. A NumPy real such as `np.int64(8)` is accepted and converted,
+since the ffmpeg writer only recognises a plain `int`/`float`. The refusal is a
+`ValueError` from `encode_clip` rather than the encoder's own `assert`, so it
+does not disappear when Python runs with `-O`:
+
+```python
+from strands_robots.rendering import encode_clip
+
+encode_clip(frames, "clip.mp4", fps=30, quality=9)   # a usable quality
+encode_clip(frames, "clip.mp4", fps=30, quality=0)   # ValueError: quality must be between 1 and 10
+```
 
 ## Video codec (H.264 default, AV1 opt-in)
 
@@ -473,6 +514,76 @@ Both mistakes used to be accepted and only surfaced in the recorded data:
 `robot_features` / `action_features`, or from `joint_names` for the action
 columns.
 
+### Camera frame shape must be a usable pixel count
+
+`camera_dims` and the `video_width` / `video_height` pair are one quantity in two
+spellings: the recorder declares each camera at
+`camera_dims.get(camera, (video_height, video_width))`, so the mapping sets the
+shape of the cameras it covers and the pair sets the shape of every other one.
+Note the order - `camera_dims` is `(height, width)`, the reverse of the pair.
+
+It is a **declaration, not a resize** - the recorder rescales nothing - so
+whatever is given goes straight into the LeRobot feature as `(3, height, width)`.
+`create()` refuses a shape it cannot honor, on the same shared domain and in the
+same place as the column names above:
+
+```python
+DatasetRecorder.create(repo_id="user/d", camera_keys=["image"],
+                       camera_dims={"imagee": (240, 320)})   # ValueError: not a declared camera
+DatasetRecorder.create(repo_id="user/d", camera_keys=["image"],
+                       camera_dims={"image": (240,)})        # ValueError: not a (height, width) pair
+DatasetRecorder.create(repo_id="user/d", camera_keys=["image"],
+                       video_width=0)                        # ValueError: must be a positive integer
+```
+
+Three mistakes used to be accepted, and none was reported near the parameter that
+caused it:
+
+- A key `camera_keys` does not declare is **never looked up**, so the camera it
+  was meant for silently took the global pair instead. A camera streaming
+  240x320 declared as `camera_dims={"imagee": (240, 320)}` against
+  `camera_keys=["image"]` was declared `(3, 480, 640)` from the defaults -
+  nothing logged, dataset created, and the mismatch surfacing later against
+  `add_frame`.
+- A component that is **not a positive integer** was written in as given, so the
+  schema declared `(3, 480, nan)` or `(3, 480, '640')` and no frame could match
+  it. A pixel count is written into `meta/info.json`, so it has to be a true
+  `int`: an integral float would be declared as `480.0`, and a NumPy integer is
+  not JSON-serializable.
+- A value that is **not a two-element sequence** unpacked as a bare `TypeError`,
+  and a non-mapping `camera_dims` as a bare `AttributeError` from the lookup.
+
+`camera_dims=None` and `{}` still mean "not supplied" - every camera then takes
+the global pair. Passing the shape as a list rather than a tuple is accepted.
+
+### The recording rate must be a usable frame count
+
+`fps` is the rate the dataset is **declared** at - it is written into
+`meta/info.json` and every timestamp is derived from it positionally - so
+`create()` holds it to the same positive-whole-number domain every backend's
+`start_recording(fps=...)` already applies to the rate it forwards here:
+
+```python
+DatasetRecorder.create(repo_id="user/d", fps=2.7)    # ValueError: fps must be a positive whole number
+DatasetRecorder.create(repo_id="user/d", fps=float("nan"))   # same refusal
+DatasetRecorder.create(repo_id="user/d", fps=True)   # refused, not read as 1 fps
+```
+
+LeRobot rejects only `fps <= 0`, so everything above used to be accepted by the
+direct API and cost the caller the episode without reporting anything: a
+fractional `2.7`, a `nan` or an `inf` created the dataset and then saved **zero
+frames**, with `create`, `add_frame`, `save_episode` and `finalize` all returning
+normally. `fps=True` recorded a 1 fps dataset (an `int` subclass acting as a 1),
+and `fps="30"` dead-ended in a bare `TypeError` naming neither the parameter nor
+the method.
+
+The rule is the facades' rule by construction - one shared domain, reached from
+both - so a rate `start_recording` accepts cannot be refused deeper. A rate that
+disagrees with a rollout's `control_frequency` is a separate check that only the
+facades can make (see [`fps` must equal the rollout's
+`control_frequency`](#fps-must-equal-the-rollouts-control_frequency)); `create()`
+judges the rate on its own terms.
+
 ### Re-recording into an existing `repo_id`
 
 `DatasetRecorder.create()` builds a **fresh** dataset. If the resolved dataset
@@ -531,8 +642,8 @@ log), and the rollout continues.
 | `save_episode()` | Flush buffer as a new episode |
 | `clear_episode_buffer()` | Discard current episode |
 | `finalize()` | Write metadata, stats, close writers |
-| `push_to_hub(tags=None, private=False)` | Upload to a versioned HF dataset repo |
-| `sync_to_bucket(bucket, run_id=None, private=True)` | Sync to a mutable HF Storage Bucket (`hf://buckets/...`) — Xet-deduped collection target; needs the `hf` CLI. `bucket` (`name` or `org/name`) and `run_id` (single segment) are allowlist-validated (`[A-Za-z0-9._-]`, no traversal) before the sync |
+| `push_to_hub(tags=None, private=False)` | Upload to a versioned HF dataset repo. `private` selects the published repo's visibility, so it must be a boolean — a truthy spelling of off such as `"false"` would otherwise select the opposite posture |
+| `sync_to_bucket(bucket, run_id=None, private=True)` | Sync to a mutable HF Storage Bucket (`hf://buckets/...`) — Xet-deduped collection target; needs the `hf` CLI. `bucket` (`name` or `org/name`) and `run_id` (single segment) are allowlist-validated (`[A-Za-z0-9._-]`, no traversal) before the sync, and `create` / `private` / `delete` must each be a boolean — `delete` mirror-deletes remote files absent locally, so a truthy `"false"` must not select it |
 
 ## Read back
 
@@ -622,6 +733,16 @@ Useful kwargs (forwarded to `StreamingLeRobotDataset`, version-tolerant):
 edge devices without a torchcodec wheel; requires `delta_timestamps` with at
 least one non-video key, otherwise `open()` raises `ValueError` rather than
 silently streaming video anyway).
+
+The four numeric kwargs (`tolerance_s`, `buffer_size`, `max_num_shards`,
+`seed`) are checked before the lerobot import: `StreamingLeRobotDataset`
+validates only `repo_type` and stores the rest verbatim, so every consumer of
+them is downstream of a call that already returned. `open()` raises `ValueError`
+naming the parameter instead - a shard count of `0` used to open successfully
+and then stream **zero frames**, a `buffer_size` of `0` raised out of NumPy
+part-way through iteration, and a `tolerance_s` of `inf` switched off the
+delta-grid check below. `tolerance_s=0` is accepted and means "require an exact
+grid match"; `seed=0` is accepted and is simply a seed.
 
 One kwarg is **not** tolerant-forwarded because its absence changes semantics:
 `repo_type="bucket"` requires `lerobot>=0.6.1`, which the `[lerobot]` extra

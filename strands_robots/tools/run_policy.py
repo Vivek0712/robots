@@ -154,12 +154,16 @@ def run_policy(
             positive int. There is no "guess from duration" fallback.
         n_steps: Hard cap on control steps per episode. Forwarded to
             ``run_policy`` as ``n_steps``.
-        control_frequency: Target Hz for policy queries.
+        control_frequency: Target Hz for policy queries. Must be a finite
+            number > 0; an unusable rate is reported before the rollout
+            starts instead of aborting every episode mid-flight.
         action_horizon: Lower bound on actions consumed per policy call
             before re-querying; the effective interval is
             ``max(action_horizon, policy.execution_horizon)``, so a
             chunk-emitting policy always consumes its full chunk and a
             smaller value has no effect (see ``resolve_chunk_length``).
+            Must be a positive integer, reported before the rollout starts
+            for the same reason.
         fast_mode: Skip real-time sleep between steps (default True for
             rollouts - wall-clock pacing slows headless eval).
         dataset_root: When set, the tool drives the full recording
@@ -248,6 +252,56 @@ def run_policy(
 
     if not isinstance(n_steps, int) or isinstance(n_steps, bool) or n_steps < 1:
         return _err(f"run_policy: n_steps must be a positive int, got {n_steps!r}.")
+
+    # Same pre-flight reason as the checks below, plus the one that makes it
+    # load-bearing rather than merely tidy: step 2 starts its recording with
+    # ``overwrite=True``, so a rollout knob the facade refuses is discovered
+    # inside the episode loop - AFTER an existing dataset at ``dataset_root``
+    # was removed and replaced with an empty one. Both knobs are forwarded
+    # verbatim to every episode's ``Simulation.run_policy`` and neither is
+    # superseded by another argument, so both are checked unconditionally on the
+    # shared domains the facade itself applies (``_validate_positive_frequency``
+    # and ``_validate_action_horizon`` delegate to exactly these two). The
+    # message is therefore byte-identical to the one the loop used to report;
+    # only its timing changes, from after the destruction to before it.
+    # ``strands_robots.utils`` imports nothing from the package, so this keeps
+    # the module's lazy-import convention without pulling in the sim stack.
+    from strands_robots.utils import positive_count_error, positive_finite_number_error
+
+    if freq_error := positive_finite_number_error(control_frequency, "control_frequency", "run_policy"):
+        return _err(freq_error)
+
+    if horizon_error := positive_count_error(action_horizon, "action_horizon", "run_policy"):
+        return _err(horizon_error)
+
+    # Same pre-flight reason as the schema checks below: the per-episode seed is
+    # derived arithmetically (``seed + ep``) OUTSIDE the per-episode try, so a
+    # non-numeric seed raised out of this tool entirely - past the structured
+    # result an agent reads - and a float/negative one reached NumPy inside the
+    # loop after step 2 had already created a dataset. Shares the domain every
+    # rollout surface uses, so a seed this loop accepts is one the facade it
+    # forwards to can apply.
+    # ``None`` is the documented "draw fresh entropy" spelling, so there is
+    # nothing to check for it - and this module keeps every strands_robots import
+    # lazy, so a caller who supplies no seed pulls in no extra module.
+    if seed is not None:
+        from strands_robots.simulation.base import MAX_EVAL_SEED, randomization_seed_error
+
+        if seed_error := randomization_seed_error(seed, "run_policy", max_seed=MAX_EVAL_SEED):
+            return _err(seed_error)
+
+        # The value each episode applies is ``seed + ep``, not ``seed``, so a
+        # seed inside the ceiling can still derive one above it - the same
+        # accepted-but-unappliable gap, one derivation further on. The check
+        # above has already established that ``seed`` is an integer, and
+        # ``n_episodes`` is validated further up, so this is computable here.
+        if randomization_seed_error(seed + n_episodes - 1, "run_policy", max_seed=MAX_EVAL_SEED):
+            return _err(
+                f"run_policy: episode seeds are derived as seed + episode index, so seed={seed!r} "
+                f"with n_episodes={n_episodes} reaches {seed + n_episodes - 1} on the last episode - "
+                f"above the {MAX_EVAL_SEED} ceiling every rollout surface accepts. Lower the seed or "
+                "the episode count."
+            )
 
     if video is not None and not isinstance(video, dict):
         return _err(

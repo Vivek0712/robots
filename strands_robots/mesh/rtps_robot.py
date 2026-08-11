@@ -40,6 +40,7 @@ from typing import Any, cast
 
 from strands_robots.mesh._mobile_base import MobileBaseRobot
 from strands_robots.tools.use_rtps import use_rtps
+from strands_robots.utils import partial_construction_repr
 
 _TWIST_TYPE = "geometry_msgs/msg/Twist"
 # ``use_rtps`` writes to a DDS topic directly, so a topic must be absolute -
@@ -158,7 +159,10 @@ class RtpsRobot(MobileBaseRobot):
         return cast(_UseRtpsTransport, self.transport).advertise(topic=self.cmd_vel_topic, type=self.cmd_vel_type)
 
     def __repr__(self) -> str:
-        return (
-            f"RtpsRobot(node_name={self.node_name!r}, cmd_vel_topic={self.cmd_vel_topic!r}, "
-            f"cmd_vel_type={self.cmd_vel_type!r})"
-        )
+        try:
+            return (
+                f"RtpsRobot(node_name={self.node_name!r}, cmd_vel_topic={self.cmd_vel_topic!r}, "
+                f"cmd_vel_type={self.cmd_vel_type!r})"
+            )
+        except AttributeError:
+            return partial_construction_repr(self)

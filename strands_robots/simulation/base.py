@@ -51,7 +51,9 @@ if TYPE_CHECKING:
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 from strands_robots.utils import (
     FREE_CAMERA_TOKENS,
+    dds_domain_id_error,
     is_boolean,
+    non_negative_count_error,
     positive_count_error,
     positive_finite_number_error,
     sequence_length,
@@ -101,6 +103,41 @@ def reject_setup_kwargs(kwargs: Mapping[str, Any]) -> None:
         'builds an empty engine, not a robot. Use Robot("so101", mode="sim") for '
         'one-step setup, or create_world() then add_robot("so101").'
     )
+
+
+def close_match_hint(requested: object, known: Sequence[str]) -> str:
+    """The ``" Did you mean: a, b?"`` fragment of an unknown-entity message.
+
+    Returns ``""`` when there is no usable suggestion, so a caller can append
+    it unconditionally.
+
+    This is the *only* part of an unknown-entity message that needs
+    ``requested`` to be a :class:`str`: :func:`difflib.get_close_matches`
+    compares character sequences, and a name of another type has none. What is
+    registered - and the discovery action that lists it - is a property of the
+    world alone, so it must not be gated on the requested name's type. Owning
+    that distinction here is what keeps the two from being conflated again: one
+    ``isinstance`` test guarding both suppressed the whole listing for every
+    non-``str`` name, and such a name is exactly what
+    :func:`strands_robots.simulation.models.registered` routes to these
+    messages - it is total so an unhashable name is reported rather than
+    raising, and the report it hands off to has to be usable.
+
+    Args:
+        requested: Caller-supplied entity name, of any type.
+        known: Entity names that are registered.
+
+    Returns:
+        A leading-space ``" Did you mean: ...?"`` fragment, or ``""`` when
+        ``requested`` is not a string, nothing is registered, or no registered
+        name is close enough to suggest.
+    """
+    if not isinstance(requested, str) or not known:
+        return ""
+    matches = difflib.get_close_matches(requested, list(known), n=3, cutoff=0.4)
+    if not matches:
+        return ""
+    return " Did you mean: " + ", ".join(matches) + "?"
 
 
 def unknown_kwargs_error(method: str, kwargs: Mapping[str, Any], accepted: Sequence[str]) -> dict[str, Any] | None:
@@ -271,7 +308,30 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
     return None
 
 
-def randomization_seed_error(value: Any, context: str) -> str | None:
+# The largest seed a rollout can apply. ``set_eval_seed`` reseeds the legacy
+# NumPy global RNG (``numpy.random.seed``), which refuses anything above
+# 2**32 - 1 - unlike ``numpy.random.default_rng``, the destination of the
+# ``randomize`` / ``set_obs_noise`` seeds, which accepts an integer of any
+# width. That is why a rollout seed carries a ceiling those two do not: the
+# accepted domain of a parameter is bounded by what its applier can honor, and
+# ``random.seed`` / ``torch.manual_seed`` (the other two RNGs seeded there) are
+# wider still.
+#
+# It lives here, beside the ``max_seed`` parameter it feeds, rather than in
+# ``policy_runner`` with the applier it describes. The note above this module's
+# ``policy_runner`` import is the reason: CodeQL's ``py/unsafe-cyclic-import``
+# walks ``TYPE_CHECKING`` blocks, and ``policy_runner`` imports ``SimEngine``
+# from here under one, so every name added to that module-level import line
+# closes an AST-visible cycle. Adding this constant to it raised
+# ``py/unsafe-cyclic-import`` on all three names that line carries. The rollout
+# side reaches it through the function-local import it already uses for
+# ``randomization_seed_error``, so neither module gains a module-level edge.
+MAX_EVAL_SEED = 2**32 - 1
+
+
+def randomization_seed_error(
+    value: Any, context: str, *, max_seed: int | None = None, allow_none: bool = True
+) -> str | None:
     """Return why a value cannot seed a reproducible randomization stream.
 
     The seed reaches ``numpy.random.default_rng``, which accepts only
@@ -281,19 +341,69 @@ def randomization_seed_error(value: Any, context: str) -> str | None:
     after the configuring call reported success - so it is rejected at the call
     that supplied it.
 
+    Two families share this domain, and they share it because the failure is
+    the same: the ``seed`` of ``randomize`` / ``set_obs_noise``, which drives
+    the domain-randomization streams, and the ``seed`` of a policy rollout or
+    evaluation (``run_policy`` / ``eval_policy`` / ``start_policy`` /
+    ``evaluate_benchmark``), which pins the client RNGs a stochastic policy
+    samples from. The name reads for the first family and is accurate for both:
+    a rollout seed exists precisely to make the policy's randomization
+    reproducible.
+
+    Their appliers are not equally wide, so the accepted domain is not either.
+    ``randomize`` / ``set_obs_noise`` reach ``default_rng``, which takes a
+    non-negative integer of any width. A rollout seed is applied through
+    :func:`~strands_robots.simulation.policy_runner.set_eval_seed`, which also
+    reseeds the legacy NumPy global RNG (``numpy.random.seed``) - the one most
+    policies draw from - and that refuses anything above :data:`MAX_EVAL_SEED`.
+    ``max_seed`` carries that ceiling, so the rollout surfaces refuse a value
+    they could not apply while the randomization surfaces keep the width they
+    can honor. One rule with an explicit bound per destination is what stops
+    the accepted domain drifting from the applier in either direction.
+
+    ``allow_none`` is the same idea at the other end of the domain. ``None`` is
+    a legitimate *parameter* value for most callers - it selects fresh entropy
+    for ``randomize`` / ``set_obs_noise`` and means "do not seed" at the rollout
+    facades - but it is not a *seed*, so an applier that has to hand one to an
+    RNG cannot honor it: ``random`` and NumPy would reseed from entropy while
+    ``torch.manual_seed`` refuses it, leaving a process-wide RNG side effect on
+    a rollout that asked for none. ``allow_none=False`` refuses it there and
+    drops ``None`` from the messages, so the reason a caller is given always
+    describes the domain that caller actually has.
+
     Args:
         value: The candidate seed (``None`` selects fresh entropy).
         context: Method name to prefix the message with.
+        max_seed: Largest value the caller's applier can honor, or ``None``
+            when the non-negative-integer rule is the only bound.
+        allow_none: Whether ``None`` is a value this caller can honor. True for
+            a parameter where it selects fresh entropy or means "do not seed";
+            False for an applier that has to hand a seed to an RNG, which has
+            nothing to apply. When False the messages stop advertising ``None``
+            too, so a caller is never offered a value this destination refuses.
 
     Returns:
         ``None`` when the seed is usable, otherwise the reason as a string.
     """
+    none_clause = " or None" if allow_none else ""
+    entropy_hint = " (None draws fresh entropy)" if allow_none else ""
     if value is None:
-        return None
+        if allow_none:
+            return None
+        return (
+            f"{context}: seed is required; None is the absence of a seed, not a seed to apply. "
+            f"To leave the RNGs untouched, do not call {context} - reseeding them from entropy "
+            "is a global side effect an unseeded rollout must not acquire."
+        )
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        return f"{context}: seed must be a non-negative integer or None, got {value!r} (None draws fresh entropy)"
+        return f"{context}: seed must be a non-negative integer{none_clause}, got {value!r}{entropy_hint}"
     if int(value) < 0:
-        return f"{context}: seed must be a non-negative integer or None, got {value!r} (None draws fresh entropy)"
+        return f"{context}: seed must be a non-negative integer{none_clause}, got {value!r}{entropy_hint}"
+    if max_seed is not None and int(value) > max_seed:
+        return (
+            f"{context}: seed must be an integer in [0, {max_seed}]{none_clause}, got {value!r} "
+            "(a rollout seed is applied to the legacy NumPy global RNG, which refuses a larger value)"
+        )
     return None
 
 
@@ -498,9 +608,15 @@ class SimEngine(ABC):
                 an :class:`ImportError` is raised here if it is missing.
                 Defaults to False - the sim never touches ROS 2.
             ros2_domain: ROS 2 domain id (``ROS_DOMAIN_ID``) to publish on.
+                Only an ``int`` in ``[0, 232]`` names a domain; a value
+                outside the RTPS port map raises :class:`ValueError`.
         """
         self._ros2_bridge_enabled = bool(ros2_bridge)
-        self._ros2_domain = int(ros2_domain)
+        # Refuse a domain id outside the RTPS port map here, so a backend that
+        # only publishes later still rejects it at construction.
+        if error := dds_domain_id_error(ros2_domain, "ros2_domain", type(self).__name__):
+            raise ValueError(error)
+        self._ros2_domain = ros2_domain
         self._ros_bridge: Any = None
         if self._ros2_bridge_enabled:
             from strands_robots.simulation.ros_bridge import SimRosBridge
@@ -577,7 +693,7 @@ class SimEngine(ABC):
             raise ValueError("No robots registered in the simulation. Add a robot first (add_robot or Robot factory).")
         raise ValueError(f"Multiple robots registered; specify robot_name. Available: {names}")
 
-    def _unknown_robot_msg(self, requested: str) -> str:
+    def _unknown_robot_msg(self, requested: object) -> str:
         """Actionable 'robot not found' message for the backend-agnostic facade.
 
         Keeps the "Robot 'X' not found." prefix (the consistent error shape the
@@ -588,13 +704,19 @@ class SimEngine(ABC):
         :meth:`list_robots` primitive, so every backend inherits it; the MuJoCo
         engine overrides with a ``self._world.robots``-backed variant. Mirrors the
         ``_unknown_object_msg`` / ``_unknown_camera_msg`` pattern (#1299/#1303/#1306).
+
+        ``requested`` is typed ``object`` because a name of any type reaches here:
+        :func:`~strands_robots.simulation.models.registered` is total, so a name
+        that cannot be a registry key resolves to "no such entity" and is
+        reported rather than raising. Only the close match needs a string (see
+        :func:`close_match_hint`); what is registered is a fact about the world,
+        so it is listed for every name type instead of being replaced by an
+        "empty scene" claim that would be false.
         """
         known = self.list_robots()
         msg = f"Robot '{requested}' not found."
-        if known and isinstance(requested, str):
-            matches = difflib.get_close_matches(requested, known, n=3, cutoff=0.4)
-            if matches:
-                msg += " Did you mean: " + ", ".join(matches) + "?"
+        if known:
+            msg += close_match_hint(requested, known)
             msg += f" Available robots: {known}. Use action='list_robots' to see all."
         else:
             msg += " No robots in the scene; add one with action='add_robot'."
@@ -950,6 +1072,19 @@ class SimEngine(ABC):
         Args:
             robot_name: Which robot to observe. If ``None`` and exactly one
                 robot exists, that robot is used; otherwise returns ``{}``.
+            skip_images: Skip camera rendering and return joint state only.
+                Rendering dominates the per-step cost, so every consumer that
+                reads joint values alone passes ``True`` - the predicate /
+                reward DSL (:mod:`~strands_robots.simulation.predicates`), the
+                LIBERO adapter's state reads, and the ROS 2 bridge when it
+                publishes ``joint_states`` without ``image_raw``. Camera keys
+                are then absent from the result rather than present and empty,
+                so a caller must not read a missing frame as a render failure.
+                A backend overrides a ``True`` here while a dataset recording is
+                active - the recorded frames must carry the camera images the
+                schema declared - so this is a hint, not a guarantee that
+                nothing renders. Defaults to False (render every attached
+                camera).
 
         Returns:
             Observation dict per schema above. Returns ``{}`` if the world
@@ -1350,15 +1485,25 @@ class SimEngine(ABC):
 
         ``n_steps`` (primary) or the legacy ``max_steps`` alias specify the
         rollout length as a step count; ``duration = n_steps / control_frequency``.
-        ``n_steps`` wins when both are passed. The inputs are validated before
-        the division so a non-positive horizon or frequency is reported as a
-        caller error rather than silently producing a no-op, a negative
-        duration, or a ``ZeroDivisionError``.
+        ``n_steps`` wins when both are passed. The effective horizon is validated
+        before the division against the shared positive-count domain
+        (:func:`~strands_robots.utils.positive_count_error`) - the same domain
+        :meth:`_validate_positive_int` already applies to ``eval_policy``'s
+        ``max_steps`` and to ``n_episodes`` / ``action_horizon`` /
+        ``control_substeps`` - so a horizon that is not a whole number of steps
+        is reported as a caller error rather than silently truncated. A bare
+        ``<= 0`` test only saw the sign: ``n_steps=2.7`` ran two steps and
+        ``n_steps=True`` ran one, both reported as a successful rollout of a
+        horizon the caller never asked for, while the identically-named
+        ``eval_policy`` budget refused both.
 
         Args:
-            n_steps: Primary step-count horizon, or ``None``.
+            n_steps: Primary step-count horizon, or ``None``. Must be a
+                positive integer when given.
             max_steps: Legacy alias, normalized to ``n_steps`` when ``n_steps``
-                is ``None``.
+                is ``None``, and validated under its own name so a caller who
+                wrote ``max_steps`` is not pointed at a parameter they never
+                passed. Same domain as ``n_steps``.
             control_frequency: Target control-loop frequency in Hz.
             duration: Fallback wall-clock duration used when no step horizon
                 is given. Returned unchanged when no horizon is given, so the
@@ -1373,18 +1518,19 @@ class SimEngine(ABC):
             wall-clock duration (recomputed from the horizon when one was
             given) and ``n_steps`` is the normalized step count (or ``None``).
         """
-        if n_steps is None and max_steps is not None:
-            n_steps = int(max_steps)
         if n_steps is not None:
-            if n_steps <= 0:
-                return (
-                    duration,
-                    n_steps,
-                    {
-                        "status": "error",
-                        "content": [{"text": f"{method}: n_steps must be > 0, got {n_steps}."}],
-                    },
-                )
+            if error := positive_count_error(n_steps, "n_steps", method):
+                return duration, n_steps, {"status": "error", "content": [{"text": error}]}
+        elif max_steps is not None:
+            # Validate the alias under its OWN name: the caller wrote
+            # ``max_steps``, so a refusal naming ``n_steps`` points them at a
+            # parameter they never passed. The normalization below is then exact
+            # (an ``int()`` coercion here would be a second, weaker contract
+            # that silently truncated the value the domain just accepted).
+            if error := positive_count_error(max_steps, "max_steps", method):
+                return duration, max_steps, {"status": "error", "content": [{"text": error}]}
+            n_steps = max_steps
+        if n_steps is not None:
             # control_frequency is validated as a positive number at the public
             # entry points (run_policy / start_policy / eval_policy) via
             # _validate_positive_frequency before this helper runs, so the
@@ -1502,6 +1648,47 @@ class SimEngine(ABC):
             An error dict naming the offending parameter, or ``None``.
         """
         if error := positive_count_error(value, name, method):
+            return {"status": "error", "content": [{"text": error}]}
+        return None
+
+    @staticmethod
+    def _validate_seed(seed: Any, method: str) -> dict[str, Any] | None:
+        """Reject an unusable RNG seed at the public API.
+
+        A rollout seed is the caller's reproducibility contract: it reseeds the
+        client RNGs (and is forwarded to ``policy.reset``) so the same scene and
+        the same policy replay identically. Only a non-negative integer can do
+        that - the seed ends at ``numpy.random.seed`` / ``default_rng``, which
+        refuses everything else - so a value that cannot be applied is refused
+        at the call that supplied it rather than at the first draw.
+
+        Without this guard the same mistake surfaced three different ways, none
+        of them naming the parameter: ``run_policy`` raised NumPy's own
+        ``TypeError: Cannot cast scalar from dtype('float64') to dtype('int64')``
+        straight out of a method documented to return this envelope,
+        ``start_policy`` reported "started" and failed on its worker thread, and
+        ``True`` was accepted everywhere as a silent seed of ``1``.
+
+        Thin binding of :func:`randomization_seed_error` to this class's
+        tool-error envelope, so a seed refused for ``randomize`` cannot be
+        accepted for the rollout whose reproducibility it is supposed to pin.
+
+        The rollout binding supplies :data:`MAX_EVAL_SEED` as the ceiling. Its
+        applier reseeds the legacy NumPy global RNG as well as ``default_rng``,
+        and that one refuses a larger value - so without the bound a seed in
+        ``[2**32, inf)`` passed this guard and then raised NumPy's own message
+        from inside the rollout, which is the failure this guard exists to
+        replace. ``randomize`` / ``set_obs_noise`` reach only ``default_rng``
+        and keep the unbounded domain they can honor.
+
+        Args:
+            seed: The caller-supplied value (``None`` draws fresh entropy).
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            An error dict naming the offending parameter, or ``None``.
+        """
+        if error := randomization_seed_error(seed, method, max_seed=MAX_EVAL_SEED):
             return {"status": "error", "content": [{"text": error}]}
         return None
 
@@ -1779,6 +1966,116 @@ class SimEngine(ABC):
             return {"status": "error", "content": [{"text": error}]}
         return None
 
+    @staticmethod
+    def _validate_rtc_inference_timeout(rtc_inference_timeout_s: Any, method: str) -> dict[str, Any] | None:
+        """Reject an async-RTC prefetch deadline the runner cannot wait out.
+
+        ``rtc_inference_timeout_s`` is the async-RTC chunk pipeline's hard
+        per-chunk deadline: the seam swap does
+        ``future.result(timeout=rtc_inference_timeout_s)`` and converts a
+        ``concurrent.futures.TimeoutError`` into "policy inference is stuck.
+        Raise the timeout or check the policy/server." That message is only true
+        of a deadline a healthy inference could have met, and every value
+        outside the accepted domain makes it false:
+
+        * ``0`` / a negative value / ``nan`` make ``Future.result`` raise
+          immediately - ``nan`` because every comparison against it is false, so
+          the deadline is never considered met - and the rollout is reported as
+          ``status="error"`` blaming a policy that answered on time. The value
+          the caller supplied is quoted back in a sentence accusing the model.
+        * ``inf`` cannot be honored either: it reaches ``time_t`` arithmetic and
+          raises ``OverflowError: timestamp out of range for platform time_t``,
+          which names neither the parameter nor the method. ``None`` - not
+          ``inf`` - is this parameter's documented "wait without a deadline"
+          spelling, so refusing ``inf`` costs no capability.
+        * ``True`` is an ``int`` subclass and acts as a silent 1-second budget.
+        * A string or a list reaches the same comparison and leaks
+          ``TypeError: '>' not supported between instances of 'str' and 'int'``.
+
+        The accepted domain is
+        :func:`~strands_robots.utils.positive_finite_number_error` - the same
+        rule as :meth:`_validate_duration` and
+        :meth:`_validate_positive_frequency`, the other wall-clock knobs of a
+        rollout - plus ``None``, which this parameter documents as "no deadline"
+        and which is its default.
+
+        Validated unconditionally rather than only when the async path is
+        active. Whether that path runs is not knowable here: ``async_rtc=None``
+        (the default) auto-resolves from the policy's own chunk-emitting shape
+        one layer down, after the policy has been constructed. Gating the check
+        on the flag would therefore leave the dominant path - every
+        chunk-emitting VLA - unguarded, and give one value two answers depending
+        on a resolution the caller cannot see. Checking here instead costs a bad
+        deadline no weight download and no frame.
+
+        Args:
+            rtc_inference_timeout_s: The caller-supplied value to validate.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            An error dict naming the offending parameter, or ``None`` when the
+            value is valid (including when it is ``None``).
+        """
+        if rtc_inference_timeout_s is None:
+            return None
+        error = positive_finite_number_error(rtc_inference_timeout_s, "rtc_inference_timeout_s", method)
+        if error:
+            return {"status": "error", "content": [{"text": error}]}
+        return None
+
+    @staticmethod
+    def _validate_onframe_failure_limit(max_onframe_failures: Any, method: str) -> dict[str, Any] | None:
+        """Reject an ``on_frame`` failure tolerance the watchdog cannot count against.
+
+        ``max_onframe_failures`` is the consecutive-failure ceiling that stops a
+        broken ``on_frame`` hook from producing an empty capture behind a
+        successful-looking rollout (GH #117). The runner counts failures into a
+        plain ``int`` and compares ``consecutive_onframe_failures >= limit``, so a
+        value outside the accepted domain does not merely mis-size the tolerance -
+        it silences the mechanism whose own abort text reads "aborting episode to
+        avoid silent dataset corruption":
+
+        * ``nan`` and ``inf`` make that comparison false for every counter value,
+          so the abort never fires. Measured on a 100-step rollout whose hook
+          raises on every step: 100 of 100 frames lost and
+          ``status="success"``. Both values also break the per-failure warning
+          that would otherwise report the hook - it interpolates the limit with
+          ``%d``, and ``"%d" % nan`` raises ``ValueError`` while ``"%d" % inf``
+          raises ``OverflowError``, so ``logging`` emits its own error instead of
+          the warning and the operator is told nothing at all.
+        * ``0`` is a duplicate spelling of ``1`` carrying a false message. The
+          counter is incremented before the comparison, so a limit of ``1``
+          already aborts on the first failure; ``0`` aborts on the same failure
+          and reports "failed 0 times in a row" when one failure occurred.
+          Refusing it costs no capability, and ``-5`` is the same abort with a
+          message that names a negative count.
+        * ``2.7`` tolerates two failures and aborts on the third while reporting
+          "failed 2.7 times in a row" - a tolerance the caller never asked for.
+          ``True`` is an ``int`` subclass and reports "failed True times in a row".
+        * A string or a list reaches the same comparison and leaks
+          ``TypeError: '>=' not supported between instances of 'int' and 'str'``
+          from inside the hook's own exception handler - and only once the hook
+          first fails, so the value is accepted and inert until then.
+
+        The accepted domain is :meth:`_validate_positive_int`
+        (:func:`~strands_robots.utils.positive_count_error`) - the same rule this
+        method already applies to ``n_steps``, ``max_steps`` and ``n_episodes``,
+        the other step counts of the same signature - plus ``None``, which this
+        parameter documents as "use the runner's own limit" and which is its
+        default.
+
+        Args:
+            max_onframe_failures: The caller-supplied value to validate.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            An error dict naming the offending parameter, or ``None`` when the
+            value is valid (including when it is ``None``).
+        """
+        if max_onframe_failures is None:
+            return None
+        return SimEngine._validate_positive_int(max_onframe_failures, "max_onframe_failures", method)
+
     def _validate_recording_rate(self, control_frequency: float, method: str) -> dict[str, Any] | None:
         """Reject a rollout whose rate the active dataset recording cannot describe.
 
@@ -1990,6 +2287,45 @@ class SimEngine(ABC):
                 dataset recording), backends plug into
                 ``PolicyRunner.run``'s ``on_frame`` hook via
                 :meth:`_make_run_policy_hook`.
+            policy_object: Already-constructed
+                :class:`~strands_robots.policies.Policy` to drive the rollout,
+                bypassing ``create_policy`` entirely (``policy_provider`` /
+                ``policy_config`` are then unused). Reuse one instance across
+                calls so the checkpoint is not reloaded per rollout - the
+                ``policy_load_cache_hit`` field below reports when a caller
+                rebuilt it instead. ``None`` (default) builds the policy from
+                ``policy_provider`` / ``policy_config``.
+            n_steps: Exact control-step horizon. When given it REPLACES
+                ``duration``, which is recomputed as
+                ``n_steps / control_frequency``, and it bypasses the lossy
+                ``int(duration * control_frequency)`` conversion so the rollout
+                executes exactly this many control steps. Must be a positive
+                integer; ``0``, a negative value, a bool, or a fractional or
+                non-numeric value is reported as a structured caller error
+                rather than truncated to a horizon the caller never asked for.
+                ``None`` (default) falls back to ``max_steps``, then to
+                ``duration``.
+            max_steps: Legacy alias for ``n_steps``, kept for callers written
+                against the older name. Consulted only when ``n_steps`` is
+                ``None`` - ``n_steps`` wins when both are passed - and refused
+                under its own name on the same domain.
+            max_onframe_failures: Maximum *consecutive* ``on_frame``-hook
+                exceptions tolerated before the rollout aborts the episode. That
+                hook is where a backend attaches dataset recording and video
+                capture, so a broken recorder otherwise fills an empty dataset
+                behind a successful-looking rollout. ``None`` (default) uses the
+                runner's own limit (currently ``5``); non-consecutive failures
+                reset the counter. Must otherwise be a positive integer - the
+                same domain as ``n_steps`` and ``n_episodes`` above, since the
+                runner compares it against a plain integer counter. ``nan`` and
+                ``inf`` make that comparison false forever and so disable the
+                abort entirely; ``0`` aborts on the first failure exactly as
+                ``1`` does while reporting a count of zero. Both are reported as
+                a structured caller error rather than silencing the watchdog -
+                see
+                :meth:`~strands_robots.simulation.base.SimEngine._validate_onframe_failure_limit`.
+                Forwarded verbatim to
+                :meth:`~strands_robots.simulation.policy_runner.PolicyRunner.run`.
             seed: Optional master RNG seed for a reproducible single rollout.
                 When set, reseeds Python / NumPy / torch / cuDNN and forwards
                 ``policy.reset(seed=...)`` so a stochastic policy (VLA action-
@@ -2187,6 +2523,13 @@ class SimEngine(ABC):
         # with a bare "cannot be interpreted as an integer" TypeError.
         control_frequency = float(control_frequency)
 
+        # The seed is the caller's reproducibility contract; an unusable one
+        # cannot be applied at all, and reached NumPy as a bare cast TypeError
+        # out of a method documented to return this envelope. Refused here,
+        # before a policy is built or a frame is written.
+        if err := self._validate_seed(seed, "run_policy"):
+            return err
+
         # accept n_steps (or legacy max_steps) as an alternate horizon
         # specification. duration = n_steps / control_frequency. If both
         # are passed, n_steps wins (primary per DoD).
@@ -2213,6 +2556,10 @@ class SimEngine(ABC):
         if err := self._validate_action_horizon(action_horizon, "run_policy"):
             return err
         if err := self._validate_control_substeps(control_substeps, "run_policy"):
+            return err
+        if err := self._validate_rtc_inference_timeout(rtc_inference_timeout_s, "run_policy"):
+            return err
+        if err := self._validate_onframe_failure_limit(max_onframe_failures, "run_policy"):
             return err
         # Both rates are known only here: the dataset rate was fixed by
         # start_recording one call earlier. Checked before any policy is
@@ -2713,7 +3060,8 @@ class SimEngine(ABC):
         still open).
 
         Args:
-            expected: The episode count the caller intended to record.
+            expected: The episode count the caller intended to record. A
+                non-negative int; anything else is reported as an error dict.
 
         Returns:
             Standard status dict. ``status`` is ``"success"`` when the parquet
@@ -2730,13 +3078,12 @@ class SimEngine(ABC):
             since the episodes found are then only a lower bound. An unreadable
             or corrupt parquet is reported as this same error dict, never raised.
         """
-        if not isinstance(expected, int) or expected < 0:
-            return {
-                "status": "error",
-                "content": [
-                    {"text": f"verify_dataset_episodes: expected must be a non-negative int, got {expected!r}."}
-                ],
-            }
+        # Shares the count domain with the programmatic
+        # :func:`strands_robots.verify_dataset.verify_dataset` gate rather than
+        # re-deriving it: one rule for one question, so neither surface can accept
+        # an episode count the other refuses.
+        if error := non_negative_count_error(expected, "expected", "verify_dataset_episodes"):
+            return {"status": "error", "content": [{"text": error}]}
 
         root = self._active_dataset_root()
         if not root:
@@ -2946,6 +3293,12 @@ class SimEngine(ABC):
     ) -> dict[str, Any]:
         """Replay a LeRobotDataset episode via ``PolicyRunner.replay``.
 
+        ``episode`` must be a non-negative whole number - the shared domain the
+        ``replay_episode`` teleop knob uses - and is rejected with a structured
+        error before the dataset is downloaded. A bool is refused rather than
+        read as an index: ``episode=True`` previously resolved episode 1 and
+        replayed it under a ``"success"`` status.
+
         ``speed`` is a playback-rate multiplier (1.0 = real time) and must be a
         positive number; a non-positive or non-numeric value is rejected with a
         structured error rather than raising or silently playing back at full
@@ -3006,6 +3359,14 @@ class SimEngine(ABC):
         ``run_policy()`` evals the same way with ``eval_policy()``.
         ``n_episodes`` default lowered from 10 to 1 (callers opt in to
         longer evals explicitly).
+
+        ``seed`` pins the eval the way it pins a single :meth:`run_policy`
+        rollout: the client RNGs are reseeded once from it and then per episode
+        from a master RNG derived from it, and each per-episode seed is
+        forwarded to ``policy.reset`` so a service-mode policy can reseed its
+        own process. Two evals at the same seed replay identically; ``None``
+        leaves RNG state untouched. Only a non-negative integer can seed those
+        RNGs, so anything else is refused here rather than at the first draw.
 
         ``policy_object`` mirrors :meth:`run_policy`: pass an already-built
         ``Policy`` to skip the ``create_policy`` round-trip (e.g. a loaded
@@ -3145,9 +3506,13 @@ class SimEngine(ABC):
             return err
         if err := self._validate_positive_int(max_steps, "max_steps", "eval_policy"):
             return err
+        if err := self._validate_seed(seed, "eval_policy"):
+            return err
         if err := self._validate_positive_frequency(control_frequency, "eval_policy"):
             return err
         if err := self._validate_control_substeps(control_substeps, "eval_policy"):
+            return err
+        if err := self._validate_rtc_inference_timeout(rtc_inference_timeout_s, "eval_policy"):
             return err
         # Both rates are known only here: the dataset rate was fixed by
         # start_recording one call earlier. Checked before any policy is
@@ -3348,6 +3713,8 @@ class SimEngine(ABC):
         # start_recording one call earlier. Checked before any policy is
         # built so a rate disagreement costs no weight download and no frame.
         if err := self._validate_recording_rate(control_frequency, "evaluate_benchmark"):
+            return err
+        if err := self._validate_seed(seed, "evaluate_benchmark"):
             return err
         # Coerce to a plain Python float now the value is validated: a NumPy
         # scalar (accepted above via numbers.Real) flows into 1 / control_frequency

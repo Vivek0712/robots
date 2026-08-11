@@ -550,7 +550,8 @@ class LerobotTrainer(Trainer):
         ``dataset_repo_id`` (for streaming) - an ``output_dir``, a usable run
         size (``steps`` / ``global_batch_size``), single-node only
         (``num_nodes == 1``), a ``val_episodes``
-        split below the dataset total, and that ``lerobot.scripts.lerobot_train``
+        split below the dataset total, usable LoRA hyperparameters when
+        ``method == "lora"``, and that ``lerobot.scripts.lerobot_train``
         is importable. ``extra['reward_model']`` switches to reward-model
         preflight; otherwise the default policy path is checked. Returns the
         problem list; empty means launchable. Read-only.
@@ -594,14 +595,29 @@ class LerobotTrainer(Trainer):
             problems.extend(self._validate_policy(spec))
 
         problems.extend(self._run_size_problems(spec))
+        problems.extend(self._learning_rate_problems(spec))
+        problems.extend(self._seed_problems(spec))
+        # Captured rather than extended blind: the multi-node refusal below
+        # compares num_nodes, which is only a meaningful comparison once this
+        # gate has established it IS a count - a string or None would raise out
+        # of the comparison instead of being reported.
+        topology_problems = self._launch_topology_problems(spec)
+        problems.extend(topology_problems)
 
-        if spec.num_nodes > 1:
+        if not topology_problems and spec.num_nodes > 1:
             problems.append(
                 f"num_nodes={spec.num_nodes}: multi-node lerobot needs a per-node "
                 "launcher and cannot run in-process; use num_nodes=1."
             )
 
-        if spec.val_episodes is not None and spec.dataset_root:
+        # Captured rather than extended blind, for the same reason as the
+        # topology gate above: the two dataset-dependent checks below compare
+        # val_episodes and interpolate it into a split fraction, and both are
+        # only meaningful once this gate has established that it IS a count.
+        val_problems = self._validation_episodes_problems(spec)
+        problems.extend(val_problems)
+
+        if not val_problems and spec.val_episodes is not None and spec.dataset_root:
             total = self._dataset_total_episodes(spec.dataset_root)
             if total is not None and spec.val_episodes >= total:
                 problems.append(f"val_episodes={spec.val_episodes} >= total_episodes={total}")
@@ -610,6 +626,8 @@ class LerobotTrainer(Trainer):
             )
             if split_err:
                 problems.append(split_err)
+
+        problems.extend(self._lora_hyperparameter_problems(spec))
 
         # lerobot must be importable to actually train.
         try:

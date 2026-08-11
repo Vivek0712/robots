@@ -371,8 +371,15 @@ sim.stop_recording(bucket="your-org/robot-fave")   # → hf://buckets/your-org/r
 ```
 
 Requires the `hf` CLI with the `buckets`/`sync` subcommands
-(`pip install -U "huggingface_hub>=1.0"` + `hf auth login` — 0.x releases of
-`huggingface_hub` ship an `hf` entry point without them).
+(`pip install -U "huggingface_hub>=1.5"` + `hf auth login` — those subcommands
+first ship in 1.5.0; every earlier release, including 1.0–1.4.x, installs an
+`hf` entry point without them).
+
+The bucket **read** side (`stream_dataset(..., repo_type="bucket")`) needs
+`strands-robots >= 0.5.1`, so upgrade with `-U` rather than a bare
+`pip install "strands-robots[...]"` — pip reports `Requirement already satisfied`
+against a pre-existing older release and upgrades nothing, and on 0.4.1 the read
+raises `TypeError: open() got an unexpected keyword argument 'repo_type'`.
 
 Any on-disk dataset directory can be synced (or daily re-synced) without a live
 recording session — one recorded earlier in the process, or on hardware via
@@ -1073,8 +1080,8 @@ touches ROS 2.
 | `STRANDS_TRUST_REMOTE_CODE` | Set `1` to allow HF `trust_remote_code` for `lerobot_local` | unset |
 | `STRANDS_ROBOTS_NO_DYLD_SHIM` | Set `1` to disable the macOS auto-fix that puts Homebrew ffmpeg on the dyld path for torchcodec video streaming (see [Recording & streaming datasets](#recording--streaming-datasets)) | unset |
 | `MUJOCO_GL` | MuJoCo GL backend (`egl`, `osmesa`, `glfw`) | auto |
-| `STRANDS_ISAAC_HEADLESS` | Isaac Sim backend: run without a GUI (`true`/`1`/`yes` = headless). Overrides `IsaacConfig(headless=...)` | unset (config default `true`) |
-| `STRANDS_ISAAC_RTX_PATHTRACING` | Isaac Sim backend: set `true`/`1`/`yes` to enable RTX path-tracing (photorealistic, slow) instead of the default render mode | unset |
+| `STRANDS_ISAAC_HEADLESS` | Isaac Sim backend: run without a GUI. On (`1`/`true`/`yes`/`on`) = headless, off (`0`/`false`/`no`/`off`) = windowed, any other spelling is refused. Overrides `IsaacConfig(headless=...)` ([#2062](https://github.com/strands-labs/robots/issues/2062)) | unset (config default `true`) |
+| `STRANDS_ISAAC_RTX_PATHTRACING` | Isaac Sim backend: on (`1`/`true`/`yes`/`on`) enables RTX path-tracing (photorealistic, slow) instead of the default render mode; off leaves the render mode alone, any other spelling is refused | unset |
 | `STRANDS_ISAAC_NUCLEUS_URL` | Isaac Sim backend: override the Omniverse Nucleus asset-server URL | unset (Isaac default) |
 | `GROOT_API_TOKEN` | API token for the GR00T inference service | unset |
 | `STRANDS_MESH` | Set `false` to disable Zenoh mesh globally | `true` |
@@ -1106,9 +1113,10 @@ touches ROS 2.
 | `STRANDS_MESH_CAMERA_HZ` | Camera publish rate; opt-in because frames are large. Unset, non-positive, or unusable leaves camera publishing off | `0` (off) |
 | `STRANDS_MESH_MAX_PEERS` | Peer registry cap; evicts oldest on overflow | `1024` |
 | `STRANDS_MESH_RESUME_MAX_FAILS` | Failed resume attempts before cooldown engages | `5` |
-| `STRANDS_MESH_RESUME_BACKOFF_S` | Cooldown (seconds) after exceeding resume fail threshold | `30` |
+| `STRANDS_MESH_RESUME_BACKOFF_S` | Cooldown (seconds) after exceeding resume fail threshold. A value no cooldown instant can be built from -- unparsable, negative, or non-finite like `inf`/`nan` -- falls back to the default, so the throttle both engages and expires (shared with `STRANDS_MESH_RESUME_FRESHNESS_S` / `_FORWARD_SKEW_S`) | `30` |
 | `STRANDS_MESH_INPUT_AUDIT_EVERY` | Emit `input_stream_applied` audit event every N frames (0 = off) | `100` |
 | `STRANDS_ESTOP_DEDUP_TTL_S` | E-stop fan-out Lambda dedup window (seconds) | `30` |
+| `STRANDS_MESH_DEDUP_TTL` | Window (seconds) the Zenoh<->IoT bridge remembers a delivered `(sender_id, turn_id, command)` triple for cross-transport deduplication. Unparsable, non-positive or non-finite falls back to the default, so a legitimately recurring heartbeat is forgotten again | `120` |
 | `STRANDS_MESH_BRIDGE_TOPICS` | Comma-separated topic suffixes the Zenoh<->IoT bridge forwards (exact match). Unset = the safe default set (`presence,health,safety/event,safety/estop,safety/resume,cmd,response,broadcast`). High-volume topics (`state,pose,imu,odom,lidar`) and LAN-only topics (`camera,input,hand`) are deliberately NOT bridged | default set |
 | `STRANDS_MESH_BRIDGE_TOPICS_PREFIX` | Comma-separated topic suffixes the bridge matches as a path **prefix** (so `response` matches `response/<turn-id>`). Extend this (not `STRANDS_MESH_BRIDGE_TOPICS`) when adding an RPC-shape topic with a per-turn tail | `response` |
 | `STRANDS_GR00T_IMAGE` | Container image the `gr00t_inference` tool runs (must pass the image allowlist; agent cannot choose it) | `gr00t:latest` |
@@ -1123,14 +1131,19 @@ touches ROS 2.
 
 These are read by the built-in, in-tree Isaac Sim backend
 (`pip install 'strands-robots[sim-isaac]'`) when it builds its
-`IsaacConfig`; an explicit `create_simulation("isaac", ...)` kwarg always wins.
-See [`docs/simulation/isaac.md`](docs/simulation/isaac.md).
+`IsaacConfig`. An explicit `create_simulation("isaac", ...)` kwarg wins for
+`nucleus_url`; the two switches override their field whenever they are set
+([#2062](https://github.com/strands-labs/robots/issues/2062)). Both switches
+accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` (case-insensitive,
+surrounding whitespace ignored); unset or empty leaves the field alone and any
+other spelling is refused. See
+[`docs/simulation/isaac.md`](docs/simulation/isaac.md).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `STRANDS_ISAAC_NUCLEUS_URL` | Override the Omniverse Nucleus server URL (when `nucleus_url` is not passed) | unset (Isaac defaults) |
-| `STRANDS_ISAAC_HEADLESS` | Truthy (`1`/`true`/`yes`) forces headless; falsy forces a window | unset (uses `headless` kwarg) |
-| `STRANDS_ISAAC_RTX_PATHTRACING` | Truthy forces `render_mode="rtx_pathtracing"` | unset |
+| `STRANDS_ISAAC_HEADLESS` | On forces headless; off forces a window | unset (uses `headless` kwarg) |
+| `STRANDS_ISAAC_RTX_PATHTRACING` | On forces `render_mode="rtx_pathtracing"`; off leaves `render_mode` alone | unset |
 
 </details>
 

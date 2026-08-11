@@ -92,21 +92,58 @@ WBCPolicy(
 A missing `onnxruntime` or a missing checkpoint raises `RuntimeError` at
 construction - WBC never falls back to silent zero torques.
 
+### Config value domain
+
+`WBCConfig` rejects an unusable *value* at construction, not just an impossible
+dimension - the same reason a bad dimension is refused there. Every numeric
+field is read verbatim into the PD law that writes `data.ctrl` or into the
+observation the network sees, so an unusable one becomes a wrong torque rather
+than an error:
+
+| Field | Accepted | Why |
+|-------|----------|-----|
+| `action_scale` | finite `> 0` | The only path from the network to the joint targets. `0` (or `False`) makes `target_q == default_angles`, discarding the policy; a negative value inverts every offset. |
+| `kps`, `kds` | finite `>= 0`, per component | `kp = 0` with `kd > 0` is a pure-damping joint and stays valid; a *negative* gain makes `(target_q - q) * kp` drive the joint away from its target. |
+| `default_angles`, `cmd_scale`, `rpy_cmd` | finite, per component | Signed quantities (a stance angle, a yaw rate, a roll target), so only finiteness is constrained. |
+| `obs_scales` values, `height_cmd`, `freq_cmd` | finite | A non-finite scale poisons the observation frame the network is given. |
+
+A `nan`/`inf` anywhere reaches `data.ctrl` as a non-finite torque on all
+`num_actions` joints; a `None` or a numeric string raises from the `float()`
+inside `compute_targets`, which runs per tick inside `get_actions` - after the
+ONNX sessions have loaded and the rollout has started. Both now surface as a
+`ValueError` naming the field (and the component index) at construction.
+
 ## Goal kwargs
 
 WBC reads locomotion commands from `**kwargs`, sharing the non-VLA goal
 vocabulary so a command can flow through `run_policy` / mesh `tell()` without
 coupling to a backend:
 
-| Key | Type | Meaning |
-|-----|------|---------|
-| `target_velocity` | `list[float]` | Locomotion command `[vx, vy, omega]` (m/s, m/s, rad/s). Scaled by `cmd_scale` (`[2.0, 2.0, 0.5]`) into the observation's command block. |
-| `target_orientation` | `list[float]` | Target base `[roll, pitch, yaw]` (rad), written to command slots `[4:7]`. Defaults to the config `rpy_cmd` (`[0,0,0]`). |
-| `height` | `float` | Target base height (m), written to command slot `[3]`. Defaults to the config `height_cmd` (`0.74`). |
+| Key | Type | Accepted | Meaning |
+|-----|------|----------|---------|
+| `target_velocity` | `list[float]` | numeric, >= 3 entries, every component finite | Locomotion command `[vx, vy, omega]` (m/s, m/s, rad/s). Scaled by `cmd_scale` (`[2.0, 2.0, 0.5]`) into the observation's command block. |
+| `target_orientation` | `list[float]` | numeric, >= 3 entries, every component finite | Target base `[roll, pitch, yaw]` (rad), written to command slots `[4:7]`. Defaults to the config `rpy_cmd` (`[0,0,0]`). |
+| `height` | `float` | finite | Target base height (m), written to command slot `[3]`. Defaults to the config `height_cmd` (`0.74`). |
 
 A per-call `target_velocity` overrides the constructor-time default. With no
 command at all the controller holds a standing balance (zero velocity, default
-height + level orientation).
+height + level orientation). Omitting a key (or passing `None`) selects the next
+source in the precedence chain, so `None` is how a kwarg spells "not supplied".
+
+Each key's accepted domain is the one `WBCConfig` enforces for the field it
+overrides - `height` for `height_cmd`, `target_orientation` for `rpy_cmd` - so a
+value the config refuses is not reachable through the kwarg documented to take
+precedence over it. Both vector keys additionally require at least three
+components: the command block is zero-initialised, so accepting a shorter
+`target_orientation` would leave the axes it omits at `0.0` rather than at the
+configured `rpy_cmd` value the omitted kwarg falls back to - silently commanding
+zero for an axis the caller never mentioned. A LONGER sequence is accepted and
+truncated to the slots available, since every component the block has room for is
+honored and only the surplus is dropped. The command block is the observation's first `command_dim`
+entries, so a non-finite component is not one wrong slot: the network is dense,
+so it reaches all `num_actions` joint targets, every one is then refused by
+`send_action`, and the rollout aborts reporting *"100% unresolved keys ... the
+robot has not moved"* - a message about the embodiment, for a bad `height`.
 
 ## Control contract
 

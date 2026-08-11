@@ -137,14 +137,19 @@ wbc = [
     # Required so create_policy("wbc") with no local checkpoint works out of the
     # box - WBCPolicy._maybe_download_checkpoint raises RuntimeError naming the
     # [wbc] extra when it is absent.
-    # Floor at >=1.0 (cap the MAJOR only, <2.0.0): the docs' bucket-sync
+    # Floor at >=1.5 (cap the MAJOR only, <2.0.0): the docs' bucket-sync
     # guidance (README streamed-training section + dataset_recorder.sync_to_bucket)
-    # instructs `pip install -U "huggingface_hub>=1.0"` because the `hf buckets`/
-    # `hf sync` CLI subcommands only exist on huggingface_hub>=1.0; a <1.0 floor
-    # lets a fresh resolve land on 0.36.x, whose `hf` entry point lacks those
-    # subcommands. >=1.0 also matches lerobot (huggingface-hub>=1.0.0) - and
-    # [wbc] is pulled into [all] alongside lerobot, so the two co-resolve.
-    "huggingface_hub>=1.0,<2.0.0",
+    # instructs `pip install -U "huggingface_hub>=1.5"` because the `hf buckets`/
+    # `hf sync` CLI subcommands first ship in huggingface_hub 1.5.0
+    # (huggingface_hub/cli/buckets.py, registered by cli/hf.py). Every earlier
+    # release installs an `hf` entry point WITHOUT them - 0.36.x, but also
+    # 1.0-1.4.x, which answer `hf buckets create` with
+    # "Error: No such command 'buckets'". A floor below 1.5 therefore lets a
+    # fresh resolve land on a CLI that cannot run a bucket sync while satisfying
+    # the documented minimum. lerobot floors it higher still
+    # (lerobot 0.6.1 requires huggingface-hub>=1.6.0) and [wbc] is pulled into
+    # [all] alongside lerobot, so the two co-resolve on the stricter of the two.
+    "huggingface_hub>=1.5,<2.0.0",
 ]
 motionbricks = [
     # MotionBricks (NVlabs/GR00T-WholeBodyControl `motionbricks/`) generative
@@ -486,6 +491,30 @@ conflicts = [
     [{ extra = "vera-sim" }, { extra = "molmoact2" }],
     [{ extra = "vera-sim" }, { extra = "all" }],
     [{ extra = "vera-sim" }, { extra = "benchmark-libero" }],
+]
+# SECURITY floors for transitive packages. Each of these arrives only through
+# another dependency (cbor2/ujson under autobahn, twisted under roslibpy,
+# pyopenssl under twisted), so nothing in [project] declares a version for
+# them and the resolver is free to pick any release the graph allows --
+# including one inside a HIGH advisory range. A constraint bounds a transitive
+# without claiming it as a direct dependency, and unlike an override it fails
+# the resolution loudly if something genuinely requires less, which is the
+# wanted behaviour for a security floor.
+#
+# Each floor is the first version that clears every HIGH/CRITICAL advisory for
+# that package, not the version currently resolved: the floor states the
+# requirement, so it stays correct as the resolution moves.
+constraint-dependencies = [
+    # GHSA-3c37-wwvx-h642 (HIGH): uncontrolled recursion DoS in cbor2.loads, <= 5.8.0.
+    "cbor2>=5.9.0",
+    # GHSA-grgv-6hw6-v9g4 (HIGH): twisted.names DNS compression-pointer DoS,
+    # <= 25.5.0. First patched in 26.4.0rc2; 26.4.0 is the first stable release
+    # that clears it, and a floor at the rc would admit a prerelease.
+    "twisted>=26.4.0",
+    # GHSA-c38f-wx89-p2xg (HIGH): memory leak in ujson.dump() on write failure, <= 5.12.0.
+    "ujson>=5.12.1",
+    # GHSA-5pwr-322w-8jr4 (HIGH): DTLS cookie-callback buffer overflow, >= 22.0.0 < 26.0.0.
+    "pyopenssl>=26.0.0",
 ]
 override-dependencies = [
     # SECURITY: diffusers <0.36 is vulnerable to a GHSA trust_remote_code bypass

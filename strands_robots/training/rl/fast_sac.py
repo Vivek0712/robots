@@ -130,6 +130,8 @@ class FastSacTrainer(BaseRLAlgo):
     def validate(self, spec: TrainSpec) -> list[str]:
         """Preflight an :class:`RLTrainSpec` for a FastSAC run (pure / read-only)."""
         problems = self._security_problems(spec)
+        problems.extend(self._learning_rate_problems(spec))
+        problems.extend(self._seed_problems(spec))
         if not isinstance(spec, RLTrainSpec):
             problems.append(f"fast_sac requires an RLTrainSpec, got {type(spec).__name__}")
             return problems
@@ -137,6 +139,13 @@ class FastSacTrainer(BaseRLAlgo):
             problems.append("env_factory is required (a zero-arg callable returning a SimEnv)")
         if not spec.output_dir:
             problems.append("output_dir is required")
+        # gamma discounts the return this backend optimizes; the arithmetic that
+        # consumes it never judges it, so the shared interval domain does.
+        problems.extend(self._discount_factor_problems(spec))
+        # alpha_lr is a second learning rate on a second optimizer: the actor
+        # and critics take spec.learning_rate, the entropy temperature takes
+        # this one, and only the first is covered above.
+        problems.extend(self._temperature_learning_rate_problems(spec))
         if spec.total_timesteps <= 0:
             problems.append(f"total_timesteps must be > 0, got {spec.total_timesteps}")
         if spec.rollout_steps <= 0:

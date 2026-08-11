@@ -401,7 +401,8 @@ def build_train_command(
         ValueError: if ``lora`` and ``train_expert_only`` are both set (both
             freeze the VLM and are mutually exclusive), if ``train_expert_only``
             is requested for a non-expert policy, if ``num_gpus < 1``, or if a
-            supplied ``steps`` / ``batch_size`` is not a positive integer.
+            supplied ``steps`` / ``batch_size`` - or, under ``lora``, a supplied
+            ``lora_r`` / ``lora_alpha`` - is not a positive integer.
     """
     if lora and train_expert_only:
         raise ValueError(
@@ -501,6 +502,17 @@ def build_train_command(
 
     if lora:
         cmd.append("--peft.method_type=LORA")
+        # The adapter's rank and scaling numerator, on the same shared count
+        # domain as the run-size knobs above. peft judges only the rank, and only
+        # from inside get_peft_model once the base model is loaded; lora_alpha is
+        # a bare numerator nothing compares, so alpha=0 trains an adapter whose
+        # scaling is 0.0 and which cannot change the model's output. Only checked
+        # under `lora`, since neither flag is emitted otherwise.
+        for lora_param, lora_value in (("lora_r", lora_r), ("lora_alpha", lora_alpha)):
+            if lora_value is not None:
+                lora_error = positive_count_error(lora_value, lora_param, "lerobot_train")
+                if lora_error:
+                    raise ValueError(lora_error)
         if lora_r is not None:
             cmd.append(f"--peft.r={lora_r}")
         if lora_alpha is not None:
@@ -509,8 +521,14 @@ def build_train_command(
             cmd.append(f"--peft.target_modules={lora_target_modules}")
 
     if val_episodes is not None:
-        if val_episodes <= 0:
-            raise ValueError(f"val_episodes must be positive, got {val_episodes}")
+        # The same shared count domain the trainer's validate() applies, rather
+        # than a local `<= 0` test: that comparison reads True as a silent
+        # request for one episode, lets 2.7 through to a fraction that reserves
+        # a different whole number, renders nan as `eval_split=nan`, and raises
+        # out of itself for a string.
+        count_err = positive_count_error(val_episodes, "val_episodes", "lerobot_train")
+        if count_err:
+            raise ValueError(count_err)
         total = _read_total_episodes(dataset_root)
         if val_episodes >= total:
             raise ValueError(
@@ -630,8 +648,9 @@ def lerobot_train(
         lora_target_modules: PEFT target module spec (e.g. "all-linear").
         train_expert_only: Freeze the VLM, train only the action expert
             (policies exposing train_expert_only: pi0/pi05/smolvla).
-        val_episodes: Reserve the LAST N episodes as a held-out validation
-            split, evaluated every ``save_freq`` steps so each checkpoint has
+        val_episodes: A positive integer below the dataset's episode count, or
+            None for no held-out set. Reserves the LAST N episodes as a held-out
+            validation split, evaluated every ``save_freq`` steps so each checkpoint has
             a validation loss beside it.
         num_gpus: Number of GPUs; >1 launches via accelerate --multi_gpu.
         push_to_hub: Push the trained checkpoint to the HF Hub at the end.

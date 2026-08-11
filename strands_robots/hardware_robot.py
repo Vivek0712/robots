@@ -37,7 +37,13 @@ from strands.types._events import ToolResultEvent
 from strands.types.tools import ToolResult, ToolSpec, ToolUse
 
 from strands_robots.teleop_mixin import TeleopMixin
-from strands_robots.utils import positive_count_error, positive_finite_number_error, require_optional
+from strands_robots.utils import (
+    dds_domain_id_error,
+    positive_count_error,
+    positive_finite_number_error,
+    require_optional,
+    tcp_port_error,
+)
 
 if TYPE_CHECKING:
     from lerobot.robots.config import RobotConfig
@@ -451,6 +457,8 @@ class Robot(TeleopMixin, AgentTool):
                 missing. Defaults to False - the robot never touches ROS 2,
                 so disabling the bridge is simply the default (opt-in).
             ros2_domain: ROS 2 domain id (``ROS_DOMAIN_ID``) to publish on.
+                Only an ``int`` in ``[0, 232]`` names a domain: RTPS derives its
+                discovery ports from it, and 233 lands past the end of the port space.
             ros2_commands: When True (default), the bridge also subscribes to
                 ``/<robot>/joint_command`` and forwards inbound messages to
                 ``send_action`` so an external ROS 2 stack can drive the real
@@ -667,6 +675,8 @@ class Robot(TeleopMixin, AgentTool):
         Args:
             ros2_bridge: Enable the ROS 2 bridge for this robot.
             ros2_domain: ROS 2 / DDS domain id to publish on.
+                Only an ``int`` in ``[0, 232]`` names a domain: RTPS derives its
+                discovery ports from it, and 233 lands past the end of the port space.
             ros2_commands: When True (default), also subscribe to
                 ``joint_command`` and drive the arm; False for read-only.
             ros2_transport: ``"rclpy"`` or ``"rtps"`` (see above).
@@ -679,13 +689,18 @@ class Robot(TeleopMixin, AgentTool):
                 layer, not by a config dict).
 
         Raises:
-            ValueError: If ``ros2_transport`` is not ``"rclpy"`` or ``"rtps"``;
+            ValueError: If ``ros2_domain`` is outside ``[0, 232]``; if
+                ``ros2_transport`` is not ``"rclpy"`` or ``"rtps"``;
                 if ``joint_limits`` / ``dds_security_config`` are supplied with
                 ``ros2_bridge=False``; or if ``dds_security_config`` is supplied
                 with ``ros2_transport="rclpy"``.
         """
         self._ros2_bridge_enabled = bool(ros2_bridge)
-        self._ros2_domain = int(ros2_domain)
+        # A domain id outside the RTPS port map cannot be published on by either
+        # transport, so refuse it here rather than letting it reach one of them.
+        if error := dds_domain_id_error(ros2_domain, "ros2_domain", type(self).__name__):
+            raise ValueError(error)
+        self._ros2_domain = ros2_domain
         self._ros2_transport = ros2_transport
         self._ros_bridge: Any = None
         if not self._ros2_bridge_enabled:
@@ -1121,7 +1136,13 @@ class Robot(TeleopMixin, AgentTool):
     async def _get_policy(
         self, policy_port: int | None = None, policy_host: str = "localhost", policy_provider: str = "groot"
     ) -> Policy:
-        """Create policy on-the-fly from invocation parameters."""
+        """Create policy on-the-fly from invocation parameters.
+
+        The public entry points refuse an unusable ``policy_port`` before the
+        arm is connected (:meth:`_policy_port_error`), so the falsy check below
+        is the floor for a direct call to this private helper rather than the
+        first place a caller's port is judged.
+        """
         from .policies import create_policy
 
         if not policy_port:
@@ -1355,7 +1376,9 @@ class Robot(TeleopMixin, AgentTool):
         ``duration`` / ``n_steps`` comes first. The two conditions are ANDed,
         so ``duration`` bounds the rollout even with a step cap - it is
         validated at every public entry point rather than only when it is the
-        sole horizon.
+        sole horizon. ``n_steps`` is validated there too: a cap the
+        ``step_count < n_steps`` comparison cannot be made against never
+        reaches this loop.
 
         Either way the policy's per-episode state is reset before the rollout,
         so a task never begins from the state the previous task left behind.
@@ -1572,6 +1595,110 @@ class Robot(TeleopMixin, AgentTool):
             return {"status": "error", "content": [{"text": error}]}
         return None
 
+    @staticmethod
+    def _n_steps_error(n_steps: Any, method: str) -> dict[str, Any] | None:
+        """Reject a task ``n_steps`` cap the control loop cannot count against.
+
+        ``n_steps`` is the optional step cap the loop compares the applied-action
+        count against (``n_steps is None or step_count < n_steps``), ANDed with
+        the wall-clock budget :meth:`_duration_error` bounds. ``None`` is the
+        documented "no cap" spelling and leaves ``duration`` the sole horizon;
+        every other value has to be a count that comparison can be made against.
+
+        A cap ``<= 0`` (and ``nan``, which is never ``<= 0`` but fails every
+        comparison it reaches) makes the condition false on its first
+        evaluation, so the task reported ``status="success"`` and "Policy
+        rollout completed: 0 steps" for a rollout that never queried the policy
+        and never commanded a servo - the same false ``completed`` an unusable
+        ``duration`` used to produce. ``inf`` is never false, so the requested
+        cap silently vanishes and the rollout runs to the ``duration`` budget
+        instead. ``True`` reads as a silent cap of one. A float cap applies a
+        count the caller never named: ``2.7`` stops after three applied
+        actions. A non-numeric cap reached the comparison intact and surfaced a
+        bare ``TypeError`` naming a comparison internal ("'<' not supported
+        between instances of 'int' and 'str'") rather than the parameter.
+
+        The accepted domain is
+        :func:`~strands_robots.utils.positive_count_error`, already shared with
+        this loop's ``action_horizon`` and with the simulation's ``run_policy``
+        step horizon, so the same cap cannot be refused for a digital twin and
+        accepted for the arm it mirrors.
+
+        Args:
+            n_steps: The caller-supplied cap to validate, or ``None`` for no cap.
+            method: Public entry point name, used to prefix the message.
+
+        Returns:
+            A tool-shaped error dict naming ``n_steps``, or ``None`` when the
+            cap can be honored (including when no cap was requested).
+        """
+        if n_steps is None:
+            return None
+        if error := positive_count_error(n_steps, "n_steps", method):
+            return {"status": "error", "content": [{"text": error}]}
+        return None
+
+    @staticmethod
+    def _policy_port_error(policy_port: Any, method: str) -> dict[str, Any] | None:
+        """Reject a ``policy_port`` no policy can be built from.
+
+        ``policy_port`` is the one caller-supplied value that decides whether a
+        policy exists at all: :meth:`_get_policy` hands it to
+        :func:`~strands_robots.policies.create_policy`, whose provider
+        constructor dials it. Every other rollout knob is checked before the
+        motors bus is claimed - see :meth:`_duration_error` and
+        :meth:`_n_steps_error`, whose call sites document why a budget "is
+        refused before the arm is commanded rather than after". This one was
+        read only inside :meth:`_execute_task_async`, *after*
+        :meth:`_connect_robot` had energized the arm, so a port that can never
+        build a policy still ran the whole bring-up window that method's own
+        comment describes as "a motors-bus handshake plus per-camera warmup -
+        seconds on a real arm". :meth:`start_task` additionally reported
+        ``status="success"`` and "Task started" for it, because the failure
+        surfaced on the executor thread with nobody left to tell.
+
+        ``None`` is the "not supplied" spelling and is refused here for the same
+        reason it is refused in :meth:`_get_policy`: without a pre-built
+        ``policy_object`` there is nothing to build a policy from. Every other
+        value is checked against
+        :func:`~strands_robots.utils.tcp_port_error`, the shared domain whose
+        docstring already names "the policy providers that dial one (``groot``,
+        ``moveit2``, ``cosmos3``, ``lerobot_async``, ``vera``)" - the very
+        providers this path forwards to - so the same port cannot be accepted by
+        the arm's task entry points and refused by the provider they hand it to.
+
+        That domain also names the value the caller supplied. A supplied-but-
+        unusable ``0`` / ``False`` used to be reported as
+        ``"policy_port is required for robot operation"``: falsy, so
+        :meth:`_get_policy` read it as absent and told the caller a port they
+        had passed was missing.
+
+        Args:
+            policy_port: The caller-supplied port to validate, or ``None`` when
+                none was supplied.
+            method: Public entry point name, used to prefix the message.
+
+        Returns:
+            A tool-shaped error dict naming ``policy_port``, or ``None`` when a
+            policy can be built from the value.
+        """
+        if policy_port is None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"{method}: policy_port is required to build a policy "
+                            "(pass the port of the policy server, or use run_policy "
+                            "with a pre-built policy_object)."
+                        )
+                    }
+                ],
+            }
+        if error := tcp_port_error(policy_port, "policy_port", method):
+            return {"status": "error", "content": [{"text": error}]}
+        return None
+
     def _shutdown_error(self, method: str) -> dict[str, Any] | None:
         """Refuse a rollout on a robot whose ``cleanup()`` has already run.
 
@@ -1688,9 +1815,26 @@ class Robot(TeleopMixin, AgentTool):
         """Execute task synchronously in thread - no new event loop.
 
         This is the chokepoint the agent-tool ``execute`` action and the mesh
-        ``execute`` dispatch reach directly, so it both validates the
-        peer-supplied budget and claims the motors bus before the arm is
-        commanded.
+        ``execute`` dispatch reach directly, so it validates the peer-supplied
+        budget and the policy endpoint, then claims the motors bus, all before
+        the arm is commanded.
+
+        Args:
+            instruction: Natural-language instruction passed to the policy.
+            policy_port: Port of the policy server to query. Required unless
+                ``policy_object`` is given, and validated on the shared
+                :func:`~strands_robots.utils.tcp_port_error` domain before the
+                arm is connected - see :meth:`_policy_port_error`.
+            policy_host: Host of the policy server.
+            policy_provider: Provider name used to build the policy.
+            duration: Wall-clock budget in seconds; positive and finite.
+            policy_object: A pre-built policy. When given, the provider/port
+                pair is not read and ``policy_port`` is not validated.
+            n_steps: Optional cap on applied actions; ``None`` for no cap.
+
+        Returns:
+            Tool-shaped result for the finished rollout, or an error naming the
+            offending parameter.
         """
         # Validated here as well as at the public methods below: a peer-supplied
         # budget is refused before the arm is commanded rather than after. The
@@ -1699,6 +1843,15 @@ class Robot(TeleopMixin, AgentTool):
         if err := self._shutdown_error("execute_task"):
             return err
         if err := self._duration_error(duration, "execute_task"):
+            return err
+        if err := self._n_steps_error(n_steps, "execute_task"):
+            return err
+        # Same reasoning one parameter over: a port no policy can be built from
+        # is refused before the arm is connected rather than after. Gated on
+        # ``policy_object``, because a pre-built policy makes the port inert -
+        # ``_execute_task_async`` never reads it on that path - and refusing a
+        # value the call ignores would be a false rejection.
+        if policy_object is None and (err := self._policy_port_error(policy_port, "execute_task")):
             return err
         if err := self._claim_task(instruction):
             return err
@@ -1818,7 +1971,13 @@ class Robot(TeleopMixin, AgentTool):
 
         Args:
             instruction: Natural-language instruction passed to the policy.
-            policy_port: Port of the policy server to query.
+            policy_port: Port of the policy server to query. Required: this
+                entry point takes no pre-built policy, so the port is the only
+                thing a policy can be built from. Validated on the shared
+                :func:`~strands_robots.utils.tcp_port_error` domain before the
+                task is submitted, so a port no policy can be built from is
+                reported here instead of as a started task that connects the
+                arm and then fails on the executor thread.
             policy_host: Host of the policy server.
             policy_provider: Provider name used to build the policy.
             duration: Wall-clock budget in seconds. Must be positive and
@@ -1846,6 +2005,13 @@ class Robot(TeleopMixin, AgentTool):
         if err := self._shutdown_error("start_task"):
             return err
         if err := self._duration_error(duration, "start_task"):
+            return err
+        # Unconditional here, unlike ``_execute_task_sync``: this entry point
+        # takes no ``policy_object``, so the port is always the only thing a
+        # policy can be built from. Pre-fix every unusable value returned
+        # "Task started" and failed on the executor thread after the arm was
+        # already connected.
+        if err := self._policy_port_error(policy_port, "start_task"):
             return err
 
         # Claim the bus here, not on the executor thread: this method returns
@@ -1931,7 +2097,13 @@ class Robot(TeleopMixin, AgentTool):
                 commanded nothing.
             n_steps: Optional cap on applied actions (mirrors the sim
                 ``run_policy`` parameter); the loop stops at whichever of
-                ``duration`` / ``n_steps`` comes first.
+                ``duration`` / ``n_steps`` comes first. ``None`` (the
+                default) requests no cap and leaves ``duration`` the sole
+                horizon. Any other value must be a positive integer, the
+                domain the sim horizon and this loop's ``action_horizon``
+                already share: the loop bounds the rollout by
+                ``step_count < n_steps``, so a cap it cannot count against
+                is refused rather than spent on the arm.
 
         Returns:
             Tool-shaped result: a text summary plus a ``{"json": ...}`` block
@@ -1947,6 +2119,8 @@ class Robot(TeleopMixin, AgentTool):
         if err := self._shutdown_error("run_policy"):
             return err
         if err := self._duration_error(duration, "run_policy"):
+            return err
+        if err := self._n_steps_error(n_steps, "run_policy"):
             return err
         if err := self._claim_task(instruction):
             return err

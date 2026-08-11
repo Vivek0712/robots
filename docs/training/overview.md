@@ -30,7 +30,7 @@ and a single `--policy.type` flag can't express them:
 
 | Provider | Upstream entry point | Config surface | Launcher | HW floor |
 |----------|---------------------|----------------|----------|----------|
-| `lerobot_local` | `lerobot.scripts.lerobot_train` | draccus `--dotted.flags` | `python` / `accelerate launch` | 1 consumer GPU |
+| `lerobot_local` | `lerobot.scripts.lerobot_train` | draccus `--dotted.flags` | `python` / `accelerate launch` | CPU for a toy run; 1 consumer GPU in practice |
 | `groot` | Isaac-GR00T `launch_finetune.py` | `FinetuneConfig` (tyro) + `tune_*` flags | `python` / `torchrun` | 1 modern GPU |
 | `cosmos3` | `cosmos_framework.scripts.train` | TOML recipe + Hydra overrides; **DCP convert** + **safetensors export** | `torchrun` (HSDP) | 8×H100 80GB |
 
@@ -96,8 +96,9 @@ supports and **ignores the rest** (the same tolerance rule as
 | `steps` / `global_batch_size` | the run size: optimizer steps x batch | each must be a positive integer; `validate()` refuses `0`, a fractional or non-finite value, and a `bool` (`True` would read as a silent one-step run) before anything is loaded |
 | `method` | `full` \| `lora` \| `expert_only` \| `frozen_backbone` | `lora`+`expert_only` are mutually exclusive |
 | `tune` | `{llm,visual,projector,diffusion}` | GR00T only |
-| `val_episodes` | hold out the LAST N episodes | deterministic split |
+| `val_episodes` | hold out the LAST N episodes | deterministic split; must be a positive integer below the dataset's episode count. `validate()` refuses `0` or a negative (they produced no split and no eval cadence at all - the run trained on everything and logged no validation loss), a `bool`, and a fractional value (`2.7` reserved 3 episodes, `0.5` reserved none while still evaluating) |
 | `num_gpus` / `num_nodes` | multi-GPU / multi-node | selects the launcher |
+| `seed` | reproducibility seed | must be a non-negative integer; `validate()` refuses a negative (`torch.manual_seed` would take it modulo `2**64`, so `-1` silently becomes `2**64 - 1`), a fractional or non-finite value, and a `bool`. `None` uses the backend's own default |
 | `extra["policy_type"]` | lerobot `--policy.type` | act/diffusion/smolvla/pi0/pi05/... |
 | `extra["groot_root"]` | Isaac-GR00T checkout | GR00T |
 | `extra["sft_toml"]` / `extra["cosmos_root"]` | recipe + checkout | Cosmos |
@@ -327,15 +328,34 @@ TrainSpec(..., num_gpus=8,
 
 ## Dependencies & extras (per provider)
 
-The base `strands-robots[lerobot]` extra is enough for **ACT / diffusion from
-scratch**, but VLA post-tunes pull in policy-specific stacks. Install the extra
-that matches your `extra["policy_type"]` / provider — verified on an L40S GPU:
+**Every `lerobot_local` row below also needs `lerobot[training]`, on CPU as well
+as GPU.** LeRobot's `train()` calls
+`require_package("accelerate", extra="training")` *before* it branches on
+device, so "no GPU" does not mean "no extra" - and nothing on this path pulls
+`accelerate` in: the `[lerobot]` extra is exactly `lerobot[feetech,dataset]`, and
+the only `strands-robots` extra that declares `accelerate` is
+`cosmos3-diffusers`, a different provider.
+
+```bash
+pip install "lerobot[training]"
+```
+
+`train()` reports the missing package in its `TrainResult` rather than raising,
+so check `result.status` and surface `result.message` - it carries LeRobot's own
+install remedy. An unchecked call hands whatever consumes `checkpoint_dir` a
+`None` instead.
+
+The base `strands-robots[lerobot]` extra covers **recording, streaming, and
+loading a trained checkpoint**, and with `lerobot[training]` it covers **ACT /
+diffusion from scratch**; VLA post-tunes pull in policy-specific stacks on top.
+Install the extra that matches your `extra["policy_type"]` / provider — verified
+on an L40S GPU:
 
 | Provider / policy | Install | Notes |
 |---|---|---|
-| `lerobot_local` + ACT / diffusion | `pip install 'strands-robots[lerobot]'` | works out of the box (torch + torchcodec + datasets) |
-| `lerobot_local` + `smolvla` | `pip install 'strands-robots[lerobot]' 'lerobot[smolvla]'` | lerobot 0.6's `[smolvla]` extra layers `transformers>=5.4.0,<5.6.0` + num2words on top. Do **not** pin `transformers==5.3.0` - it conflicts with lerobot 0.6's transformers floor. |
-| `lerobot_local` + `pi0` / `pi05` | `pip install 'strands-robots[lerobot]' 'lerobot[pi]'` | lerobot 0.6's `[pi]` extra (same `transformers>=5.4.0,<5.6.0` range + scipy) |
+| `lerobot_local` + ACT / diffusion | `pip install 'strands-robots[lerobot]' 'lerobot[training]'` | `[lerobot]` supplies torch + torchcodec + datasets; it does **not** supply `accelerate` |
+| `lerobot_local` + `smolvla` | `pip install 'strands-robots[lerobot]' 'lerobot[training]' 'lerobot[smolvla]'` | lerobot 0.6's `[smolvla]` extra layers `transformers>=5.4.0,<5.6.0` + num2words on top. Do **not** pin `transformers==5.3.0` - it conflicts with lerobot 0.6's transformers floor. |
+| `lerobot_local` + `pi0` / `pi05` | `pip install 'strands-robots[lerobot]' 'lerobot[training]' 'lerobot[pi]'` | lerobot 0.6's `[pi]` extra (same `transformers>=5.4.0,<5.6.0` range + scipy) |
 | `groot` | Isaac-GR00T checkout + its own venv (`omegaconf`, `tyro`, …); point `extra["groot_root"]` / `GR00T_ROOT` at it | launched as a subprocess, so it uses GR00T's interpreter, not ours |
 | `cosmos3` | cosmos-framework checkout (`uv sync --group=cu130-train`); point `extra["cosmos_root"]` / `COSMOS_ROOT` at it | torchrun-driven; same subprocess-interpreter rule |
 
