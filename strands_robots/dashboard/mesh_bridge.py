@@ -18,13 +18,117 @@ from typing import Any, cast
 
 from strands_robots.dashboard import safety_state
 from strands_robots.mesh._zenoh_config import cmd_bytes_cap as _cmd_bytes_cap
+from strands_robots.utils import finite_number_error
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: str) -> float:
+    """Read an operator-tunable float out of the environment.
+
+    Every knob below is resolved once, at import, from a string an operator
+    typed, and ``float()`` accepts far more than a knob can honor: it raises on
+    a typo, and it returns ``nan`` for ``"nan"`` and ``inf`` for both ``"inf"``
+    and an overflowing ``"1e999"``. A bare coercion therefore has two failure
+    modes, and neither is reported. A typo raises ``ValueError`` while the
+    module body is executing, so the dashboard's mesh bridge does not fail to
+    read one knob - it fails to import, with a traceback that names ``float``
+    rather than the variable. A non-finite value is worse for being accepted:
+    it reaches a comparison as one side of a bound and removes the bound
+    instead of widening it. ``PEER_TTL_S`` is compared as ``age > ttl``, which
+    is ``False`` for every age against ``nan`` and against ``inf``, so a robot
+    that left the fleet is never aged out of the snapshot; each
+    :data:`COALESCE_HZ` rate becomes a period through ``1.0 / hz``, and no
+    elapsed span is under ``nan`` or under the ``0.0`` an ``inf`` rate yields,
+    so the repeat ceiling that rate names never applies.
+
+    Finiteness is decided by the shared numeric domain
+    (:func:`~strands_robots.utils.finite_number_error`) rather than left to a
+    comparison, which cannot express it: ``inf > 0`` is ``True``, so a
+    positivity floor admits ``inf``, ``Infinity`` and ``1e999`` as resolved
+    knobs and refuses ``nan`` only incidentally, because ``nan > 0`` is
+    ``False``. This is the rule
+    :func:`~strands_robots.simulation.isaac.simulation._env_float` and
+    :func:`~strands_robots.mesh.core._parse_positive_float_env` already state
+    and apply for the same kind of operator input, and every rejection is
+    reported for the reason those two report theirs: substituting the default
+    in silence leaves the operator's model of the knob wrong with nothing to
+    correct it against.
+
+    No floor is applied, deliberately, and for the reason
+    :func:`~strands_robots.mesh.core._parse_positive_float_env` gives: what a
+    zero means differs per knob, so it belongs to the consumer rather than to
+    this domain. Both consumers here already decide it - ``prune_peers`` treats
+    a non-positive ``ttl`` as "never prune" and
+    :meth:`EventCoalescer.allow` treats a non-positive rate as "no ceiling".
+
+    Args:
+        name: Environment variable to read. Unset, blank or unusable falls back.
+        default: Value applied when the variable names no usable number, held as
+            the string it would have been read from so the log names what the
+            fallback was.
+
+    Returns:
+        The override when it is a usable finite number, else ``default``.
+    """
+    raw = os.getenv(name, default)
+    if raw.strip() == "":
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a number; using %r", name, raw, default)
+        return float(default)
+    reason = finite_number_error(value, name, "dashboard mesh bridge")
+    if reason is not None:
+        logger.warning("%s; using %r", reason, default)
+        return float(default)
+    return value
+
+
+def _resolve_mesh_camera_hz() -> float:
+    """Resolve the camera publish rate ``STRANDS_MESH_CAMERA_HZ`` names.
+
+    This is not the dashboard's knob. ``STRANDS_MESH_CAMERA_HZ`` is the mesh's,
+    read by :meth:`~strands_robots.mesh.core.Mesh._resolve_camera_hz` to
+    decide whether the camera loop runs at all, and the dashboard is the surface
+    that *writes* it: the settings panel holds ``camera_hz``, and
+    :func:`~strands_robots.dashboard.settings.apply_mesh_env` pushes it into the
+    environment the mesh peers then read. Reporting it back through a second,
+    looser reading closed that loop onto a value nothing publishes at - an
+    operator typing a rate the mesh refuses saw it echoed as the live one, on
+    the same panel they had typed it into.
+
+    So the question is asked of the mesh's own owner,
+    :func:`~strands_robots.mesh.session.hz_from_env`, and the fallback mirrors
+    the publisher's documented one: unset takes the
+    :data:`~strands_robots.mesh.session.CAMERA_HZ` default, and non-positive or
+    unusable is ``0.0``, camera publishing off. Frames are large, so an
+    unusable override disables the loop rather than substituting a rate the
+    operator did not ask for, and this surface has to say the same. The two
+    answers are held equal across every spelling an operator can type, which is
+    the invariant to keep: whatever this returns has to be what the camera loop
+    resolves, so it is asked of the loop's own resolver rather than re-derived.
+
+    Returns:
+        The rate the mesh camera loop resolves for this host, in Hz, with
+        ``0.0`` meaning camera publishing is off.
+    """
+    from strands_robots.mesh.session import CAMERA_HZ, hz_from_env
+
+    hz, reason = hz_from_env("STRANDS_MESH_CAMERA_HZ")
+    if reason is not None:
+        logger.warning("%s; camera publishing off", reason)
+        return 0.0
+    if hz is None:
+        hz = CAMERA_HZ
+    return hz if hz > 0 else 0.0
+
 
 PEER_STALE_S = 15.0  # presence heartbeat timeout before a card greys out
 
 # : How long a peer may stay quiet before it is dropped from the fleet snapshot : entirely.
-PEER_TTL_S = float(os.getenv("STRANDS_DASHBOARD_PEER_TTL_S", "300"))
+PEER_TTL_S = _env_float("STRANDS_DASHBOARD_PEER_TTL_S", "300")
 
 
 def prune_peers(
@@ -52,7 +156,7 @@ def prune_peers(
 # larger is dropped pre-deserialise and the sender only ever sees a : timeout, so we check
 # before publishing and return a real error instead.
 # One parser, the SDK's: this was a hand copy of the default (16*1024) that
-# would silently diverge the day _zenoh_config changes DEFAULT_MAX_CMD_BYTES —
+# would silently diverge the day _zenoh_config changes DEFAULT_MAX_CMD_BYTES -
 # the pre-publish check here MUST agree with the transport's drop filter or a
 # command passes the check and vanishes into the documented timeout anyway.
 # cmd_bytes_cap() also refuses a garbage env value with an actionable message.
@@ -273,20 +377,20 @@ def stop_outcome(response: dict[str, Any] | None) -> dict[str, Any]:
 
 # : Per-type ceiling on UNCHANGED repeats, in Hz.
 COALESCE_HZ: dict[str, float] = {
-    "presence": float(os.getenv("STRANDS_DASHBOARD_PRESENCE_HZ", "1.0")),
-    "camera_meta": float(os.getenv("STRANDS_DASHBOARD_CAMERA_META_HZ", "2.0")),
+    "presence": _env_float("STRANDS_DASHBOARD_PRESENCE_HZ", "1.0"),
+    "camera_meta": _env_float("STRANDS_DASHBOARD_CAMERA_META_HZ", "2.0"),
     # The SensorLoops rates these mirror are pose/imu/odom 10 Hz each and lidar
     # summary 5 Hz, so one rover publishing all of them is ~36 events/s -- the
     # order of the 34.7 Hz for a single arm this coalescer was built for. A
     # CHANGED reading is never delayed, so a moving robot still streams; the
     # rate is the floor for a repeat that says nothing new.
-    "pose": float(os.getenv("STRANDS_DASHBOARD_POSE_HZ", "1.0")),
-    "imu": float(os.getenv("STRANDS_DASHBOARD_IMU_HZ", "1.0")),
-    "odom": float(os.getenv("STRANDS_DASHBOARD_ODOM_HZ", "1.0")),
-    "lidar": float(os.getenv("STRANDS_DASHBOARD_LIDAR_HZ", "1.0")),
+    "pose": _env_float("STRANDS_DASHBOARD_POSE_HZ", "1.0"),
+    "imu": _env_float("STRANDS_DASHBOARD_IMU_HZ", "1.0"),
+    "odom": _env_float("STRANDS_DASHBOARD_ODOM_HZ", "1.0"),
+    "lidar": _env_float("STRANDS_DASHBOARD_LIDAR_HZ", "1.0"),
     # Health already publishes at 0.5 Hz upstream; the floor matches it rather
     # than inventing a slower one.
-    "health": float(os.getenv("STRANDS_DASHBOARD_HEALTH_HZ", "0.5")),
+    "health": _env_float("STRANDS_DASHBOARD_HEALTH_HZ", "0.5"),
 }
 
 #: Fields that tick on their own and therefore say nothing about whether the
@@ -346,6 +450,19 @@ class EventCoalescer:
         return (event.get("type"), event.get("peer_id"), event.get("cam"), event.get("kind"))
 
     def allow(self, event: dict, now: float) -> bool:
+        """Has enough time passed to forward an UNCHANGED repeat of *event*?
+
+        Args:
+            event: The event to decide about.
+            now: Reading of a MONOTONIC clock. What is compared is ``now`` minus
+                the previous reading against ``1.0 / hz``, an elapsed span, so a
+                clock that can be stepped moves the decision by the size of the
+                step rather than by the time that passed.
+
+        Returns:
+            ``True`` when the event is new, changed, or carries no rate, and when
+            its rate is non-positive - which every consumer reads as "no ceiling".
+        """
         hz = self.rates.get(event.get("type") or "")
         if not hz or hz <= 0:
             self.forwarded += 1
@@ -538,7 +655,6 @@ class MeshBridge:
         from strands_robots.dashboard import settings
 
         local_dev = os.getenv("STRANDS_MESH_LOCAL_DEV", "") not in ("", "0", "false")
-        camera_hz = os.getenv("STRANDS_MESH_CAMERA_HZ")
         info = {
             **self._endpoints,
             "online": self._running,
@@ -550,7 +666,7 @@ class MeshBridge:
             # _build_config logs "WIRE SECURITY DISABLED". Surface it so a lab
             # posture can't be mistaken for a secured one.
             "wire_security": "DISABLED (local dev)" if local_dev else self._endpoints.get("auth_mode"),
-            "camera_hz": float(camera_hz) if camera_hz else 0.0,
+            "camera_hz": _resolve_mesh_camera_hz(),
             "settings": settings.load()["mesh"],
             "multicast": os.getenv("STRANDS_MESH_MULTICAST", ""),
             "max_cmd_bytes": MAX_CMD_BYTES,
@@ -622,9 +738,12 @@ class MeshBridge:
         if loop is None or loop.is_closed():
             return
         # Coalesce BEFORE fan-out: one decision serves every client, and the
-        # serialization it avoids is per-client.
+        # serialization it avoids is per-client. On the monotonic clock, because
+        # what the coalescer compares is an elapsed span against a period: an NTP
+        # step moves a wall-clock span by the size of the step, which either
+        # suppresses a reading that was due or forwards one the rate had capped.
         with self._coalesce_lock:
-            if not self._coalescer.allow(event, time.time()):
+            if not self._coalescer.allow(event, time.monotonic()):
                 return
         with self._queues_lock:
             queues = list(self._queues)
@@ -835,7 +954,7 @@ class MeshBridge:
             # Without it, any ACL-authorised peer observing a turn_id could
             # answer someone else's pending turn and have its result taken
             # for the target's. Legacy peers that omit responder_id are
-            # rejected the same way — an absent identity is not a match.
+            # rejected the same way - an absent identity is not a match.
             expected = self._expected_responders.get(turn)
             if expected is not None and responder != expected:
                 logger.warning(
@@ -963,7 +1082,7 @@ class MeshBridge:
             return {"error": "mesh offline", "ok": False}
         # Mesh.send parity, missing from this clone until now (§2.1):
         # target sanity + client-side validate_command. Receiver-side
-        # _exec_cmd still validates — this turns "the peer refused it" (a
+        # _exec_cmd still validates - this turns "the peer refused it" (a
         # timeout or opaque error narrated as a robot fault) into a
         # structured local error naming the actual defect.
         if not isinstance(target, str) or not target:
