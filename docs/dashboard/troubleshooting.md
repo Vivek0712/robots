@@ -183,6 +183,13 @@ brute-force throttled; the code itself never crosses the wire. Every peer must
 share the same `STRANDS_MESH_OVERRIDE_CODE`, or each one stays locked until its
 process restarts.
 
+If the answer names `STRANDS_MESH=false` rather than the code, the override is
+not the problem: the kill switch is set, so there is no signed rail to resume
+over and none was opened. Clear the switch to use the signed rail, or clear the
+lockout on each peer directly. Both signed verbs report the switch by name
+rather than as a fault, so "safety mesh unavailable" from either one means the
+rail was allowed and would not start.
+
 ## Tests
 
 **`ModuleNotFoundError: No module named 'psutil'` / `'msgpack'` during pytest

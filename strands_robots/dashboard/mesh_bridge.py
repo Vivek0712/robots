@@ -1010,24 +1010,35 @@ class MeshBridge:
                 logger.warning("signed safety rail unavailable: %s", exc)
                 return None
 
+    def _rail_unavailable(self) -> dict[str, Any]:
+        """The one answer for "there is no signed rail", switch-aware.
+
+        "Switched off" and "broken" are different answers and an operator acts
+        on them differently: one is the switch they set, the other is a fault to
+        chase. Every rail verb answers through here so the two wordings have a
+        single owner. A second copy is exactly how the resume half came to
+        report a switched-off rail as a fault while the e-stop half reported it
+        correctly, 38 lines apart in this file -- and the operator reading
+        "unavailable" is sent to the two ``override_code`` causes the
+        troubleshooting sheet lists for a refused resume, neither of which is
+        the switch they set.
+        """
+        from strands_robots.mesh.core import mesh_disabled_by_env
+
+        return {
+            "signed": False,
+            "error": (
+                "signed safety rail disabled by STRANDS_MESH=false"
+                if mesh_disabled_by_env()
+                else "safety mesh unavailable"
+            ),
+        }
+
     def signed_estop(self) -> dict[str, Any]:
         """Fleet e-stop over the SIGNED rail."""
         m = self._safety_mesh()
         if m is None:
-            # "Switched off" and "broken" are different answers, and the sheet
-            # shows this string: an operator who set STRANDS_MESH=false chose
-            # to have no signed rail, and reading "unavailable" would send them
-            # hunting a fault instead of looking at the switch they set.
-            from strands_robots.mesh.core import mesh_disabled_by_env
-
-            return {
-                "signed": False,
-                "error": (
-                    "signed safety rail disabled by STRANDS_MESH=false"
-                    if mesh_disabled_by_env()
-                    else "safety mesh unavailable"
-                ),
-            }
+            return self._rail_unavailable()
         responses = m.emergency_stop()
         # Carried through rather than recomputed: _peers_that_did_not_stop
         # grades the four response shapes that report a stop which did NOT
@@ -1063,7 +1074,7 @@ class MeshBridge:
         """Clear the fleet lockout with the operator override code."""
         m = self._safety_mesh()
         if m is None:
-            return {"signed": False, "error": "safety mesh unavailable"}
+            return self._rail_unavailable()
         res = m._resume_lockout(override_code)
         return {"signed": True, "issuer": m.peer_id, **(res or {})}
 
