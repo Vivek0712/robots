@@ -383,7 +383,9 @@ hatch run format            # ruff check --fix, ruff format
    all of those resolve. The one shape that does not is a symbol imported from
    a module that only *re-exports* it: the import does not say which file the
    symbol came from, so it resolves to nothing rather than to a guess. Import
-   from the defining module.
+   from the defining module. A pin screens the whole tree for that shape and
+   names the module to import from, so a site that breaks the rule fails the
+   required check instead of dropping out of the roster unnoticed (#3273).
 3. Record the change as a news fragment: `changelog.d/<pr-number>-<slug>.md`
    (see [`changelog.d/README.md`](changelog.d/README.md)). **Never append to
    `## [Unreleased]` in `CHANGELOG.md` directly** - every branch inserts at the
@@ -986,6 +988,34 @@ hatch run format            # ruff check --fix, ruff format
      `require_last_push_approval` then disqualifies the pushing account from
      re-supplying it, turning a one-approval merge into one that needs a second
      reviewer.
+
+     **`CHANGES_REQUESTED` is a fourth reading, and it is the one no approval
+     answers.** A standing request for changes holds the merge until *its own
+     author* approves or dismisses it, so an approval from anybody else
+     satisfies `required_approving_review_count` and leaves the pull request
+     `BLOCKED`. That makes it the opposite of every other value here: the party
+     it needs is not "a reviewer" but one named account, and asking a different
+     reviewer for the approval spends a round that cannot merge anything.
+
+     It is also the reading a resolved thread hides. #3205 sat at
+     `CHANGES_REQUESTED` for 15h44m with its one review thread **resolved**,
+     `call-test-lint` `SUCCESS`, and `check_thread_is_answered.py` reading
+     `nothing-owed` -- 12h51m of that after the fix had landed. Thread
+     resolution and review decision are separate objects and resolving the
+     thread does not retract the review, so the sweep that answers "does this
+     owe me anything" correctly said no while the decision went on blocking.
+     Nor does the requester's own follow-up reply clear it: a reply is a
+     `COMMENTED` review, which expresses no position, so it supersedes nothing.
+
+     `check_merge_blockers.py` reports this as `changes-requested`, owed by
+     `the reviewer who requested changes` and named account by account, ahead of
+     the approval rules it is not answerable by. It did not always: it modelled
+     the approval side alone, so it reported #3205 as `missing-approval` owed by
+     "a reviewer other than the pusher" -- a party whose approval could not have
+     merged it, which is the #1905 presentation reached from the review-decision
+     side rather than the last-push side. If you are the requester and the work
+     has landed, the remedy is to supersede your own review; that is a review,
+     not a push, and it costs the branch nothing.
    - *And that the head it names is the branch's tip.* A pull request has three
      answers to "what is the head commit" and they can disagree for hours. Two
      of them are the API's, and are the pair this bullet compares: `headRefOid`
@@ -1280,14 +1310,17 @@ hatch run format            # ruff check --fix, ruff format
    It reads the branch ruleset - so a rule that is changed in settings cannot
    drift from this file - and names every rule the pull request leaves
    unsatisfied together with the party who can clear it: a conflict or an
-   unresolved thread or a failing check (the author), a missing approval (any
+   unresolved thread or a failing check (the author), a standing request for
+   changes (only the account that made it, by approving or dismissing its own
+   review -- no other reviewer's approval clears it), a missing approval (any
    reviewer), an approval only its own pusher supplied (a different reviewer,
    per #1905), a required check absent because a fork run is held at
    `action_required` (a maintainer, by approving each run), a required check
    absent because the head carries no check suite at all (also a maintainer,
    but by closing and reopening: there is no held run to approve and no
    suite to re-run), a check still running (nobody), a
-   mergeability GitHub has not finished computing (nobody, until a re-read), or
+   mergeability GitHub has not finished computing (nobody, until a re-read), a
+   pull request that has already merged (nobody, terminally), or
    no unsatisfied rule at all, which is the #2574 case and the one worth saying
    out loud. A conflict, a draft, or an uncomputed mergeability is reported as
    *gating*: the rules behind it cannot be assessed, so an approval there is
@@ -1301,6 +1334,18 @@ hatch run format            # ruff check --fix, ruff format
    while it was in fact `CONFLICTING`/`DIRTY`, and an otherwise-satisfied pull
    request in the same state read `no-unsatisfied-rule`, whose printed remedy is
    to attempt the merge. Both are now `merge-state-unknown`. See #2585.
+
+   Read the null against `merged`, though, because "every open pull request" is
+   the whole of that claim. The pull request whose *own* merge invalidated the
+   value is not open, and for it the null never resolves: #2586 still read
+   `mergeable: null` / `mergeable_state: unknown` fourteen days after it
+   squashed. So a merged pull request reports `already-merged`, terminal and
+   ahead of every rule, rather than the re-read -- which on a closed pull request
+   describes a wait with no terminating condition, and reads in the reassuring
+   direction while a merge-and-verify cycle polls for an answer it already has.
+   A pull request closed *without* merging is a different reading again and does
+   not share the null: measured on #3194, it retains its last computed
+   `mergeable` (`true`/`blocked`). See #3231.
 
    It composes `check_last_push_approval.py` rather than restating it, so what
    counts as a current approval has one owner. Neither script gates a merge.
@@ -1923,6 +1968,28 @@ which side the enum is on.
   below the 100 ms threshold. Pinned on behaviour by
   `tests/tools/test_camera_durations_survive_a_clock_step.py`, which asserts what the tool
   reports across a step rather than which clock the source names.
+- **A process identity compared across processes is a duration too.** A pid does not name
+  a process - the kernel reuses the number - so a session record that outlives its run has
+  to carry the identity of the process it was written for, and `psutil.Process(pid)`
+  constructed to *ask* that question captures the identity it is being asked to check, so
+  `Process(pid).is_running()` cannot contradict a reused pid (measured: over 647 live pids
+  it never disagreed with `pid_exists`). What is recorded is the process's start offset
+  since boot, not its creation date: `create_time()` is the process's start ticks plus
+  `/proc/stat`'s btime, so a correction between the write and the read would make a live
+  session read as a stranger - and refusing to stop a training run that holds a GPU is
+  worse than the defect. Read the ticks from the kernel (`/proc/<pid>/stat` field 22 over
+  `SC_CLK_TCK`), **not** as `create_time() - boot_time()`: that subtraction puts the wall
+  clock on both sides and the two terms are not guaranteed to be one read of it. On psutil
+  at or before 7.0 the process side adds a btime cached at import while top-level
+  `boot_time()` deliberately re-reads `/proc/stat` ("we are not caching this because it is
+  subject to system clock updates"), so a step after the cache was populated moves the
+  result by the step size; on 7.2 the cache is gone and both re-read, narrowing the window
+  to a step landing between the two reads without closing it. Measured on this tree with
+  the two terms skewed by 10 s, the subtraction moved by exactly 10 s and a live session
+  mismatched its own record; the field-22 read moved by 0. Keep the subtraction only as the
+  non-procfs fallback, and say so where it is written. Pinned by
+  `tests/tools/test_session_running_verdict_names_its_own_process.py`, whose clock-step
+  cell asserts equality with the kernel value rather than a tolerance any spelling meets.
 - Pinned by `tests/test_expiry_gates_survive_a_clock_step.py` (a scan over the whole
   package, no exemption list), by `tests/tools/test_tool_wait_budgets_survive_a_clock_step.py`
   for the real `spin_for` behaviour, by
@@ -2052,6 +2119,18 @@ which side the enum is on.
   the remedy names the `robots=` that caller passed rather than the `names=` it never
   did. Pinned by `tests/test_asset_download_selection_domain.py`, whose controls pin the
   three tolerated spellings so the narrowing stays deliberate rather than incidental.
+- **A provider keyword is the same surface, and the erasure can happen before the read.**
+  `VeraPolicy(image_keys=...)` selects which of the observation's own image keys are
+  width-concatenated into the one frame the video planner acts on, and `[]` was stored as
+  `None` - so the selection was gone before the resolver ran, and a caller who excluded
+  every camera drove the arm from all of them, in a *wider* frame, under a success result.
+  Four sites spell one parameter there (shape guard, store, resolver, and the docstring
+  that documented `None` alone), and the guard being gated on a truthy value is what let
+  `""` widen too - it never reached the bare-string refusal it was already owed. Fix the
+  store and the resolver together: one alone leaves the other free to widen. Pinned by
+  `tests/policies/vera/test_vera_image_keys_selection_domain.py`, whose controls pin the
+  documented spellings under both handshake cases and the `action_mapping` carve-out one
+  line below, which is a rename map rather than a subset and is correct as it stands.
 - Pinned by `tests/test_teleop_device_selection_domain.py`, whose controls assert that the
   documented spellings (`names=None`, a real subset, `detach_teleop(None)`) are unchanged,
   and by the render path's `cameras` resolution, which has read the same kind of selector
@@ -2269,10 +2348,46 @@ Corrections from code review that apply to all future contributions:
   Rewriting the flagged code to satisfy the query is the tempting fourth option
   and the one that costs: #1879 spent a round removing a `__float__` from a test
   fixture for a finding that gated nothing. It can also destroy the measurement
-  the code exists for. On #1890 the query asked for a `LookupError`; the one it
-  names first, `IndexError`, is what CPython's `seqiter` *clears* to terminate
-  legacy-protocol iteration, so taking the suggestion would have left the fixture
-  raising nothing and the test asserting nothing, still green.
+  the code exists for - but *which* rewrite does that is a fact about the probe
+  rather than about the rule, and the short version of this reason has now been
+  read onto a shape it is false of.
+
+  For `__getitem__` the query asks for "`KeyError` or `IndexError`" by name, and
+  those two are not interchangeable. Each row below is constructed and executed by
+  `TestTheGetItemRewriteIsNotOneBehaviour` in
+  `tests/test_codeql_query_filters.py`, which reads this table rather than
+  restating it, so a row that stops being true fails there:
+
+  | probe, `__getitem__` raising | `list(probe)` | the raise is swallowed |
+  |---|---|---|
+  | `_LegacySequence` (`__len__` and `__getitem__`, no `__iter__`), `IndexError` | `[]` | **yes** - `seqiter` clears it to end the protocol |
+  | `_LegacySequence`, `KeyError` | `KeyError` | no - it propagates, as a `RuntimeError` does |
+  | `_HostileStr` (a `str` subclass), `IndexError` | `['[', ':', ':', '1', ']']` | no - `str` supplies `__iter__`, so `seqiter` is never built |
+
+  Row 1 is the #1890 reason: `IndexError` is what CPython's `seqiter` *clears* to
+  terminate the legacy iteration protocol, so the probe is consulted, raises, and
+  the read completes empty - a cell asserting a refusal is no longer measuring the
+  read that failed. Rows 2 and 3 are the two ways that reason does not travel.
+  `KeyError` satisfies the same query and is not cleared, so one spelling of the
+  suggestion keeps the measurement intact. And a `str` subclass supplies its own
+  `__iter__`, so `seqiter` is never constructed and `__getitem__` is not consulted
+  at all - the mechanism is absent rather than adverse. That third row is alert
+  1168 on #3272, where this reason was reached for and measured false (#3276).
+
+  `list(probe)` is the whole discriminator, so run it before citing a mechanism.
+  The 280-character dismissal comment cites this file instead of restating an
+  argument, which is what makes a wrong reason here expensive: it becomes a wrong
+  claim in a dismissal that outlives the branch.
+
+  Refuse the rewrite on the **property** instead, because that holds for every
+  probe shape. The query's own help text gives the harm as a user of the class
+  meeting an exception the protocol did not lead them to expect, and a probe
+  written to be an unconventional class *is* that harm, under test on purpose. A
+  conforming `LookupError` models a value refusing *within* the protocol, which is
+  strictly weaker than what a guarded read documents itself as surviving. Then
+  check the population before calling it convention rather than defect: on #3272
+  the same file raised `RuntimeError` from `__str__`, `__iter__` and `__repr__`
+  and none of the three was flagged.
 - **One alert class clears under none of the three, and the question that settles
   it is which thread you marshal onto.** `py/catch-base-exception` never fires on
   cleanup-and-reraise: the query accepts a handler that re-raises *lexically*, and
@@ -2368,6 +2483,55 @@ Corrections from code review that apply to all future contributions:
   that a record cannot split rather than the record's field layout, and keep the
   escape to `\r` and `\n`: these messages are read by a human diagnosing a
   binding, and a broader filter corrupts the diagnosis they exist for.
+- **`py/unused-import` does not read a string forward reference, so a
+  `TYPE_CHECKING` import consumed only by a `cast("X", ...)` is reported as
+  dead.** `cast`'s first argument is an ordinary runtime expression, so
+  `from __future__ import annotations` is not what makes it a string - the idiom
+  writes it as one, and a type checker resolves it against the module namespace,
+  which is where the `TYPE_CHECKING` block puts the name. The extractor reads
+  bare `Name` loads and a string carries none.
+
+  Do not answer the alert by reading it. Run the counterfactual - delete the
+  import and lint the file - because that is what separates the two cases, and
+  they need opposite actions:
+
+  | `ruff check` after deleting the import | meaning | action |
+  |---|---|---|
+  | `F821 Undefined name 'X'` at the cast | the import is the name's only binding, and load-bearing | dismiss as `false positive`, keep the import |
+  | clean | the name is bound at runtime too, so the import carries nothing | the alert is right: delete the import |
+
+  Measured on `strands_robots/training/rl/fast_td3.py` (alert 1160), where
+  `SimEnv` reaches nothing but `cast("SimEnv", self.env)`: `ruff` reports
+  `F821` at that line and `mypy` reports `Name "SimEnv" is not defined`
+  `[name-defined]`, both inside `call-test-lint / Test and Lint`. So the two
+  gates the repository actually runs refuse the edit the alert asks for, and the
+  remaining ways to take it anyway are a suppression or a runtime import - which
+  on that file also invites the `isinstance` narrow the comment above the cast
+  exists to refuse. Do not reach for the query filter either: the rule carries
+  live signal here, seven of its twelve alerts on `main` being open and
+  unadjudicated, and `tests/test_codeql_query_filters.py` pins that file at two
+  ids.
+
+  This is written down because the decision was already made once and did not
+  survive. Alert 599 was dismissed with this reasoning **32 minutes** after it
+  opened on 2026-07-02, and the reasoning went into the dismissal comment - 280
+  characters, in the Security tab, invisible from the tree. Two recurrences then
+  had nothing to point at:
+
+  | alert | site | cost before it was adjudicated |
+  |---|---|---|
+  | 599 | `tests/training/test_rl_truncation_bootstrap.py:27` | 32 minutes |
+  | 1138 | `tests/drivers/robotiq/test_robotiq_gripper_moves_over_modbus_tcp.py:24` | open on `main` for five days |
+  | 1160 | `strands_robots/training/rl/fast_td3.py:54` | a review thread held #3206 for twelve hours under `required_review_thread_resolution` |
+
+  A dismissal comment is a less durable home than the PR comment this file
+  already warns about, which is why the entry is here and not a fourth
+  dismissal. `tests/test_cast_string_imports_are_the_names_only_binding.py`
+  grades the boundary in the table above - it derives the sites from the tree
+  and refuses a `TYPE_CHECKING` import of a name the module also binds at
+  runtime, the one shape where this exemption would suppress a true finding and
+  the one direction `ruff` and `mypy` cannot report, since the cast string
+  resolves either way.
 - **Dependency Review hard-fails on high/critical CVEs in new deps.** If a PR
   needs a dep with a known critical CVE, the conversation is "do we need this
   dep" not "let's bypass the check."

@@ -71,6 +71,18 @@ is*, so the outcomes group that way rather than by severity:
     ``awaiting-first-review`` as passing: if the common case is a finding, the
     finding means nothing.
 
+    Which reviewer depends on a second fact. Where the branch carries
+    ``require_last_push_approval`` and the pusher is known, the pusher's own
+    approval would not count, so the party named is ``a reviewer other than the
+    pusher`` -- the same party ``pusher-only-approval`` names, one review round
+    earlier. Saying "any reviewer" there sends the round to an account that
+    cannot clear the rule and arrives at ``pusher-only-approval``, which needs
+    somebody else anyway; on a repository where one account pushes most heads
+    and reviews most pull requests, that account is the likeliest to be asked.
+    The outcome stays ``missing-approval`` either way: an unreviewed pull
+    request is still the ordinary state, so it must not start gating or
+    counting as a finding merely because the eligible set is narrower.
+
 ``pusher-only-approval``
     A reviewer **other than the pusher** owes it. Not re-derived here; see the
     sibling note below.
@@ -82,11 +94,25 @@ is*, so the outcomes group that way rather than by severity:
     Nobody, for now, and the same shape as the entry above one field over.
     ``mergeable`` is ``bool | None``: GitHub computes it on demand and returns
     null while it works, which is neither "conflicts" nor "merges cleanly". A
-    merge into the base invalidates it for every open pull request, so a sweep
+    merge into the base invalidates it for every *open* pull request, so a sweep
     run just after a merge is precisely when it is null. Reported as *gating*,
     because reading the null as clean is how a conflicted branch is reported as
     owed by a reviewer -- measured on #1035, which read
     ``pusher-only-approval`` while it was ``DIRTY``. Re-read to resolve it.
+
+    Scoped to an open pull request deliberately: the pull request whose own
+    merge invalidated the value is not open, and for it the null never resolves
+    at all. That case is ``already-merged`` below, not this one.
+
+``already-merged``
+    Nobody, terminally. A merged pull request is closed, so ``mergeable`` stays
+    null permanently -- measured on #2586, still ``null``/``unknown`` fourteen
+    days after it squashed -- and the re-read above describes a wait with no
+    terminating condition. Read from ``merged``, which the same response
+    already carries. Reported ahead of every rule and short-circuiting them:
+    once the change is on the base, "0 of 1 approvals" is not an unsatisfied
+    rule, it is a question about a closed pull request. Not a finding, because
+    there is nothing for an author-side pass to act on.
 
 ``required-check-cancelled``
     A **maintainer**, by re-running the run. A cancelled run is not a verdict
@@ -217,11 +243,13 @@ _approval = _load_sibling()
 current_approvers = _approval.current_approvers
 resolve_pusher = _approval.resolve_pusher
 resolve_reviews = _approval.resolve_reviews
+current_change_requesters = _approval.current_change_requesters
 
 
 # Outcome names. Ordered here the way they bind in practice, which is also the
 # order they are reported in: a conflict makes the approval question moot, and
 # an unresolved thread makes it moot for a different reason.
+ALREADY_MERGED = "already-merged"
 MERGE_CONFLICT = "merge-conflict"
 MERGE_STATE_UNKNOWN = "merge-state-unknown"
 DRAFT = "draft"
@@ -231,6 +259,7 @@ REQUIRED_CHECK_CANCELLED = "required-check-cancelled"
 REQUIRED_CHECK_ABSENT = "required-check-absent"
 CHECK_SUITE_ABSENT = "check-suite-absent"
 UNRESOLVED_THREADS = "unresolved-threads"
+CHANGES_REQUESTED = "changes-requested"
 MISSING_APPROVAL = "missing-approval"
 PUSHER_ONLY_APPROVAL = "pusher-only-approval"
 NO_UNSATISFIED_RULE = "no-unsatisfied-rule"
@@ -239,11 +268,13 @@ NO_UNSATISFIED_RULE = "no-unsatisfied-rule"
 AUTHOR = "the author"
 REVIEWER = "any reviewer"
 OTHER_REVIEWER = "a reviewer other than the pusher"
+REQUESTING_REVIEWER = "the reviewer who requested changes"
 MAINTAINER = "a maintainer"
 NOBODY = "nobody"
 ANYONE = "anyone, by attempting the merge"
 
 _OWED_BY: dict[str, str] = {
+    ALREADY_MERGED: NOBODY,
     MERGE_CONFLICT: AUTHOR,
     MERGE_STATE_UNKNOWN: NOBODY,
     DRAFT: AUTHOR,
@@ -253,6 +284,7 @@ _OWED_BY: dict[str, str] = {
     REQUIRED_CHECK_ABSENT: MAINTAINER,
     CHECK_SUITE_ABSENT: MAINTAINER,
     UNRESOLVED_THREADS: AUTHOR,
+    CHANGES_REQUESTED: REQUESTING_REVIEWER,
     MISSING_APPROVAL: REVIEWER,
     PUSHER_ONLY_APPROVAL: OTHER_REVIEWER,
     NO_UNSATISFIED_RULE: ANYONE,
@@ -271,6 +303,15 @@ _OWED_BY: dict[str, str] = {
 # action on a branch that turns out to be conflicted burns an approval, and
 # reporting it as necessary-but-not-sufficient costs one re-read (#2585).
 _GATING: frozenset[str] = frozenset({MERGE_CONFLICT, MERGE_STATE_UNKNOWN, DRAFT})
+
+# An outcome that answers the question rather than deferring it. Distinct from
+# gating: a gating blocker is one the rules below it wait on, and it clears. A
+# terminal one has nothing below it and never clears, so the remedy language
+# every other outcome carries -- re-read, re-run, attempt the merge -- is wrong
+# for it. Held as a set rather than checked at the two render sites because
+# ``primary`` and ``_next_action`` are handed blockers alone, and the module's
+# own rule is that precedence cannot be applied to one report and not the other.
+_TERMINAL: frozenset[str] = frozenset({ALREADY_MERGED})
 
 
 # The outcomes a scheduled author-side pass can act on without anyone else.
@@ -314,10 +355,19 @@ class Blocker:
     outcome: str
     rule: str
     detail: str
+    # The party is a function of the outcome for every outcome but one. An
+    # absent approval is owed by "any reviewer" only where any reviewer's
+    # approval would actually count, and under require_last_push_approval the
+    # pusher's would not -- a second fact, known to the evaluator and not
+    # recoverable from the outcome name. Carried per blocker rather than by
+    # splitting the outcome, because the outcome also decides gating, finding
+    # and exit status, and none of those change: an unreviewed pull request is
+    # still the ordinary state.
+    owed_by_override: str | None = None
 
     @property
     def owed_by(self) -> str:
-        return _OWED_BY.get(self.outcome, NOBODY)
+        return self.owed_by_override or _OWED_BY.get(self.outcome, NOBODY)
 
     @property
     def is_finding(self) -> bool:
@@ -327,6 +377,15 @@ class Blocker:
     def is_gating(self) -> bool:
         """Whether the rules after this one cannot be assessed until it clears."""
         return self.outcome in _GATING
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether this answers the question rather than deferring it.
+
+        A terminal outcome is not waiting on a person, a clock or a later read,
+        so it takes precedence over every other and must not carry a remedy.
+        """
+        return self.outcome in _TERMINAL
 
 
 @dataclass(frozen=True)
@@ -353,6 +412,12 @@ class PullRequestState:
     mergeable: bool | None
     merge_state: str
     unresolved_threads: int
+    # Whether the change is already on the base. Read because ``mergeable`` is
+    # null for a merged pull request exactly as it is for one GitHub is still
+    # computing, and the two need opposite reports: one is terminal, the other
+    # settles on a re-read. Defaults to ``False`` so the ordinary open case is
+    # unchanged, and every caller names its fields.
+    merged: bool = False
     check_conclusions: dict[str, str | None] = field(default_factory=dict)
     # Each check suite's conclusion on the head, or ``None`` for a census that
     # was not read. ``()`` is a positive observation -- zero suites exist -- and
@@ -361,6 +426,12 @@ class PullRequestState:
     # silently pick one.
     check_suite_conclusions: tuple[str | None, ...] | None = None
     approvers: tuple[str, ...] = ()
+    # Accounts whose latest position requests changes. Read separately from
+    # ``approvers`` because the two name different parties: a standing request
+    # for changes is clearable only by its own author, and no approval from
+    # anyone else clears it. Defaults to ``()`` so every existing caller and
+    # fixture describes an unblocked review state unchanged.
+    change_requesters: tuple[str, ...] = ()
     pusher: str | None = None
 
 
@@ -469,7 +540,25 @@ def evaluate(state: PullRequestState, rules: Ruleset) -> tuple[Blocker, ...]:
     is a single ``no-unsatisfied-rule`` blocker rather than an empty tuple: the
     caller asked why a pull request is blocked, and "no reason found" is an
     answer with a remedy, not an absence of one.
+
+    A merged pull request short-circuits every rule below. Its ``mergeable`` is
+    null for good, so falling through would report the transient
+    ``merge-state-unknown`` and prescribe a re-read that cannot settle; and an
+    approval count on a change already on the base is not an unsatisfied rule.
     """
+    if state.merged:
+        return (
+            Blocker(
+                ALREADY_MERGED,
+                "(not a ruleset rule)",
+                f"The pull request is already merged into {state.base_ref or 'its base'}, "
+                f"so no rule is outstanding. Its cached merge state reads "
+                f"{state.merge_state or 'unknown'} and stays that way: mergeability is "
+                f"computed for open pull requests only, so re-reading this one cannot "
+                f"settle it and no party owes an action.",
+            ),
+        )
+
     found: list[Blocker] = []
 
     if state.draft:
@@ -564,6 +653,29 @@ def evaluate(state: PullRequestState, rules: Ruleset) -> tuple[Blocker, ...]:
         )
 
     if rules.required_approving_review_count:
+        if state.change_requesters:
+            # Reported ahead of the approval rules, and separately from them,
+            # because an approval does not answer it. With required reviews in
+            # force a standing CHANGES_REQUESTED holds the merge until its own
+            # author approves or dismisses it, so another account's approval
+            # satisfies the count and the pull request stays BLOCKED. Reading
+            # the approval side alone therefore names a reviewer who cannot
+            # clear it -- measured on #3205, which this check reported as
+            # `missing-approval` owed by "a reviewer other than the pusher"
+            # while the only account that could clear it was the one that had
+            # requested the changes. It stood 15h44m, of which 12h51m was after
+            # the fix had landed and the thread was resolved.
+            found.append(
+                Blocker(
+                    CHANGES_REQUESTED,
+                    "required_approving_review_count",
+                    f"{_join(sorted(state.change_requesters))} "
+                    f"{'has' if len(state.change_requesters) == 1 else 'have'} a standing "
+                    f"request for changes. Only that account can clear it, by approving or "
+                    f"by dismissing its own review; an approval from anyone else is necessary "
+                    f"but not sufficient while it stands.",
+                )
+            )
         # The pusher's own approval is discounted only when the branch actually
         # carries require_last_push_approval. Filtering unconditionally would
         # invent a blocker on a branch that permits a self-approved head.
@@ -573,13 +685,29 @@ def evaluate(state: PullRequestState, rules: Ruleset) -> tuple[Blocker, ...]:
             else list(state.approvers)
         )
         if not state.approvers:
+            # "any reviewer" over-promises wherever the branch carries
+            # require_last_push_approval: the pusher's approval would not
+            # count, so pointing a review round at that account cannot clear
+            # the rule and lands the pull request in pusher-only-approval,
+            # which needs a different person regardless. Not hypothetical --
+            # measured on #2907, whose head and its only approval both belong
+            # to the same account and which has been blocked ever since. The
+            # pusher is already resolved and already printed in this report's
+            # own table one line below the party it contradicts.
+            discounted = rules.require_last_push_approval and bool(state.pusher)
             found.append(
                 Blocker(
                     MISSING_APPROVAL,
                     "required_approving_review_count",
                     f"{len(state.approvers)} of {rules.required_approving_review_count} "
-                    f"required approvals. Waiting on a first review, which is the "
-                    f"ordinary state.",
+                    + (
+                        f"required approvals. Waiting on a first review from an account "
+                        f"other than {state.pusher}, which pushed the head: under "
+                        f"require_last_push_approval its own approval would not count."
+                        if discounted
+                        else "required approvals. Waiting on a first review, which is the ordinary state."
+                    ),
+                    owed_by_override=OTHER_REVIEWER if discounted else None,
                 )
             )
         elif rules.require_last_push_approval and not eligible:
@@ -599,6 +727,7 @@ def evaluate(state: PullRequestState, rules: Ruleset) -> tuple[Blocker, ...]:
                     "required_approving_review_count",
                     f"{len(eligible)} of {rules.required_approving_review_count} "
                     f"required approvals from an account that did not push the head.",
+                    owed_by_override=(OTHER_REVIEWER if rules.require_last_push_approval and state.pusher else None),
                 )
             )
 
@@ -812,10 +941,12 @@ def resolve_state(repo: str, pr: int, token: str) -> PullRequestState:
         draft=bool(payload.get("draft")),
         mergeable=payload.get("mergeable"),
         merge_state=str(payload.get("mergeable_state") or ""),
+        merged=bool(payload.get("merged")),
         unresolved_threads=resolve_unresolved_threads(repo, pr, token),
         check_conclusions=resolve_check_conclusions(repo, head_sha, token) if head_sha else {},
         check_suite_conclusions=resolve_check_suites(repo, head_sha, token) if head_sha else None,
         approvers=current_approvers(reviews),
+        change_requesters=current_change_requesters(reviews),
         pusher=resolve_pusher(repo, head_sha, token) if head_sha else None,
     )
 
@@ -836,14 +967,20 @@ def primary(blockers: Sequence[Blocker]) -> Blocker:
     reviewer now, and reporting it as owed by nobody would park it. Only if no
     blocker is owed by anyone does the earliest-binding one stand.
 
+    A terminal blocker precedes even a gating one: gating asks the reader to wait
+    for something, and there is nothing left to wait for.
+
     Both renderers and both warning paths route through this, so precedence
     cannot be applied to one report and not the other.
     """
     return next(
-        (b for b in blockers if b.is_gating),
+        (b for b in blockers if b.is_terminal),
         next(
-            (b for b in blockers if b.is_finding),
-            next((b for b in blockers if b.owed_by != NOBODY), blockers[0]),
+            (b for b in blockers if b.is_gating),
+            next(
+                (b for b in blockers if b.is_finding),
+                next((b for b in blockers if b.owed_by != NOBODY), blockers[0]),
+            ),
         ),
     )
 
@@ -857,7 +994,18 @@ def _next_action(blockers: Sequence[Blocker]) -> list[str]:
     merge anything. Non-gating blockers genuinely are parallel -- a pending
     check and a missing approval wait on different people at once -- so those
     are listed together.
+
+    A terminal blocker is reported first and alone, and says so in as many
+    words. The fall-through line below it -- "the answer is not in yet" -- is
+    the reassuring reading a merged pull request must not get: it is true only
+    of an outcome that a later read can change.
     """
+    terminal = next((b for b in blockers if b.is_terminal), None)
+    if terminal is not None:
+        return [
+            f"No party owes an action, and none will: `{terminal.outcome}`.",
+            "This is terminal rather than not-in-yet -- no later read changes it.",
+        ]
     gating = primary(blockers) if any(b.is_gating for b in blockers) else None
     if gating is not None:
         trailing = [b for b in blockers if b is not gating]

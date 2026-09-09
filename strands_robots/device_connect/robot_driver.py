@@ -18,8 +18,8 @@ from device_connect_edge.drivers import (
 )
 from device_connect_edge.types import DeviceIdentity, DeviceStatus
 
-from strands_robots.bus_access import read_joints
-from strands_robots.device_connect._authz import authz_error, is_authorized_caller
+from strands_robots.bus_access import joint_read_source, read_joints
+from strands_robots.device_connect._authz import attached_runtime, authz_error, is_authorized_caller
 from strands_robots.mesh.security import is_safe_policy_provider
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,7 @@ class RobotDeviceDriver(DeviceDriver):
         # Security hardening: authorize the calling device before mutating
         # physical robot state.
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "execute")
 
         # Security hardening: restrict policy_provider to the vetted allowlist
@@ -171,7 +171,7 @@ class RobotDeviceDriver(DeviceDriver):
     async def stop(self) -> dict[str, Any]:
         """Stop the currently running task."""
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "stop")
         return self._robot.stop_task()
 
@@ -199,6 +199,11 @@ class RobotDeviceDriver(DeviceDriver):
         waits its turn behind an in-flight rollout, teleop write or mesh probe
         instead of colliding with it, and reports the joints even when a
         camera on the same driver is failing.
+
+        The device those joints are read from is resolved by
+        :func:`~strands_robots.bus_access.joint_read_source`, so a native driver
+        that owns its bus directly answers this RPC as well as a lerobot wrapper
+        does.
         """
         result = {}
         task = getattr(self._robot, "_task_state", None)
@@ -218,8 +223,20 @@ class RobotDeviceDriver(DeviceDriver):
         # away the joint positions already in hand. The frame filter below still
         # matters: a driver exposing no readable motor bus falls back to the full
         # observation, frames included.
-        inner = getattr(self._robot, "robot", None)
-        if inner and hasattr(inner, "get_observation"):
+        # Resolve the device through :func:`joint_read_source` rather than
+        # reading ``self._robot.robot`` here. A robot reaches its motors one of
+        # two ways: a lerobot robot is a WRAPPER holding the device under
+        # ``robot``, while a native driver owns its bus directly and so IS the
+        # device. Resolving only the wrapper shape is what left a native driver
+        # publishing no joint telemetry on the mesh state topic (#2749), and
+        # ``Robot(mode="real")`` attaches Device Connect to both kinds -- so this
+        # RPC answered a native driver with no ``joints`` key at all, under the
+        # same successful status a readable arm gets. Its admission rule is
+        # derived from ``read_joints``' own branch, so demanding
+        # ``get_observation`` here also refused a device whose bus the reader
+        # below prefers and could already read.
+        inner = joint_read_source(self._robot)
+        if inner is not None:
             try:
                 obs = await asyncio.to_thread(read_joints, inner)
                 # Filter out camera frames (numpy arrays) - only include scalars
@@ -290,7 +307,7 @@ class RobotDeviceDriver(DeviceDriver):
         stop that arrives over Device Connect rather than over the mesh is the
         same operator request and gets the same accounting.
         """
-        if not is_authorized_caller(device_id, scope="estop"):
+        if not is_authorized_caller(device_id, scope="estop", device=attached_runtime(self)):
             logger.warning("Ignoring emergencyStop from unauthorized source %s", device_id)
             return
         logger.warning("Emergency stop received from %s - stopping task", device_id)

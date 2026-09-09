@@ -28,8 +28,8 @@ python -m cosmos_framework.scripts.action_policy_server_robolab \
 ```python
 Cosmos3Policy(
     embodiment="droid",          # droid | umi | av | bridge | openarm
-    host="localhost",
-    port=8000,
+    host="localhost",         # bare hostname or IP literal; IPv6 bracketed "[::1]"
+    port=8000,                   # int in [1, 65535]
     action_space=None,
     observation_mapping=None,
     action_mapping=None,
@@ -43,6 +43,16 @@ Cosmos3Policy(
     model=None,                 # HF repo id / path for the diffusers backend
 )
 ```
+
+`host` and `port` are the two halves of the one address this client dials
+(`ws://<host>:<port>`), and both are refused before the endpoint is built rather
+than surfacing later as an unreachable server. `host` must be a bare hostname or
+IP literal - no `/`, `:`, scheme or credentials, IPv6 bracketed as `"[::1]"` -
+because the URI parse gives a delimiter to a later component and takes the port
+with it: `host="localhost/foo"` reads as port **80**, so the configured `8000`
+lands in the path. Both are read only when this constructor builds the client; an
+injected `client=` owns its own address. `host="0.0.0.0"` reaches a server bound
+on every interface.
 
 ## Embodiments
 
@@ -68,6 +78,15 @@ one names its own columns:
 keys must be columns of the active space. Mapping the gripper is therefore
 `{"grasp": ...}` under `midtrain` and `{"gripper": ...}` under `joint_pos`; a key
 that names no column is refused, listing the ones that are valid.
+
+It has to be a rename, so two columns may not arrive at one actuator name. A
+step dict holds one entry per column, so a merge would collapse two columns into
+one entry and drop a command - the actuator that lost would hold position while
+the model asked it to move. Both spellings are refused at construction, naming
+the columns and the target they collide on: two entries sharing a target, and a
+single entry aimed at another column's own name (`{"joint_0": "joint_1"}` on
+`joint_pos` names only real columns and still costs a joint). Renaming *every*
+column is a bijection and is accepted.
 
 `joint_pos` needs seven joint values plus a gripper, and it reads them in the
 order you declare with `set_robot_state_keys()`. Declaring that order is what
