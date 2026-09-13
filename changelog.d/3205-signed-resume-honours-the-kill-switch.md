@@ -5,9 +5,9 @@ broken", because an operator acts on the two differently: one is the switch they
 set, the other is a fault to chase. `MeshBridge.signed_resume` is the same rail
 and the same operator and did not - with `STRANDS_MESH` set to any kill spelling
 it answered `safety mesh unavailable`, which is the wording the rail's own suite
-pins as meaning a fault. The troubleshooting sheet documents exactly two causes
-for a refused resume, both about `override_code`, so an operator who set the
-switch was sent to a code that is fine rather than to the switch they set.
+pins as meaning a fault. Every documented cause of a refused resume is about
+`override_code`, so an operator who set the switch was sent to a code that is
+fine rather than to the switch they set.
 
 Both verbs now answer through one owner, so the two wordings have a single
 spelling and a second copy cannot disagree with the first. The rail's guard is

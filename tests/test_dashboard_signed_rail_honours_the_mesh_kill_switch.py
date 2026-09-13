@@ -25,9 +25,9 @@ fault to chase.
 ``signed_estop`` got both. ``signed_resume`` -- the same rail, the same
 operator, 38 lines down the same file -- got only the first, and answered
 ``"safety mesh unavailable"`` in the one state this file spends 30 lines proving
-is not a fault. ``docs/dashboard/troubleshooting.md`` lists exactly two causes
-for a refused resume, both about ``override_code``, so "unavailable" sends the
-operator to a code that is fine rather than to the switch they set.
+is not a fault. Every documented cause of a refused resume is about
+``override_code``, so "unavailable" sends the operator to a code that is fine
+rather than to the switch they set.
 
 These pin, for both consequences:
 

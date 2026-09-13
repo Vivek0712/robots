@@ -192,6 +192,11 @@ def managed_without_presence(
     now: float | None = None,
     grace_s: float = 20.0,
 ) -> list[str]:
+    """Managed peers that never appeared in presence, past their start-up grace.
+
+    A peer that spawned a child (``parent__child``) counts as present through it,
+    and one still inside ``grace_s`` of its ``spawn_times`` stamp is not yet late.
+    """
     present = set(peers)
     stamps = spawn_times or {}
     clock = time.time() if now is None else now
@@ -212,6 +217,11 @@ def managed_without_presence(
 
 
 def silent_arms(peers: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Peers present but publishing no joints, or ``None`` when every arm streams.
+
+    A stale peer and a host process that owns a ``<pid>__<robot>`` child are
+    counted separately rather than reported: for both, silence is expected.
+    """
     ids = list(peers)
     streaming: list[str] = []
     silent: list[str] = []
@@ -263,6 +273,11 @@ def absent_children(
     peers: Mapping[str, Any] | Iterable[str],
     children: Iterable[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
+    """Managed children that have exited and hold no peer id in the fleet.
+
+    A child whose id is present, or is the family prefix of a present
+    ``parent__child`` peer, is still on the mesh whatever its process reports.
+    """
     present = set(peers)
     families = {pid.split("__", 1)[0] for pid in present if "__" in pid}
     out: list[dict[str, Any]] = []
@@ -441,6 +456,7 @@ class EventCoalescer:
         self.forwarded = 0
 
     def key(self, event: dict) -> tuple:
+        """The identity an UNCHANGED repeat is measured against."""
         # `kind` separates two streams that share a type: lidar publishes both a
         # summary and a state document, and without it their alternating
         # payloads read as a change every tick and coalesce to nothing. A strict
@@ -483,6 +499,7 @@ class EventCoalescer:
             self._last.pop(k, None)
 
     def stats(self) -> dict:
+        """Forwarded vs suppressed counts, their ratio, and the rates in force."""
         total = self.forwarded + self.suppressed
         return {
             "forwarded": self.forwarded,
@@ -695,6 +712,11 @@ class MeshBridge:
         return ok
 
     def stop(self) -> None:
+        """Leave the fleet: stop the safety rail, drop subscriptions, close the session.
+
+        Best-effort and idempotent - every step is attempted whatever the one
+        before it did, so a failure part-way still releases the rest.
+        """
         self._running = False
         if self._safety is not None:
             try:
@@ -718,12 +740,14 @@ class MeshBridge:
     # ------------------------------------------------------------------
 
     def attach_queue(self) -> asyncio.Queue:
+        """Register a bounded fan-out queue and return it to the consumer."""
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
         with self._queues_lock:
             self._queues.add(q)
         return q
 
     def detach_queue(self, q: asyncio.Queue) -> None:
+        """Stop fanning events out to *q*. Idempotent."""
         with self._queues_lock:
             self._queues.discard(q)
 
@@ -1166,6 +1190,7 @@ class MeshBridge:
         *,
         source: str = "api",
     ) -> dict[str, Any]:
+        """:meth:`send_cmd` off the event loop, so an await does not block it."""
         return await asyncio.to_thread(self.send_cmd, target, cmd, timeout, source=source)
 
     # ------------------------------------------------------------------
@@ -1183,6 +1208,11 @@ class MeshBridge:
         result: Any = None,
         elapsed: float | None = None,
     ) -> None:
+        """Append one operator-facing entry to the activity log and emit it live.
+
+        ``result`` is JSON-encoded and truncated, so an unbounded payload cannot
+        grow the log or the event it is fanned out on.
+        """
         entry = {
             "t": time.time(),
             "source": source,
@@ -1199,6 +1229,7 @@ class MeshBridge:
         self._emit({"type": "activity", "data": entry})
 
     def activity_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        """The most recent *limit* activity entries, newest first."""
         with self._activity_lock:
             items = list(self.activity)
         return items[-limit:][::-1]
@@ -1208,6 +1239,12 @@ class MeshBridge:
     # ------------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
+        """The whole fleet as one payload, for a client that just connected.
+
+        Aged-out peers are forgotten rather than only filtered, so a ghost cannot
+        reappear on the next snapshot, and each peer carries its origin and
+        lockout verdict.
+        """
         now = time.time()
         protected = self._protected_peer_ids()
         with self._peers_lock:
@@ -1275,5 +1312,6 @@ class MeshBridge:
             return [pid for pid, entry in self.peers.items() if (now - entry.get("last_seen", 0)) <= PEER_STALE_S]
 
     def latest_frame(self, peer_id: str, cam: str) -> dict[str, Any] | None:
+        """The last frame received for *cam* on *peer_id*, or ``None`` if there is none."""
         with self._frames_lock:
             return self.frames.get((peer_id, cam))
