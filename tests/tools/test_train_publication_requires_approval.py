@@ -42,7 +42,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import strands_robots.tools.lerobot_train as train_mod
+pytest.importorskip("psutil")
+
+import strands_robots.tools.lerobot_train as train_mod  # noqa: E402
+from strands_robots.tools import _process_stop  # noqa: E402
 
 lerobot_train = train_mod.lerobot_train
 
@@ -87,7 +90,7 @@ def launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     sessions = tmp_path / ".sessions"
     sessions.mkdir()
-    monkeypatch.setattr(train_mod, "SESSION_DIR", sessions)
+    monkeypatch.setattr(_process_stop, "SESSION_DIR", sessions)
 
     launched: list[list[str]] = []
 

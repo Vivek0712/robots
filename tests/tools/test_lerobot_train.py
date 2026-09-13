@@ -28,8 +28,11 @@ from typing import Any
 
 import pytest
 
-import strands_robots.tools.lerobot_train as train_mod
-from tests.tool_result_contract import tool_json
+pytest.importorskip("psutil")
+
+import strands_robots.tools.lerobot_train as train_mod  # noqa: E402
+from strands_robots.tools import _process_stop  # noqa: E402
+from tests.tool_result_contract import tool_json  # noqa: E402
 
 build_train_command = train_mod.build_train_command
 lerobot_train = train_mod.lerobot_train
@@ -57,7 +60,7 @@ def _write_dataset(root: Path, total_episodes: int = 10) -> Path:
 def _isolate_session_dir(tmp_path, monkeypatch: pytest.MonkeyPatch):
     session_dir = tmp_path / ".sessions"
     session_dir.mkdir()
-    monkeypatch.setattr(train_mod, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(_process_stop, "SESSION_DIR", session_dir)
     return session_dir
 
 
@@ -450,6 +453,10 @@ def test_session_lifecycle_round_trips(tmp_path: Path, monkeypatch: pytest.Monke
         def __init__(self, pid: int) -> None:
             self.pid = pid
 
+        def create_time(self) -> float:
+            """The identity the record is written with, so the PID is still its own."""
+            return train_mod.psutil.boot_time() + 1.0
+
         def is_running(self) -> bool:
             return True
 
@@ -501,6 +508,35 @@ def test_status_requires_session_name(tmp_path: Path) -> None:
     result = lerobot_train(action="status", dataset_root=str(root))
     assert result["status"] == "error"
     _assert_ascii(_texts(result))
+
+
+def test_session_verbs_do_not_require_a_dataset_root() -> None:
+    """``status``/``stop``/``list`` look a session up by name and never read the dataset.
+
+    ``dataset_root`` was the tool's one required parameter, so an agent had to
+    invent a dataset path to ask about a run, and a Python caller of
+    ``lerobot_train(action="list")`` got a ``TypeError`` instead of a result.
+    Only ``start`` reads it, so only ``start`` is refused without it.
+    """
+    required = lerobot_train.tool_spec["inputSchema"]["json"].get("required") or []
+    assert "dataset_root" not in required
+
+    listed = lerobot_train(action="list")
+    assert listed["status"] == "success"
+    assert tool_json(listed)["count"] == 0
+
+    status = lerobot_train(action="status", session_name="nope")
+    assert status["status"] == "error"
+    assert "not found" in _texts(status)
+
+    stop = lerobot_train(action="stop", session_name="nope")
+    assert stop["status"] == "error"
+    assert "not found" in _texts(stop)
+
+    start = lerobot_train(action="start")
+    assert start["status"] == "error"
+    assert "dataset_root required" in _texts(start)
+    _assert_ascii(_texts(listed) + _texts(status) + _texts(stop) + _texts(start))
 
 
 def test_unknown_action_errors(tmp_path: Path) -> None:
@@ -591,7 +627,7 @@ def test_session_whose_probe_raises_keeps_its_record(monkeypatch: pytest.MonkeyP
     "cannot be confirmed running" is not a reason to drop the record, because
     being in the store is not the running claim - ``list`` and ``status`` derive
     that from the PID when asked. The consequences are pinned in
-    ``tests.tools.test_train_session_store_keeps_a_live_pid``.
+    ``tests.tools.test_the_session_store_keeps_a_live_pid``.
     """
     mgr = SessionManager()
     mgr.add_session("racy", {"pid": 4242, "action": "train"})

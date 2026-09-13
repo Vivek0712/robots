@@ -27,6 +27,11 @@ from tests._sim_stop_policy_stand_in import stop_policy_stand_in
 
 mock_device_connect_edge = MagicMock()
 mock_drivers = MagicMock()
+# The drivers bind ``get_rpc_source_device`` from this mock at import time. It
+# reports the operator ``named_rpc_caller`` (tests/conftest.py) allowlists, so
+# the RPCs graded here are admitted; authorization fails closed and is graded
+# in test_device_connect_hardening.py.
+mock_drivers.get_rpc_source_device.return_value = "test-operator"
 
 
 class _FakeDeviceDriver:
@@ -124,6 +129,10 @@ mock_device_connect_edge.DeviceRuntime = mock_device_runtime
 
 from strands_robots.device_connect.robot_driver import RobotDeviceDriver  # noqa: E402
 from strands_robots.device_connect.sim_driver import SimulationDeviceDriver  # noqa: E402
+
+# The RPCs graded here run as an allowlisted operator: authorization fails
+# closed and is graded in test_device_connect_hardening.py, not here.
+pytestmark = pytest.mark.usefixtures("named_rpc_caller")
 
 
 def teardown_module():
@@ -253,6 +262,11 @@ def _make_mock_sim(name, info, robots_in_world=None):
     # See ``tests._sim_stop_policy_stand_in``: the driver's ``stop`` reads the
     # verdict this returns, which a bare ``MagicMock`` does not carry.
     sim.stop_policy.side_effect = stop_policy_stand_in(world)
+    # ``list_robots`` is an ABSTRACT method of the SimEngine ABC, so a stand-in
+    # for a simulation has to answer it: the driver's stop enumerates through it
+    # rather than off ``sim._world.robots``, which is only the MuJoCo/Newton
+    # spelling of the registry. A bare ``MagicMock`` returns a mock, not a list.
+    sim.list_robots.return_value = list(world.robots)
     sim.start_policy.return_value = {"status": "success", "content": [{"text": "Policy started"}]}
     sim.get_state.return_value = {"status": "success", "content": [{"text": "State info"}]}
     sim.get_features.return_value = {"status": "success", "content": [{"json": {"features": {}}}]}
@@ -521,9 +535,19 @@ class TestEdgeCases:
         assert "joints" not in result
 
     def test_no_inner_robot(self):
-        """robot.robot is None → getState skips observation."""
+        """A host with no inner device and no joint read of its own → no joints.
+
+        The two ``del``s are what make the mock able to state that. A device is
+        resolved through ``bus_access.joint_read_source``, which falls back to
+        the host itself when it holds no inner device -- and a ``MagicMock``
+        answers every attribute, so it auto-creates both a ``bus.sync_read`` and
+        a ``get_observation`` and reads as a perfectly good joint source. Only a
+        host that refuses both routes poses the case named here.
+        """
         robot = _make_mock_robot("so100", _REGISTRY["so100"], task_status="running")
         robot.robot = None
+        del robot.bus
+        del robot.get_observation
         driver = RobotDeviceDriver(robot)
         result = asyncio.run(driver.getState())
         assert result["task_status"] == "running"

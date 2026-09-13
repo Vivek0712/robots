@@ -38,27 +38,33 @@ if TYPE_CHECKING:
 
 # PolicyRunner and VideoConfig are used by run_policy / replay / eval_policy.
 # We could defer these with inline lazy imports (and historically did), but
-# policy_runner.py only imports `SimEngine` from base under TYPE_CHECKING so
+# ``simulation.policy_runner`` only imports `SimEngine` from base under
+# TYPE_CHECKING so
 # the runtime cycle doesn't actually exist. Keep the imports at module level
 # to break the AST-visible cycle that static analysers flag.
 #
 # Note (#191): we deliberately do NOT import ``OnFrame`` here, even under
 # ``TYPE_CHECKING`` - CodeQL's ``py/unsafe-cyclic-import`` rule walks
 # ``TYPE_CHECKING`` blocks too and would flag the static cycle (
-# policy_runner.py imports SimEngine from base under TYPE_CHECKING,
+# ``simulation.policy_runner`` imports SimEngine from base under TYPE_CHECKING,
 # so importing OnFrame from policy_runner here closes the loop in the
 # AST). Instead, we reference ``OnFrame`` in the ``evaluate_benchmark``
 # signature as a *string* annotation; ``from __future__ import
 # annotations`` (already in effect) makes that a no-op at runtime.
+from strands_robots.simulation.observers import RunPolicyObserver
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 from strands_robots.utils import (
     FREE_CAMERA_TOKENS,
+    boolean_flag_error,
     dds_domain_id_error,
     is_boolean,
     non_negative_count_error,
+    optional_callable_error,
     positive_count_error,
     positive_finite_number_error,
     process_rss_mb,
+    refusal_container_repr,
+    refusal_repr,
     sequence_length,
 )
 
@@ -341,7 +347,11 @@ def _boolean_world_error(method: str, param: str, value: Any) -> dict[str, Any]:
     return {
         "status": "error",
         "content": [
-            {"text": (f"{method}: '{param}' must be a number, not a bool (got {value!r}). {_BOOLEAN_WORLD_REASON}")}
+            {
+                "text": (
+                    f"{method}: '{param}' must be a number, not a bool (got {refusal_repr(value)}). {_BOOLEAN_WORLD_REASON}"
+                )
+            }
         ],
     }
 
@@ -372,7 +382,7 @@ def randomization_range_error(value: Any, param: str, *, allow_zero: bool = True
     """
     # The unpack and the coercion are separate steps so the boolean check can sit
     # between them; both report the same thing to the caller.
-    not_a_pair = f"{param} must be a (lo, hi) pair of numbers, got {value!r}"
+    not_a_pair = f"{param} must be a (lo, hi) pair of numbers, got {refusal_container_repr(value)}"
     try:
         lo, hi = value
     except (TypeError, ValueError):
@@ -381,25 +391,27 @@ def randomization_range_error(value: Any, param: str, *, allow_zero: bool = True
     # (erases the quantity it multiplies), and the sampler cannot tell either
     # from a deliberate one once coerced.
     if is_boolean(lo) or is_boolean(hi):
-        return f"{param} bounds must be numbers, not bools (got {value!r}). {_BOOLEAN_WORLD_REASON}"
+        return (
+            f"{param} bounds must be numbers, not bools (got {refusal_container_repr(value)}). {_BOOLEAN_WORLD_REASON}"
+        )
     try:
         lo, hi = float(lo), float(hi)
     except (TypeError, ValueError):
         return not_a_pair
     if not (math.isfinite(lo) and math.isfinite(hi)):
-        return f"{param} bounds must be finite, got {value!r}"
+        return f"{param} bounds must be finite, got {refusal_container_repr(value)}"
     if lo > hi:
         return f"{param} lower bound {lo} exceeds upper bound {hi}"
     if allow_zero:
         if lo < 0:
-            return f"{param} bounds must be non-negative, got {value!r}"
+            return f"{param} bounds must be non-negative, got {refusal_container_repr(value)}"
     elif lo <= 0:
         detail = (
             "a zero scale erases the quantity it multiplies"
             if lo == 0
             else "a negative scale flips the sign of the quantity it multiplies"
         )
-        return f"{param} bounds must be positive, got {value!r} ({detail})"
+        return f"{param} bounds must be positive, got {refusal_container_repr(value)} ({detail})"
     return None
 
 
@@ -429,13 +441,13 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
     # not a flag disabling the noise, which is what a caller passing True
     # would most plausibly have meant.
     if is_boolean(value):
-        return f"{context}: {param} must be a number, not a bool (got {value!r}). {_BOOLEAN_WORLD_REASON}"
+        return f"{context}: {param} must be a number, not a bool (got {refusal_repr(value)}). {_BOOLEAN_WORLD_REASON}"
     try:
         fvalue = float(value)
     except (TypeError, ValueError):
-        return f"{context}: {param} must be a number, got {value!r}"
+        return f"{context}: {param} must be a number, got {refusal_repr(value)}"
     if not math.isfinite(fvalue) or fvalue < 0:
-        return f"{context}: {param} must be a finite non-negative number, got {value!r}"
+        return f"{context}: {param} must be a finite non-negative number, got {refusal_repr(value)}"
     return None
 
 
@@ -457,6 +469,24 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
 # ``py/unsafe-cyclic-import`` on all three names that line carries. The rollout
 # side reaches it through the function-local import it already uses for
 # ``randomization_seed_error``, so neither module gains a module-level edge.
+LIST_POLICIES_RUNNING_DESCRIBE_ENTRY = (
+    "() -> dict  # name the robots a rollout is driving right now, read from "
+    "the same in-flight population stop_policy derives its verdict from, so "
+    "the two never report opposite facts about one robot at one instant. "
+    "Counts a rollout in either launch shape - one submitted by start_policy "
+    "and one being driven right now by a blocking run_policy - and answers "
+    "status='error' on a backend that keeps no rollout registry, because "
+    "reporting none would be an affirmative claim about robots it cannot see"
+)
+"""The ``describe()`` entry for :meth:`SimEngine.list_policies_running`.
+
+One owner, because the surface is assembled twice: a backend that builds on
+``super().describe()`` inherits this entry, and a backend that writes its own
+``methods`` mapping imports it. A second copy of the text is what let the
+verb's promotion to this ABC reach the implementation and not the
+advertisement.
+"""
+
 MAX_EVAL_SEED = 2**32 - 1
 
 
@@ -527,12 +557,12 @@ def randomization_seed_error(
             "is a global side effect an unseeded rollout must not acquire."
         )
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        return f"{context}: seed must be a non-negative integer{none_clause}, got {value!r}{entropy_hint}"
+        return f"{context}: seed must be a non-negative integer{none_clause}, got {refusal_repr(value)}{entropy_hint}"
     if int(value) < 0:
-        return f"{context}: seed must be a non-negative integer{none_clause}, got {value!r}{entropy_hint}"
+        return f"{context}: seed must be a non-negative integer{none_clause}, got {refusal_repr(value)}{entropy_hint}"
     if max_seed is not None and int(value) > max_seed:
         return (
-            f"{context}: seed must be an integer in [0, {max_seed}]{none_clause}, got {value!r} "
+            f"{context}: seed must be an integer in [0, {max_seed}]{none_clause}, got {refusal_repr(value)} "
             "(a rollout seed is applied to the legacy NumPy global RNG, which refuses a larger value)"
         )
     return None
@@ -573,7 +603,11 @@ def _non_finite_action_error(label: str, value: Any) -> dict[str, Any] | None:
     return {
         "status": "error",
         "content": [
-            {"text": (f"send_action: {label} must be finite (no nan/inf), got {value!r}. {_NON_FINITE_ACTION_REASON}")}
+            {
+                "text": (
+                    f"send_action: {label} must be finite (no nan/inf), got {refusal_repr(value)}. {_NON_FINITE_ACTION_REASON}"
+                )
+            }
         ],
     }
 
@@ -642,7 +676,11 @@ def _boolean_action_error(label: str, value: Any) -> dict[str, Any] | None:
     return {
         "status": "error",
         "content": [
-            {"text": (f"send_action: {label} must be a number, not a bool (got {value!r}). {_BOOLEAN_ACTION_REASON}")}
+            {
+                "text": (
+                    f"send_action: {label} must be a number, not a bool (got {refusal_repr(value)}). {_BOOLEAN_ACTION_REASON}"
+                )
+            }
         ],
     }
 
@@ -1041,11 +1079,13 @@ class SimEngine(ABC):
     def bind_policy_sim_context(self, policy: Any, robot_name: str) -> None:
         """Give a policy the backend sim context it needs to close the loop.
 
-        Default no-op. The MuJoCo engine overrides this to hand policies that
-        opt in (e.g. ``VeraPolicy.set_sim_context``) the compiled ``MjModel`` +
-        the robot's namespace, so eef/cartesian-delta policies can auto-configure
-        their IK end-effector frame with zero manual wiring. Policies that don't
-        expose ``set_sim_context`` are unaffected.
+        Default no-op. The MuJoCo engine overrides this to hand a policy that
+        opts in - by exposing a callable ``set_sim_context`` - the compiled
+        ``MjModel`` + the robot's namespace, so an eef/cartesian-delta policy can
+        auto-configure its IK end-effector frame with zero manual wiring. No
+        shipped provider opts in today; this is the extension point an
+        out-of-tree one uses. Policies that do not expose ``set_sim_context``
+        are unaffected.
         """
         return None
 
@@ -1137,34 +1177,6 @@ class SimEngine(ABC):
             return {"status": "error", "content": [{"text": str(e)}]}
         return None
 
-    def _unresolvable_policy_provider_error(
-        self,
-        policy_provider: str,
-        policy_config: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        """Report an unresolvable ``policy_provider`` as a structured error.
-
-        For surfaces that cannot use :meth:`_preflight_policy_config` because
-        they build the policy elsewhere -- notably a ``start_policy`` that
-        submits the rollout to a worker thread -- this gives the same verdict
-        synchronously, so the caller is refused instead of being told a
-        rollout started that could never build its policy.
-
-        Args:
-            policy_provider: Provider name / smart string.
-            policy_config: Provider kwargs (the policy_config).
-
-        Returns:
-            A ``status=error`` dict when the provider cannot be resolved;
-            ``None`` when it resolves.
-        """
-        from strands_robots.policies import policy_provider_error
-
-        reason = policy_provider_error(policy_provider, **(policy_config or {}))
-        if reason is None:
-            return None
-        return {"status": "error", "content": [{"text": reason}]}
-
     # Object management
 
     @abstractmethod
@@ -1221,6 +1233,17 @@ class SimEngine(ABC):
         ``False`` would state a value the default backend does not deliver, and
         would make restating that declared default a hard error for the one
         shape whose whole point is being static.
+
+        The two chosen values select a *posture* -- welded to the world, or a
+        free body the solver integrates -- so a supplied ``is_static`` is
+        checked rather than read by truthiness: anything that is neither a
+        boolean nor ``None`` is refused. Reading it by truthiness inverts both
+        halves. ``0`` is the same value as the ``False`` a backend may refuse
+        for a shape it forces static, so it reaches the quiet override that
+        refusal exists to prevent, and every non-empty string is truthy, so
+        ``"false"`` welds a body the caller asked to be dynamic and lands on
+        :class:`SimObject.is_static`, which is annotated ``bool`` and read by
+        ``list_objects``, the scene rebuild and domain randomization.
 
         ``material`` (optional): backend-specific visual material/texture
         spec. ``None`` keeps the flat ``color`` rgba (unchanged); a backend
@@ -1874,6 +1897,39 @@ class SimEngine(ABC):
         return None
 
     @staticmethod
+    def _validate_posture_flags(method: str, **flags: Any) -> dict[str, Any] | None:
+        """Refuse a posture flag that is not a boolean, naming the flag.
+
+        A flag that selects one of two *postures* - pace the loop or run it
+        unpaced, reset the scene between episodes or carry it over, install the
+        WBC torque shim or leave the actuators as they are, overlap inference
+        with actuation or drain each chunk first - is checked rather than read
+        by truthiness. Every non-empty string is truthy, so ``"false"``,
+        ``"no"``, ``"off"`` and ``"0"`` select the posture the word asks to
+        skip, while ``0``, ``""`` and ``[]`` take the other branch without ever
+        being a declared spelling of it. Nothing raises and nothing logs on
+        either half, so the wrong posture is indistinguishable from the right
+        one until the rollout's telemetry is read.
+
+        Thin binding of :func:`~strands_robots.utils.boolean_flag_error` to this
+        class's tool-error envelope, the inverse of the numeric bindings above
+        (which refuse a ``bool`` because it would pass as a silent ``1``). Flags
+        are checked in the order given and the first refusal is returned, so a
+        caller who mistyped two sees the first named.
+
+        Args:
+            method: Public method name the message is prefixed with.
+            **flags: The posture flags to check, keyed by parameter name.
+
+        Returns:
+            A structured error, or ``None`` when every flag is a boolean.
+        """
+        for param, value in flags.items():
+            if message := boolean_flag_error(value, param, method):
+                return {"status": "error", "content": [{"text": message}]}
+        return None
+
+    @staticmethod
     def _validate_seed(seed: Any, method: str) -> dict[str, Any] | None:
         """Reject an unusable RNG seed at the public API.
 
@@ -2014,7 +2070,7 @@ class SimEngine(ABC):
             A structured ``{"status": "error", ...}`` dict to surface, or
             ``None`` when the value is usable.
         """
-        message = f"{method}: {param} must be a finite positive number, got {timestep!r}."
+        message = f"{method}: {param} must be a finite positive number, got {refusal_repr(timestep)}."
         # is_boolean, not isinstance(timestep, bool): numpy.bool_ is not a bool
         # subclass, so the narrower check refused a hand-typed True and admitted
         # the np.True_ a comparison produces - a 1-second dt under success.
@@ -2066,7 +2122,7 @@ class SimEngine(ABC):
         except (TypeError, ValueError):
             return {
                 "status": "error",
-                "content": [{"text": f"{method}: '{param}' must be a positive number, got {mass!r}"}],
+                "content": [{"text": f"{method}: '{param}' must be a positive number, got {refusal_repr(mass)}"}],
             }
         if not math.isfinite(value) or value <= 0:
             return {
@@ -2468,6 +2524,41 @@ class SimEngine(ABC):
             return None
         return {"status": "error", "content": [{"text": f"{method}: {message}"}]}
 
+    @staticmethod
+    def _validate_policy_object(value: Any, method: str) -> dict[str, Any] | None:
+        """Reject a ``policy_object`` that is not a :class:`Policy` instance.
+
+        The counterpart of :meth:`_validate_policy_mapping` for the third opaque
+        policy parameter on this surface. ``policy_object`` hands the rollout a
+        pre-built policy, so it BYPASSES provider resolution and the provider's
+        ``preflight`` hook - the two checks that would otherwise have something
+        to say about it. Unguarded, the wrong shape surfaced as a bare
+        ``AttributeError`` from the first attribute the runner reached for
+        (``set_control_frequency`` on the rollout path,
+        ``set_robot_state_keys`` on the eval path), naming a library internal
+        instead of the parameter the caller got wrong.
+
+        On ``start_policy`` it was worse than a bad message: that raise happened
+        on the executor worker, whose result nothing reads, so the caller was
+        handed ``status="success"`` / "Policy started" for a rollout that
+        applied no action, and ``list_policies_running`` then reported nothing
+        running - the same reading a completed rollout gives.
+
+        Args:
+            value: The caller-supplied value, or ``None``.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            A structured ``{"status": "error", ...}`` dict to surface, or
+            ``None`` when the value can be driven.
+        """
+        from strands_robots.policies import policy_object_error
+
+        message = policy_object_error(value)
+        if message is None:
+            return None
+        return {"status": "error", "content": [{"text": f"{method}: {message}"}]}
+
     def run_policy(
         self,
         robot_name: str | None = None,
@@ -2492,6 +2583,7 @@ class SimEngine(ABC):
         rtc_inference_timeout_s: float | None = None,
         wbc_install_torque_control: bool = True,
         stop_when: dict[str, Any] | Callable[[SimEngine], bool] | None = None,
+        observer: RunPolicyObserver | None = None,
     ) -> dict[str, Any]:
         """Run a policy loop in the simulation (blocking).
 
@@ -2547,7 +2639,11 @@ class SimEngine(ABC):
                 and physics allow. When False (default) the loop is paced on a
                 deadline at ``control_frequency``, so the wall clock a step
                 spends working is subtracted from the period rather than added
-                to it and ``duration`` is honored whatever a step costs.
+                to it and ``duration`` is honored whatever a step costs. Must be
+                a boolean: it selects a posture rather than scaling a quantity,
+                so a value of any other type is reported as a structured caller
+                error rather than read by truthiness - a truthy ``"false"``
+                would otherwise run the loop unpaced.
             video: Optional video-recording config dict. Accepted keys:
                 ``path`` (str, output MP4 - required to enable recording),
                 ``fps`` (int, default 30), ``camera`` (str, default backend
@@ -2647,7 +2743,10 @@ class SimEngine(ABC):
             reset_between: When running multiple episodes, reset the sim to its
                 initial state between episodes (default ``True``). The reset
                 never fires after the final episode. Set ``False`` to chain
-                episodes from the end state of the previous one.
+                episodes from the end state of the previous one. Must be a
+                boolean, reported as a structured caller error otherwise - a
+                falsy ``0`` would otherwise chain the episodes without being a
+                declared spelling of that.
             async_rtc: When ``True``, overlap policy inference with action
                 execution so the next action chunk is computed in the
                 background while the current chunk is still draining (latency
@@ -2656,10 +2755,13 @@ class SimEngine(ABC):
                 so chunk-emitting VLA/flow-matching policies (pi0, pi0.5,
                 pi0-FAST, SmolVLA, MolmoAct2) get latency masking automatically
                 while single-step policies stay synchronous; an explicit
-                ``True``/``False`` always wins. Forwarded verbatim to
-                :meth:`PolicyRunner.run`; see its docstring for the full
-                contract (provider-agnostic, RTC-policy seam blending, thread
-                safety).
+                ``True``/``False`` always wins, and a supplied value must be one
+                of those two: any other type is reported as a structured caller
+                error rather than read by truthiness, since a truthy ``"false"``
+                would otherwise start the background inference thread it reads
+                as declining. Forwarded verbatim to :meth:`PolicyRunner.run`;
+                see its docstring for the full contract (provider-agnostic,
+                RTC-policy seam blending, thread safety).
             rtc_inference_timeout_s: Optional hard per-chunk timeout (seconds)
                 for the async-RTC prefetch. When set, a stuck inference surfaces
                 as a structured ``status=error`` result (carrying the RTC
@@ -2675,7 +2777,10 @@ class SimEngine(ABC):
                 PD and the gait diverges, so the documented quickstart silently
                 falls over without it. Set ``False`` to manage the controller
                 yourself or to drive a torque-actuated scene directly. No-op for
-                non-WBC policies and on backends without the hook.
+                non-WBC policies and on backends without the hook. Must be a
+                boolean, reported as a structured caller error otherwise - a
+                falsy ``0`` would otherwise skip the shim without being a
+                declared spelling of that.
             stop_when: Optional semantic early-return condition: end the
                 rollout as soon as the WORLD reaches a state, not only when
                 the step budget runs out - which turns a monolithic rollout
@@ -2704,6 +2809,32 @@ class SimEngine(ABC):
                 dict (the tool surface accepts dicts only). ``None`` (default)
                 keeps the pure step-budget horizon. The result json reports
                 why the rollout ended via ``stopped_reason``.
+            observer: Optional read-only rollout observer, forwarded verbatim to
+                :meth:`PolicyRunner.run`. Receives one
+                :class:`~strands_robots.simulation.observers.RunPolicyStarted`,
+                one :class:`~strands_robots.simulation.observers.RunPolicyStep`
+                per completed ``send_action`` call and one
+                :class:`~strands_robots.simulation.observers.RunPolicyEnded`,
+                carrying the per-key ``send_action`` verdict, authoritative
+                ``observation_age_steps`` (with the narrower
+                ``observation_is_chunk_reused`` chunk-position flag), and what
+                the backend's own ``on_frame`` hook did. Must be ``None`` or
+                callable; another value is refused before policy construction,
+                backend hook creation, or rollout side effects.
+
+                This is a SECOND lane, not the backend's hook: the hook slot is
+                filled from ``_make_run_policy_hook`` (cancellation, trajectory,
+                mesh telemetry, dataset recording) and is not available to
+                callers, which is exactly why a read-only consumer needs this.
+                Installing one changes neither the actions applied nor any
+                existing field of the result json; it adds
+                ``observer_failures``. With ``n_episodes > 1`` each episode is
+                its own lifecycle with its own ``run_id``. Called synchronously,
+                so a blocking observer blocks the rollout, and payloads are
+                borrowed rather than copied - see
+                :mod:`strands_robots.simulation.observers` for the ownership
+                rules. Not yet wired into ``eval_policy``,
+                ``evaluate_benchmark`` or ``run_multi_policy``.
 
         Returns:
             The standard agent-tool envelope
@@ -2728,8 +2859,11 @@ class SimEngine(ABC):
             operational), so ``status`` alone cannot see it: a policy driving 1
             of a Panda's 8 actuators returns ``status="success"`` with
             ``action_errors=0`` and ``partial_action_failure_rate=0.875``. Gate
-            on ``partial_action_failure_rate`` and the binding-degradation
-            flags below to decide whether a rollout is worth anything. A TOTAL
+            on ``action_errors``, ``partial_action_failure_rate`` and the
+            binding-degradation flags below to decide whether a rollout is worth
+            anything. Coarse backend errors remain in ``action_errors`` but are
+            excluded from action-rate denominators rather than fabricated as
+            confirmed misses. A TOTAL
             failure - no emitted key resolving to any actuator - is reported as
             ``status="error"``.
 
@@ -2747,13 +2881,16 @@ class SimEngine(ABC):
             ``stop_policy``; ``"error"`` on error results - so an agent
             deciding whether to retry knows WHY the rollout ended).
 
-            Action health: ``action_errors`` (steps where at least one emitted
-            key did not resolve), ``action_resolution_rate`` (an
-            ``{actuator_name: fraction_of_steps_driven}`` map, so a joint stuck
-            at ``0.0`` names the actuator the policy never drove) and
-            ``partial_action_failure_rate`` (the mean fraction of the robot's
-            DOF never driven; ``0.0`` == every actuator moved every step,
-            ``~0.83`` == only 1 of 6 actuators ever moved).
+            Action health: ``action_errors`` (steps where the backend reported
+            an error), ``action_resolution_rate`` (an
+            ``{actuator_name: fraction_of_resolution-known_steps_driven}`` map,
+            so a joint stuck at ``0.0`` names an actuator not confirmed on any
+            known step) and ``partial_action_failure_rate`` (the mean fraction
+            of the robot's DOF not confirmed driven across those known steps;
+            ``0.0`` == every actuator confirmed every known step, ``~0.83`` ==
+            only 1 of 6). A coarse backend error is excluded from both rate
+            denominators instead of being counted as a physical miss; it remains
+            visible in ``action_errors`` and the human-readable diagnostic.
 
             Video: ``video_path`` (``None`` when no MP4 was written),
             ``video_frames`` and ``video_fps`` (the rate the MP4 plays at -
@@ -2779,11 +2916,17 @@ class SimEngine(ABC):
             rebuilt the policy instead of reusing ``policy_object=``) and
             ``policy_resident_rss_mb``.
 
-            Async-RTC telemetry, so latency masking is provable from the
-            payload instead of from logs: ``rtc_async_enabled``,
-            ``rtc_chunks_acquired``, ``rtc_prefetch_hits``,
-            ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms`` and
-            ``rtc_max_inference_ms``.
+            Chunk-prefetch telemetry, so latency masking is provable from the
+            payload instead of from logs: ``chunk_prefetch_enabled`` (the
+            background chunk pipeline was on - this is NOT the policy's RTC
+            algorithm, which ``policy_rtc_enabled`` reports),
+            ``chunk_prefetch_chunks_acquired``, ``chunk_prefetch_hits``,
+            ``chunk_prefetch_blocks``, ``avg_inference_ms`` and
+            ``max_inference_ms``. The pre-rename spellings
+            ``rtc_async_enabled``, ``rtc_chunks_acquired``,
+            ``rtc_prefetch_hits``, ``rtc_prefetch_blocks``,
+            ``rtc_avg_inference_ms`` and ``rtc_max_inference_ms`` are kept for
+            one release with the same values.
 
             Across episodes (``n_episodes > 1``): the aggregate payload adds
             ``total_steps``, the per-episode ``episodes`` records,
@@ -2812,6 +2955,31 @@ class SimEngine(ABC):
             surfaced via ``partial_action_failure_rate``.
         """
         from strands_robots.policies import create_policy
+
+        # Refuse a value outside the observer's domain before robot discovery,
+        # policy construction, backend hook creation, clocks, or rollout work.
+        if observer_error := optional_callable_error(observer, "observer", "run_policy"):
+            return {"status": "error", "content": [{"text": observer_error}]}
+
+        # The posture flags are checked next, for the same reason and ahead of
+        # everything they select: ``fast_mode`` decides whether the runner
+        # acquires a pacer, ``reset_between`` whether ``reset`` runs between
+        # episodes, ``wbc_install_torque_control`` whether the torque shim is
+        # installed on the scene. Read by truthiness, ``"false"`` selected the
+        # posture the word asks to skip and ``0`` took the other branch without
+        # being a declared spelling of it - a two-episode ``reset_between=0``
+        # carried episode one's end state into episode two and reported
+        # success. ``async_rtc`` is the same flag with a ``None`` sentinel that
+        # means "resolve from the policy", so only a supplied value is checked.
+        if err := self._validate_posture_flags(
+            "run_policy",
+            fast_mode=fast_mode,
+            reset_between=reset_between,
+            wbc_install_torque_control=wbc_install_torque_control,
+        ):
+            return err
+        if async_rtc is not None and (err := self._validate_posture_flags("run_policy", async_rtc=async_rtc)):
+            return err
 
         robot_name = self._resolve_single_robot(robot_name)
 
@@ -2848,6 +3016,8 @@ class SimEngine(ABC):
             return err
 
         if err := self._validate_video_config(video, "run_policy"):
+            return err
+        if err := self._validate_policy_object(policy_object, "run_policy"):
             return err
         if err := self._validate_policy_mapping(policy_config, "policy_config", "run_policy"):
             return err
@@ -2963,25 +3133,29 @@ class SimEngine(ABC):
                         int(duration * control_frequency),
                     )
                 on_frame = self._make_run_policy_hook(robot_name, instruction)
-                result = runner.run(
-                    robot_name,
-                    policy,
-                    instruction=instruction,
-                    duration=duration,
-                    n_steps=n_steps,
-                    control_frequency=control_frequency,
-                    action_horizon=action_horizon,
-                    fast_mode=fast_mode,
-                    video=VideoConfig.from_dict(video),
-                    on_frame=on_frame,
-                    max_onframe_failures=max_onframe_failures,
-                    control_substeps=control_substeps,
-                    policy_kwargs=policy_kwargs,
-                    seed=seed,
-                    async_rtc=async_rtc,
-                    rtc_inference_timeout_s=rtc_inference_timeout_s,
-                    stop_when=stop_when_fn,
-                )
+                try:
+                    result = runner.run(
+                        robot_name,
+                        policy,
+                        instruction=instruction,
+                        duration=duration,
+                        n_steps=n_steps,
+                        control_frequency=control_frequency,
+                        action_horizon=action_horizon,
+                        fast_mode=fast_mode,
+                        video=VideoConfig.from_dict(video),
+                        on_frame=on_frame,
+                        observer=observer,
+                        max_onframe_failures=max_onframe_failures,
+                        control_substeps=control_substeps,
+                        policy_kwargs=policy_kwargs,
+                        seed=seed,
+                        async_rtc=async_rtc,
+                        rtc_inference_timeout_s=rtc_inference_timeout_s,
+                        stop_when=stop_when_fn,
+                    )
+                finally:
+                    self._release_run_policy_hook(robot_name)
                 completed = 1 if result.get("status") == "success" else 0
                 contract = self._episode_contract_fields(
                     requested=1, completed=completed, saved=0, flush_deferred=recording
@@ -3013,6 +3187,7 @@ class SimEngine(ABC):
                 async_rtc=async_rtc,
                 rtc_inference_timeout_s=rtc_inference_timeout_s,
                 stop_when=stop_when_fn,
+                observer=observer,
             )
         finally:
             if controller_cleanup is not None:
@@ -3246,22 +3421,105 @@ class SimEngine(ABC):
             return None, err
         return {r: int(action_horizon) for r in policies}, None
 
+    def _unresolvable_entity_error(
+        self,
+        entities: tuple[list[str], list[str], list[str | None]],
+        *,
+        subject: str,
+        consequence: str,
+        err: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Structured error if any entity in *entities* does not resolve in this sim.
+
+        The one owner of the four probes a predicate-DSL clause needs, shared
+        by :meth:`_stop_when_unresolved_error` (``run_policy``) and
+        :meth:`evaluate_benchmark`: whether the backend can look bodies up at
+        all, then each body, each joint, and each robot floating base, through
+        the SAME lookup path the predicates use at evaluation time
+        (:func:`~strands_robots.simulation.predicates.can_resolve_body` /
+        :func:`~strands_robots.simulation.predicates.can_resolve_joint` /
+        :func:`~strands_robots.simulation.predicates.can_resolve_base`,
+        including the LIBERO ``<name>_main`` body fallback).
+
+        Both callers admit the same DSL and both are undone by the same
+        mistake, so they share the wording rather than each spelling its own
+        copy of it - only the clause named and the consequence differ.
+
+        Args:
+            entities: ``(bodies, joints, robot_bases)`` as collected by
+                :func:`~strands_robots.simulation.benchmark_spec.stop_when_referenced_entities`.
+            subject: What references the entities, opening every message
+                (``"stop_when"``, ``"benchmark 'drawer-open' ..."``).
+            consequence: One capitalized sentence naming what the caller gets
+                if the clause is armed anyway. Slotted between the finding and
+                the remedy in each message.
+            err: Builds the caller's error envelope from a message, so each
+                surface keeps its own prefix and json block.
+
+        Returns:
+            ``None`` when every entity resolves, else *err*'s envelope.
+        """
+        from strands_robots.simulation.predicates import (
+            can_resolve_base,
+            can_resolve_body,
+            can_resolve_joint,
+            supports_body_lookup,
+        )
+
+        bodies, joints, robot_bases = entities
+
+        if bodies and not supports_body_lookup(self):
+            return err(
+                f"{subject} references bodies {bodies} but this backend has no body lookup "
+                f"(get_body_state). {consequence} Use a clause without body-referencing "
+                "predicates, or a backend that supports body lookups."
+            )
+        missing_bodies = [b for b in bodies if not can_resolve_body(self, b)]
+        if missing_bodies:
+            return err(
+                f"{subject} references bodies not present in the scene: {missing_bodies}. "
+                f"{consequence} Check the names against the loaded scene (get_state lists "
+                "objects; describe() lists actions)."
+            )
+        missing_joints = [j for j in joints if not can_resolve_joint(self, j)]
+        if missing_joints:
+            return err(
+                f"{subject} references joints not present in the observation: {missing_joints}. "
+                f"{consequence} Check the names against get_observation()'s keys "
+                "(joint names are namespaced '<robot>/<joint>')."
+            )
+        unresolved_bases = [r for r in robot_bases if not can_resolve_base(self, r)]
+        if unresolved_bases:
+            try:
+                known = self.list_robots()
+            except Exception:  # noqa: BLE001 - the refusal must not depend on the listing
+                known = []
+            named = [r for r in unresolved_bases if r is not None and r not in known]
+            spelled = [r if r is not None else "<the sole robot>" for r in unresolved_bases]
+            cause = (
+                f"no robot in the scene is named {named} (robots: {known})"
+                if named
+                else f"{spelled} has no floating base - a fixed-base arm reports no base_pos/base_quat"
+            )
+            return err(
+                f"{subject} arms a base_* predicate on {spelled}, but {cause}. Base predicates "
+                f"read the floating-base signals. {consequence} Use a body/joint predicate for "
+                "a fixed-base robot, or name a robot that has a floating base."
+            )
+        return None
+
     def _stop_when_unresolved_error(self, stop_when: dict[str, Any]) -> dict[str, Any] | None:
         """Structured error if a ``stop_when`` clause references unresolvable entities.
 
-        Probes every body/joint name in the clause through the SAME lookup
-        path the predicates use at evaluation time
-        (:func:`~strands_robots.simulation.predicates.can_resolve_body` /
-        :func:`~strands_robots.simulation.predicates.can_resolve_joint`,
-        including the LIBERO ``<name>_main`` fallback), against the live
-        scene, once, before the rollout starts. Returns ``None`` when every
-        referenced entity resolves. Bodies added to the scene AFTER this
-        check are out of contract - a rollout does not create bodies.
+        Probes every body/joint/robot-base name in the clause against the live
+        scene, once, before the rollout starts, through
+        :meth:`_unresolvable_entity_error` - the prober
+        :meth:`evaluate_benchmark` shares for a benchmark spec's clauses, which
+        are authored in the same DSL. Returns ``None`` when every referenced
+        entity resolves. Bodies added to the scene AFTER this check are out of
+        contract - a rollout does not create bodies.
         """
         from strands_robots.simulation.benchmark_spec import stop_when_referenced_entities
-        from strands_robots.simulation.predicates import can_resolve_body, can_resolve_joint, supports_body_lookup
-
-        bodies, joints = stop_when_referenced_entities(stop_when)
 
         def _err(text: str) -> dict[str, Any]:
             return {
@@ -3272,30 +3530,12 @@ class SimEngine(ABC):
                 ],
             }
 
-        if bodies and not supports_body_lookup(self):
-            return _err(
-                f"stop_when references bodies {bodies} but this backend has no body lookup "
-                "(get_body_state), so the clause could never fire and the rollout would "
-                "silently run to its step budget. Use a clause without body-referencing "
-                "predicates, or a backend that supports body lookups."
-            )
-        missing_bodies = [b for b in bodies if not can_resolve_body(self, b)]
-        if missing_bodies:
-            return _err(
-                f"stop_when references bodies not present in the scene: {missing_bodies}. "
-                "The clause would never fire and the rollout would silently run to its "
-                "step budget. Check the names against the loaded scene (get_state lists "
-                "objects; describe() lists actions)."
-            )
-        missing_joints = [j for j in joints if not can_resolve_joint(self, j)]
-        if missing_joints:
-            return _err(
-                f"stop_when references joints not present in the observation: {missing_joints}. "
-                "The clause would never fire and the rollout would silently run to its "
-                "step budget. Check the names against get_observation()'s keys "
-                "(joint names are namespaced '<robot>/<joint>')."
-            )
-        return None
+        return self._unresolvable_entity_error(
+            stop_when_referenced_entities(stop_when),
+            subject="stop_when",
+            consequence="The clause would never fire and the rollout would silently run to its step budget.",
+            err=_err,
+        )
 
     def _run_episodes(
         self,
@@ -3319,6 +3559,7 @@ class SimEngine(ABC):
         async_rtc: bool | None = None,
         rtc_inference_timeout_s: float | None = None,
         stop_when: Callable[[SimEngine], bool] | None = None,
+        observer: RunPolicyObserver | None = None,
     ) -> dict[str, Any]:
         """Run ``n_episodes`` sequential rollouts; shared multi-episode driver.
 
@@ -3344,25 +3585,29 @@ class SimEngine(ABC):
             ep_seed = None if seed is None else seed + ep
             ep_video = self._episode_video_config(video, ep)
             on_frame = self._make_run_policy_hook(robot_name, instruction)
-            result = runner.run(
-                robot_name,
-                policy,
-                instruction=instruction,
-                duration=duration,
-                n_steps=n_steps,
-                control_frequency=control_frequency,
-                action_horizon=action_horizon,
-                fast_mode=fast_mode,
-                video=ep_video,
-                on_frame=on_frame,
-                max_onframe_failures=max_onframe_failures,
-                control_substeps=control_substeps,
-                policy_kwargs=policy_kwargs,
-                seed=ep_seed,
-                async_rtc=async_rtc,
-                rtc_inference_timeout_s=rtc_inference_timeout_s,
-                stop_when=stop_when,
-            )
+            try:
+                result = runner.run(
+                    robot_name,
+                    policy,
+                    instruction=instruction,
+                    duration=duration,
+                    n_steps=n_steps,
+                    control_frequency=control_frequency,
+                    action_horizon=action_horizon,
+                    fast_mode=fast_mode,
+                    video=ep_video,
+                    on_frame=on_frame,
+                    observer=observer,
+                    max_onframe_failures=max_onframe_failures,
+                    control_substeps=control_substeps,
+                    policy_kwargs=policy_kwargs,
+                    seed=ep_seed,
+                    async_rtc=async_rtc,
+                    rtc_inference_timeout_s=rtc_inference_timeout_s,
+                    stop_when=stop_when,
+                )
+            finally:
+                self._release_run_policy_hook(robot_name)
             ep_json = self._extract_json_payload(result)
             ep_record: dict[str, Any] = {"episode": ep, **ep_json}
             total_steps += int(ep_json.get("n_steps", 0) or 0)
@@ -3675,7 +3920,8 @@ class SimEngine(ABC):
             Standard status dict. ``status`` is ``"success"`` when the parquet
             holds exactly ``expected`` episodes, else ``"error"``. The
             ``{"json": {...}}`` block carries ``expected``, ``actual``,
-            ``info_total_episodes``, ``sources_agree``, ``episode_indices``,
+            ``info_total_episodes``, ``info_problems``, ``sources_agree``,
+            ``episode_indices``,
             ``total_frames``, ``total_frames_per_ep``, ``unreadable_files`` and
             ``root`` so a caller (or CI) can fail loudly programmatically.
             ``status`` is ``"error"`` when the parquet count differs from
@@ -3707,7 +3953,7 @@ class SimEngine(ABC):
                 ],
             }
 
-        from strands_robots.dataset_recorder import read_dataset_episode_indices
+        from strands_robots.verify_dataset import read_dataset_episode_indices
 
         try:
             info = read_dataset_episode_indices(root)
@@ -3726,6 +3972,7 @@ class SimEngine(ABC):
                             "expected": expected,
                             "actual": 0,
                             "info_total_episodes": None,
+                            "info_problems": [],
                             "sources_agree": False,
                             "episode_indices": [],
                             "total_frames": 0,
@@ -3741,6 +3988,7 @@ class SimEngine(ABC):
 
         actual = info["total_episodes"]
         info_total = info.get("info_total_episodes")
+        info_problems = info.get("info_problems") or []
         unreadable = info.get("unreadable_files") or []
 
         # Two independent truths must agree: the parquet episode count AND the
@@ -3749,7 +3997,11 @@ class SimEngine(ABC):
         # finalize), so a parquet-only check is not sufficient. sources_agree is
         # True when info.json is absent (parquet is then the sole truth) or when
         # the header matches the parquet.
-        sources_agree = info_total is None or info_total == actual
+        # A header that declares something which is not an episode count agrees
+        # with nothing: it is neither a matching count nor an absent header, and
+        # reading it as the latter (the parquet is then the sole truth) would
+        # certify the inconsistent dataset this cross-check exists to catch.
+        sources_agree = not info_problems and (info_total is None or info_total == actual)
         # A dataset with unreadable episode parquet files can never be certified:
         # the readable files are a LOWER BOUND on the episode count, so a count
         # that happens to equal ``expected`` proves nothing about the whole
@@ -3763,6 +4015,12 @@ class SimEngine(ABC):
                 f"parquet file(s) could not be read, so the {actual} episode(s) found "
                 f"are a lower bound (expected {expected}): {'; '.join(unreadable)}. "
                 f"Root: {root}"
+            )
+        elif info_problems:
+            text = (
+                f"verify_dataset_episodes: MISMATCH - {'; '.join(info_problems)}; the parquet "
+                f"holds {actual} episode(s) (expected {expected}), so the two metadata sources "
+                f"cannot be shown to agree. Root: {root}"
             )
         elif not sources_agree:
             verdict = "MISMATCH"
@@ -3788,6 +4046,7 @@ class SimEngine(ABC):
                         "expected": expected,
                         "actual": actual,
                         "info_total_episodes": info_total,
+                        "info_problems": list(info_problems),
                         "sources_agree": sources_agree,
                         "episode_indices": info["episode_indices"],
                         "total_frames": info["total_frames"],
@@ -3861,11 +4120,24 @@ class SimEngine(ABC):
         policy_kwargs: dict[str, Any] | None = None,
         seed: int | None = None,
     ) -> dict[str, Any]:
-        """Start policy execution in a background thread (non-blocking).
+        """Run a policy rollout, in the background where the backend has one.
 
-        Default implementation: synchronous passthrough to ``run_policy``.
-        Backends that support true background execution (like MuJoCo via
-        its ``ThreadPoolExecutor``) should override.
+        DEFAULT IMPLEMENTATION IS SYNCHRONOUS: it passes through to
+        :meth:`run_policy` and returns only after the rollout has finished, so
+        its result reports a COMPLETED rollout ("Policy complete on ...") and
+        the call blocks for the whole ``duration``. The summary line used to
+        promise a background thread outright, which is what MuJoCo's override
+        does, not what a caller of this default gets - and the two backends
+        shipped on this default are the ones whose callers most need to know.
+        Backends with true background execution override this (MuJoCo, via the
+        ``ThreadPoolExecutor`` it owns) and return as soon as the rollout is
+        submitted.
+
+        Either way :meth:`stop_policy` is the counterpart, and a caller can tell
+        which of the two it holds without reading the source: this method's
+        entry in :meth:`describe` states which one this engine implements, and a
+        backend that also tracks rollouts in flight advertises
+        ``list_policies_running`` there beside it.
 
         accepts ``n_steps`` (primary) or legacy ``max_steps`` as an
         alternate to ``duration``. See ``run_policy`` for conversion rules.
@@ -3889,6 +4161,195 @@ class SimEngine(ABC):
             policy_kwargs=policy_kwargs,
             seed=seed,
         )
+
+    def stop_policy(self, robot_name: str = "") -> dict[str, Any]:
+        """Stop ``robot_name``'s rollout (cooperative) and report what was in flight.
+
+        The counterpart to :meth:`start_policy`, and the verb that OWNS the
+        question "was a rollout halted" for every backend. It lived only on the
+        MuJoCo engine, so on the other backends the attribute did not exist at
+        all: :meth:`~strands_robots.mesh.Mesh._dispatch` probes for it with
+        ``hasattr`` and answered "peer exposes no stop_task" for a sim it could
+        in fact have stopped, and the Device Connect ``stop`` RPC re-derived the
+        answer inline from the per-robot flag - a second construction of the
+        verdict that
+        :meth:`~strands_robots.simulation.models.SimRobot.request_policy_stop`
+        exists to prevent ("EVERY stop path goes through here ... so they cannot
+        drift to different answers about whether a rollout was halted"). This is
+        the same promotion :meth:`run_multi_policy` had (#2157): a capability
+        every backend is asked for answers in the tool envelope on all of them,
+        never with ``AttributeError`` because there was no contract.
+
+        The flag write itself is backend-owned, because the per-robot rollout
+        claim is: :meth:`_request_policy_stop` is the seam, the mirror of the
+        :meth:`_make_run_policy_hook` / :meth:`_release_run_policy_hook` pair
+        that raises and lowers the same flag around a rollout driven here.
+
+        This is a cooperative stop, not a join: it moves the robot's claim out
+        of date so the rollout's next frame ends it. It cannot interrupt a
+        rollout that is blocked inside a single ``send_action`` or a single
+        policy inference, and on a backend whose :meth:`start_policy` is the
+        synchronous default the caller's own thread is the one inside the
+        rollout - so the callers that reach this verb usefully are the ones on
+        another thread (the Device Connect ``stop`` RPC and the mesh fanout).
+
+        Args:
+            robot_name: The robot whose rollout to stop. Required: an empty name
+                is refused rather than silently matched against the sole robot,
+                because a stop aimed at the wrong robot reads as a stop that
+                worked.
+
+        Returns:
+            The agent-tool envelope. On success the ``json`` block reports
+            ``was_running`` - whether a rollout really was in flight when the
+            stop arrived - so a caller aggregating several answers reads the
+            verdict rather than matching on the sentence. Idempotent: a robot
+            with nothing running is ``status="success"`` with
+            ``was_running=False``, so a caller may stop unconditionally.
+            ``status="error"`` for an empty or unknown ``robot_name``, and for a
+            backend that keeps no durable per-robot claim to move - that refusal
+            names the class, because "nothing was running" would be an
+            affirmative answer given on no evidence. Isaac is on that default
+            today: its per-robot record carries a bare ``policy_running`` flag
+            and not the durable counter, and a bare flag write is the exact
+            thing a worker that has not reached its first frame overwrites
+            (#2833), so it refuses rather than reporting a stop it cannot keep.
+        """
+        if not robot_name:
+            return {"status": "error", "content": [{"text": "stop_policy requires 'robot_name'."}]}
+        if robot_name not in self.list_robots():
+            return {"status": "error", "content": [{"text": self._unknown_robot_msg(robot_name)}]}
+        was_running = self._request_policy_stop(robot_name)
+        if was_running is None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"{type(self).__name__} keeps no durable per-robot rollout claim, so a "
+                            f"rollout in flight on '{robot_name}' cannot be stopped cooperatively "
+                            "and this call reports nothing about one. Bound the rollout instead of "
+                            "stopping it: run_policy(n_steps=...) caps its length, and "
+                            "run_policy(stop_when={'predicate': ...}) ends it as soon as the world "
+                            "reaches a state. A backend whose per-robot record carries the durable "
+                            "claim (SimRobot.request_policy_stop) makes this verb work by "
+                            "overriding _request_policy_stop."
+                        )
+                    }
+                ],
+            }
+        msg = f"Stopped on '{robot_name}'" if was_running else f"Was not running on '{robot_name}'"
+        return {
+            "status": "success",
+            "content": [{"text": msg}, {"json": {"robot": robot_name, "was_running": was_running}}],
+        }
+
+    def _request_policy_stop(self, robot_name: str) -> bool | None:
+        """Move ``robot_name``'s rollout claim out of date; report what was in flight.
+
+        The backend half of :meth:`stop_policy`, and the third member of the
+        hook seam that owns the per-robot ``policy_running`` flag:
+        :meth:`_make_run_policy_hook` raises it, :meth:`_release_run_policy_hook`
+        lowers it when the rollout ends, and this lowers it when a caller asks
+        for the rollout to end early. A backend that overrides either of those
+        holds a robot registry and should override this too; the write itself
+        belongs to :meth:`~strands_robots.simulation.models.SimRobot.request_policy_stop`
+        so every stop path reports the same fact.
+
+        Args:
+            robot_name: A robot :meth:`list_robots` names, already validated by
+                :meth:`stop_policy`.
+
+        Returns:
+            Whether a rollout was in flight when the stop arrived, or ``None``
+            when this backend keeps no durable claim to move. ``None`` is a stated
+            absence of a verdict, not a ``False``: the tri-state matches
+            :func:`~strands_robots.mesh.core._reported_a_rollout_in_flight`,
+            which reads "reported neither way" as neither, so a backend with
+            nothing to report cannot be quoted as having reported an idle robot.
+            Default: ``None`` - nothing was claimed, so nothing can be released.
+        """
+        return None
+
+    def _rollouts_in_flight(self) -> tuple[str, ...] | None:
+        """Names of this world's robots a rollout is driving right now.
+
+        The reporting counterpart of :meth:`_request_policy_stop`, and the one
+        population every remote reader of "is a rollout in flight" asks for:
+        :meth:`~strands_robots.mesh.Mesh._dispatch`'s ``status`` command and the
+        ``robots`` section of its state topic. Reporting a rollout is a strictly
+        weaker requirement than halting one - a backend whose per-robot record
+        carries a bare flag cannot keep a stop it promises (#2833), but that flag
+        is a perfectly good answer to what is running - so a backend may well
+        answer here and still refuse :meth:`stop_policy`.
+
+        Tri-state, for the reason ``_request_policy_stop`` is: ``None`` is a
+        stated absence of a verdict and not an empty population. A backend
+        keeping no rollout claim that answered ``()`` would have every reader
+        publish "nothing is running" on no evidence, which is the affirmative
+        lie :meth:`stop_policy` and
+        :func:`~strands_robots.mesh.core._reported_a_rollout_in_flight` are both
+        written against - and the state topic renders an empty population as
+        ``active=false`` on every robot in the world.
+
+        Returns:
+            The names, in any order, when this backend can enumerate the
+            rollouts it is driving; ``()`` when it can and none is; ``None``
+            when it keeps no such claim, or when the world it would read is
+            gone. Default: ``None`` - the ABC itself owns no registry.
+        """
+        return None
+
+    def list_policies_running(self) -> dict[str, Any]:
+        """Name the robots a rollout is driving right now.
+
+        The public reader of the in-flight population, promoted here from the
+        MuJoCo engine so it answers on every backend: ``docs/simulation/overview.md``
+        lists it in the Policy action table with no backend qualifier, and
+        documents :meth:`stop_policy` -- on this ABC since a robot's stop became
+        a base contract -- as deriving its verdict from "the same in-flight
+        population ``list_policies_running`` reads". Only one of that documented
+        pair existed on Newton and Isaac; asking for the other raised
+        ``AttributeError``. ``docs/device-connect.md`` makes the same promise for
+        the Device Connect stop, whose driver runs on any backend.
+
+        The population comes from :meth:`_rollouts_in_flight`, the one seam the
+        mesh's reporting surfaces also ask, so a peer polled over the wire and a
+        caller holding the engine cannot be told different things about the same
+        instant. MuJoCo's override of that seam delegates to its own registry
+        reader, so the prune this verb used to perform still happens.
+
+        Returns:
+            ``status="success"`` naming the robots in flight, or reporting that
+            none are, when this backend reports a population.
+            ``status="error"`` when it reports none at all: "no policies
+            running" is an affirmative claim, and a backend that cannot
+            enumerate its rollouts has no evidence for it. That mirrors
+            :meth:`stop_policy`, which refuses rather than reporting a halt it
+            cannot stand behind, and names the seam to override.
+        """
+        names = self._rollouts_in_flight()
+        if names is None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"list_policies_running: {type(self).__name__} keeps no rollout registry, so "
+                            "which robots are running a policy cannot be reported. Reporting none would be "
+                            "an affirmative claim about robots this backend cannot see. Fix by overriding "
+                            "_rollouts_in_flight."
+                        )
+                    }
+                ],
+            }
+        if not names:
+            return {"status": "success", "content": [{"text": "No policies running."}]}
+        robot_lines = "\n".join(f"  - {n}" for n in names)
+        return {
+            "status": "success",
+            "content": [{"text": f"Active policies ({len(names)}):\n{robot_lines}"}],
+        }
 
     def replay_episode(
         self,
@@ -3975,6 +4436,11 @@ class SimEngine(ABC):
         own process. Two evals at the same seed replay identically; ``None``
         leaves RNG state untouched. Only a non-negative integer can seed those
         RNGs, so anything else is refused here rather than at the first draw.
+        Each episode's record in the returned ``episodes`` list reports the
+        ``seed`` that attempt ran on, so a caller reading a single failed
+        episode out of a batch can replay that one rather than the whole eval;
+        it is ``None`` when no ``seed`` was given, because an unseeded eval
+        derives no per-episode seed to report.
 
         ``policy_object`` mirrors :meth:`run_policy`: pass an already-built
         ``Policy`` to skip the ``create_policy`` round-trip (e.g. a loaded
@@ -3995,7 +4461,12 @@ class SimEngine(ABC):
         inference with action-chunk execution, evaluating a chunk-emitting
         policy under the realistic control latency it faces in deployment.
         It is forwarded to :meth:`PolicyRunner.evaluate`; the default keeps
-        the success-rate synchronous and bit-stable. ``rtc_inference_timeout_s``
+        the success-rate synchronous and bit-stable. It must be a boolean -
+        a value of any other type is reported as a structured caller error
+        rather than read by truthiness, since a truthy ``"false"`` would
+        otherwise evaluate under the latency it reads as declining, and a
+        success rate measured that way is not the one the caller asked for.
+        ``rtc_inference_timeout_s``
         bounds each async inference (structured error instead of a hung
         rollout). For benchmark-style latency masking use
         :meth:`run_policy` (``async_rtc=...``).
@@ -4016,7 +4487,11 @@ class SimEngine(ABC):
         eval. Raising :class:`~strands_robots.simulation.policy_runner.CooperativeStop`
         stops the evaluation gracefully after the episodes completed so far
         (the result carries ``stopped_early=True`` and ``episodes_completed``),
-        matching :meth:`run_policy`.
+        matching :meth:`run_policy`. That best-effort posture covers a hook that
+        FAILS, not one that cannot be called at all: a non-callable ``on_frame``
+        is a caller error, refused up front with a structured error like
+        :meth:`run_policy`'s ``observer``, because absorbing it per frame would
+        return a success rate the caller's telemetry had watched none of.
 
         ``n_episodes`` and ``max_steps`` must be positive integers and
         ``control_frequency`` must be ``> 0``; a non-positive value is
@@ -4099,11 +4574,33 @@ class SimEngine(ABC):
             Policy load: ``policy_load_time_s``, ``policy_load_cache_hit`` and
             ``policy_resident_rss_mb``.
 
-            Async-RTC telemetry: ``rtc_async_enabled``,
-            ``rtc_chunks_acquired``, ``rtc_prefetch_hits``,
-            ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms`` and
-            ``rtc_max_inference_ms``.
+            Chunk-prefetch telemetry: ``chunk_prefetch_enabled`` (the
+            background chunk pipeline, not the policy's RTC algorithm, which
+            ``policy_rtc_enabled`` reports), ``chunk_prefetch_chunks_acquired``,
+            ``chunk_prefetch_hits``, ``chunk_prefetch_blocks``,
+            ``avg_inference_ms`` and ``max_inference_ms``; the pre-rename
+            ``rtc_async_enabled``, ``rtc_chunks_acquired``,
+            ``rtc_prefetch_hits``, ``rtc_prefetch_blocks``,
+            ``rtc_avg_inference_ms`` and ``rtc_max_inference_ms`` are kept for
+            one release with the same values.
         """
+        # Same posture-flag rule as run_policy, ahead of robot resolution: an
+        # evaluation is the one place a misread here would be trusted as a
+        # number, since a success rate carries no field saying which pipeline
+        # produced it.
+        if err := self._validate_posture_flags("eval_policy", async_rtc=async_rtc):
+            return err
+        # A hook that cannot be called is configuration, not telemetry, and is
+        # knowable before the first step - so it is refused here, ahead of robot
+        # resolution, exactly as run_policy refuses its observer. The eval loop
+        # treats a hook exception as best-effort telemetry (logged, never
+        # fatal), which is right for a hook that fails at frame 700 and wrong
+        # for one that can never run: every frame raised the same TypeError, the
+        # caller's telemetry recorded nothing, and the returned success rate was
+        # byte-identical to the healthy call.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "eval_policy"):
+            return {"status": "error", "content": [{"text": hook_error}]}
+
         robots = self.list_robots()
         if not robots:
             return {"status": "error", "content": [{"text": "No robots in sim. Add one first."}]}
@@ -4118,6 +4615,8 @@ class SimEngine(ABC):
             }
 
         if err := self._validate_video_config(video, "eval_policy"):
+            return err
+        if err := self._validate_policy_object(policy_object, "eval_policy"):
             return err
         if err := self._validate_policy_mapping(policy_config, "policy_config", "eval_policy"):
             return err
@@ -4270,7 +4769,8 @@ class SimEngine(ABC):
                 :class:`~strands_robots.dataset_recorder.RecordingFrameError` is
                 logged at WARN and never aborts the eval; a
                 ``RecordingFrameError`` is data loss rather than telemetry and
-                propagates on the first occurrence.
+                propagates on the first occurrence. A value that is not callable
+                at all is refused up front instead, as in :meth:`eval_policy`.
             policy_kwargs: Per-call goal payload forwarded verbatim to every
                 ``policy.get_actions(obs, instruction, **policy_kwargs)`` call
                 (same contract as :meth:`run_policy` / :meth:`eval_policy`).
@@ -4328,7 +4828,13 @@ class SimEngine(ABC):
         from strands_robots.policies import create_policy
         from strands_robots.simulation.benchmark import get_benchmark
 
+        # Same rule as eval_policy: an uncallable hook is refused before any
+        # other work, not absorbed frame by frame inside the shared eval loop.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "evaluate_benchmark"):
+            return {"status": "error", "content": [{"text": hook_error}]}
         if err := self._validate_video_config(video, "evaluate_benchmark"):
+            return err
+        if err := self._validate_policy_object(policy_object, "evaluate_benchmark"):
             return err
         if err := self._validate_policy_mapping(policy_config, "policy_config", "evaluate_benchmark"):
             return err
@@ -4400,6 +4906,38 @@ class SimEngine(ABC):
                 "status": "error",
                 "content": [{"text": self._unknown_robot_msg(resolved_robot)}],
             }
+
+        # Probe the entities the spec's clauses name against the LIVE scene,
+        # before any policy is built. A benchmark clause is authored in the
+        # same predicate DSL as ``stop_when`` and compiles the same way, so it
+        # fails the same way: a body the scene does not have makes its term a
+        # constant (predicates never raise), which for a success clause means
+        # every episode scores a miss. The eval then reports success_rate 0.0
+        # under status="success" - the number a caller publishes, and
+        # indistinguishable from an honest policy failure. ``run_policy``
+        # refuses the identical clause up front; this is that guard on the
+        # surface whose entire output is that rate. Benchmarks that cannot be
+        # probed (their own ``scene``, or opaque compiled clauses) report no
+        # entities and are evaluated unchanged.
+        referenced = getattr(spec, "referenced_entities", None)
+        if callable(referenced):
+
+            def _benchmark_err(text: str) -> dict[str, Any]:
+                return {"status": "error", "content": [{"text": f"evaluate_benchmark: {text}"}]}
+
+            probe_error = self._unresolvable_entity_error(
+                referenced(),
+                subject=f"benchmark {benchmark_name!r} (success / failure / dense_reward)",
+                consequence=(
+                    "Each referencing term degrades to a constant, so no success or failure "
+                    "clause built on it can ever fire and no dense_reward term built on it can "
+                    "ever be non-zero: every episode would score a miss and the benchmark would "
+                    "report a 0% success rate that reads as an honest policy failure."
+                ),
+                err=_benchmark_err,
+            )
+            if probe_error is not None:
+                return probe_error
 
         if policy_object is None:
             policy = create_policy(policy_provider, **(policy_config or {}))
@@ -4549,6 +5087,34 @@ class SimEngine(ABC):
 
         Returns:
             Callable or ``None``.
+        """
+        return None
+
+    def _release_run_policy_hook(self, robot_name: str) -> None:
+        """Release whatever :meth:`_make_run_policy_hook` claimed for the rollout.
+
+        The other half of the hook seam. A backend whose hook builder marks the
+        robot as driven -- ``policy_running``, the per-robot flag its motion
+        primitives and its busy guards refuse on -- has to lower it when the
+        rollout ends, and only this facade knows when that is: the closure is
+        called per frame and cannot see its own last one.
+
+        Called in a ``finally`` around every rollout driven here (the
+        single-episode :meth:`run_policy` path and each episode of
+        :meth:`_run_episodes`), so a rollout that ends for any reason --
+        completion, a cooperative stop, or a raise -- leaves the robot idle.
+        That is the guarantee
+        :meth:`~strands_robots.simulation.mujoco.simulation.MuJoCoSimEngine._drive_rollout`
+        states for the MuJoCo backend, which reaches it through its own
+        ``run_policy`` override; a backend without such an override reaches it
+        here.
+
+        Args:
+            robot_name: The robot whose rollout has ended.
+
+        Returns:
+            ``None``. Default: nothing was claimed, so nothing is released.
+            Override alongside :meth:`_make_run_policy_hook`.
         """
         return None
 
@@ -4967,7 +5533,20 @@ class SimEngine(ABC):
                     "'error' on failures) + steps_used so a caller can decide "
                     "whether to retry"
                 ),
-                "start_policy": "(robot_name: str, policy_provider='mock', ...) -> dict",
+                "start_policy": (
+                    "(robot_name: str, policy_provider='mock', ...) -> dict  # on "
+                    "THIS engine it runs the rollout to completion and returns "
+                    "its result (synchronous); a backend that runs it in the "
+                    "background instead says so here and advertises "
+                    "list_policies_running beside it, so this entry is how to "
+                    "tell which one you hold"
+                ),
+                "stop_policy": (
+                    "(robot_name: str) -> dict  # cooperatively end a rollout "
+                    "in flight; the json block reports was_running, and "
+                    "robot_name is required (never defaulted to the sole robot)"
+                ),
+                "list_policies_running": LIST_POLICIES_RUNNING_DESCRIBE_ENTRY,
                 "eval_policy": (
                     "(robot_name: str, policy_provider='mock', n_episodes=1, "
                     "max_steps=300, success_fn=None, ...) -> dict  # multi-episode "

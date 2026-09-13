@@ -9,10 +9,30 @@ This tool provides comprehensive pose management for robotic arms, including:
 - Integration with LeRobot and serial communication
 - Pose interpolation and smooth transitions
 - Framed decoding of servo status replies
+
+Operator approval: the five actions that move the arm - ``move_motor``,
+``move_multiple``, ``incremental_move``, ``load_pose`` and ``reset_to_home`` -
+stop for a human BEFORE the :class:`MotorController` is built, through the same
+decision path the ROS transports, ``use_unitree`` and ``serial_tool`` use
+(:func:`~strands_robots.tools._command_gate.gate_motion`).
+``STRANDS_POSE_COMMAND_ALLOW`` (comma-separated action names, or ``*``)
+pre-approves, ``BYPASS_TOOL_CONSENT=true`` lifts the gate with a WARNING,
+otherwise the operator is prompted through the tool context and, with none
+reachable, the call is refused and no packet is written. The dashboard's
+:class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook` lists the same
+five actions; when that hook has already asked and deposited a grant for this
+exact call the in-tool gate spends the grant instead of asking twice. Before
+this gate the hook was the only human check, and it is a hook an ``Agent`` has
+to be built with - every canonical ``Agent(tools=robot.tools)`` build had none,
+so the default wiring moved the arm unasked (F-010, CWE-862). ``connect``,
+``read_position``, ``read_all``, the pose library actions (``store_pose``,
+``list_poses``, ``show_pose``, ``delete_pose``) and ``emergency_stop`` are never
+gated: stopping is never gated.
 """
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,10 +41,18 @@ from typing import Any, TypedDict
 import serial
 import serial.tools.list_ports
 from strands import tool
+from strands.types.tools import ToolContext
 
 from strands_robots.drivers.feetech.protocol import MAX_GOAL_POSITION, decode_word, encode_word
+from strands_robots.tools._command_gate import gate_motion
 from strands_robots.tools._path_validation import resolve_output_path, validate_save_path
-from strands_robots.utils import finite_number_error, positive_count_error, positive_finite_number_error
+from strands_robots.utils import (
+    boolean_flag_error,
+    finite_number_error,
+    positive_count_error,
+    positive_finite_number_error,
+    refusal_str,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +62,9 @@ logger = logging.getLogger(__name__)
 # ``steps`` and ``step_delay`` are only consumed on the interpolated path, so an
 # action that moves in one shot never reads them and must never be refused for
 # them. ``reset_to_home`` interpolates unconditionally; ``load_pose`` and
-# ``move_multiple`` interpolate only when the caller leaves ``smooth`` truthy.
+# ``move_multiple`` interpolate only when the caller leaves ``smooth`` true, so
+# they are also the actions that read ``smooth`` at all and the ones it is
+# checked for.
 _INTERPOLATING_ACTIONS = frozenset({"load_pose", "move_multiple"})
 _ALWAYS_INTERPOLATING_ACTIONS = frozenset({"reset_to_home"})
 
@@ -51,7 +81,51 @@ def _interpolates(action: str, smooth: bool) -> bool:
     """
     if action in _ALWAYS_INTERPOLATING_ACTIONS:
         return True
-    return action in _INTERPOLATING_ACTIONS and bool(smooth)
+    return action in _INTERPOLATING_ACTIONS and smooth
+
+
+def _smooth_posture_error(action: str, smooth: Any) -> str | None:
+    """Error text when ``smooth`` is not a spelling of a posture this action reads.
+
+    ``smooth`` selects between two trajectories towards the same targets, not a
+    quantity: interpolate over ``steps * step_delay`` seconds, or write each
+    goal position once. Read by truthiness, the two undeclared halves fail in
+    opposite directions and neither reports itself.
+
+    A falsy non-boolean - ``0``, ``""``, ``None``, ``[]`` - takes the one-shot
+    branch, and the flag defaults to ``True``, so it silently *removes* the
+    interpolation a caller never asked to leave. What arrives at the servo is a
+    single write to the far end of the travel: the full-travel jump this module
+    already refuses ``steps=True`` for, on the grounds that it is "exactly the
+    path a caller asking to interpolate wanted to avoid". Every non-empty string
+    is truthy, so the opt-out spellings ``"false"``, ``"no"``, ``"off"`` and
+    ``"0"`` select the *interpolating* branch instead - and, because this flag
+    also decides whether ``steps`` and ``step_delay`` are read at all, the
+    caller is then refused for one of those options while believing they had
+    spelled nobody reading them.
+
+    It is checked only for the actions that consult it, matching
+    :func:`_smooth_move_option_error`: ``reset_to_home`` interpolates
+    unconditionally and passes its own ``smooth=True``, and every other action
+    moves in one shot, so neither reads the caller's flag and neither may be
+    refused for it.
+
+    The check is ordered ahead of :func:`_smooth_move_option_error` so a bad
+    flag is named as the flag. Behind it, the refusal names ``steps`` or
+    ``step_delay`` - sending the caller to correct a value whose only problem
+    was the posture that decided it would be read.
+
+    Args:
+        action: The requested action; decides whether the flag is read.
+        smooth: The interpolation posture, as supplied.
+
+    Returns:
+        An error message naming the action and the flag, or ``None`` when the
+        action ignores it or the value is a boolean.
+    """
+    if action not in _INTERPOLATING_ACTIONS:
+        return None
+    return boolean_flag_error(smooth, "smooth", action)
 
 
 def _smooth_move_option_error(action: str, *, smooth: bool, steps: Any, step_delay: Any) -> str | None:
@@ -95,7 +169,7 @@ def _smooth_move_option_error(action: str, *, smooth: bool, steps: Any, step_del
         An error message naming the action and the option, or ``None`` when the
         action reads neither option or both values are usable.
     """
-    if not _interpolates(action, bool(smooth)):
+    if not _interpolates(action, smooth):
         return None
     if error := positive_count_error(steps, "steps", action):
         return error
@@ -138,7 +212,7 @@ class PoseManager:
         """Load poses from storage."""
         if self.pose_file.exists():
             try:
-                with open(self.pose_file) as f:
+                with open(self.pose_file, encoding="utf-8") as f:
                     data = json.load(f)
                     self.poses = {name: RobotPose.from_dict(pose_data) for name, pose_data in data.items()}
                 logger.info(f"Loaded {len(self.poses)} poses for robot {self.robot_id}")
@@ -147,14 +221,62 @@ class PoseManager:
                 self.poses = {}
 
     def _save_poses(self) -> None:
-        """Save poses to storage."""
+        """Store the pose library in full, or leave the stored one untouched.
+
+        Every write here rewrites the WHOLE library: :meth:`store_pose` and
+        :meth:`delete_pose` change one entry and store the document back. A
+        write that lands partially therefore does not lose the pose being
+        changed, it loses every pose the file held - and :meth:`_load_poses`
+        reports an unparseable file as *no poses* (an error line, then an empty
+        library), so the loss surfaces as poses that were stored simply not
+        being there.
+
+        So the document is serialized in full *before* the destination is
+        touched, and the text is committed through a temp file in the same
+        directory plus :func:`os.replace` - the sequence
+        :func:`strands_robots.registry.user_registry._save_user_registry`
+        documents for its own whole-document store, for the same two reasons:
+
+        * Serializing first is what keeps a rejected write harmless.
+          ``json.dump`` encodes straight into the stream it is given, so a
+          value it cannot encode - a NumPy scalar read off a joint, say -
+          raises only after a prefix of the new document has replaced the old
+          one on disk.
+        * :func:`os.replace` is atomic within a directory, so a full disk or an
+          I/O error during the commit leaves the previous library intact rather
+          than truncated, and a concurrent reader observes one whole document
+          or the other, never a prefix.
+
+        The temp file is written with :meth:`pathlib.Path.write_text` rather
+        than :func:`tempfile.mkstemp` so the library keeps the ordinary
+        umask-derived mode a plain ``open(path, "w")`` gave it: replacing its
+        contents is not the moment to decide who may read it.
+
+        Raises:
+            ValueError: A pose holds a value JSON cannot represent. Raised
+                before the stored library is touched, so it is still the last
+                one that loaded; the originating ``TypeError`` stays on
+                ``__cause__``, naming the offending type.
+            OSError: The temp file could not be written or renamed. The stored
+                library is likewise unchanged, and no temp file is left behind.
+        """
+        data = {name: pose.to_dict() for name, pose in self.poses.items()}
         try:
-            data = {name: pose.to_dict() for name, pose in self.poses.items()}
-            with open(self.pose_file, "w") as f:
-                json.dump(data, f, indent=2)
-            logger.info(f"Saved {len(self.poses)} poses for robot {self.robot_id}")
-        except Exception as e:
-            logger.error(f"Failed to save poses: {e}")
+            payload = json.dumps(data, indent=2) + "\n"
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"a pose is not JSON-serializable, so the library cannot be stored in {self.pose_file}: "
+                f"{exc}. The stored library is unchanged. Pass only JSON types (str, int, float, bool, "
+                "None, list, dict) - a NumPy scalar read off a joint must be converted first."
+            ) from exc
+        tmp = self.pose_file.with_suffix(self.pose_file.suffix + ".tmp")
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, self.pose_file)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+        logger.info(f"Saved {len(self.poses)} poses for robot {self.robot_id}")
 
     def store_pose(
         self,
@@ -163,7 +285,25 @@ class PoseManager:
         description: str | None = None,
         safety_bounds: dict[str, tuple[float, float]] | None = None,
     ) -> RobotPose:
-        """Store a new pose."""
+        """Store a named pose, in the library on disk as well as in memory.
+
+        Args:
+            name: Name the pose is stored under; an existing pose of that name
+                is replaced.
+            positions: Joint angles in degrees.
+            description: Optional free-text note.
+            safety_bounds: Optional per-joint ``(low, high)`` limits.
+
+        Returns:
+            The stored pose.
+
+        Raises:
+            ValueError: The pose holds a value JSON cannot represent.
+            OSError: The library could not be committed to disk.
+
+        Either way the pose is stored nowhere - not on disk, and not in the
+        in-memory library (see :meth:`_save_poses`).
+        """
         pose = RobotPose(
             name=name,
             positions=positions.copy(),
@@ -171,8 +311,20 @@ class PoseManager:
             description=description,
             safety_bounds=safety_bounds,
         )
+        previous = self.poses.get(name)
         self.poses[name] = pose
-        self._save_poses()
+        try:
+            self._save_poses()
+        except (OSError, ValueError):
+            # The library on disk is the one that loaded, so the library in
+            # memory must be too: leaving the pose here would let the next
+            # successful store resurrect a pose this call already reported it
+            # could not keep.
+            if previous is None:
+                del self.poses[name]
+            else:
+                self.poses[name] = previous
+            raise
         return pose
 
     def get_pose(self, name: str) -> RobotPose | None:
@@ -184,10 +336,27 @@ class PoseManager:
         return list(self.poses.keys())
 
     def delete_pose(self, name: str) -> bool:
-        """Delete a pose."""
+        """Delete a pose from the library on disk as well as in memory.
+
+        Args:
+            name: Pose to delete.
+
+        Returns:
+            True when a pose of that name was deleted, False when none existed.
+
+        Raises:
+            ValueError: A pose holds a value JSON cannot represent.
+            OSError: The library could not be committed to disk. The pose is
+                then deleted nowhere - it is still in the stored library and
+                still in the in-memory one (see :meth:`_save_poses`).
+        """
         if name in self.poses:
-            del self.poses[name]
-            self._save_poses()
+            deleted = self.poses.pop(name)
+            try:
+                self._save_poses()
+            except (OSError, ValueError):
+                self.poses[name] = deleted
+                raise
             return True
         return False
 
@@ -320,7 +489,7 @@ def _joint_target_error(action: str, label: str, motor_name: str | None, value: 
     if not low <= value <= high:
         return (
             f"{action}: {label} must be within [{low}, {high}] {_target_unit(name)} "
-            f"(the configured travel of '{name}'), got {value}."
+            f"(the configured travel of '{name}'), got {refusal_str(value)}."
         )
     return None
 
@@ -366,7 +535,7 @@ def _joint_delta_error(action: str, motor_name: str | None, delta: Any) -> str |
     if abs(delta) > span:
         return (
             f"{action}: delta must be at most {span} {_target_unit(name)} in magnitude "
-            f"(the full travel of '{name}', so no starting position could honor more), got {delta}."
+            f"(the full travel of '{name}', so no starting position could honor more), got {refusal_str(delta)}."
         )
     return None
 
@@ -533,6 +702,22 @@ class MotorController:
     """Low-level motor control for fine movements."""
 
     def __init__(self, port: str, baudrate: int = 1000000):
+        """Bind a controller to one serial port.
+
+        Args:
+            port: Serial device path; opened by :meth:`connect`.
+            baudrate: Bus speed, a positive integer. Refused here rather than at
+                :meth:`connect`, which reports a failure to open as a reason
+                string: pyserial coerces the speed through its own ``int()`` and
+                refuses only a negative, so an unusable value opens the port at a
+                speed no servo answers and every read then times out, which is
+                indistinguishable from an unplugged arm.
+
+        Raises:
+            ValueError: ``baudrate`` is not a positive integer.
+        """
+        if (reason := positive_count_error(baudrate, "baudrate", type(self).__name__)) is not None:
+            raise ValueError(reason)
         self.port = port
         self.baudrate = baudrate
         self.serial_conn: serial.Serial | None = None
@@ -835,7 +1020,68 @@ class MotorController:
         return self.move_motor(motor_name, new_pos)
 
 
-@tool
+# The actions that move the arm. Everything else reads the bus, releases torque
+# (``emergency_stop``) or edits the pose library on disk.
+MOTION_ACTIONS = frozenset({"move_motor", "move_multiple", "incremental_move", "load_pose", "reset_to_home"})
+
+# Pre-approve motion actions by name (comma-separated, ``*`` for all) for
+# headless runs. Read by the shared gate, which also honours BYPASS_TOOL_CONSENT.
+COMMAND_ALLOW_ENV = "STRANDS_POSE_COMMAND_ALLOW"
+
+
+def _dashboard_grant(tool_input: dict[str, Any]) -> bool:
+    """Spend a grant the dashboard's motion hook deposited for this exact call.
+
+    The dashboard registers :class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook`
+    on its agent, which asks the operator before the tool runs and records a
+    one-shot grant keyed on what they were shown. Asking again here would be
+    the same question twice, so a grant is consumed and the call proceeds. The
+    dashboard extra may be absent, and a missing module must read as "no
+    grant", never as a crash: the gate below then asks the operator itself.
+
+    Args:
+        tool_input: The call as the hook saw it - the same field names, with
+            the unset ones omitted.
+
+    Returns:
+        True when a grant for this exact call existed and was spent.
+    """
+    try:
+        from strands_robots.dashboard import agent_hitl
+    except ImportError:
+        return False
+    return bool(agent_hitl.consume_grant("pose_tool", tool_input))
+
+
+def _gate_motion(action: str, tool_input: dict[str, Any], tool_context: ToolContext | None) -> str | None:
+    """Operator approval for one arm motion, before the controller is built.
+
+    Args:
+        action: One of :data:`MOTION_ACTIONS`.
+        tool_input: The call's own fields (port, motor_name, position, delta,
+            positions, pose_name), unset ones omitted; shown to the operator
+            and used to match a dashboard grant.
+        tool_context: The agent tool context supplying ``interrupt()``.
+
+    Returns:
+        A refusal message, or None to let the motion proceed.
+    """
+    if _dashboard_grant(tool_input):
+        return None
+    port = str(tool_input.get("port") or "")
+    detail = " ".join(f"{k}={v}" for k, v in tool_input.items() if k not in ("action", "port"))
+    return gate_motion(
+        "pose_tool",
+        action,
+        port,
+        f"{action!r} moves the arm on {port!r} ({detail}); it needs operator approval before any goal position is sent.",
+        tool_context,
+        allow_env=COMMAND_ALLOW_ENV,
+        allow_match=lambda allowed: "*" in allowed or action in allowed,
+    )
+
+
+@tool(context=True)
 def pose_tool(
     action: str,
     robot_id: str = "so101_follower",
@@ -849,6 +1095,7 @@ def pose_tool(
     smooth: bool = True,
     steps: int = 20,
     step_delay: float = 0.05,
+    tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """
     Advanced robot pose management tool with fine motor control.
@@ -878,11 +1125,12 @@ def pose_tool(
 
     Calibration:
         This tool performs no calibration - every action above drives or reads a
-        motor through the calibration already on disk. Stored calibrations are
-        managed by the separate lerobot_calibrate tool (list, view, backup,
-        restore), and the interactive prompt LeRobot shows when a device has
-        none is answered by a lerobot_teleoperate session's
-        ``auto_accept_calibration``.
+        motor through the calibration already on disk. Recording one is
+        LeRobot's own procedure, run from the shell with ``lerobot-calibrate``
+        (after ``lerobot-find-port`` and ``lerobot-setup-motors``), which writes
+        the JSON under ``HF_LEROBOT_CALIBRATION``; the interactive prompt
+        LeRobot shows when a device has none is answered by a
+        ``lerobot_teleoperate`` session's ``auto_accept_calibration``.
 
     Args:
         action: Action to perform
@@ -904,7 +1152,13 @@ def pose_tool(
             value is held to the same domain as ``position``, and the first that
             is not names the motor it came from.
         description: Description for stored poses
-        smooth: Use smooth interpolated movement
+        smooth: Interpolate towards the targets over ``steps * step_delay``
+            seconds instead of writing each goal position once. A boolean:
+            it selects one of two trajectories, so a value that is only
+            truthy or only falsy is refused rather than read as one of
+            them - ``smooth=0`` would drop the interpolation this defaults
+            to, and ``smooth="false"`` would keep it. Read only by
+            ``load_pose`` and ``move_multiple``.
         steps: Number of increments for an interpolated move. A positive
             integer - it divides the travel and bounds the write loop.
         step_delay: Seconds between increments of an interpolated move. A
@@ -912,17 +1166,37 @@ def pose_tool(
             so ``0`` is refused; use ``smooth=False`` to go straight to the
             target. Together with ``steps`` it sets the trajectory duration
             (the default 20 x 0.05s = ~1s).
+        tool_context: Supplied by the agent runtime; carries the operator
+            interrupt the motion actions are approved through. Without it a
+            motion is refused unless pre-approved via
+            STRANDS_POSE_COMMAND_ALLOW or BYPASS_TOOL_CONSENT=true
+
+    Operator approval:
+        "move_motor", "move_multiple", "incremental_move", "load_pose" and
+        "reset_to_home" move the arm, so each stops for a human before the
+        motor controller is built; a declined or headless call sends no goal
+        position. Pre-approve with STRANDS_POSE_COMMAND_ALLOW=move_motor,load_pose
+        (or "*"). "connect", the reads, the pose library actions and
+        "emergency_stop" are never gated.
 
     Both interpolation options are read only by ``load_pose`` and
-    ``move_multiple`` (when ``smooth`` is left truthy) and by
-    ``reset_to_home``, which always interpolates; any other action ignores them
-    and is never refused for them.
+    ``move_multiple`` (when ``smooth`` is left true) and by ``reset_to_home``,
+    which always interpolates; any other action ignores them and is never
+    refused for them. ``smooth`` itself is read only by the first two -
+    ``reset_to_home`` supplies its own - so only those two are refused for it.
 
     Returns:
         Dict containing status and response content, or an error dict when an
         interpolation option or a joint target the requested action reads cannot
         be honored.
     """
+
+    # ``smooth`` decides which of two trajectories reaches the servos, and it
+    # also decides whether the two options below are read at all - so it is
+    # checked first, and a bad flag is named as the flag rather than surfacing
+    # as a refusal for an option the caller's posture says nobody reads.
+    if posture_error := _smooth_posture_error(action, smooth):
+        return {"status": "error", "content": [{"text": posture_error}]}
 
     # Both interpolation options are consumed on a live servo bus - one as a
     # divisor and loop bound, one as the pause between goal positions - so an
@@ -1018,7 +1292,24 @@ def pose_tool(
             if not pose_name:
                 return {"status": "error", "content": [{"text": "pose_name required"}]}
 
-            if pose_manager.delete_pose(pose_name):
+            try:
+                deleted = pose_manager.delete_pose(pose_name)
+            except (OSError, ValueError) as exc:
+                # Same reason the partial-arm case below refuses: this one
+                # persists, so a success reported over a library that still
+                # holds the pose would be read as a deletion that happened.
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                f"Not deleting '{pose_name}': the pose library could not be stored "
+                                f"({exc}). All {len(pose_manager.list_poses())} stored poses are unchanged."
+                            )
+                        }
+                    ],
+                }
+            if deleted:
                 return {"status": "success", "content": [{"text": f"Deleted pose '{pose_name}'"}]}
             else:
                 return {"status": "error", "content": [{"text": f"Pose '{pose_name}' not found"}]}
@@ -1026,6 +1317,30 @@ def pose_tool(
         # Actions that need motor controller
         if not port:
             return {"status": "error", "content": [{"text": "port required for motor operations"}]}
+
+        if action in MOTION_ACTIONS:
+            tool_input = {
+                key: value
+                for key, value in (
+                    ("action", action),
+                    ("port", port),
+                    ("pose_name", pose_name),
+                    ("motor_name", motor_name),
+                    ("position", position),
+                    ("delta", delta),
+                    ("positions", positions),
+                    # The dashboard hook keys its grant on the fields the model
+                    # supplied; ``steps`` has a default here, so it is carried
+                    # only when it differs from it. A model that spelled out the
+                    # default is asked twice, which errs on the side of asking.
+                    ("steps", steps if steps != 20 else None),
+                )
+                if value is not None and value != ""
+            }
+            if refusal := _gate_motion(action, tool_input, tool_context):
+                # The controller does not exist yet: a refused motion is exactly
+                # as inert as a call that never happened.
+                return {"status": "error", "content": [{"text": f"pose_tool: {refusal}"}]}
 
         controller = MotorController(port)
 
@@ -1144,7 +1459,26 @@ def pose_tool(
                         ],
                     }
 
-                pose = pose_manager.store_pose(pose_name, current_positions, description)
+                try:
+                    pose = pose_manager.store_pose(pose_name, current_positions, description)
+                except (OSError, ValueError) as exc:
+                    # A stored pose is a durable named posture, so the same rule
+                    # as the partial-arm refusal above applies to the write
+                    # itself: a library that could not be committed leaves the
+                    # arm's postures as they were, and saying otherwise would
+                    # have the caller believe this posture is recoverable.
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"Not storing '{pose_name}': the pose library could not be stored "
+                                    f"({exc}). All {len(pose_manager.list_poses())} previously stored "
+                                    "poses are unchanged."
+                                )
+                            }
+                        ],
+                    }
 
                 pos_text = "\n".join(
                     [

@@ -34,7 +34,7 @@ def _ensure_policy_configs_registered() -> None:
     (``ACTConfig``, ``MolmoAct2Config``, ...) calls
     ``@PreTrainedConfig.register_subclass(...)`` at module import time.
     The previous strategy here was to import ONE known config (``act``)
-    on the assumption that lerobot's eager ``policies/__init__.py`` would
+    on the assumption that lerobot's eager ``lerobot.policies`` package would
     pull in every other policy as a side effect.
 
     That assumption is fragile:
@@ -116,8 +116,8 @@ def _ensure_policy_configs_registered() -> None:
     #
     # 1. ``pkgutil.iter_modules`` -- yields regular packages (those with
     #    ``__init__.py``). We filter with ``is_pkg=True`` so non-package
-    #    siblings (``factory.py``, ``utils.py``, ``pretrained.py``,
-    #    ``pi_gemma.py``) are excluded. Importing those as a package-level
+    #    siblings (``lerobot.policies.factory``, ``lerobot.policies.utils``,
+    #    ``lerobot.policies.pretrained``, ``lerobot.policies.pi_gemma``) are excluded. Importing those as a package-level
     #    fallback would pull in transformers/diffusers -- exactly the heavy
     #    import graph the stub mechanism exists to avoid.
     #
@@ -584,7 +584,7 @@ def _read_policy_type_from_config(pretrained_name_or_path: str, revision: str | 
     # Try local path first
     local_path = Path(pretrained_name_or_path)
     if local_path.is_dir() and (local_path / "config.json").exists():
-        with open(local_path / "config.json") as config_file:
+        with open(local_path / "config.json", encoding="utf-8") as config_file:
             config = json.load(config_file)
         return _policy_type_from_config(config)
 
@@ -593,7 +593,7 @@ def _read_policy_type_from_config(pretrained_name_or_path: str, revision: str | 
         from huggingface_hub import hf_hub_download
 
         config_path = hf_hub_download(pretrained_name_or_path, "config.json", revision=revision)
-        with open(config_path) as config_file:
+        with open(config_path, encoding="utf-8") as config_file:
             config = json.load(config_file)
         return _policy_type_from_config(config)
     except (ImportError, OSError, ValueError, KeyError) as exc:

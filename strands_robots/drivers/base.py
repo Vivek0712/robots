@@ -53,10 +53,13 @@ interpreted by the driver that receives it.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from ..utils import refusal_repr
+
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable, Mapping
 
     from strands.types.tools import ToolSpec, ToolUse
 
@@ -196,7 +199,17 @@ class HardwareDriver(Protocol):
         """
 
     def cleanup(self) -> None:
-        """Release the device and every background resource held for it."""
+        """Release the device and every background resource held for it.
+
+        Annotated ``-> None``, so like :meth:`stop` it carries no verdict, and
+        the same obligation follows: an implementation that delegates to a halt
+        verb must read that verb's envelope and log a non-success, naming what
+        may still be moving. Here it is the more urgent of the two, because this
+        hook goes on to release the channel a retry would need - a refused halt
+        it did not report leaves a robot moving with nothing left in the process
+        able to reach it. The release is owed either way: stopping half-way
+        leaks the resource *and* leaves the robot moving.
+        """
 
 
 #: The driver a robot gets when nothing says otherwise. Every robot in the
@@ -219,6 +232,13 @@ DRIVER_CHOICES = ("auto", DEFAULT_DRIVER, "strands")
 DRIVER_SURFACE: tuple[str, ...] = tuple(sorted(name for name in dir(HardwareDriver) if not name.startswith("_")))
 
 
+#: Stand-in receiver for binding an *unbound* verb in
+#: :func:`drifted_driver_parameters`. Binding a signature that still declares
+#: ``self`` needs something in that slot, and it is never called or read - a
+#: driver class is graded before any instance of it exists.
+_UNBOUND_SELF = object()
+
+
 def missing_driver_members(candidate: object) -> tuple[str, ...]:
     """Report which :data:`DRIVER_SURFACE` members ``candidate`` does not have.
 
@@ -236,6 +256,55 @@ def missing_driver_members(candidate: object) -> tuple[str, ...]:
         satisfies the whole surface.
     """
     return tuple(name for name in DRIVER_SURFACE if not hasattr(candidate, name))
+
+
+def drifted_driver_parameters(candidate: object) -> tuple[tuple[str, str], ...]:
+    """Report verbs whose parameters ``candidate`` spells differently from the Protocol.
+
+    :func:`missing_driver_members` answers whether the *names on the class* are
+    all there, and that is all it can answer: it is ``hasattr``, so a driver
+    that renames a documented parameter satisfies it completely. A driver is
+    invoked as an agent tool, and a dispatcher that spells the contract's own
+    parameter names as keywords is the ordinary caller - so a renamed parameter
+    is not a style difference, it is a ``TypeError`` raised past dispatch in
+    place of the status envelope every verb here promises to return.
+
+    The check is the call a conforming caller makes: bind every parameter
+    :class:`HardwareDriver` declares for the verb, by keyword. That admits the
+    freedoms a driver legitimately has - extra parameters of its own, its own
+    ordering, absorbing the ones it ignores in ``**kwargs`` - and refuses only
+    the one thing no caller can work around, a required parameter reachable
+    solely under a name the contract does not document.
+
+    Args:
+        candidate: A driver class or a built driver instance.
+
+    Returns:
+        ``(verb, reason)`` pairs in sorted order, ``reason`` being the binding
+        failure; empty when every verb accepts the contract's own spelling.
+    """
+    drifted: list[tuple[str, str]] = []
+    for verb in DRIVER_SURFACE:
+        declared = getattr(HardwareDriver, verb, None)
+        implemented = getattr(candidate, verb, None)
+        if not callable(declared) or not callable(implemented):
+            continue
+        try:
+            contract = inspect.signature(declared)
+            actual = inspect.signature(implemented)
+        except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+            continue
+        keywords = {
+            name: None
+            for name, parameter in contract.parameters.items()
+            if name != "self" and parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+        }
+        bound = actual.parameters.get("self") is not None
+        try:
+            actual.bind(*((_UNBOUND_SELF,) if bound else ()), **keywords)
+        except TypeError as e:
+            drifted.append((verb, str(e)))
+    return tuple(sorted(drifted))
 
 
 def halt_failure_detail(envelope: dict[str, Any]) -> str | None:
@@ -270,3 +339,330 @@ def halt_failure_detail(envelope: dict[str, Any]) -> str | None:
             for payload in payloads
         )
     return "no detail reported"
+
+
+def declared_verbs(tool_spec: ToolSpec | dict[str, Any]) -> list[str]:
+    """The ``action`` verbs a driver's own tool spec declares, in schema order.
+
+    Read back out of the spec rather than restated, so the verb list a refusal
+    hands an agent is the one the schema really carries. A hand-copied list
+    drifts the moment a verb is added or narrowed, and the agent then corrects
+    itself towards a verb that is not there.
+
+    Args:
+        tool_spec: The driver's :attr:`HardwareDriver.tool_spec`.
+
+    Returns:
+        The declared verbs, in the order the schema lists them.
+    """
+    return [str(verb) for verb in tool_spec["inputSchema"]["json"]["properties"]["action"]["enum"]]
+
+
+def undeclared_verb_error(driver: Any, action: Any) -> dict[str, Any]:
+    """Refuse an ``action`` the driver's own tool spec does not declare.
+
+    The ``enum`` a ``tool_spec`` carries *describes* the verbs an agent may
+    send; nothing between the model and :meth:`HardwareDriver.stream` enforces
+    it. A dispatcher whose last branch is a bare ``else`` therefore runs its
+    final verb for every value the enum does not cover, and on these drivers
+    the final verb is the write one - so a typo, a stale verb from an earlier
+    schema, or a verb borrowed from a sibling driver halted the robot and
+    answered ``status="success"``, leaving the caller unable to tell that its
+    own verb had not been dispatched.
+
+    One owner rather than one per driver, because the list the refusal quotes
+    has to come off the same schema the agent planned against
+    (:func:`declared_verbs`).
+
+    Args:
+        driver: The driver that was invoked; named in the refusal, and read for
+            its :attr:`HardwareDriver.tool_spec`.
+        action: Whatever arrived in the tool input, quoted back verbatim - it is
+            not necessarily a string, and a caller cannot correct a value the
+            refusal does not show.
+
+    Returns:
+        A ``status="error"`` envelope naming the action and every declared verb.
+    """
+    return {
+        "status": "error",
+        "content": [
+            {
+                "text": (
+                    f"{type(driver).__name__}: unknown action {refusal_repr(action)}; "
+                    f"declared verbs are {declared_verbs(driver.tool_spec)}"
+                )
+            }
+        ],
+    }
+
+
+def policy_step(
+    policy_object: Any,
+    instruction: str,
+) -> Callable[[dict[str, Any]], Any] | None:
+    """Return the one-step callable for ``policy_object``, or ``None``.
+
+    :meth:`HardwareDriver.run_policy` types its first argument
+    :class:`~strands_robots.policies.Policy`, and that class declares exactly
+    two ways to ask for an action: :meth:`~strands_robots.policies.Policy.get_actions`
+    and its synchronous wrapper
+    :meth:`~strands_robots.policies.Policy.get_actions_sync`. It declares no
+    ``step`` and no ``__call__``, and no subclass in this package adds either -
+    so a driver whose admission asks for ``step`` refuses every policy the
+    package builds, while accepting objects the seam does not type. Resolving
+    the shapes here, once, is what keeps the admission a driver performs and the
+    call its loop makes describing the same set.
+
+    Three shapes are legitimate and all three resolve:
+
+    * a built :class:`~strands_robots.policies.Policy`, called as
+      ``get_actions_sync(observation, instruction)`` - the typed contract;
+    * an object exposing ``step(observation)`` - the shape a control-loop
+      policy written against a native driver already uses;
+    * a bare callable ``policy(observation)``.
+
+    An action *chunk* is unwrapped to its first action.
+    :meth:`~strands_robots.policies.Policy.get_actions` returns a list whose
+    length is the chunk horizon, but a native control loop commands one frame
+    per step, so it needs the dict rather than the list - the same first-action
+    convention :mod:`strands_robots.hardware_robot` applies when it consumes a
+    chunk. Unwrapping for all three shapes rather than only the typed one keeps
+    a single return contract: the returned callable answers with an action dict,
+    or ``None`` when the policy produced no action for this step.
+
+    Args:
+        policy_object: The candidate policy.
+        instruction: Instruction bound into the ``get_actions_sync`` call, which
+            takes it as its second argument. Ignored by the other two shapes,
+            neither of which accepts one.
+
+    Returns:
+        A callable taking an observation dict and answering with the action the
+        policy commanded - or ``None`` when ``policy_object`` is none of the
+        three shapes, which is the refusal a driver's admission renders. What
+        that callable answers is *not* narrowed to a dict: each loop validates
+        the action's shape against its own wire and names its own refusal, and
+        widening here would hide the value that refusal has to quote.
+    """
+    get_actions = getattr(policy_object, "get_actions_sync", None)
+    if callable(get_actions):
+        return lambda observation: _first_action(get_actions(observation, instruction))
+    step = getattr(policy_object, "step", None)
+    if callable(step):
+        return lambda observation: _first_action(step(observation))
+    if callable(policy_object):
+        return lambda observation: _first_action(policy_object(observation))
+    return None
+
+
+def _first_action(result: Any) -> Any:
+    """Reduce whatever a policy returned to the one action a step commands.
+
+    Args:
+        result: The policy's return value - an action dict, or a chunk of them.
+
+    Returns:
+        ``result`` itself when it is already a single action, its first element
+        when it is a non-empty chunk, or ``None`` when the policy yielded
+        nothing to command. A non-dict, non-sequence value is returned
+        unchanged: the calling loop owns the refusal that names it, and quoting
+        the value the policy actually returned is what makes that refusal
+        actionable.
+    """
+    if isinstance(result, list | tuple):
+        return result[0] if result else None
+    return result
+
+
+#: The bytes-like types a vector telemetry field must never be read through.
+#: Every one of them iterates - as integers for the buffers, as characters for
+#: ``str`` - so a raw buffer landing on a field declared as a numeric vector
+#: would otherwise decode into a plausible-looking reading of the wrong length
+#: instead of reporting that there is no reading.
+_BYTES_LIKE: tuple[type, ...] = (str, bytes, bytearray, memoryview)
+
+
+def telemetry_float(value: Any) -> float | None:
+    """Coerce one scalar telemetry field to ``float``, or ``None`` if it is no reading.
+
+    Every caller passes ``getattr(msg, <field>, None)`` off a decoded SDK
+    message rather than a typed default, because a firmware revision that
+    renames or drops a field must cost that field and not the whole callback.
+    This is what makes that arrive at the envelope as ``None``: a typed default
+    of ``0.0`` would be indistinguishable from a real zero reading, and raising
+    would lose every other field the same message carries.
+
+    A ``bool`` is refused for the same reason. ``float(True)`` is ``1.0``, which
+    on a state-of-charge field reads as a real one-percent pack - so a field
+    that turned into a flag would report a plausible number rather than an
+    absence.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The reading, or ``None`` when ``value`` is absent or is not numeric.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def telemetry_int(value: Any) -> int | None:
+    """Coerce one scalar telemetry field to ``int``, or ``None`` if it is no reading.
+
+    The integer counterpart of :func:`telemetry_float`, for the fields an IDL
+    declares integer - a battery cycle count, a fan step, a mode enum. Same two
+    rules, and the ``bool`` refusal matters here too: ``int(False)`` is ``0``,
+    which on a cycle count reads as a factory-fresh pack.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The reading, or ``None`` when ``value`` is absent or is not numeric.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def telemetry_float_list(value: Any) -> list[float] | None:
+    """Coerce a vector telemetry field to ``list[float]``, or ``None`` if unusable.
+
+    For the sequence fields - a quaternion, an accelerometer triple, a per-cell
+    temperature vector. Three rules beyond :func:`telemetry_float`'s:
+
+    * A bytes-like value is no reading (:data:`_BYTES_LIKE`), even though it
+      iterates.
+    * All or nothing. A single element that is not a reading discards the whole
+      vector, because half a quaternion is worse than no quaternion - a
+      consumer cannot tell that it is half.
+    * The list is fresh, so a caller mutating the envelope it lands in does not
+      race the callback thread's next write into the same cache.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The vector, or ``None`` when it is absent, not iterable, bytes-like, or
+        holds an element that is not a reading.
+    """
+    return _telemetry_list(value, telemetry_float)
+
+
+def telemetry_int_list(value: Any) -> list[int] | None:
+    """Coerce a vector telemetry field to ``list[int]``, or ``None`` if unusable.
+
+    The integer counterpart of :func:`telemetry_float_list`, for the vectors an
+    IDL declares integer - foot-contact forces, a fan-state vector. Same three
+    rules.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The vector, or ``None`` when it is absent, not iterable, bytes-like, or
+        holds an element that is not a reading.
+    """
+    return _telemetry_list(value, telemetry_int)
+
+
+def _telemetry_list[T: (float, int)](value: Any, coerce: Callable[[Any], T | None]) -> list[T] | None:
+    """Apply ``coerce`` across a vector field, all or nothing.
+
+    Written once so the two public vector readers cannot drift apart in which
+    values they refuse - the drift this replaced was exactly that, one copy
+    guarding a bytes-like type the other did not.
+
+    Args:
+        value: The field, as the caller's ``getattr`` left it.
+        coerce: :func:`telemetry_float` or :func:`telemetry_int`.
+
+    Returns:
+        A fresh list, or ``None`` per :func:`telemetry_float_list`'s rules.
+    """
+    if value is None or isinstance(value, _BYTES_LIKE):
+        return None
+    try:
+        items = list(value)
+    except TypeError:
+        return None
+    out: list[T] = []
+    for item in items:
+        coerced = coerce(item)
+        if coerced is None:
+            return None
+        out.append(coerced)
+    return out
+
+
+def decode_motor_state(motors: Any, index: Mapping[str, int]) -> dict[str, dict[str, Any]] | None:
+    """Decode a Unitree ``LowState_.motor_state`` array into per-joint readings.
+
+    Both Unitree drivers subscribe ``rt/lowstate`` and both are handed the same
+    fixed-length ``motor_state`` array, addressed by wire slot: the G1's
+    ``unitree_hg`` layout declares 35 slots of which
+    :data:`~strands_robots.drivers.g1._G1_JOINT_INDEX` names 29, and the Go2's
+    ``unitree_go`` layout is read through
+    :data:`~strands_robots.drivers.go2.GO2_JOINT_INDEX`'s 12. The array is the
+    only proprioception either robot publishes, so a driver that does not read
+    it commands PD targets it cannot check against a measured pose.
+
+    One decoder rather than one per driver, for the reason the vector readers
+    are written once: two copies of a coercion rule drift into disagreeing
+    about which values are readings, and the copy that never gets audited is
+    the one still manufacturing numbers.
+
+    Every field is read through ``getattr(motor, name, None)`` and coerced by
+    :func:`telemetry_float` / :func:`telemetry_int`, so a name a firmware
+    revision drops lands ``None`` in the record rather than a typed default. A
+    zero here is not a harmless placeholder: ``q=0.0`` is a valid reading of a
+    joint at its zero position, so a defaulted read of a renamed field
+    publishes a plausible pose - and on the G1 that pose is what a proprioceptive
+    policy is handed at 500 Hz.
+
+    A slot the array cannot answer is skipped rather than defaulted, so a
+    firmware carrying fewer slots than the index names costs those joints and
+    not the rest of the frame.
+
+    Args:
+        motors: The ``motor_state`` field, already defaulted to ``None`` by the
+            caller's ``getattr``.
+        index: Joint name to wire slot, as the driver's own index table
+            declares it.
+
+    Returns:
+        A mapping of joint name to a ``{"q", "dq", "tau_est", "temperature"}``
+        record for every slot the array answered, or ``None`` when the field is
+        absent, bytes-like (a buffer indexes to integers, which carry none of
+        these names and would read as a full-width record of ``None``), or
+        answered no slot at all. ``None`` says the array was not read, which is
+        a different fact from a robot reporting no joints.
+    """
+    if motors is None or isinstance(motors, _BYTES_LIKE):
+        return None
+    joints: dict[str, dict[str, Any]] = {}
+    for name, slot in index.items():
+        try:
+            motor = motors[slot]
+        except (IndexError, KeyError, TypeError):
+            continue
+        joints[name] = {
+            "q": telemetry_float(getattr(motor, "q", None)),
+            "dq": telemetry_float(getattr(motor, "dq", None)),
+            "tau_est": telemetry_float(getattr(motor, "tau_est", None)),
+            "temperature": telemetry_int(getattr(motor, "temperature", None)),
+        }
+    return joints or None

@@ -832,6 +832,61 @@ class TestBuildBatchFromLerobotFormat:
         assert batch["observation.cam1"].shape == (1, 3, 48, 64)
         assert float(batch["observation.cam1"].max()) == 1.0
 
+    def test_unlabeled_torch_uint8_image_normalized(self):
+        """A uint8 channel-last torch tensor is detected and scaled to [0, 1]."""
+        policy = _make_loaded_policy(state_dim=6, include_images=False)
+        img = torch.full((48, 64, 3), 255, dtype=torch.uint8)
+        batch = policy._build_batch_from_lerobot_format({"observation.cam1": img}, {})
+        assert batch["observation.cam1"].shape == (1, 3, 48, 64)
+        assert batch["observation.cam1"].dtype == torch.float32
+        assert float(batch["observation.cam1"].max()) == 1.0
+
+    def test_uint8_frame_converts_the_same_as_numpy_or_torch(self):
+        """The same frame converts identically whether the caller pre-tensorized it.
+
+        A torch tensor is what a torch-native caller naturally holds; leaving it
+        as Byte reaches the model at 255x the numpy path's scale.
+        """
+        policy = _make_loaded_policy(state_dim=6, include_images=False)
+        frame = np.arange(48 * 64 * 3, dtype=np.uint8).reshape(48, 64, 3)
+        from_numpy = policy._build_batch_from_lerobot_format({"observation.images.c": frame}, {})
+        from_torch = policy._build_batch_from_lerobot_format(
+            {"observation.images.c": torch.from_numpy(frame.copy())}, {}
+        )
+        assert torch.equal(from_numpy["observation.images.c"], from_torch["observation.images.c"])
+
+    def test_torch_uint8_frame_matches_the_preprocess_path(self):
+        """This builder agrees with ``_canonicalize_obs_images`` on a uint8 frame.
+
+        The two run on opposite sides of one branch - this builder when no
+        processor pipeline is loaded, the canonicalizer when one is - so a caller
+        must not get a differently scaled image for setting ``use_processor``.
+        The frame is shaped so its leading dimension is not itself a plausible
+        channel count, which is the one case where the two layout heuristics
+        still differ and which this cell is not about.
+        """
+        policy = _make_loaded_policy(state_dim=6, include_images=False)
+        img = torch.from_numpy(np.arange(48 * 64 * 3, dtype=np.uint8).reshape(48, 64, 3))
+        built = policy._build_batch_from_lerobot_format({"observation.images.c": img}, {})
+        canonical = policy._canonicalize_obs_images({"observation.images.c": img})
+        # The canonicalizer leaves batching to _fixup_preprocessed_batch.
+        assert torch.equal(built["observation.images.c"], canonical["observation.images.c"].unsqueeze(0))
+
+    def test_torch_float_image_is_not_rescaled(self):
+        """An already-scaled float frame passes through untouched (no second /255)."""
+        policy = _make_loaded_policy(state_dim=6, include_images=False)
+        img = torch.full((4, 6, 3), 0.5, dtype=torch.float32)
+        batch = policy._build_batch_from_lerobot_format({"observation.images.c": img}, {})
+        assert float(batch["observation.images.c"].max()) == 0.5
+
+    def test_non_image_uint8_tensor_keeps_its_values(self):
+        """Only images are rescaled - a uint8 scalar/state entry is left alone."""
+        policy = _make_loaded_policy(state_dim=6, include_images=False)
+        batch = policy._build_batch_from_lerobot_format(
+            {"observation.gripper_ticks": torch.tensor([200], dtype=torch.uint8)}, {}
+        )
+        assert float(batch["observation.gripper_ticks"].max()) == 200.0
+
     def test_numeric_list_state_becomes_batched_tensor(self):
         """A 1D numeric list gains a batch dimension."""
         policy = _make_loaded_policy(state_dim=6, include_images=False)
@@ -1685,15 +1740,16 @@ class TestRTCInference:
         assert policy._rtc_prev_chunk is not None
         assert policy._rtc_prev_chunk.dim() == 2
 
-    def test_predict_with_rtc_leftover_keyed_on_execution_horizon(self):
-        """Leftover is the chunk tail past execution_horizon, not actions_per_step.
+    def test_predict_with_rtc_prefix_keyed_on_execution_horizon(self):
+        """The prefix is keyed on execution_horizon, not actions_per_step.
 
         Regression: when the consumer drained the FULL trained chunk
-        (actions_per_step == chunk length) the old bookkeeping set steps_to_consume
-        to the whole chunk, so ``_rtc_prev_chunk`` was always ``None`` and the
-        cross-chunk blend never received a previous-chunk tail. With the
-        execution-horizon contract the consumer re-queries every
-        execution_horizon steps, so the tail past that point must carry over.
+        (actions_per_step == chunk length) the old bookkeeping consumed the whole
+        chunk, so no prefix was ever carried and the cross-chunk blend never
+        received one. With the execution-horizon contract the consumer re-queries
+        every execution_horizon steps, so the chunk past that point must carry
+        over. ``prev_chunk_left_over`` is what the model actually receives, so
+        assert it there rather than on the policy's bookkeeping.
         """
         policy = _make_policy()
         policy._rtc_enabled = True
@@ -1705,11 +1761,15 @@ class TestRTCInference:
         mock_policy.predict_action_chunk.return_value = torch.randn(1, 20, 6)
         policy._policy = mock_policy
 
+        # Two zero-overlap queries: the consumer drained its execution horizon
+        # and re-queried with nothing pending.
+        policy.set_rtc_observed_delay(0)
+        policy._predict_with_rtc({})
+        policy.set_rtc_observed_delay(0)
         policy._predict_with_rtc({})
 
-        # delay ~= 0 on the first call -> leftover starts at execution_horizon.
-        assert policy._rtc_prev_chunk is not None
-        assert policy._rtc_prev_chunk.shape == (10, 6)
+        prefix = mock_policy.predict_action_chunk.call_args.kwargs["prev_chunk_left_over"]
+        assert prefix.shape == (10, 6)
 
     def test_execution_horizon_prefers_rtc_over_actions_per_step(self):
         """execution_horizon is the RTC horizon while RTC is active."""
@@ -1949,6 +2009,7 @@ def _load_model_with_mocks(policy, *, param_device="cpu", has_postprocessor=True
         bridge = MagicMock()
         bridge.is_active = True
         bridge.has_postprocessor = has_postprocessor
+        bridge.mismatched_normalization_widths.return_value = []
 
     with (
         patch.object(

@@ -8,7 +8,7 @@ or modify robots.
 import logging
 from typing import Any
 
-from .loader import _load
+from .loader import _load, normalize_robot_name
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,31 @@ def _build_alias_map() -> dict[str, str]:
 
     Each robot entry may have an "aliases" list.  This function
     inverts those into a flat lookup dict.
+
+    Keyed by :func:`~strands_robots.registry.loader.normalize_robot_name`, the
+    same fold :func:`resolve_name` applies to the query it looks up here: an
+    alias keyed as declared is unreachable in EVERY spelling once its declared
+    one is not already folded, because the query is folded before it arrives.
     """
     reg = _load("robots")
     alias_map: dict[str, str] = {}
     for name, info in reg.get("robots", {}).items():
+        canonical_key = normalize_robot_name(name)
         for alias in info.get("aliases", []):
-            alias_map[alias] = name
+            key = normalize_robot_name(alias)
+            # An alias that folds onto its OWNER's canonical name is a second
+            # spelling of that name, not a separate lookup: ``resolve_name``
+            # answers it from ``canonical_names`` whether or not it is here.
+            # Emitting it anyway would make this an identity entry, and
+            # ``list_aliases`` is the public read of this map - a caller asking
+            # "what does this alias mean" would be told it means itself. The
+            # shipped registry has exactly one (``reachy_mini`` aliases
+            # ``reachy-mini``), which only became an identity entry once alias
+            # keys were folded. Skipping it costs no resolution; it is the same
+            # carve-out ``_validate_robots`` makes when it allows the alias.
+            if key == canonical_key:
+                continue
+            alias_map[key] = name
     return alias_map
 
 
@@ -48,7 +67,7 @@ def resolve_name(name: str) -> str:
         resolve_name("SO100_follower") # → "so100"
         resolve_name("g1")            # → "unitree_g1"
     """
-    normalized = name.lower().strip().replace("-", "_")
+    normalized = normalize_robot_name(name)
     alias_map = _build_alias_map()
     # Canonical names come straight from the registry keys. Using
     # ``alias_map.values()`` here was wrong: it only contains robots that
@@ -214,11 +233,38 @@ def list_robots(mode: str = "all") -> list[dict[str, Any]]:
     return results
 
 
+#: Group name for a robot whose registry entry declares no category. It is a
+#: group name and not a category: nothing in the registry carries it, and
+#: :func:`list_robots` keeps reporting such a robot's own ``category`` verbatim.
+#: Named because the grouping, the table cell and the display order must all
+#: spell it the same way - three literals would be three things to keep in step.
+_UNCATEGORIZED = "other"
+
+
 def list_robots_by_category() -> dict[str, list[dict[str, Any]]]:
-    """List robots grouped by category (arm, humanoid, mobile, ...)."""
+    """Group every registered robot under the category name it is listed by.
+
+    A group name is something a caller switches on and a reader sees in a table
+    cell, so every group here has one. A robot whose registry entry declares no
+    category - ``category`` is optional in both the package registry and the
+    user overlay, and :func:`register_robot` accepts ``category=""`` - is
+    grouped under ``"other"``, and a declared name is stripped of surrounding
+    whitespace so a padded spelling joins its own group instead of opening a
+    blank-looking second one beside it. :func:`list_robots` still reports each
+    robot's ``category`` exactly as the entry declares it; the normalization is
+    this grouping's, not the registry's.
+
+    Returns:
+        Group name to the :func:`list_robots` records in it. Every robot appears
+        in exactly one group, so the group sizes sum to ``len(list_robots())``.
+    """
     categories: dict[str, list] = {}
     for robot in list_robots():
-        cat = robot.get("category", "other")
+        # Read by value, not by presence. :func:`list_robots` always supplies
+        # the key, substituting "" for an entry that declares no category, so a
+        # presence-default (``get("category", _UNCATEGORIZED)``) can never fire:
+        # it grouped such a robot under "" instead.
+        cat = str(robot.get("category") or "").strip() or _UNCATEGORIZED
         categories.setdefault(cat, []).append(robot)
     return categories
 
@@ -290,7 +336,11 @@ def format_robot_table(max_width: int = 100) -> str:
     # Preferred groups first, then any remaining categories in sorted order
     # so no robot is silently dropped from the body (see _CATEGORY_DISPLAY_ORDER).
     ordered_cats = [c for c in _CATEGORY_DISPLAY_ORDER if c in by_cat]
-    ordered_cats += sorted(c for c in by_cat if c not in _CATEGORY_DISPLAY_ORDER)
+    ordered_cats += sorted(c for c in by_cat if c not in _CATEGORY_DISPLAY_ORDER and c != _UNCATEGORIZED)
+    # Last, because it is the absence of a category rather than one: sorted in,
+    # "other" would outrank every custom category from "quadruped" on.
+    if _UNCATEGORIZED in by_cat:
+        ordered_cats.append(_UNCATEGORIZED)
     for cat in ordered_cats:
         for r in by_cat[cat]:
             sim = "yes" if r["has_sim"] else ""
@@ -300,8 +350,11 @@ def format_robot_table(max_width: int = 100) -> str:
             if len(desc) > desc_width:
                 desc = desc[: desc_width - 3].rstrip() + "..."
             lines.append(
+                # The group name, not ``r["category"]``: a robot that declares
+                # none is rendered under the group it is grouped in rather than
+                # in a blank cell that names no group at all.
                 f"{r['name']:<{_NAME_WIDTH}} "
-                f"{r['category']:<{_CAT_WIDTH}} "
+                f"{cat:<{_CAT_WIDTH}} "
                 f"{joints:<{_JOINTS_WIDTH}} "
                 f"{sim:<{_SIM_WIDTH}} "
                 f"{real:<{_REAL_WIDTH}} "

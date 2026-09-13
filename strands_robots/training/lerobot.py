@@ -60,7 +60,17 @@ from typing import TYPE_CHECKING, Any
 
 from strands_robots.training._inproc import call_callable, elastic_launch_callable, resume_argv
 from strands_robots.training.base import Trainer, TrainResult, TrainSpec
-from strands_robots.utils import lerobot_version, validation_split_error, validation_split_fraction
+from strands_robots.utils import (
+    boolean_flag_error,
+    declared_count,
+    effective_episode_count,
+    episode_subset_budget_error,
+    lerobot_version,
+    stale_output_dir_is_clearable,
+    torch_device_error,
+    validation_split_error,
+    validation_split_fraction,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from lerobot.configs.train import TrainPipelineConfig
@@ -140,6 +150,32 @@ _RELATIVE_ACTION_POLICY_TYPES_FALLBACK = frozenset({"pi0", "pi05", "pi0_fast", "
 # :func:`_policy_supports_expert_only`); the static set is the offline FALLBACK.
 # Currently pi0, pi05, and smolvla expose the field (pi0_fast does NOT).
 _EXPERT_ONLY_POLICY_TYPES_FALLBACK = frozenset({"pi0", "pi05", "smolvla"})
+
+# LeRobot policy types whose config exposes ``embodiment_tag`` - the tag that
+# selects WHICH state/action projector head the run trains, so a tag the caller
+# did not ask for trains a different head from the one their robot's data was
+# recorded on. Every other lerobot policy takes its state/action shape from the
+# dataset features and has no such field. Discovered live per policy type off
+# the config class (see :func:`_policy_supports_embodiment_tag`); the static set
+# is the offline FALLBACK. Currently only groot exposes the field.
+_EMBODIMENT_TAG_POLICY_TYPES_FALLBACK = frozenset({"groot"})
+
+# ``TrainSpec.tune`` component -> the lerobot policy-config field that freezes
+# or unfreezes it. ``expert_only`` is deliberately absent: it is a ``method``,
+# gated by :func:`_policy_supports_expert_only`, and :meth:`_validate_policy`
+# reads it out of ``tune`` only for the lora mutual-exclusion check.
+_TUNE_COMPONENT_FIELDS = {
+    "llm": "tune_llm",
+    "visual": "tune_visual",
+    "projector": "tune_projector",
+    "diffusion": "tune_diffusion_model",
+}
+
+# LeRobot policy types whose config exposes the ``_TUNE_COMPONENT_FIELDS``
+# toggles. Discovered live per policy type off the config class (see
+# :func:`_policy_tune_components`); the static set is the offline FALLBACK.
+# Currently only groot exposes them.
+_TUNE_COMPONENT_POLICY_TYPES_FALLBACK = frozenset({"groot"})
 
 # LeRobot policy types whose config normalizes STATE/ACTION with QUANTILES
 # (``NormalizationMode.QUANTILES``). Such a policy needs the dataset's stats to
@@ -286,6 +322,47 @@ def _policy_supports_expert_only(ptype: str) -> bool:
     return ptype in _EXPERT_ONLY_POLICY_TYPES_FALLBACK
 
 
+def _policy_supports_embodiment_tag(ptype: str) -> bool:
+    """Whether ``ptype``'s lerobot config exposes ``embodiment_tag``.
+
+    ``embodiment_tag`` selects which state/action projector head a run trains,
+    so a policy that exposes it MUST be told the caller's tag: leaving it at the
+    config default trains the default head while reporting success, which is the
+    same silent no-op :func:`_policy_supports_expert_only` describes for
+    ``train_expert_only``. Probed live off the registry's config *class* (a
+    dataclass field lookup, no instantiation - so no device warnings or
+    construction cost), so any policy lerobot adds with an embodiment tag is
+    recognized with zero per-type maintenance. Falls back to the documented
+    static set when lerobot's registry is unavailable offline.
+    """
+    reg = _policy_registry()
+    if reg is not None and ptype in reg:
+        return any(f.name == "embodiment_tag" for f in dataclasses.fields(reg[ptype]))
+    return ptype in _EMBODIMENT_TAG_POLICY_TYPES_FALLBACK
+
+
+def _policy_tune_components(ptype: str) -> set[str]:
+    """The :attr:`~strands_robots.training.base.TrainSpec.tune` components ``ptype`` can toggle.
+
+    A VLA whose config carries per-component switches can freeze or unfreeze its
+    language backbone, vision tower, projector and action head independently.
+    Probed live off the registry's config *class* by field name (see
+    :data:`_TUNE_COMPONENT_FIELDS`), the same dataclass-field lookup its three
+    sibling probes use, so a policy lerobot adds with such switches is
+    recognized with zero per-type maintenance. Falls back to the documented
+    static set when lerobot's registry is unavailable offline.
+
+    Returns:
+        The subset of :data:`_TUNE_COMPONENT_FIELDS` keys ``ptype`` exposes;
+        empty for a policy that tunes as a whole.
+    """
+    reg = _policy_registry()
+    if reg is None or ptype not in reg:
+        return set(_TUNE_COMPONENT_FIELDS) if ptype in _TUNE_COMPONENT_POLICY_TYPES_FALLBACK else set()
+    names = {f.name for f in dataclasses.fields(reg[ptype])}
+    return {component for component, field in _TUNE_COMPONENT_FIELDS.items() if field in names}
+
+
 def _policy_uses_quantile_norm(ptype: str) -> bool:
     """Whether ``ptype``'s lerobot config normalizes any feature with QUANTILES.
 
@@ -332,12 +409,19 @@ def _dataset_quantile_stats_present(dataset_root: str) -> bool | None:
     the file is absent or unreadable (unknown - e.g. a Hub dataset with no
     materialized local cache), so a definite miss can be flagged without false
     positives on the unknown case.
+
+    Unreadable is ``ValueError`` and not the narrower ``json.JSONDecodeError``:
+    a partially-synced file carries bytes the declared encoding does not
+    describe (``UnicodeDecodeError``) and a number longer than
+    ``sys.get_int_max_str_digits`` raises a plain ``ValueError``, neither of
+    which is a JSON decode error. Both aborted the whole :meth:`LerobotTrainer.validate`
+    preflight instead of leaving this one probe unknown.
     """
     stats_path = os.path.join(dataset_root, "meta", "stats.json")
     try:
         with open(stats_path, encoding="utf-8") as fh:
             stats = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return _stats_have_quantiles(stats)
 
@@ -378,13 +462,14 @@ def _dataset_codebase_version(dataset_root: str) -> str | None:
     count). Returns ``None`` when the file is absent, unreadable, or carries no
     string ``codebase_version`` - the unknown case, e.g. a Hub dataset with no
     materialized local cache - so a DEFINITE mismatch can be reported without
-    false positives on the unknown one.
+    false positives on the unknown one. Unreadable is graded by ``ValueError``
+    for the reason :func:`_dataset_quantile_stats_present` carries.
     """
     info_path = os.path.join(dataset_root, "meta", "info.json")
     try:
         with open(info_path, encoding="utf-8") as fh:
             declared = json.load(fh).get("codebase_version")
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
     return declared if isinstance(declared, str) else None
 
@@ -546,12 +631,50 @@ class LerobotTrainer(Trainer):
         return f"policy:{self._resolve_policy_type(spec)}"
 
     def _dataset_total_episodes(self, dataset_root: str) -> int | None:
+        """Episode count declared by a local dataset's ``meta/info.json``, or None.
+
+        The count is graded by :func:`~strands_robots.utils.declared_count`, the
+        one owner every reader of this header shares, so the validation split
+        cannot be computed from a denominator another surface refuses. ``None``
+        is the unknown case - an absent, unreadable or unusable header - and
+        every caller here already treats it as "no split can be derived".
+        """
         info = os.path.join(dataset_root, "meta", "info.json")
         try:
             with open(info, encoding="utf-8") as f:
-                return int(json.load(f).get("total_episodes"))
-        except (OSError, ValueError, TypeError):
+                return declared_count(json.load(f).get("total_episodes"))
+        except (OSError, ValueError, AttributeError):
             return None
+
+    def _effective_episode_count(self, spec: TrainSpec) -> int | None:
+        """Episodes this spec's run will actually split, or ``None`` when unknown.
+
+        :meth:`_dataset_total_episodes` answers what the dataset HOLDS; this
+        answers what the run LOADS, which ``extra['dataset.episodes']`` and
+        ``extra['dataset.exclude_episodes']`` narrow. lerobot sizes the
+        validation split against the loaded subset, so that is the denominator
+        ``val_episodes`` has to be divided by - see
+        :func:`~strands_robots.utils.effective_episode_count`, the owner both
+        this backend and the ``lerobot_train`` tool share so the two cannot
+        disagree about how many episodes a subset leaves.
+
+        The subset is read from the same ``extra`` keys
+        :meth:`_apply_extra_passthrough` delivers to lerobot's ``DatasetConfig``,
+        under the spellings that passthrough accepts.
+
+        Returns:
+            The loaded episode count, or ``None`` when the header itself is
+            unreadable - the unknown case every caller here already treats as
+            "no split can be derived".
+        """
+        total = self._dataset_total_episodes(spec.dataset_root)
+        if total is None:
+            return None
+        return effective_episode_count(
+            total,
+            spec.extra.get("dataset.episodes"),
+            spec.extra.get("dataset.exclude_episodes"),
+        )
 
     def _resume_config_path(self, output_dir: str) -> str | None:
         """Return the resumable ``train_config.json`` FILE path, or None.
@@ -591,8 +714,8 @@ class LerobotTrainer(Trainer):
         lerobot's loadable artifact is the ``pretrained_model`` dir that holds
         ``model.safetensors`` + ``train_config.json``; we locate it from the
         resume config file's parent. For reward-model runs this is the directory
-        :func:`~strands_robots.training.reward.compute_rabc_weights` consumes as
-        ``reward_model_path``.
+        ``python -m lerobot.rewards.sarm.compute_rabc_weights`` consumes as its
+        reward-model path.
         """
         cfg_file = self._resume_config_path(output_dir)
         return os.path.dirname(cfg_file) if cfg_file else None
@@ -630,9 +753,9 @@ class LerobotTrainer(Trainer):
             return None
         if not spec.dataset_root:
             return None
-        total = self._dataset_total_episodes(spec.dataset_root)
-        if total is not None and 0 < spec.val_episodes < total:
-            return validation_split_fraction(spec.val_episodes, total)
+        effective = self._effective_episode_count(spec)
+        if effective is not None and 0 < spec.val_episodes < effective:
+            return validation_split_fraction(spec.val_episodes, effective)
         return None
 
     def _unreadable_episode_count_problem(self, spec: TrainSpec) -> str:
@@ -728,19 +851,30 @@ class LerobotTrainer(Trainer):
             "keep the stream."
         )
 
-    def _dataset_total_tasks(self, dataset_root: str) -> int:
-        """``total_tasks`` from ``meta/info.json``, or 0 when not recorded."""
+    def _dataset_total_tasks(self, dataset_root: str) -> Any:
+        """What ``meta/info.json`` declares for ``total_tasks``, verbatim.
+
+        ``None`` when there is no header to read - absent, unreadable, or no such
+        key - which :func:`~strands_robots.utils.validation_split_error` treats as
+        single-task, as lerobot's own field defaults to 0.
+
+        The declaration is not converted here: that guard owns this header's
+        domain and is the only surface that can tell a usable count from a
+        declaration that is not one. Coercing an unusable declaration to 0
+        reported it as the absent case, which the guard honors as single-task -
+        so a three-task dataset whose header spelled the count ``3.0`` reached
+        lerobot's per-task ceiling instead of being refused.
+        """
         from pathlib import Path
 
         info_path = Path(dataset_root) / "meta" / "info.json"
         if not info_path.exists():
-            return 0
+            return None
         try:
-            with open(info_path) as f:
-                total = json.load(f).get("total_tasks")
-        except (OSError, ValueError):
-            return 0
-        return total if isinstance(total, int) and not isinstance(total, bool) else 0
+            with open(info_path, encoding="utf-8") as f:
+                return json.load(f).get("total_tasks")
+        except (OSError, ValueError, AttributeError):
+            return None
 
     def _relative_actions(self, spec: TrainSpec) -> bool:
         """Whether to train with relative (delta) actions (``extra['relative_actions']``).
@@ -811,40 +945,17 @@ class LerobotTrainer(Trainer):
         ``dataset_repo_id`` against ``_HUB_REPO_ID_RE``. ``device`` was the one
         knob beside them with none.
 
-        The admitted domain is torch's own, read by handing the value to
-        ``torch.device`` rather than by comparing against a copied list of
-        device types, so a torch build that gains a backend is admitted here
-        with no change and torch's own exception enumerates the types it
-        accepts. Only the spelling is graded, never availability:
-        ``torch.device("cuda")`` constructs on a CPU-only box, and a spec
-        legitimately names a device the machine writing it does not have - a
-        queued or containerised run is dispatched from one host and executed on
-        another. A non-``str`` is refused before torch is consulted for that
-        same reason, because ``torch.device(0)`` reads the accelerator inventory
-        and would make one spec validate on a GPU box and fail on a CPU box.
+        What stays here is the reason the check happens on *this* surface. The
+        domain is :func:`~strands_robots.utils.torch_device_error`, the one owner
+        the ``lerobot_train`` tool and the from-scratch RL preflight also consult,
+        so a device this trainer refuses cannot be accepted by the tool that
+        builds an argv for the same pipeline or by the RL backend beside it.
 
-        When torch is not importable the domain is unknown and the value passes
-        through unguarded, which is the same posture the reward-model field set
-        takes when its registry cannot be read.
+        The falsy case never reaches the domain: ``__init__`` resolves it through
+        :func:`_auto_device` first, which is what the constructor documents, so
+        ``self.device`` is always a stated device by the time it is graded here.
         """
-        device = self.device
-        if not isinstance(device, str):
-            return [
-                f"device must be a torch device string, got {type(device).__name__}; "
-                "pass a device type, optionally with an index (e.g. 'cuda', 'cuda:0', 'cpu', 'mps')."
-            ]
-        try:
-            import torch
-        except Exception:  # noqa: BLE001 - torch missing -> domain unknown, pass through
-            return []
-        try:
-            torch.device(device)
-        except (RuntimeError, ValueError) as e:
-            return [
-                f"device={device!r} is not a torch device string ({e}); "
-                "pass a device type, optionally with an index (e.g. 'cuda', 'cuda:0', 'cpu', 'mps')."
-            ]
-        return []
+        return [p for p in (torch_device_error(self.device, "device", self.provider_name),) if p is not None]
 
     # ---- ABC ---------------------------------------------------------------
 
@@ -856,7 +967,9 @@ class LerobotTrainer(Trainer):
         ``dataset_repo_id`` (for streaming) - an ``output_dir``, a usable run
         size (``steps`` / ``global_batch_size``), a ``device`` torch can parse,
         single-node only
-        (``num_nodes == 1``), a ``val_episodes``
+        (``num_nodes == 1``), a boolean ``resume`` and ``streaming`` (each
+        selects a posture, so each is checked rather than read by truthiness -
+        ``streaming`` ahead of the pair check it gates), a ``val_episodes``
         split below the dataset total and not asked for alongside ``streaming``
         (lerobot's split path is map-style only), a local dataset format version
         the installed lerobot can read, usable LoRA hyperparameters when
@@ -909,6 +1022,13 @@ class LerobotTrainer(Trainer):
         problems.extend(self._checkpoint_cadence_problems(spec))
         problems.extend(self._learning_rate_problems(spec))
         problems.extend(self._seed_problems(spec))
+        problems.extend(self._resume_problems(spec))
+        # Captured rather than extended blind: the streaming / val_episodes pair
+        # check below branches on the flag, and a flag that is not a boolean
+        # would select that branch by truthiness - so the pair was refused with
+        # "set streaming=False" at a caller who had spelled exactly that.
+        streaming_problems = self._streaming_problems(spec)
+        problems.extend(streaming_problems)
         problems.extend(self._device_problems())
         # Captured rather than extended blind: the multi-node refusal below
         # compares num_nodes, which is only a meaningful comparison once this
@@ -932,7 +1052,7 @@ class LerobotTrainer(Trainer):
 
         if not val_problems and spec.val_episodes is not None:
             total = self._dataset_total_episodes(spec.dataset_root) if spec.dataset_root else None
-            if spec.streaming:
+            if not streaming_problems and spec.streaming:
                 # Decided from the two fields alone, ahead of every count-derived
                 # check below, because the pair delivers neither field whatever
                 # the episode count is. That count is only readable from a local
@@ -951,8 +1071,18 @@ class LerobotTrainer(Trainer):
                 # that trains on every episode and records no validation loss.
                 problems.append(self._unreadable_episode_count_problem(spec))
             else:
-                if spec.val_episodes >= total:
-                    problems.append(f"val_episodes={spec.val_episodes} >= total_episodes={total}")
+                # Compared against what the run LOADS, not what the header
+                # declares: an episode subset narrows the budget below the
+                # header count, and 5 of a selected 4 passed a check against 30.
+                effective = self._effective_episode_count(spec)
+                assert effective is not None, "a readable episode count makes the loaded count readable too"
+                if spec.val_episodes >= effective:
+                    problems.append(
+                        episode_subset_budget_error(
+                            spec.val_episodes, total, effective, self.provider_name, passthrough_param="extra"
+                        )
+                        or f"val_episodes={spec.val_episodes} >= total_episodes={total}"
+                    )
                 split_err = validation_split_error(
                     spec.val_episodes,
                     self._dataset_total_tasks(spec.dataset_root),
@@ -1063,8 +1193,108 @@ class LerobotTrainer(Trainer):
                 if isinstance(v, str) and v.startswith("-"):
                     problems.append(f"sample_weighting['{k}'] must not start with '-' (would parse as a stray flag)")
 
+        problems.extend(self._embodiment_problems(spec, ptype))
+        problems.extend(self._tune_component_problems(spec, ptype))
         problems.extend(self._quantile_stats_problems(spec, ptype))
         return problems
+
+    def _embodiment_problems(self, spec: TrainSpec, ptype: str) -> list[str]:
+        """Preflight ``embodiment`` against the policy's own ``embodiment_tag``.
+
+        The mirror of the ``relative_actions`` and ``method='expert_only'``
+        checks above: a spec field that names a policy-config field is refused
+        for a policy whose config lacks it, rather than being dropped on the
+        ``hasattr`` guard in :meth:`_build_policy_config` and leaving the run to
+        train the default head while reporting success.
+        """
+        if not spec.embodiment or _policy_supports_embodiment_tag(ptype):
+            return []
+        supported = sorted(t for t in _lerobot_policy_types() if _policy_supports_embodiment_tag(t))
+        return [
+            f"embodiment='{spec.embodiment}' is not supported by policy_type '{ptype}' "
+            f"(only {supported} expose embodiment_tag; every other lerobot policy takes its "
+            "state/action shape from the dataset features); drop embodiment or pick a "
+            "supporting policy"
+        ]
+
+    def _tune_component_problems(self, spec: TrainSpec, ptype: str) -> list[str]:
+        """Preflight ``tune``: the spelling, the policy's own toggles, the values.
+
+        Two ways a component toggle goes quiet, and both end the same way - the
+        run trains the config default and reports success. A key naming no
+        component (``vision`` for ``visual``) matches nothing to forward, and a
+        recognized component on a policy with no such field has nothing to set.
+
+        The third way is louder in effect and just as silent in signal: a value
+        read by truthiness. Each toggle selects whether a model component
+        trains, so it is a posture flag in the sense of
+        :func:`~strands_robots.utils.boolean_flag_error`, and ``"false"``,
+        ``"no"``, ``"off"`` and ``"0"`` - the spellings a YAML- or JSON-sourced
+        config carries - are all truthy, so a component the caller asked to
+        freeze would train. Graded here by the flag's own name, the way
+        ``resume`` and ``streaming`` are graded through
+        :meth:`_resume_problems` / :meth:`_streaming_problems`.
+        """
+        requested = {k for k in spec.tune if k != "expert_only"}
+        if not requested:
+            return []
+        problems: list[str] = []
+        unknown = sorted(requested - set(_TUNE_COMPONENT_FIELDS))
+        if unknown:
+            problems.append(
+                f"tune key(s) {unknown} name no tunable component (accepted: "
+                f"{sorted(_TUNE_COMPONENT_FIELDS)}, plus 'expert_only' for the method "
+                "mutual-exclusion check)"
+            )
+        unsupported = sorted((requested & set(_TUNE_COMPONENT_FIELDS)) - _policy_tune_components(ptype))
+        if unsupported:
+            supported = sorted(t for t in _lerobot_policy_types() if _policy_tune_components(t))
+            problems.append(
+                f"tune component(s) {unsupported} are not supported by policy_type '{ptype}' "
+                f"(only {supported} expose per-component tune_* fields; every other lerobot "
+                "policy tunes as a whole); drop them from tune or pick a supporting policy"
+            )
+        for component in sorted(requested & set(_TUNE_COMPONENT_FIELDS)):
+            error = self._tune_value_error(spec, component)
+            if error is not None:
+                problems.append(error)
+        return problems
+
+    def _tune_value_error(self, spec: TrainSpec, component: str) -> str | None:
+        """The refusal for ``tune[component]`` unless it is a boolean, else None.
+
+        One owner for the domain, so :meth:`validate` and the two builders
+        cannot disagree about which spellings are honoured.
+        """
+        return boolean_flag_error(spec.tune[component], f"tune['{component}']", self.provider_name)
+
+    def _tune_component_fields(self, spec: TrainSpec) -> dict[str, bool]:
+        """The requested component toggles, keyed by lerobot policy-config field.
+
+        Iterates :data:`_TUNE_COMPONENT_FIELDS` rather than ``spec.tune`` so the
+        order is the canonical one whatever order the caller's dict has - which
+        is what makes :meth:`build_command`'s argv comparable run to run.
+        ``expert_only`` is excluded: it is a ``method``, not a component.
+
+        The value is forwarded as checked, never coerced: ``bool("false")`` is
+        ``True``, so a coercion here would be the truthiness read
+        :meth:`_tune_component_problems` refuses. A builder reached without
+        :meth:`validate` gets the same refusal as a ``ValueError``, the shape
+        :meth:`_build_policy_config` already uses for a component the policy
+        lacks.
+
+        Raises:
+            ValueError: When a requested component's value is not a boolean.
+        """
+        toggles: dict[str, bool] = {}
+        for component, field in _TUNE_COMPONENT_FIELDS.items():
+            if component not in spec.tune:
+                continue
+            error = self._tune_value_error(spec, component)
+            if error is not None:
+                raise ValueError(error)
+            toggles[field] = spec.tune[component]
+        return toggles
 
     def _quantile_stats_problems(self, spec: TrainSpec, ptype: str) -> list[str]:
         """Preflight the dataset's quantile stats for a QUANTILES-normalizing policy.
@@ -1266,6 +1496,10 @@ class LerobotTrainer(Trainer):
                 cmd.append("--policy.train_expert_only=true")
             if self._relative_actions(spec):
                 cmd.append("--policy.use_relative_actions=true")
+            if spec.embodiment:
+                cmd.append(f"--policy.embodiment_tag={spec.embodiment}")
+            for field_name, enabled in self._tune_component_fields(spec).items():
+                cmd.append(f"--policy.{field_name}={'true' if enabled else 'false'}")
             sw = self._sample_weighting_dict(spec)
             if sw is not None:
                 for key in ("type", "progress_path", "head_mode", "kappa", "epsilon"):
@@ -1596,6 +1830,25 @@ class LerobotTrainer(Trainer):
                     f"use_relative_actions field (supported: {rel_supported})"
                 )
             policy_cfg.use_relative_actions = True
+        if spec.embodiment:
+            if not hasattr(policy_cfg, "embodiment_tag"):
+                tagged = sorted(t for t in _lerobot_policy_types() if _policy_supports_embodiment_tag(t))
+                raise ValueError(
+                    f"embodiment='{spec.embodiment}' was requested but policy_type '{ptype}' has "
+                    "no 'embodiment_tag' field (its state/action shape comes from the dataset "
+                    f"features, not a tag; supported: {tagged}). Drop embodiment, or pick a "
+                    "supporting policy."
+                )
+            policy_cfg.embodiment_tag = spec.embodiment
+        for field_name, enabled in self._tune_component_fields(spec).items():
+            if not hasattr(policy_cfg, field_name):
+                toggleable = sorted(t for t in _lerobot_policy_types() if _policy_tune_components(t))
+                raise ValueError(
+                    f"tune requested '{field_name}' but policy_type '{ptype}' has no such field "
+                    f"(it tunes as a whole; per-component toggles: {toggleable}). Drop the "
+                    "component from tune, or pick a supporting policy."
+                )
+            setattr(policy_cfg, field_name, enabled)
 
         peft_cfg = None
         if spec.method == "lora":
@@ -1709,10 +1962,13 @@ class LerobotTrainer(Trainer):
         parent = os.path.dirname(os.path.abspath(spec.output_dir)) or "."
         os.makedirs(parent, exist_ok=True)
 
-        # Fresh-start hygiene: clear a stale output_dir with no resumable ckpt.
-        if not spec.resume and os.path.isdir(spec.output_dir):
-            if self.latest_checkpoint(spec.output_dir) is None:
-                shutil.rmtree(spec.output_dir, ignore_errors=True)
+        # Fresh-start hygiene: clear a stale EMPTY output_dir so lerobot's
+        # "already exists" guard does not refuse the run. Asked through the one
+        # owner of that bound, which the lerobot_train tool asks too: a directory
+        # holding anything is left for lerobot to refuse by name, because the
+        # removal is recursive and reports neither what it took nor a failure.
+        if not spec.resume and stale_output_dir_is_clearable(spec.output_dir):
+            shutil.rmtree(spec.output_dir, ignore_errors=True)
 
         job_id = f"lerobot-{int(time.time())}"
         log_path = os.path.join(parent, f"{os.path.basename(spec.output_dir)}.{job_id}.log")

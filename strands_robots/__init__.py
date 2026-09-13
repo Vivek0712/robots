@@ -62,14 +62,6 @@ if TYPE_CHECKING:
     from strands_robots.streaming_dataset import StreamingDatasetReader, stream_dataset
     from strands_robots.teleoperator import Teleoperator
     from strands_robots.tools.download_assets import download_assets
-    from strands_robots.tools.earthrover import (
-        rover_camera,
-        rover_lamp,
-        rover_move,
-        rover_speak,
-        rover_state,
-        rover_stop,
-    )
     from strands_robots.tools.episode_judge import (
         create_judge_agent,
         load_episode,
@@ -79,7 +71,6 @@ if TYPE_CHECKING:
     )
     from strands_robots.tools.gr00t_inference import gr00t_inference
     from strands_robots.tools.harness_memory import harness_memory
-    from strands_robots.tools.lerobot_calibrate import lerobot_calibrate
     from strands_robots.tools.lerobot_camera import lerobot_camera
     from strands_robots.tools.lerobot_teleoperate import lerobot_teleoperate
     from strands_robots.tools.lerobot_train import lerobot_train
@@ -145,17 +136,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "sample_frames": ("strands_robots.tools.episode_judge", "sample_frames"),
     "read_predicate_verdict": ("strands_robots.tools.episode_judge", "read_predicate_verdict"),
     "write_label": ("strands_robots.tools.episode_judge", "write_label"),
-    "lerobot_calibrate": ("strands_robots.tools.lerobot_calibrate", "lerobot_calibrate"),
     "lerobot_camera": ("strands_robots.tools.lerobot_camera", "lerobot_camera"),
     "lerobot_teleoperate": ("strands_robots.tools.lerobot_teleoperate", "lerobot_teleoperate"),
     "lerobot_train": ("strands_robots.tools.lerobot_train", "lerobot_train"),
     "pose_tool": ("strands_robots.tools.pose_tool", "pose_tool"),
-    "rover_camera": ("strands_robots.tools.earthrover", "rover_camera"),
-    "rover_lamp": ("strands_robots.tools.earthrover", "rover_lamp"),
-    "rover_move": ("strands_robots.tools.earthrover", "rover_move"),
-    "rover_speak": ("strands_robots.tools.earthrover", "rover_speak"),
-    "rover_state": ("strands_robots.tools.earthrover", "rover_state"),
-    "rover_stop": ("strands_robots.tools.earthrover", "rover_stop"),
     "run_policy": ("strands_robots.tools.run_policy", "run_policy"),
     "serial_tool": ("strands_robots.tools.serial_tool", "serial_tool"),
     "train_policy": ("strands_robots.tools.train_policy", "train_policy"),
@@ -217,7 +201,6 @@ __all__ = [
     "lerobot_camera",
     "lerobot_teleoperate",
     "lerobot_train",
-    "lerobot_calibrate",
     "run_policy",
     "serial_tool",
     "train_policy",
@@ -227,12 +210,6 @@ __all__ = [
     "use_rtps",
     "pose_tool",
     "robot_mesh",
-    "rover_camera",
-    "rover_lamp",
-    "rover_move",
-    "rover_speak",
-    "rover_state",
-    "rover_stop",
     "init_device_connect",
     "init_device_connect_sync",
     "RobotDeviceDriver",
@@ -258,11 +235,17 @@ __all__ = [
 # extra do not pay import-attempt cost on every `import strands_robots`.
 # This is the canonical location - strands_robots/simulation/__init__.py
 # intentionally does NOT duplicate this call.
+#
+# LEAF: the selector is imported from ``strands_robots._mujoco_gl`` and not from
+# the MuJoCo backend module, because importing anything under
+# ``strands_robots.simulation`` runs that package's ``__init__`` and, through
+# ``SimEngine`` -> the policy runner -> the rendering package, initialises
+# numpy - which ``__getattr__`` below promises this import does not do (#3587).
 import importlib.util as _importlib_util  # noqa: E402
 
 if _importlib_util.find_spec("mujoco") is not None:
     try:
-        from strands_robots.simulation.mujoco.backend import _configure_gl_backend
+        from strands_robots._mujoco_gl import _configure_gl_backend
 
         _configure_gl_backend()
     except (ImportError, AttributeError, OSError):
@@ -273,7 +256,7 @@ if _importlib_util.find_spec("mujoco") is not None:
 # ffmpeg with zero user setup - making ``sim.stream_dataset(...)`` video decode
 # work out of the box. No-op off macOS, without torchcodec, or when already set.
 # May re-exec the interpreter ONCE on a plain script run (guarded; never in
-# Jupyter/REPL/pytest). Opt out with STRANDS_ROBOTS_NO_DYLD_SHIM=1. See _dyld.py.
+# Jupyter/REPL/pytest). Opt out with STRANDS_ROBOTS_NO_DYLD_SHIM=1. See :mod:`strands_robots._dyld`.
 try:
     from strands_robots._dyld import ensure_ffmpeg_on_dyld_path
 

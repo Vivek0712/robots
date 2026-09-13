@@ -72,6 +72,17 @@ _BOOL_KEYS: set[tuple[str, str]] = {
     ("runtime", "trust_remote_code"),
 }
 
+#: Keys whose value is a number, split by the shape it takes. One owner for the
+#: same reason ``_BOOL_KEYS`` is one: the strict path and the lenient degrade
+#: both have to agree about which keys these are, and the degrade spelled their
+#: union as a second literal tuple -- so the two halves of the numeric domain
+#: could drift apart, and they had, on the value neither literal names.
+#: Keyed by name rather than ``(section, key)``, which is how both paths already
+#: match them.
+_FLOAT_KEYS: tuple[str, ...] = ("temperature", "camera_hz")
+_INT_KEYS: tuple[str, ...] = ("max_tokens", "port")
+_NUMERIC_KEYS: tuple[str, ...] = _FLOAT_KEYS + _INT_KEYS
+
 _lock = threading.RLock()
 # The resolved tree, cached under the path it was resolved from. A `dict | None`
 # rebound through `global` -- and at two of the four write sites through
@@ -81,7 +92,8 @@ _lock = threading.RLock()
 # process that repoints SETTINGS_FILE is served the tree resolved from the
 # previous file, and a stale hit is indistinguishable from a fresh one. Keyed
 # this way they cannot, because the path is the dict's key, so a tree is only
-# reachable through the file it came from. `auth.py` keys its store cache on a
+# reachable through the file it came from. ``strands_robots.dashboard.auth``
+# keys its store cache on a
 # file identity for the same reason. Cleared before each insert, so it holds at
 # most one entry.
 _cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -112,6 +124,7 @@ def _as_bool(value: Any) -> bool:
 #: Public alias - other dashboard modules parse comma-separated endpoint
 #: strings with the same rules the settings store uses.
 def as_list(value: Any) -> list[str]:
+    """Split a comma-separated string - or a sequence - into non-empty entries."""
     return _as_list(value)
 
 
@@ -131,6 +144,40 @@ def _finite_float(key: str, value: Any) -> float:
         # such write bricks the config screen for every browser forever.
         raise CoercionError(f"{key}: {value!r} is not a finite number")
     return out
+
+
+def _finite_int(key: str, value: Any) -> int:
+    """An integer key's value, refusing the non-finite numbers ``int()`` cannot convert.
+
+    ``int(float("inf"))`` raises ``OverflowError``, which is neither of the two
+    errors the conversion below catches, so a non-finite value in an integer
+    slot used to escape :class:`CoercionError` altogether: the strict path
+    raised out of :func:`update_strict` instead of reporting the key, and the
+    lenient path raised out of :func:`load` -- where a process-scoped
+    :func:`override` left every later read of the WHOLE tree raising for as
+    long as it was set, since there is no value for the degrade to fall back
+    to if the coercion never returns. ``json.loads`` accepts the bare
+    ``Infinity`` token, so a request body is one of the ways such a value
+    arrives; :func:`_read_file` refuses it for the file for the neighbouring
+    reason, and :func:`_finite_float` refuses it for the other two numeric
+    keys. This is that same refusal for the two whose shape is an integer.
+
+    Non-finite is one class and gets one message, the wording
+    :func:`_finite_float` already uses. ``int(float("nan"))`` happens to raise
+    ``ValueError`` and so was reported -- but as "is not an integer", which
+    describes how the value was spelled rather than what it is.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise CoercionError(f"{key}: {value!r} is not a finite number")
+    try:
+        return int(value)
+    except OverflowError:
+        # A non-finite that is not a ``float`` instance, so the check above does
+        # not see it: ``numpy.float32("inf")`` and ``Decimal("Infinity")`` both
+        # convert with an OverflowError rather than one of the two below.
+        raise CoercionError(f"{key}: {value!r} is not a finite number")
+    except (TypeError, ValueError):
+        raise CoercionError(f"{key}: {value!r} is not an integer")
 
 
 def _coerce(section: str, key: str, value: Any, strict: bool = False) -> Any:
@@ -154,7 +201,7 @@ def _coerce(section: str, key: str, value: Any, strict: bool = False) -> Any:
         # fail-closed rather than a passthrough.
         if (section, key) in _BOOL_KEYS:
             return False
-        return None if key in ("temperature", "camera_hz", "max_tokens", "port") else value
+        return None if key in _NUMERIC_KEYS else value
 
 
 # : What "true" and "false" may be spelled like.
@@ -173,34 +220,26 @@ def _coerce_strict(section: str, key: str, value: Any) -> Any:
             if spelled not in _TRUTHY and spelled not in _FALSY:
                 raise CoercionError(f"{key}: {value!r} is not a boolean (use true/false)")
         return _as_bool(value)
-    if key == "temperature":
+    if key in _FLOAT_KEYS:
         if value in (None, ""):
             return None
         out = _finite_float(key, value)
-        if not 0.0 <= out <= 2.0:
+        if key == "temperature" and not 0.0 <= out <= 2.0:
             raise CoercionError(f"temperature: {out} is outside 0..2")
-        return out
-    if key == "camera_hz":
-        if value in (None, ""):
-            return None
-        out = _finite_float(key, value)
-        if not 0.0 < out <= 240.0:
+        if key == "camera_hz" and not 0.0 < out <= 240.0:
             # a publisher sleeps 1/hz between frames: 0 divides by zero,
             # negative sleeps never, huge busy-loops the camera thread.
             raise CoercionError(f"camera_hz: {out} is outside (0, 240]")
         return out
-    if key in ("max_tokens", "port"):
+    if key in _INT_KEYS:
         if value in (None, ""):
             return None
-        try:
-            out = int(value)
-        except (TypeError, ValueError):
-            raise CoercionError(f"{key}: {value!r} is not an integer")
-        if key == "port" and not 1 <= out <= 65535:
-            raise CoercionError(f"port: {out} is outside 1..65535")
-        if key == "max_tokens" and out < 1:
-            raise CoercionError(f"max_tokens: {out} must be at least 1")
-        return out
+        whole = _finite_int(key, value)
+        if key == "port" and not 1 <= whole <= 65535:
+            raise CoercionError(f"port: {whole} is outside 1..65535")
+        if key == "max_tokens" and whole < 1:
+            raise CoercionError(f"max_tokens: {whole} must be at least 1")
+        return whole
     if value is None:
         return None
     if isinstance(value, (dict, list, tuple, set)):
@@ -231,7 +270,7 @@ def _read_file() -> dict[str, Any]:
             # write must count as corrupt (browsers already refuse it), so it heals to defaults instead of
             # being handed back to JSON.parse forever.
             data = json.loads(
-                SETTINGS_FILE.read_text(),
+                SETTINGS_FILE.read_text(encoding="utf-8"),
                 parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f"non-finite {c}")),
             )
             if isinstance(data, dict):
@@ -285,6 +324,17 @@ def load(refresh: bool = False) -> dict[str, dict[str, Any]]:
 
 
 def get(section: str, key: str | None = None, default: Any = None) -> Any:
+    """One settings value, or a whole section, with a default for what is unset.
+
+    Args:
+        section: Settings section name.
+        key: A key within that section; omit it for the whole section.
+        default: Returned when the section, the key or its value is absent - an
+            empty string and an empty list count as absent.
+
+    Returns:
+        The stored value, the section mapping, or *default*.
+    """
     tree = load()
     if section not in tree:
         return default
@@ -301,13 +351,22 @@ def update(patch: dict[str, Any]) -> list[str]:
 
 
 def unknown_keys(patch: dict[str, Any]) -> list[str]:
-    """Dotted names in ``patch`` that this schema does not know."""
+    """Dotted names in ``patch`` that this schema does not know.
+
+    NAMES only. A name this schema does know, carrying a value it cannot use, is
+    not reported here - that is :func:`update_strict`'s errors, which is where a
+    flattened section (a known section given a scalar rather than a mapping of
+    its keys) is reported too. The two doors together account for every part of
+    a patch that cannot be applied, and the split is by name-versus-value so
+    that neither has to guess what the other reported.
+    """
     out: list[str] = []
     for section, values in (patch or {}).items():
         if section not in _SCHEMA:
             out.append(f"{section}.*" if isinstance(values, dict) else str(section))
             continue
         if not isinstance(values, dict):
+            # Known name, unusable value: update_strict's error, not this list.
             continue
         for key in values:
             if key not in _SCHEMA[section]:
@@ -318,6 +377,10 @@ def unknown_keys(patch: dict[str, Any]) -> list[str]:
 def update_strict(patch: dict[str, Any]) -> tuple[list[str], list[str]]:
     """Like :func:`update`, but invalid VALUES are reported, never stored. Returns ``(changed,
     errors)`` where each error names the dotted key and the reason.
+
+    A section given something other than a mapping of its keys is such a value,
+    and is reported under the section's own name; :func:`unknown_keys` does not
+    report it, because the name is one this schema knows.
     """
     return _update(patch, strict=True)
 
@@ -329,7 +392,30 @@ def _update(patch: dict[str, Any], strict: bool) -> tuple[list[str], list[str]]:
         current = load()
         stored = _read_file()
         for section, values in (patch or {}).items():
-            if section not in _SCHEMA or not isinstance(values, dict):
+            if section not in _SCHEMA:
+                continue
+            if not isinstance(values, dict):
+                # A section holds keys, so a scalar - or a list, or None - in its
+                # place names none of them: there is nothing to coerce, and no
+                # key whose shape a lenient degrade could fall back to. Every
+                # other part of a patch this store cannot apply is accounted for
+                # to the caller: an unknown NAME by unknown_keys(), an unusable
+                # VALUE by the errors below. A known section flattened to a
+                # scalar was the one spelling accounted for by neither, so
+                # ``{"security": "<token>"}`` - the section holding the bearer
+                # every /api and /ws request must present - returned no unknown
+                # name, no error and no changed key, and stored nothing. The
+                # caller's only honest report of that is a success.
+                #
+                # WARNING rather than DEBUG on the lenient path for the same
+                # reason: there the report the caller can make IS a success (an
+                # empty changed list), so this log line is the only signal the
+                # patch went nowhere.
+                reason = f"{section}: expected a mapping of {section} keys, got {type(values).__name__}"
+                if strict:
+                    errors.append(reason)
+                else:
+                    logger.warning("ignoring settings patch: %s", reason)
                 continue
             for key, raw in values.items():
                 if key not in _SCHEMA[section]:
@@ -384,7 +470,7 @@ def _write_file(data: dict[str, Any]) -> None:
     payload = json.dumps(data, indent=2, sort_keys=True, allow_nan=False)
     fd, tmp = tempfile.mkstemp(prefix=f"{SETTINGS_FILE.name}.", suffix=".tmp", dir=SETTINGS_FILE.parent)
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
         os.replace(tmp, SETTINGS_FILE)
     except BaseException:
@@ -403,7 +489,8 @@ def _write_file(data: dict[str, Any]) -> None:
 # Mesh env application
 # ----------------------------------------------------------------------
 
-#: Settings key -> env var read by ``mesh/session.py`` / the transport factory.
+#: Settings key -> env var read by ``strands_robots.mesh.session`` / the
+#: transport factory.
 MESH_ENV = {
     "connect": "ZENOH_CONNECT",
     "listen": "ZENOH_LISTEN",

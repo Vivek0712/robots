@@ -14,12 +14,20 @@ FPS``, ``Fast``/``Slow``, ``Good``/``Slow``), so a corrected clock is reported
 as a device measurement. The absolute stamps this tool writes - a filename's
 date, a report's ``Timestamp`` line - are the other half of that boundary and
 stay on ``datetime.now()``.
+
+RealSense support needs the Intel SDK (``pyrealsense2``) in addition to lerobot,
+which is what ``REALSENSE_AVAILABLE`` reports; importing lerobot's RealSense
+camera classes does not establish it, because lerobot requires the SDK at its
+call sites rather than at import. Every surface that reports the SDK absent
+names the same install, :data:`REALSENSE_SDK_ABSENT`.
 """
 
+import importlib.util
 import json
 import logging
 import os
 import time
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
@@ -37,7 +45,14 @@ try:
         from lerobot.cameras.realsense.camera_realsense import RealSenseCamera
         from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 
-        REALSENSE_AVAILABLE = True
+        # These modules import whether or not the Intel SDK is installed: lerobot
+        # binds ``pyrealsense2`` to None behind an availability flag and requires
+        # it at the call sites instead. So the import succeeding says the camera
+        # classes exist, not that a RealSense camera can be opened - that is what
+        # the SDK decides, and it is the question every use of this flag asks. It
+        # is probed under the import name, which is the one both the
+        # ``pyrealsense2`` and the ``pyrealsense2-macosx`` distribution provide.
+        REALSENSE_AVAILABLE = importlib.util.find_spec("pyrealsense2") is not None
     except ImportError:
         REALSENSE_AVAILABLE = False
         RealSenseCamera = None
@@ -49,15 +64,62 @@ except ImportError as e:
 from strands import tool
 
 from strands_robots.tools._path_validation import resolve_output_path, validate_save_path
-from strands_robots.utils import positive_finite_number_error, positive_whole_number_error
+from strands_robots.utils import (
+    boolean_flag_error,
+    positive_finite_number_error,
+    positive_whole_number_error,
+    refusal_container_repr,
+)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# The one remedy for an absent RealSense SDK, so every surface that reports it
+# reports the same install. It names lerobot's ``intelrealsense`` extra rather
+# than the ``pyrealsense2`` distribution because the extra is what carries the
+# per-platform split - on macOS the wheel ships as ``pyrealsense2-macosx``, so a
+# bare ``pip install pyrealsense2`` there installs nothing that can be imported.
+REALSENSE_SDK_ABSENT = (
+    "The Intel RealSense SDK (pyrealsense2) is not installed, so RealSense "
+    "cameras cannot be opened. Install with: pip install 'lerobot[intelrealsense]'"
+)
+
 logger = logging.getLogger(__name__)
 
 
+#: The ``format`` spellings whose inline copy is encoded as JPEG. Every other
+#: spelling gets PNG - see :func:`_frame_to_image_content` for why the set is
+#: this way round rather than a default.
+_INLINE_JPEG_FORMATS: frozenset[str] = frozenset({"jpg", "jpeg"})
+
+
 def _frame_to_image_content(frame: np.ndarray, format: str = "jpg") -> dict[str, Any]:
-    """Convert a numpy frame to image content format for Converse API."""
+    """Encode *frame* as Converse-API image content, keeping its pixels.
+
+    The Converse API carries a fixed set of encodings, so a capture saved in a
+    container it does not accept still has to be re-encoded for the inline copy.
+    The only thing that decision can cost is pixels, so JPEG is used when - and
+    only when - a JPEG was asked for; every other spelling is carried as PNG,
+    which is lossless and which the API accepts.
+
+    Reading it the other way round, as a default, made the lossy codec the
+    answer to every spelling the branch did not name. Measured on ``20a7ea49``
+    against a captured 8x6 frame, ``format="bmp"`` - one of the three the tool's
+    own docstring lists - wrote a real BMP to disk and handed back a JPEG whose
+    pixels differ from the frame by up to 213 of 255, under ``status="success"``
+    and an "Image Capture Success!" summary that says nothing about it. A caller
+    selects a lossless container precisely so that the frame survives, and the
+    half of the result a model actually looks at was the half that discarded it.
+    ``format="tiff"``, ``"webp"`` and ``"gif"`` reached the same fallback.
+
+    ``format="jpg"`` and ``format="png"`` are unchanged, which is every spelling
+    the fallback was not answering.
+
+    Args:
+        frame: The captured frame, RGB (or any shape OpenCV can encode as-is).
+        format: The caller's requested image format, compared case-insensitively.
+
+    Returns:
+        Converse image content, or text content naming the failure when the
+        frame cannot be encoded at all.
+    """
     try:
         # Convert RGB to BGR for OpenCV encoding
         if len(frame.shape) == 3 and frame.shape[2] == 3:
@@ -65,16 +127,12 @@ def _frame_to_image_content(frame: np.ndarray, format: str = "jpg") -> dict[str,
         else:
             bgr_frame = frame
 
-        # Encode frame to specified format
-        if format.lower() in ["jpg", "jpeg"]:
+        if format.lower() in _INLINE_JPEG_FORMATS:
             success, encoded_img = cv2.imencode(".jpg", bgr_frame)
             image_format = "jpeg"
-        elif format.lower() == "png":
+        else:
             success, encoded_img = cv2.imencode(".png", bgr_frame)
             image_format = "png"
-        else:
-            success, encoded_img = cv2.imencode(".jpg", bgr_frame)  # Default to JPEG
-            image_format = "jpeg"
 
         if not success:
             raise ValueError("Failed to encode frame")
@@ -124,6 +182,76 @@ _ACTION_NUMERIC_OPTIONS: dict[str, tuple[str, ...]] = {
 }
 
 
+_ACTION_POSTURE_FLAGS: dict[str, tuple[str, ...]] = {
+    "capture": ("async_mode", "warmup"),
+    "capture_batch": ("async_mode", "warmup"),
+    "record": ("async_mode", "warmup"),
+    "preview": ("async_mode", "warmup"),
+    "test": ("async_mode", "warmup"),
+    "configure": ("save_config", "warmup"),
+}
+
+
+def _posture_flag_error(action: str, *, async_mode: Any, warmup: Any, save_config: Any) -> str | None:
+    """Error text for the first posture flag ``action`` consumes but cannot read.
+
+    These three select a *posture* rather than scaling a quantity, and each was
+    read by truthiness - so every non-empty string, the spellings a caller
+    reaches for when opting out included, selected the affirmative posture.
+    Measured on ``eecaa80`` against a recording camera stand-in:
+
+    * ``save_config="false"`` wrote the configuration file, so a caller who
+      spelled the opt-out got a durable artifact on disk under
+      ``status="success"``;
+    * ``warmup="false"`` was handed to ``Camera.connect`` as the string, was
+      persisted into that file as ``"warmup": "false"`` - a string in the one
+      field of that document declared a boolean, beside the integer geometry and
+      rate that are validated - and was reported on the line above it as
+      ``Warmup: on``, so the file, the report and the caller disagree three ways
+      about one posture;
+    * ``async_mode="false"`` selected the asynchronous read path, which the
+      plain boolean ``False`` does not: one ``async_read`` and no synchronous
+      read, against zero and one.
+
+    It runs ahead of :func:`_numeric_option_error` because that guard's
+    ``timeout_ms`` row is *gated* on this flag - the synchronous read consumes no
+    budget, so an option no handler reads is not refused. Reading the gate by
+    truthiness switched the row off from outside its own table: ``async_mode=0``
+    with ``timeout_ms=-5`` was answered ``status="success"``, an unusable budget
+    accepted because a falsy value that is not a declared spelling of *off*
+    discarded the row. Ordered the other way the refusal also names the wrong
+    parameter - ``async_mode="false", timeout_ms=-5`` reported ``capture:
+    timeout_ms must be > 0``, sending the caller to correct a budget whose only
+    problem was the flag that selected it.
+
+    Keyed by action, and holding only the flags each handler is actually passed,
+    for the reason the numeric table is: ``discover`` and ``list`` take none of
+    the three, so a value neither consults is not refused. The domain itself
+    belongs to neither surface, so it delegates to
+    :func:`~strands_robots.utils.boolean_flag_error` - the one owner the sibling
+    ``lerobot_train`` builder already consults - exactly as the numeric rows
+    delegate their spans and counts. What stays here is the
+    roster and the report order, which puts ``save_config`` ahead of ``warmup``
+    so the flag that writes a file is named before the one that only opens a
+    camera.
+
+    Args:
+        action: The requested action; decides which flags are effective.
+        async_mode: Whether the asynchronous read path is selected, as supplied.
+        warmup: Whether the camera is warmed on connection, as supplied.
+        save_config: Whether the configuration is written to a file, as supplied.
+
+    Returns:
+        An error message naming the action and the flag, or ``None`` when every
+        flag this action reads is a boolean.
+    """
+    supplied = {"async_mode": async_mode, "warmup": warmup, "save_config": save_config}
+    for param in _ACTION_POSTURE_FLAGS.get(action, ()):
+        if error := boolean_flag_error(supplied[param], param, action):
+            return error
+    return None
+
+
 def _numeric_option_error(
     action: str,
     *,
@@ -157,7 +285,10 @@ def _numeric_option_error(
     preview's frame period.
 
     ``timeout_ms`` is only effective under ``async_mode``: the synchronous read
-    takes no timeout, so a value it never consumes is not refused.
+    takes no timeout, so a value it never consumes is not refused. That makes the
+    flag a gate on this table, so it is a boolean by the time it is read here -
+    :func:`_posture_flag_error` runs first, and a truthy spelling of *off* can no
+    longer switch the row off from outside the table.
 
     **The frame count is a product, so one factor's sign does not decide whether a
     frame can be captured.** ``positive_finite_number_error`` reads
@@ -291,6 +422,95 @@ def _vocabulary_option_error(action: str, *, color_mode: Any, rotation: Any) -> 
     return None
 
 
+# The cameras ``capture_batch`` reads when the caller names none. Held in one
+# place so the documented default and the resolution below cannot drift apart.
+_DEFAULT_BATCH_CAMERA_IDS: tuple[int | str, ...] = (0, "/dev/video4")
+
+
+def _camera_ids_error(camera_ids: Any) -> str | None:
+    """Error text when ``camera_ids`` is not a usable selection of cameras.
+
+    ``camera_ids`` SELECTS the cameras one ``capture_batch`` call opens, and a
+    selection is read by membership, never by truthiness: ``None`` is the one
+    spelling of "the default robot cameras", so it is the caller's to skip and
+    never reaches here. Every other value is graded.
+
+    Read by truthiness, ``[]`` took the same branch as ``None`` and was widened
+    to the two default cameras, so a caller who selected no camera - which is
+    what a filter that matched nothing produces - had two devices opened and two
+    files written, under ``status="success"`` and a "2/2 cameras" summary
+    quoting a count the caller never asked for. The empty selection is refused
+    rather than widened, which is the verdict the shared name-list domain
+    (:func:`strands_robots.utils.name_list_error`) reserves for the caller. That
+    domain is not reused here because a camera id is legitimately an ``int``
+    index as well as a device-path string, and it accepts names only.
+
+    The other shapes fail the same way that domain describes. A bare string is
+    iterable per character, so ``"/dev/video4"`` opened eleven one-character
+    cameras on eleven threads and reported eleven verdicts about devices the
+    caller never named, instead of one about the parameter. A ``Mapping`` is
+    iterable over its keys, so its values were discarded. A repeated id opens
+    one device twice concurrently and writes two files for it. A one-shot
+    iterator is consumed by the ``len()`` that sizes the thread pool before the
+    loop that submits work reads it. A ``bool`` is an ``int`` subclass, so
+    ``True`` selected camera index 1 without the caller writing a 1.
+
+    Every refusal here precedes the save directory being created, the thread
+    pool being built and any camera being opened, so a refused selection has no
+    partial effect to undo.
+
+    Args:
+        camera_ids: The caller-supplied selection, anything but ``None``.
+
+    Returns:
+        An error message naming the shape and the accepted one, or ``None`` when
+        the selection can be honored as written.
+    """
+    prefix = "capture_batch: camera_ids"
+    accepted = (
+        "a list of distinct camera ids, each an int index or a device path string; "
+        "omit it (None) for the default robot cameras"
+    )
+    if isinstance(camera_ids, str):
+        return (
+            f"{prefix} must be {accepted}, not a single string ({refusal_container_repr(camera_ids)}). A "
+            f"string is read one camera per character, so pass [{refusal_container_repr(camera_ids)}] to "
+            f"name one camera."
+        )
+    if isinstance(camera_ids, bytes):
+        return f"{prefix} must be {accepted}, not bytes ({refusal_container_repr(camera_ids)})."
+    if isinstance(camera_ids, Mapping):
+        return f"{prefix} must be {accepted}, not a mapping - its values would be discarded."
+    if not isinstance(camera_ids, Sequence):
+        return (
+            f"{prefix} must be {accepted}, got {type(camera_ids).__name__}. A one-shot "
+            f"iterator is consumed before the cameras are opened."
+        )
+    ids = list(camera_ids)
+    if not ids:
+        return (
+            f"{prefix}=[] selects no camera, so there is nothing to capture. Omit "
+            f"camera_ids to select the default robot cameras "
+            f"{list(_DEFAULT_BATCH_CAMERA_IDS)!r}, or name the cameras to capture from."
+        )
+    for i, cam_id in enumerate(ids):
+        if isinstance(cam_id, bool) or not isinstance(cam_id, int | str):
+            return (
+                f"{prefix}[{i}] must be an int index or a device path string, got {cam_id!r} ({type(cam_id).__name__})."
+            )
+        if isinstance(cam_id, str) and not cam_id.strip():
+            return f"{prefix}[{i}] is blank ({cam_id!r}); a camera path must name a device."
+    seen: set[int | str] = set()
+    for cam_id in ids:
+        if cam_id in seen:
+            return (
+                f"{prefix} names {cam_id!r} more than once ({ids!r}); each camera is "
+                f"opened once per batch, so name each id once."
+            )
+        seen.add(cam_id)
+    return None
+
+
 @tool
 def lerobot_camera(
     action: str = "list",
@@ -324,13 +544,19 @@ def lerobot_camera(
             - "preview": Show live preview from camera
             - "test": Test camera functionality and performance
             - "configure": Configure camera settings and save
-        camera_type: Camera type ("opencv" or "realsense")
+        camera_type: Camera type ("opencv" or "realsense"). "realsense" needs
+            the Intel SDK installed on top of lerobot; without it the action is
+            refused naming that install, rather than reported as unsupported.
         camera_id: Camera device ID (int for index, str for path like "/dev/video0")
         save_path: Directory to save captured images/videos
         filename: Custom filename (without extension). Resolved inside
             save_path; a value naming a location outside it is refused rather
             than written there.
-        camera_ids: List of camera IDs for batch operations
+        camera_ids: Cameras to capture from in one capture_batch call - a list
+            of distinct ids, each an int index or a device path string. Omit it
+            for the default robot cameras. An empty list selects no camera and
+            is refused rather than widened to those defaults; a single id passed
+            as a bare string is refused rather than read one camera per character.
         width: Frame width in pixels (a positive whole number)
         height: Frame height in pixels (a positive whole number)
         fps: Frames per second (a positive whole number)
@@ -341,19 +567,33 @@ def lerobot_camera(
             refused rather than silently read as "NO_ROTATION".
         format: Image format ("jpg", "png", "bmp"). Becomes the saved file's
             extension, so like filename it is resolved inside save_path and
-            refused if it names a location outside it.
+            refused if it names a location outside it. The image returned
+            alongside the file is encoded as JPEG only for a JPEG request; any
+            other format is carried back losslessly as PNG, so the inline copy
+            has the frame's own pixels.
         capture_duration: Duration for video recording (positive seconds)
         preview_duration: Duration for preview display (positive seconds)
-        async_mode: Use async reading for better performance
+        async_mode: Use async reading for better performance. A boolean; it
+            selects a read path rather than scaling one, so any other value is
+            refused rather than read as its opposite.
         timeout_ms: Timeout for async operations (positive milliseconds; read only when async_mode is on)
-        warmup: Enable camera warmup on connection
-        save_config: Save camera configuration to file
+        warmup: Enable camera warmup on connection. A boolean, refused rather
+            than read by truthiness - it is also recorded in the saved
+            configuration, so a non-boolean would persist there.
+        save_config: Save camera configuration to file. A boolean, refused
+            rather than read by truthiness: it writes a file, so a truthy
+            spelling of off would leave one behind.
 
     Returns:
         Dict containing status and detailed camera operation results
     """
 
     try:
+        # Ahead of the numeric guard: that guard's ``timeout_ms`` row is gated on
+        # ``async_mode``, so the gate is checked before it decides a row.
+        posture_error = _posture_flag_error(action, async_mode=async_mode, warmup=warmup, save_config=save_config)
+        if posture_error:
+            return {"status": "error", "content": [{"text": posture_error}]}
         numeric_error = _numeric_option_error(
             action,
             width=width,
@@ -401,8 +641,14 @@ def lerobot_camera(
                 warmup,
             )
         elif action == "capture_batch":
-            if not camera_ids:
-                camera_ids = [0, "/dev/video4"]  # Default robot cameras
+            # Read ``is None``: camera_ids selects a SUBSET of the cameras, so
+            # only the absent spelling means the default robot cameras. An empty
+            # selection, a bare string, a mapping or a repeat is refused here,
+            # before the save directory, the thread pool or any camera exists.
+            if camera_ids is None:
+                camera_ids = list(_DEFAULT_BATCH_CAMERA_IDS)
+            elif selection_error := _camera_ids_error(camera_ids):
+                return {"status": "error", "content": [{"text": selection_error}]}
             return _capture_batch_images(
                 camera_type,
                 camera_ids,
@@ -611,7 +857,7 @@ def _list_camera_details(camera_type: str, camera_id: int | str | None = None) -
             if not REALSENSE_AVAILABLE and camera_type.lower() == "realsense":
                 details.append(" **RealSense Camera System:**")
                 details.append("   - SDK Available:  Not installed")
-                details.append("   - Install with: `pip install pyrealsense2`")
+                details.append(f"   - {REALSENSE_SDK_ABSENT}")
             else:
                 details.append(f"**Unknown camera type: {camera_type}**")
 
@@ -1178,7 +1424,7 @@ def _configure_camera_settings(
             config_filename = f"camera_config_{camera_type}_{cam_id_safe}_{timestamp}.json"
             config_path = os.path.join(save_path, config_filename)
 
-            with open(config_path, "w") as f:
+            with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(actual_config, f, indent=2)
 
             config_info.extend(
@@ -1230,7 +1476,13 @@ def _create_camera(
         )
         return OpenCVCamera(config)
 
-    elif camera_type.lower() == "realsense" and REALSENSE_AVAILABLE:
+    elif camera_type.lower() == "realsense":
+        # "realsense" is a supported type on every platform this package runs
+        # on, so an absent SDK is reported as the absent SDK. Falling through to
+        # the unsupported-type refusal below would answer a question the caller
+        # did not ask, and send them looking for a spelling that does not exist.
+        if not REALSENSE_AVAILABLE:
+            raise ImportError(REALSENSE_SDK_ABSENT, name="pyrealsense2")
         config = RealSenseCameraConfig(serial_number_or_name=str(camera_id), fps=fps, width=width, height=height)
         return RealSenseCamera(config)
 

@@ -6,11 +6,17 @@ depend on: it **records** every request rather than discarding it. A double
 that dropped the POST could not tell "the driver clamped the twist" from "the
 driver sent nothing" - and the parting zero twist in ``cleanup()`` is exactly
 one recorded POST, which is the property that stops the wheels.
+
+The agent surface is graded the same way, through ``stream``: every verb the
+schema declares is driven and judged on what reached the recorder, because
+"the lamp rides a zero twist" and "a timed move ends in a stop" are claims
+about what was sent.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import sys
 import types
 from typing import Any
@@ -18,14 +24,18 @@ from typing import Any
 import pytest
 
 from strands_robots.drivers import get_native_driver_class
-from strands_robots.drivers.base import HardwareDriver, missing_driver_members
+from strands_robots.drivers.base import HardwareDriver, declared_verbs, missing_driver_members
 from strands_robots.drivers.earthrover import (
     CAMERA_VIEWS,
     DEFAULT_SDK_URL,
+    DRIVE_AXIS_LIMIT,
     DRIVE_CHANNELS,
+    MAX_MOVE_DURATION_S,
     EarthRoverDriver,
     base_url_error,
     detect_image_format,
+    drive_axis_error,
+    telemetry_summary,
 )
 
 _DATA = {
@@ -142,8 +152,9 @@ class TestConstructionRefusesTheWrongShape:
             ("http://10.0.0.9:8001/", "http://10.0.0.9:8001"),
             ("10.0.0.9:8001", "http://10.0.0.9:8001"),
             ("https://rover.local:8001", "https://rover.local:8001"),
+            ("HTTP://10.0.0.9:8001", "HTTP://10.0.0.9:8001"),
         ],
-        ids=["default", "trailing-slash", "bare-host-port", "https"],
+        ids=["default", "trailing-slash", "bare-host-port", "https", "uppercase-scheme"],
     )
     def test_the_base_url_is_normalised(self, port: str | None, base: str) -> None:
         assert EarthRoverDriver(port=port)._base == base
@@ -253,15 +264,14 @@ class TestSendActionReachesTheWire:
         ("action", "expected"),
         [
             ({"linear": 0.5, "angular": -0.25}, {"linear": 0.5, "angular": -0.25}),
-            ({"linear": 2.0}, {"linear": 1.0, "angular": 0.0}),
-            ({"angular": -3.0}, {"linear": 0.0, "angular": -1.0}),
+            ({"linear": 1.0, "angular": -1.0}, {"linear": 1.0, "angular": -1.0}),
             ({}, {"linear": 0.0, "angular": 0.0}),
             ({"lamp": True}, {"linear": 0.0, "angular": 0.0, "lamp": 1}),
-            ({"lamp": 0}, {"linear": 0.0, "angular": 0.0, "lamp": 0}),
+            ({"lamp": False}, {"linear": 0.0, "angular": 0.0, "lamp": 0}),
         ],
-        ids=["plain", "clamp-linear", "clamp-angular", "empty-is-stop", "lamp-on", "lamp-off"],
+        ids=["plain", "full-speed-both-ways", "empty-is-stop", "lamp-on", "lamp-off"],
     )
-    def test_the_posted_command_is_the_clamped_twist(
+    def test_the_posted_command_is_the_callers_twist(
         self, session: _FakeSession, action: dict[str, Any], expected: dict[str, float]
     ) -> None:
         driver = _live_driver(session)
@@ -293,8 +303,23 @@ class TestSendActionRefusesRatherThanGuesses:
             ({"linear": float("nan")}, "linear"),
             ({"angular": float("inf")}, "angular"),
             ({"linear": "fast"}, "linear"),
+            ({"linear": 2.0}, "outside the normalised drive envelope"),
+            ({"linear": 30.0}, "percent or SI scale"),
+            ({"angular": -3.0}, "outside the normalised drive envelope"),
+            ({"lamp": "off"}, "lamp"),
+            ({"lamp": 1}, "lamp"),
         ],
-        ids=["typo-channel", "nan", "inf", "string"],
+        ids=[
+            "typo-channel",
+            "nan",
+            "inf",
+            "string",
+            "linear-past-full-speed",
+            "linear-on-a-percent-scale",
+            "angular-past-full-speed",
+            "lamp-spelled-off",
+            "lamp-as-an-int",
+        ],
     )
     def test_a_bad_action_is_refused_before_the_wire(
         self, session: _FakeSession, action: dict[str, Any], needle: str
@@ -309,6 +334,57 @@ class TestSendActionRefusesRatherThanGuesses:
     def test_the_channel_refusal_names_the_valid_set(self, session: _FakeSession) -> None:
         refusal = _live_driver(session).send_action({"warp": 9})
         assert str(list(DRIVE_CHANNELS)) in refusal["content"][0]["text"]
+
+    def test_a_twist_past_full_speed_is_not_sent_at_full_speed(self, session: _FakeSession) -> None:
+        """The scale is no longer collapsed onto the fastest command there is.
+
+        Both axes are a fraction of full speed, so clamping mapped every
+        out-of-range magnitude onto the same wire value: on a nought-to-a-hundred
+        percent model a crawl and a top speed were the identical command, and the
+        rover holds a twist until the next one arrives. Neither request is
+        guessed at now, and the grading property is that nothing reached
+        ``/control`` - a refusal that still posted would stop the wheels only by
+        accident.
+        """
+        driver = _live_driver(session)
+        posts_before = len(session.posts)
+        crawl, flat_out = (driver.send_action({"linear": value}) for value in (5.0, 100.0))
+        assert crawl["status"] == "error" and flat_out["status"] == "error"
+        assert len(session.posts) == posts_before
+
+    def test_move_refuses_the_same_envelope_send_action_does(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        posts_before = len(session.posts)
+        assert driver.move(2.0, 0.0)["status"] == "error"
+        assert len(session.posts) == posts_before
+
+
+class TestTheDriveEnvelopeIsTheNormalisedRange:
+    """:func:`drive_axis_error`'s domain, graded as a set rather than a constant.
+
+    The bound is pinned by what it discriminates - every magnitude up to and
+    including :data:`DRIVE_AXIS_LIMIT` is commandable and everything past it is
+    not - so widening the envelope fails the refused cells and narrowing it fails
+    the accepted ones. An ``== 1.0`` assertion would survive both.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [0.0, 0.5, -0.5, DRIVE_AXIS_LIMIT, -DRIVE_AXIS_LIMIT],
+        ids=["stop", "forward", "reverse", "full-speed", "full-reverse"],
+    )
+    def test_a_magnitude_inside_the_envelope_is_commandable(self, value: float) -> None:
+        assert drive_axis_error(value, "linear", "send_action") is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [DRIVE_AXIS_LIMIT + 1e-9, 1.5, -1.5, 30.0, -100.0],
+        ids=["just-past-full-speed", "half-again", "reverse-half-again", "percent-scale", "far-past"],
+    )
+    def test_a_magnitude_outside_the_envelope_names_the_axis_and_the_surface(self, value: float) -> None:
+        reason = drive_axis_error(value, "angular", "send_action")
+        assert reason is not None
+        assert "angular" in reason and "send_action" in reason
 
     @pytest.mark.parametrize(
         ("post_response", "needle"),
@@ -448,36 +524,246 @@ class TestCameraFrames:
         assert CAMERA_VIEWS == ("front", "rear")
 
 
+class TestTheLampIsReadAsAFlag:
+    """The summary line reports the headlamp the rover described, or says it cannot.
+
+    ``send_action`` writes the lamp as the ``1``/``0`` the SDK carries and
+    refuses anything that is not a boolean, so those two integers and the two
+    booleans are the readings this field arrives in. Read for truthiness
+    instead, the summary answered for the rover: a snapshot whose firmware no
+    longer carries ``lamp`` read *off*, and one that spelled it ``"off"`` -
+    the very value the write door refuses because a word must not switch a
+    headlamp - read *on*.
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(True, "on"), (1, "on"), (False, "off"), (0, "off")],
+        ids=["true", "one", "false", "zero"],
+    )
+    def test_a_reported_lamp_is_named(self, value: Any, expected: str) -> None:
+        assert f"lamp {expected}" in telemetry_summary({**_DATA, "lamp": value})
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "off", "false", "on", "", [], 2],
+        ids=["null", "off-word", "false-word", "on-word", "empty", "list", "out-of-range"],
+    )
+    def test_a_lamp_that_is_no_reading_is_not_named_at_all(self, value: Any) -> None:
+        """Neither state may be invented from a value that is not a flag."""
+        line = telemetry_summary({**_DATA, "lamp": value})
+        assert "lamp ?" in line
+        assert "lamp on" not in line and "lamp off" not in line
+
+    def test_a_snapshot_without_the_field_reads_like_its_absent_siblings(self) -> None:
+        """``?`` is what battery, signal, heading and speed already read absent."""
+        line = telemetry_summary({"gps_signal": 0})
+        assert line == "battery ?% | signal ?/4 | heading ? deg | speed ? | lamp ? | GPS no fix"
+
+    def test_an_unreadable_lamp_costs_the_lamp_and_nothing_else(self) -> None:
+        """A verb must not lose the battery beside the field it cannot read."""
+        line = telemetry_summary({**_DATA, "lamp": "off", "gps_signal": 3})
+        assert f"battery {_DATA['battery']}%" in line
+        assert f"GPS {_DATA['latitude']:.6f}," in line
+
+
 # --------------------------------------------------------------------------- #
 # The agent surface.                                                          #
 # --------------------------------------------------------------------------- #
 
 
+#: The least a caller must send for each declared verb to do its work. Keyed by
+#: verb so a verb added to the schema without a row here fails
+#: ``test_the_table_covers_every_declared_verb`` rather than going ungraded.
+_MINIMAL_REQUEST: dict[str, dict[str, Any]] = {
+    "sensors": {},
+    "status": {},
+    "camera": {},
+    "move": {"linear": 0.2},
+    "lamp": {"on": True},
+    "speak": {"text": "hello"},
+    "stop": {},
+}
+
+
+class _DropsTheSecondPost(_FakeSession):
+    """A link that carries the twist and then loses the stop that must follow it.
+
+    The failure a timed move has to report: half a move is not a completed
+    move, because a velocity-commanded base is still rolling.
+    """
+
+    def post(self, url: str, json: Any = None, timeout: float = 0.0, **kwargs: Any) -> _FakeResponse:
+        if self.posts:
+            self.post_response = _FakeResponse(503, None, "the link went away")
+        return super().post(url, json, timeout, **kwargs)
+
+
+@pytest.fixture
+def dropping_session(monkeypatch: pytest.MonkeyPatch) -> _DropsTheSecondPost:
+    """Install a fake ``requests`` whose second POST is refused."""
+    fake_session = _DropsTheSecondPost()
+    fake = types.ModuleType("requests")
+    fake.Session = lambda: fake_session  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "requests", fake)
+    return fake_session
+
+
 class TestTheAgentSurface:
-    def _events(self, driver: EarthRoverDriver, action: str) -> list[Any]:
+    """Every capability the SDK exposes is a verb an agent can actually send.
+
+    The verbs need nothing a model cannot emit - the driver handle is ``self`` -
+    which is the property ``test_a_robot_verb_needs_no_handle_a_model_cannot_send``
+    pins for the whole package. Here each verb is driven through ``stream`` and
+    graded on what reached the recorder, because "the lamp rides a zero twist"
+    and "a timed move ends in a stop" are claims about what was *sent*.
+    """
+
+    def _invoke(self, driver: EarthRoverDriver, **request: Any) -> dict[str, Any]:
         async def collect() -> list[Any]:
             return [
-                event
-                async for event in driver.stream(
-                    {"toolUseId": "t-1", "name": "earthrover", "input": {"action": action}}, {}
-                )
+                event async for event in driver.stream({"toolUseId": "t-1", "name": "earthrover", "input": request}, {})
             ]
 
-        return asyncio.run(collect())
-
-    def test_sensors_yields_one_result_with_the_snapshot(self, session: _FakeSession) -> None:
-        events = self._events(_live_driver(session), "sensors")
-        assert len(events) == 1
+        events = asyncio.run(collect())
+        assert len(events) == 1, f"a verb must yield exactly one result, got {len(events)}"
         assert events[0]["toolUseId"] == "t-1"
-        assert events[0]["content"][0]["json"]["battery"] == _DATA["battery"]
+        return dict(events[0])
+
+    def _with_a_frame(self, session: _FakeSession) -> None:
+        session.routes["/v2/front"] = _FakeResponse(200, {"front_frame": base64.b64encode(b"\xff\xd8\xff").decode()})
+
+    def test_the_spec_declares_one_verb_per_capability(self, session: _FakeSession) -> None:
+        spec = _live_driver(session).tool_spec
+        assert spec["name"] == "earthrover"
+        assert spec["inputSchema"]["json"]["properties"]["action"]["enum"] == [
+            "sensors",
+            "status",
+            "camera",
+            "move",
+            "lamp",
+            "speak",
+            "stop",
+        ]
+
+    def test_the_table_covers_every_declared_verb(self, session: _FakeSession) -> None:
+        assert sorted(_MINIMAL_REQUEST) == sorted(declared_verbs(_live_driver(session).tool_spec))
+
+    @pytest.mark.parametrize("verb", sorted(_MINIMAL_REQUEST))
+    def test_every_declared_verb_works(self, session: _FakeSession, verb: str) -> None:
+        driver = _live_driver(session)
+        self._with_a_frame(session)
+        assert self._invoke(driver, action=verb, **_MINIMAL_REQUEST[verb])["status"] == "success"
+
+    def test_sensors_summarises_and_carries_the_whole_snapshot(self, session: _FakeSession) -> None:
+        answer = self._invoke(_live_driver(session), action="sensors")
+        assert f"battery {_DATA['battery']}%" in answer["content"][0]["text"]
+        assert answer["content"][1]["json"]["battery"] == _DATA["battery"]
+
+    @pytest.mark.parametrize("coordinate", ["n/a", None, True, float("nan")], ids=["string", "absent", "flag", "nan"])
+    def test_a_coordinate_that_is_no_reading_reads_as_no_fix(self, session: _FakeSession, coordinate: Any) -> None:
+        """A verb must not raise past its dispatcher, losing the battery beside it."""
+        driver = _live_driver(session)
+        session.routes["/data"] = _FakeResponse(200, {**_DATA, "gps_signal": 3, "latitude": coordinate})
+        answer = self._invoke(driver, action="sensors")
+        assert answer["status"] == "success"
+        assert "GPS no fix" in answer["content"][0]["text"]
+        assert f"battery {_DATA['battery']}%" in answer["content"][0]["text"]
+
+    def test_a_reported_fix_is_shown_at_full_precision(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        session.routes["/data"] = _FakeResponse(200, {**_DATA, "gps_signal": 3, "latitude": 41.015337})
+        assert "GPS 41.015337," in self._invoke(driver, action="sensors")["content"][0]["text"]
+
+    def test_an_empty_cache_is_a_refusal_naming_the_remedy(self) -> None:
+        answer = self._invoke(EarthRoverDriver(), action="sensors")
+        assert answer["status"] == "error"
+        assert "no telemetry yet" in answer["content"][0]["text"]
+        assert "earth-rovers-sdk" in answer["content"][0]["text"]
+
+    def test_move_sends_the_callers_twist(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        assert self._invoke(driver, action="move", linear=0.4, angular=-0.2)["status"] == "success"
+        assert session.posts[-1][1] == {"command": {"linear": 0.4, "angular": -0.2}}
+
+    def test_a_timed_move_ends_in_a_stop_and_reports_both_halves(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        answer = self._invoke(driver, action="move", linear=0.3, duration_s=0.01)
+        assert answer["status"] == "success"
+        assert answer["content"][0]["json"] == {
+            "commanded": {"linear": 0.3, "angular": 0.0},
+            "held_s": 0.01,
+            "stopped": True,
+        }
+        assert [post[1]["command"] for post in session.posts] == [
+            {"linear": 0.3, "angular": 0.0},
+            {"linear": 0.0, "angular": 0.0},
+        ]
+
+    def test_a_lost_trailing_stop_is_an_error_not_a_success(self, dropping_session: _DropsTheSecondPost) -> None:
+        driver = _live_driver(dropping_session)
+        answer = self._invoke(driver, action="move", linear=0.3, duration_s=0.01)
+        assert answer["status"] == "error"
+        assert "may still be rolling" in answer["content"][0]["text"]
+        assert answer["content"][1]["json"]["stopped"] is False
+
+    @pytest.mark.parametrize(
+        "duration_s",
+        [0.0, -1.0, MAX_MOVE_DURATION_S + 0.5, float("inf"), "10"],
+        ids=["zero", "negative", "too-long", "inf", "string"],
+    )
+    def test_an_unholdable_duration_is_refused_before_the_wire(self, session: _FakeSession, duration_s: Any) -> None:
+        driver = _live_driver(session)
+        answer = self._invoke(driver, action="move", linear=0.3, duration_s=duration_s)
+        assert answer["status"] == "error"
+        assert "duration_s" in answer["content"][0]["text"]
+        assert session.posts == []
+
+    def test_a_refused_twist_never_starts_the_hold(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        session.post_response = _FakeResponse(503, None, "unavailable")
+        answer = self._invoke(driver, action="move", linear=0.3, duration_s=MAX_MOVE_DURATION_S)
+        assert answer["status"] == "error"
+        assert len(session.posts) == 1, "the trailing stop must not follow a twist that never landed"
+
+    @pytest.mark.parametrize("on", [True, False], ids=["on", "off"])
+    def test_the_lamp_rides_a_zero_twist(self, session: _FakeSession, on: bool) -> None:
+        driver = _live_driver(session)
+        assert self._invoke(driver, action="lamp", on=on)["status"] == "success"
+        assert session.posts[-1][1] == {"command": {"linear": 0.0, "angular": 0.0, "lamp": 1 if on else 0}}
+
+    def test_the_sensors_verb_reports_a_lamp_the_snapshot_never_carried_as_unknown(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        session.routes["/data"] = _FakeResponse(200, {k: v for k, v in _DATA.items() if k != "lamp"})
+        assert "lamp ?" in self._invoke(driver, action="sensors")["content"][0]["text"]
+
+    def test_a_lamp_that_is_not_a_boolean_is_refused_not_read_for_truth(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        answer = self._invoke(driver, action="lamp", on="off")
+        assert answer["status"] == "error"
+        assert "lamp must be a boolean" in answer["content"][0]["text"]
+        assert session.posts == []
+
+    def test_speak_carries_the_text_and_refuses_an_empty_one(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        assert self._invoke(driver, action="speak", text="scanning")["status"] == "success"
+        assert session.posts[-1][:2] == (f"{DEFAULT_SDK_URL}/speak", {"text": "scanning"})
+        assert self._invoke(driver, action="speak")["status"] == "error"
+
+    def test_a_frame_becomes_a_block_the_model_can_see(self, session: _FakeSession) -> None:
+        driver = _live_driver(session)
+        session.routes["/v2/rear"] = _FakeResponse(200, {"rear_frame": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()})
+        answer = self._invoke(driver, action="camera", camera="rear")
+        assert answer["content"][0]["text"] == "[rear]"
+        assert answer["content"][1]["image"]["format"] == "png"
+        assert answer["content"][1]["image"]["source"]["bytes"] == b"\x89PNG\r\n\x1a\n"
+
+    def test_an_unusable_frame_refusal_reaches_the_agent_verbatim(self, session: _FakeSession) -> None:
+        answer = self._invoke(_live_driver(session), action="camera", camera="side")
+        assert answer["status"] == "error"
+        assert "camera must be one of" in answer["content"][0]["text"]
 
     def test_stop_reaches_the_wire(self, session: _FakeSession) -> None:
         driver = _live_driver(session)
-        events = self._events(driver, "stop")
-        assert events[0]["status"] == "success"
+        assert self._invoke(driver, action="stop")["status"] == "success"
         assert session.posts[-1][1] == {"command": {"linear": 0.0, "angular": 0.0}}
-
-    def test_the_spec_offers_exactly_the_read_only_trio(self, session: _FakeSession) -> None:
-        spec = _live_driver(session).tool_spec
-        assert spec["name"] == "earthrover"
-        assert spec["inputSchema"]["json"]["properties"]["action"]["enum"] == ["sensors", "status", "stop"]

@@ -143,17 +143,18 @@ class _RecordingMotionSwitcher:
     def __init__(self, readings: list[Any]) -> None:
         self._readings = list(readings)
         self.release_calls = 0
+        self.check_calls = 0
 
     def CheckMode(self) -> Any:
+        self.check_calls += 1
         return self._readings.pop(0) if self._readings else (0, {"name": ""})
 
     def ReleaseMode(self) -> None:
         self.release_calls += 1
 
 
-@pytest.fixture
-def stub_unitree_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Install a ``unitree_sdk2py`` stub for the duration of one test.
+def install_unitree_sdk_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register a ``unitree_sdk2py`` stub on :mod:`sys.modules`.
 
     The Go2 driver imports ``unitree_sdk2py.idl.default``,
     ``unitree_sdk2py.utils.crc`` and ``unitree_sdk2py.idl.unitree_go.msg.dds_``
@@ -161,6 +162,12 @@ def stub_unitree_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     production lane hardware drives, on a box with no SDK.
     ``monkeypatch.setitem`` restores the previous entries - normally absent - on
     teardown.
+
+    A plain function rather than only a fixture, so a sibling suite grading the
+    same driver installs the same stub instead of keeping a second copy of it.
+
+    Args:
+        monkeypatch: The requesting test's patcher, which owns the teardown.
     """
     names = {
         "unitree_sdk2py": types.ModuleType("unitree_sdk2py"),
@@ -177,6 +184,12 @@ def stub_unitree_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     names["unitree_sdk2py.utils.crc"].CRC = _StubCRC  # type: ignore[attr-defined]
     for name, module in names.items():
         monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.fixture
+def stub_unitree_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK stub, installed for the duration of one test."""
+    install_unitree_sdk_stub(monkeypatch)
 
 
 def _released_driver() -> tuple[Go2Driver, _RecordingPublisher]:
@@ -556,6 +569,49 @@ def test_release_sport_mode_gives_up_by_name_when_the_mode_will_not_clear() -> N
     assert driver._sport_mode_released is False
 
 
+@pytest.mark.parametrize("attempts", [1, 2, 5])
+def test_a_mode_that_clears_on_the_last_release_is_reported_released(attempts: int) -> None:
+    """The release that finally works is confirmed, whichever round performs it.
+
+    ``attempts`` counts release-then-verify rounds, so the last round's release
+    owes a read as much as the earlier ones do. Reading once per round instead
+    spends the budget on reads that precede a release and never looks after the
+    final one, which reports failure on a robot that let go - and, because the
+    write gate caches that verdict, keeps ``send_action`` refused until the
+    caller happens to ask a second time.
+    """
+    switcher = _RecordingMotionSwitcher([(0, {"name": "ai"})] * attempts + [(0, {"name": ""})])
+    driver = Go2Driver(motion_switcher_client_factory=lambda _iface: switcher)
+
+    result = driver.release_sport_mode(attempts=attempts)
+
+    assert result["status"] == "success", _text(result)
+    assert result["content"][0]["json"]["released_mode"] == "ai"
+    assert driver._sport_mode_released is True
+    assert switcher.release_calls == attempts, "one release per mode still holding the robot"
+
+
+@pytest.mark.parametrize("attempts", [1, 2, 5])
+def test_giving_up_names_a_mode_read_after_the_last_release(attempts: int) -> None:
+    """The refusal's claim is backed by a reading taken since the last release.
+
+    "still active after N release attempts" is a statement about the robot now,
+    so the driver must have asked it after letting go for the Nth time: N rounds
+    take N releases and N + 1 reads. Refusing on the read that came *before* the
+    last release would name a mode the driver had not looked for since.
+    """
+    switcher = _RecordingMotionSwitcher([(0, {"name": "normal"})] * (attempts + 1))
+    driver = Go2Driver(motion_switcher_client_factory=lambda _iface: switcher)
+
+    result = driver.release_sport_mode(attempts=attempts)
+
+    assert result["status"] == "error"
+    assert f"'normal' still active after {attempts} release attempts" in _text(result)
+    assert switcher.release_calls == attempts
+    assert switcher.check_calls == attempts + 1, "every release is followed by the read that verifies it"
+    assert driver._sport_mode_released is False
+
+
 # --------------------------------------------------------------------------- #
 # The task path.                                                              #
 # --------------------------------------------------------------------------- #
@@ -594,7 +650,7 @@ def test_run_policy_refuses_an_unusable_budget_before_starting_a_thread(
     ("policy", "expected_fragment"),
     [
         pytest.param(None, "policy_object is required", id="none"),
-        pytest.param(object(), "must be callable or expose a .step()", id="not-callable"),
+        pytest.param(object(), "must be callable or expose get_actions_sync() or step()", id="not-callable"),
     ],
 )
 def test_run_policy_refuses_a_policy_it_cannot_call(

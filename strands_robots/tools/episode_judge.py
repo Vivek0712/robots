@@ -133,7 +133,7 @@ def _episode_frame_rows(root: Path, episode: int) -> list[dict[str, Any]]:
     over consecutive frames, so dropping a shard makes the surviving rows read
     as consecutive when they are not, and ``max_state_delta`` /
     ``rms_state_jerk`` then measure the gap instead of the robot.
-    :func:`strands_robots.dataset_recorder.read_dataset_episode_indices`
+    :func:`strands_robots.verify_dataset.read_dataset_episode_indices`
     tolerates the same damage because naming the damaged files *is* its
     product; it reports them in ``unreadable_files`` and documents its totals
     as a lower bound. Here there is no field to carry that caveat into a
@@ -311,8 +311,8 @@ def load_episode(root: str, episode: int) -> dict[str, Any]:
             return _error(msg)
         episode = int(episode)
 
-        from strands_robots.dataset_recorder import read_dataset_episode_indices
         from strands_robots.episode_labels import labels_path, read_labels
+        from strands_robots.verify_dataset import read_dataset_episode_indices
 
         indices = read_dataset_episode_indices(root_path)
         if episode not in indices["episode_indices"]:
@@ -351,7 +351,17 @@ def load_episode(root: str, episode: int) -> dict[str, Any]:
                 {"json": payload},
             ],
         }
-    except (ValueError, OSError) as e:
+    except (ImportError, ValueError, OSError) as e:
+        # ``read_dataset_episode_indices`` documents ImportError for an absent
+        # ``pyarrow`` - it ships with the lerobot extra, so a judge process that
+        # only reads recorded datasets can lack it. Caught here alongside the
+        # corruption and IO failures because this module's contract is that no
+        # tool raises: a judge run over a hundred episodes must report the
+        # episode it could not read, not die on it. That callee's other two
+        # callers already read it this way -
+        # :func:`strands_robots.verify_dataset.verify_dataset` in one tuple, and
+        # :meth:`~strands_robots.simulation.base.SimEngine.verify_dataset_episodes`
+        # in a handler of its own.
         return _error(f"load_episode: {e}")
 
 
@@ -388,10 +398,19 @@ def sample_frames(root: str, episode: int, n_frames: int = 4, include_images: bo
         when the episode is shorter than four frames). When images are
         requested, one image block follows per camera per sampled position -
         position-major, cameras in sorted key order within each position (the
-        same order ``load_episode`` reports ``camera_keys``) - and the leading
-        text block states the block count and that grouping, so a judge handed
-        ``n_frames x n_cameras`` unlabelled images knows which are the same
-        timestep from different viewpoints. Every camera is deliberately
+        same order ``load_episode`` reports ``camera_keys``) - the leading text
+        block states the block count and that grouping, and every image block is
+        immediately preceded by a text block naming its camera and its
+        ``frame_index``, so a judge reading a run of ``n_frames x n_cameras``
+        images can say *which* view a per-view observation belongs to and join
+        that view back onto the state row for the same frame in ``samples``. The label is adjacent to its
+        image because that is what binds: the grouping sentence alone is a rule
+        the judge must apply, and a rule stated at a distance from the images
+        does not survive the flat run (measured on a three-camera recording with
+        one view fully blocked, naming the blind camera scored 22/40 from the
+        grouping sentence alone, 17/40 from the full block map spelled out in
+        one text block, and 40/40 from these per-block labels, against 30/30 on
+        the same frames asked one at a time). Every camera is deliberately
         included rather than one canonical view: the same world motion can be
         legible in one view and below a judge's threshold in another (measured
         on a real two-camera recording, where a 185 mm slide read as 84 px of
@@ -445,16 +464,29 @@ def sample_frames(root: str, episode: int, n_frames: int = 4, include_images: bo
                     "to decode; record with cameras for a multimodal judge."
                 )
             image_blocks = _decoded_image_blocks(root_path, episode, positions)
-            # State the block count and grouping where the judge reads it: a
-            # judge asked for n_frames and handed n_frames x n_cameras
-            # unlabelled images has no other way to know that adjacent blocks
-            # are the same timestep from different viewpoints.
+            # State the block count and grouping where the judge reads it, then
+            # label every block with its own camera and frame index. The grouping
+            # sentence alone is a rule the judge would have to apply to a flat
+            # image run, and a stated rule does not bind: measured on a
+            # three-camera recording with one view fully blocked (0 object
+            # pixels in every sampled frame of that view, the other two 1.2-2.1%
+            # of frame), naming the blind camera from the payload scored 22/40
+            # with the grouping sentence alone and 40/40 with these per-block
+            # labels, while the same model scored 30/30 on the identical frames
+            # asked one at a time - so the frames carried the answer and the
+            # payload structure was what lost it. Enumerating the whole map in
+            # one text block instead ("image 1 = camera1 at position 0; ...")
+            # scored 17/40 at MORE tokens, so the fix is adjacency, not words.
             content[0]["text"] = (
                 f"Episode {episode}: sampled {count} of {length} frames; "
                 f"{len(image_blocks)} image blocks, position-major, "
                 f"cameras sorted ({', '.join(camera_keys)})."
             )
-            content.extend(image_blocks)
+            for index, block in enumerate(image_blocks):
+                ordinal, camera = divmod(index, len(camera_keys))
+                frame = samples[ordinal]["frame_index"]
+                content.append({"text": f"frame {frame}, camera {camera_keys[camera]}:"})
+                content.append(block)
         return {"status": "success", "content": content}
     except (
         ValueError,

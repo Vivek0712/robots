@@ -39,8 +39,35 @@ def _mlp(in_dim: int, hidden: tuple[int, ...], out_dim: int) -> Any:
     return nn.Sequential(*layers)
 
 
-def _build_actor_critic(num_actor_obs: int, num_critic_obs: int, num_actions: int, spec: RLTrainSpec) -> Any:
-    """Construct the Gaussian-MLP ``ActorCritic`` module (torch required)."""
+def build_actor_critic(
+    num_actor_obs: int,
+    num_critic_obs: int,
+    num_actions: int,
+    *,
+    hidden_dims: tuple[int, ...] = (128, 128),
+    init_noise_std: float = 1.0,
+) -> Any:
+    """Construct the Gaussian-MLP ``ActorCritic`` module (torch required).
+
+    Public because a checkpoint is only deployable if its architecture can be
+    rebuilt outside a training run: ``load_deployable_actor`` calls this to
+    reconstruct the graph ``policy.pt``'s ``state_dict`` was saved from, so the
+    trainer and the deployer cannot drift into two different networks.
+
+    Args:
+        num_actor_obs: Width of the actor observation vector.
+        num_critic_obs: Width of the critic observation vector (>= actor's under
+            an asymmetric actor-critic).
+        num_actions: Number of action outputs.
+        hidden_dims: Hidden layer widths, expanded for both actor and critic.
+        init_noise_std: Initial action standard deviation. Only the *initial*
+            value: ``log_std`` is a learned parameter, so loading a checkpoint
+            overwrites it and any positive value reconstructs the same graph.
+
+    Returns:
+        An ``ActorCritic`` ``nn.Module`` whose ``act_inference`` is the
+        deterministic (mean) action a deployed checkpoint commands.
+    """
     import torch
     import torch.nn as nn
     from torch.distributions import Normal
@@ -50,9 +77,9 @@ def _build_actor_critic(num_actor_obs: int, num_critic_obs: int, num_actions: in
 
         def __init__(self) -> None:
             super().__init__()
-            self.actor = _mlp(num_actor_obs, spec.hidden_dims, num_actions)
-            self.critic = _mlp(num_critic_obs, spec.hidden_dims, 1)
-            self.log_std = nn.Parameter(torch.ones(num_actions) * float(torch.log(torch.tensor(spec.init_noise_std))))
+            self.actor = _mlp(num_actor_obs, hidden_dims, num_actions)
+            self.critic = _mlp(num_critic_obs, hidden_dims, 1)
+            self.log_std = nn.Parameter(torch.ones(num_actions) * float(torch.log(torch.tensor(init_noise_std))))
 
         def _distribution(self, actor_obs: torch.Tensor) -> Normal:
             mean = self.actor(actor_obs)
@@ -152,6 +179,13 @@ class PpoTrainer(BaseRLAlgo):
             problems.append("output_dir is required")
         # gamma discounts the return this backend optimizes; the arithmetic that
         # consumes it never judges it, so the shared interval domain does.
+        # normalize_obs and normalize_advantage each select a posture - wrap the
+        # observation streams or feed them raw; standardize advantages per batch
+        # or use them as computed - and setup() and update() read both by
+        # truthiness, so the spellings a caller reaches for to opt out select the
+        # affirmative branch. The shared boolean domain refuses them by name.
+        problems.extend(self._observation_normalization_problems(spec))
+        problems.extend(self._advantage_normalization_problems(spec))
         problems.extend(self._discount_factor_problems(spec))
         # lam is the other factor of the same trace decay: the recursion decays by
         # gamma * lam, so the gate above cannot bound the trace on its own.
@@ -180,6 +214,20 @@ class PpoTrainer(BaseRLAlgo):
         # it reads True, a fraction below one iteration, nan and inf as a single
         # iteration under a successful run.
         problems.extend(self._rl_run_size_problems(spec))
+        # hidden_dims is the shape of every network this backend builds - the
+        # actor and the critics alike. The expansion loop judges nothing and
+        # nn.Linear accepts a width of zero, which makes the activation after it
+        # empty and the next layer's output its bias alone: the policy stops
+        # being a function of the observation, and the run reports success while
+        # exporting a deployable checkpoint whose actor is one fixed action.
+        problems.extend(self._network_width_problems(spec))
+        # device is spent by torch.device itself, which judges nothing: every
+        # network, buffer and rollout tensor is placed on the result. "gpu" and
+        # "cuda:abc" raise out of setup after the preflight passed, and a
+        # non-str ordinal constructs on any host and then dies at the first
+        # .to() with "invalid device ordinal" - the same spec training fine on a
+        # box with more GPUs.
+        problems.extend(self._spec_device_problems(spec))
         # num_envs is the third factor of that same product. Which *counts* are
         # usable is per-backend - this one parallelizes, so any positive count is,
         # while the single-env FastSAC requires exactly 1 - but that a count is
@@ -214,6 +262,15 @@ class PpoTrainer(BaseRLAlgo):
             problems.append(
                 f"rollout_steps ({spec.rollout_steps}) must be divisible by num_mini_batches ({spec.num_mini_batches})"
             )
+        # log_interval is this loop's checkpoint cadence - the modulus of the one
+        # test that decides whether an intermediate checkpoint is written - so it
+        # answers the same question save_freq does for a supervised run and takes
+        # the same shared domain. The modulus judges it not at all: nan never
+        # satisfies it and silently keeps only the final checkpoint of a
+        # successful run, True writes one every iteration, a fraction is a
+        # silently different cadence, and a str raises out of the loop after
+        # setup has built the env, the networks and the optimizers.
+        problems.extend(self._rl_checkpoint_interval_problems(spec))
         return problems
 
     def setup(self, spec: RLTrainSpec) -> None:
@@ -252,8 +309,12 @@ class PpoTrainer(BaseRLAlgo):
             self.env.device = self.device
         self.steps_per_iter = spec.rollout_steps * spec.num_envs
 
-        self.actor_critic = _build_actor_critic(
-            self.env.num_actor_obs, self.env.num_critic_obs, self.env.num_actions, spec
+        self.actor_critic = build_actor_critic(
+            self.env.num_actor_obs,
+            self.env.num_critic_obs,
+            self.env.num_actions,
+            hidden_dims=tuple(spec.hidden_dims),
+            init_noise_std=spec.init_noise_std,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.actor_critic.parameters(), lr=spec.learning_rate)
 

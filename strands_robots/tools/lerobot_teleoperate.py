@@ -10,13 +10,12 @@ This tool integrates teleoperation and recording functionality from lerobot, all
 """
 
 import importlib.util
-import json
 import logging
 import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -24,26 +23,31 @@ import psutil
 from strands import tool
 
 from strands_robots.tools._process_stop import (
+    PID_STARTED_SINCE_BOOT,
     SIGKILL_CONFIRM_S,
     SIGTERM_GRACE_S,
+    SessionManager,
     confirm_exit,
+    generate_session_name,
+    process_started_since_boot,
+    recorded_pid,
+    reused_pid_result,
+    session_is_running,
+    session_log_path,
+    session_uptime,
     unstopped_result,
+    unusable_pid_result,
 )
 from strands_robots.utils import (
     boolean_flag_error,
+    camera_token_error,
     non_negative_whole_number_error,
     positive_finite_number_error,
     positive_whole_number_error,
+    refusal_repr,
 )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Session storage directory
-SESSION_DIR = Path.cwd() / ".strands_robots/.sessions"
-SESSION_DIR.mkdir(parents=True, exist_ok=True)
-
 
 # The numeric knobs each command mode actually puts on the lerobot argv. Every
 # one is interpolated with ``str()`` into the command line of a DETACHED
@@ -266,140 +270,226 @@ def _execution_flag_error(supplied: dict[str, Any]) -> str | None:
     return None
 
 
-class SessionManager:
-    """Manage teleoperation sessions with persistence."""
+# The camera map is the one argument that reaches the lerobot argv as
+# *structure* rather than as a value: it is rendered into the nested-dict
+# literal draccus parses, so a name or a value carrying one of the delimiters
+# below changes the shape of that dict instead of the number in it. Measured on
+# ``e588be1``, with nothing refused:
+#
+#   {"front": {"index": 4}}          -> index_or_path: 0   (camera 0 recorded
+#                                       under the name "front"; the misspelled
+#                                       key is dropped and the default rendered)
+#   {"front": {"fps": 0}}           -> fps: 0              (the same quantity
+#                                       ``--dataset.fps 0`` is refused)
+#   {"front": {"width": -640}}      -> width: -640
+#   {"front": {"type": "realsense"}} -> type: realsense    (not a registered
+#                                       backend; lerobot's is ``intelrealsense``)
+#   {"front,wrist": {}}             -> one entry parsed as two
+#   {"front": {"index_or_path":
+#     "0, wrist: {type: opencv, index_or_path: 5"}}
+#                                   -> a SECOND camera the call never named
+#
+# The first three are silent: the session starts, ``status="success"`` is
+# returned, and an episode is recorded from a camera nobody asked for. The last
+# three are the failure this module's numeric table already exists to prevent -
+# argv the detached subprocess cannot parse, reported minutes later in its log.
+# A name is a key in that dict and must be a bare token, which is not this
+# module's rule to state either: ``utils.camera_token_error`` owns it, because
+# the ``Robot`` factory's ``cameras`` mapping is a second door onto the same
+# name and the two must accept one alphabet. A value is quoted at the render
+# (``_yaml_scalar``) so it is read back as the string it was.
+#
+# Which ``type`` values exist, and which options each admits, is not this
+# module's to list: ``type`` selects a class from lerobot's ``CameraConfig``
+# registry and the options are that class's declared fields, read through the
+# one owner of that vocabulary, ``hardware_robot._camera_option_vocabulary``
+# (AGENTS.md: derive the refuses-nothing-real half of an enumerable domain from
+# the shipped catalogue rather than a copied list). A copy here admitted the
+# ``realsense`` spelling the tool's own schema suggested and refused the
+# ``serial_number_or_name`` a RealSense is identified by.
 
-    def __init__(self):
-        self.sessions_file = SESSION_DIR / "active_sessions.json"
+# The options rendered for every camera whether or not the entry states them,
+# in the order they are rendered, with the value an unstated one takes. Only
+# the ones the resolved class declares are emitted: ``index_or_path`` names an
+# OpenCV device and is absent from a RealSense config. The geometry defaults are
+# the ``Robot`` factory's, so the two surfaces open an unstated camera alike.
+_CAMERA_RENDER_DEFAULTS: tuple[tuple[str, Any], ...] = (
+    ("index_or_path", 0),
+    ("width", 640),
+    ("height", 480),
+    ("fps", 30),
+)
 
-    def _load_sessions(self) -> dict[str, Any]:
-        """Load the session store, pruning records whose process is gone.
+# ``width`` / ``height`` / ``fps`` are the same pixels and frames
+# ``lerobot_camera`` already reads with these guards, so a geometry that tool
+# refuses cannot reach a recording through this one either.
+_CAMERA_GEOMETRY_DOMAINS: tuple[tuple[str, Callable[[Any, str, str], str | None]], ...] = (
+    ("width", positive_whole_number_error),
+    ("height", positive_whole_number_error),
+    ("fps", positive_whole_number_error),
+)
 
-        ``psutil.pid_exists`` answers whether the PID exists;
-        ``Process(pid).is_running()`` refines that (it also rules out PID reuse).
-        The two probes can disagree, and the two ways they disagree mean opposite
-        things, so they are handled separately:
 
-        * :class:`psutil.NoSuchProcess` - the process was reaped between the two
-          calls. The record names nothing, so it is pruned.
-        * :class:`psutil.AccessDenied` - the process exists (``pid_exists`` just
-          said so) but this user may not inspect it; a session started under
-          ``sudo`` for serial-port access and then listed as the invoking user
-          reads this way. That is not death, so the record is kept.
+def _camera_entry_error(context: str, name: str, entry: Any) -> str | None:
+    """Refuse a per-camera config the rendered argv would not carry as asked.
 
-        Keeping it matters because the prune below is *written back to disk* and
-        this store is the only place a detached session's PID is recorded: a
-        pruned record leaves the teleoperation process running with no supported
-        way to stop it. Presence here is not the running claim - ``list`` and
-        ``status`` each derive that from ``pid_exists`` - so a retained record is
-        reported running only while its PID really exists.
+    Args:
+        context: The message prefix naming the surface.
+        name: The camera's name in the map, already known to be a bare token.
+        entry: The config mapping for one camera, as supplied.
 
-        Returns:
-            The surviving session records, keyed by session name.
-        """
-        if not self.sessions_file.exists():
-            return {}
+    Returns:
+        An error message naming the option and its domain, or ``None`` when every
+        option this entry states is rendered as given.
+    """
+    where = f"{context}: robot_cameras[{refusal_repr(name)}]"
+    if not isinstance(entry, Mapping):
+        return (
+            f"{where} must be a mapping of camera option to value, got {refusal_repr(entry)}. "
+            "'type' selects the lerobot camera backend (default 'opencv'); the other options "
+            "are the fields that backend declares."
+        )
+    # Lazy for the reason ``teleoperator`` imports its registry walk lazily:
+    # ``hardware_robot`` is the ``Robot`` factory, and this tool is importable
+    # without it. The registry is lerobot's, so an unregistered ``type`` or an
+    # undeclared option is refused with the owner's own wording - the known
+    # backends, and the resolved class's fields with a closest-match hint.
+    from strands_robots.hardware_robot import _camera_option_vocabulary
 
-        try:
-            # Read with a decode policy that cannot raise, for the reason the
-            # training store carries: the handler below answers "gone" and "not
-            # JSON", and an undecodable byte is a ``ValueError`` that is neither,
-            # so it would abort the action instead of degrading. U+FFFD keeps a
-            # damaged record's ASCII pid readable, and a pid is what stops it.
-            with open(self.sessions_file, encoding="utf-8", errors="replace") as f:
-                sessions = json.load(f)
+    try:
+        _camera_option_vocabulary(name, entry)
+    except ValueError as exc:
+        return (
+            f"{where}: {exc} Every option an entry does not name is rendered as its default, so a "
+            "misspelling is not dropped - it opens the default device at the default geometry "
+            "under this camera's name."
+        )
+    for key, check in _CAMERA_GEOMETRY_DOMAINS:
+        if key in entry and (error := check(entry[key], key, where)):
+            return error
+    if "index_or_path" in entry and not isinstance(entry["index_or_path"], str):
+        return non_negative_whole_number_error(entry["index_or_path"], "index_or_path", where)
+    # An empty string names no device index, path or serial. Any other string is
+    # carried as given: the render quotes it (:func:`_yaml_scalar`).
+    for key, value in entry.items():
+        if key != "type" and isinstance(value, str) and not value:
+            return f"{where}: {key} is empty, which names no device."
+    return None
 
-            # Check if processes are still running and clean up dead sessions
-            active_sessions = {}
-            for name, info in sessions.items():
-                pid = info.get("pid")
-                if pid and psutil.pid_exists(pid):
-                    try:
-                        proc = psutil.Process(pid)
-                        if proc.is_running():
-                            active_sessions[name] = info
-                    except psutil.NoSuchProcess:
-                        # Reaped between pid_exists and this probe: the record
-                        # names nothing, so pruning it loses no live session.
-                        pass
-                    except psutil.AccessDenied:
-                        # Exists but not inspectable: keep the record (see above)
-                        # and say so, because the store is written back below and
-                        # silence here loses the PID for good.
-                        active_sessions[name] = info
-                        logger.warning(
-                            "Teleop session PID %s exists but cannot be inspected; "
-                            "keeping its record so the session stays stoppable",
-                            pid,
-                        )
 
-            # Update sessions file with only active sessions
-            if len(active_sessions) != len(sessions):
-                self._save_sessions(active_sessions)
+def _camera_map_error(robot_cameras: Any) -> str | None:
+    """Error text for the first camera this map cannot open as described.
 
-            return active_sessions
+    Checked here rather than left to lerobot for the reason
+    :data:`_OPTION_DOMAINS` gives for the numeric knobs: the map is rendered into
+    the command line of a subprocess started with ``start_new_session=True``,
+    which is not a channel this call can read a failure back from. The map is the
+    stronger case, because a name or a value can change how many cameras that
+    argv describes - and because an option the entry misspells is not an error
+    anywhere, at any point: the rendered entry simply carries the default.
 
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"Error loading sessions: {e}")
-            return {}
+    Args:
+        robot_cameras: The camera map, as supplied. Anything at all.
 
-    def _save_sessions(self, sessions: dict[str, Any]):
-        """Save sessions to disk, in the encoding the load path reads."""
-        try:
-            with open(self.sessions_file, "w", encoding="utf-8") as f:
-                json.dump(sessions, f, indent=2)
-        except OSError as e:
-            logger.error(f"Error saving sessions: {e}")
+    Returns:
+        An error message naming the camera and the option, or ``None`` when every
+        entry renders as given.
+    """
+    context = "build_lerobot_command"
+    if not isinstance(robot_cameras, Mapping):
+        return (
+            f"{context}: robot_cameras must be a mapping of camera name to its option "
+            f"mapping, got {refusal_repr(robot_cameras)}."
+        )
+    for name, entry in robot_cameras.items():
+        if error := camera_token_error(context, "robot_cameras camera name", name):
+            return error
+        if error := _camera_entry_error(context, name, entry):
+            return error
+    return None
 
-    def add_session(self, name: str, info: dict[str, Any]):
-        """Add a new session."""
-        sessions = self._load_sessions()
-        sessions[name] = info
-        self._save_sessions(sessions)
 
-    def remove_session(self, name: str):
-        """Remove a session."""
-        sessions = self._load_sessions()
-        if name in sessions:
-            del sessions[name]
-            self._save_sessions(sessions)
+def _yaml_scalar(value: Any) -> str:
+    """Render one option value so draccus reads back exactly the value given.
 
-    def get_session(self, name: str) -> dict[str, Any] | None:
-        """Get session info."""
-        sessions = self._load_sessions()
-        return sessions.get(name)
+    A string is single-quoted, the one YAML form in which no character is
+    structure and nothing is re-typed: unquoted, ``/dev/video[1]`` fails to
+    parse, ``0, wrist: {...}`` describes a second camera, and a RealSense serial
+    ``0123`` is read as the octal integer ``83`` and arrives as the string
+    ``"83"`` (measured against lerobot 0.6.1 / draccus 0.8.0). A blocklist of
+    characters cannot close that, because YAML also re-types ``yes``, ``~``,
+    ``1e3`` and a date; quoting closes it for every string at once. Numbers and
+    flags render bare, since those are the types the fields declare.
 
-    def list_sessions(self) -> dict[str, Any]:
-        """List all active sessions."""
-        return self._load_sessions()
+    Args:
+        value: The option value, already admitted by :func:`_camera_entry_error`.
+
+    Returns:
+        The scalar as it appears inside the rendered ``{key: value}`` dict.
+    """
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return str(value)
 
 
 def _build_camera_arg(robot_cameras: dict[str, Any]) -> str:
     """Render a camera map as a lerobot 0.5 nested ``--robot.cameras`` value.
 
     lerobot 0.5's draccus CLI parses ``--robot.cameras`` as a nested dict, e.g.
-    ``{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}``.
+    ``{'front': {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}``.
     The pre-0.5 ``--camera-config name=type:path:fps:WxH`` flat form no longer
     exists. Each entry defaults to opencv/index 0/640x480/30fps when unset.
 
+    Every render is checked first (:func:`_camera_map_error`), for the reason
+    ``mj_name_to_id`` records for entity lookups: routing the one render through
+    the one funnel means a caller added later is safe by construction rather than
+    by remembering.
+
     Args:
-        robot_cameras: Map of camera name to a config dict with optional keys
-            ``type``, ``index_or_path``, ``width``, ``height``, ``fps``.
+        robot_cameras: Map of camera name to a config dict. ``type`` selects the
+            lerobot camera backend (default ``opencv``); every other key must be
+            a field the selected backend's config class declares.
 
     Returns:
         The nested dict string suitable for ``--robot.cameras=<value>``.
+
+    Raises:
+        ValueError: If any name or option would not be rendered as given - a
+            name that is not a bare token, a ``type`` lerobot does not register,
+            an option the selected backend does not declare (silently defaulted),
+            a geometry or rate outside the domain the recorders share, or an
+            empty device string. The refusal precedes the argv, so no subprocess
+            is launched.
     """
+    if error := _camera_map_error(robot_cameras):
+        raise ValueError(error)
+    from strands_robots.hardware_robot import _camera_option_vocabulary
+
     entries = []
     for cam_name, cam_config in robot_cameras.items():
-        cam_type = cam_config.get("type", "opencv")
-        cam_path = cam_config.get("index_or_path", 0)
-        fps_val = cam_config.get("fps", 30)
-        width = cam_config.get("width", 640)
-        height = cam_config.get("height", 480)
-        entries.append(
-            f"{cam_name}: {{type: {cam_type}, index_or_path: {cam_path}, "
-            f"width: {width}, height: {height}, fps: {fps_val}}}"
+        _, fields = _camera_option_vocabulary(cam_name, cam_config)
+        rendered: dict[str, Any] = {"type": cam_config.get("type", "opencv")}
+        for key, default in _CAMERA_RENDER_DEFAULTS:
+            if key in fields:
+                rendered[key] = cam_config.get(key, default)
+        for key in fields:
+            if key in cam_config and key not in rendered:
+                rendered[key] = cam_config[key]
+        # lerobot declares the camera config's ``index_or_path`` as ``int | Path``
+        # and ``fps`` / ``width`` / ``height`` as ``int``, and the check above
+        # accepts an integral real so a geometry or an index read from a config
+        # or promoted by NumPy is still honored. Rendered as the whole number the
+        # field is declared, the way every other numeric flag on this argv is
+        # (``str(int(dataset_fps))``): a ``30.0`` or ``4.0`` token would
+        # otherwise be a value accepted here and rejected there - draccus parses
+        # ``4.0`` as neither an ``int`` nor a ``Path``.
+        for key, _ in _CAMERA_RENDER_DEFAULTS:
+            if key in rendered and not isinstance(rendered[key], str):
+                rendered[key] = int(rendered[key])
+        options = ", ".join(
+            f"{key}: {value if key == 'type' else _yaml_scalar(value)}" for key, value in rendered.items()
         )
+        entries.append(f"{_yaml_scalar(cam_name)}: {{{options}}}")
     return "{" + ", ".join(entries) + "}"
 
 
@@ -529,10 +619,10 @@ def build_lerobot_command(
 
     Raises:
         ValueError: If ``action`` is unknown, ``replay`` is requested without
-            ``dataset_repo_id``, or a numeric knob (see :data:`_OPTION_DOMAINS`)
-            or boolean flag (see :data:`_MODE_FLAG_OPTIONS`) the requested mode
-            emits cannot be honored. The refusal precedes the argv, so no
-            subprocess is launched.
+            ``dataset_repo_id``, or a numeric knob (see :data:`_OPTION_DOMAINS`),
+            boolean flag (see :data:`_MODE_FLAG_OPTIONS`) or camera map entry
+            (see :func:`_camera_map_error`) the requested mode emits cannot be
+            honored. The refusal precedes the argv, so no subprocess is launched.
         RuntimeError: If ``dagger`` is requested on an install whose lerobot has
             no ``lerobot.scripts.lerobot_rollout`` - the DAgger rollout entry
             point, which landed in lerobot 0.6.0. A missing module is an
@@ -813,13 +903,29 @@ def lerobot_teleoperate(
     Camera Configuration Format:
         {
             "camera_name": {
-                "type": "opencv",  # or "realsense"
-                "index_or_path": 0,  # camera index or device path
+                "type": "opencv",  # a lerobot camera backend; "intelrealsense" for a RealSense
+                "index_or_path": 0,  # camera index or device path (opencv)
                 "width": 640,
                 "height": 480,
                 "fps": 30
             }
         }
+
+        "type" selects the backend from lerobot's camera registry, and the other
+        options an entry may name are the fields that backend's config declares
+        - an opencv camera is identified by "index_or_path", a RealSense by
+        "serial_number_or_name" - the same vocabulary Robot(cameras=...) reads.
+        An unstated "index_or_path" / "width" / "height" / "fps" is rendered as
+        the default shown above. So a misspelled option is refused rather than
+        dropped: "index" instead of "index_or_path" would otherwise record the
+        default device under this camera's name. The name itself must be a bare
+        token (letters, digits, "_", "-"); "width" / "height" / "fps" must be
+        positive whole numbers, the same domain lerobot_camera reads them with;
+        and "index_or_path" must be a non-negative index or a device path. A
+        string value is quoted in the rendered argv, so a device path or a
+        serial is read back exactly as given ("0123" stays "0123"). The map is
+        rendered into the argv of a detached subprocess, so a value that would
+        not be carried as given is reported here instead of in a session log.
 
     Examples:
         # Simple teleoperation
@@ -872,16 +978,14 @@ def lerobot_teleoperate(
             replay_episode=5
         )
 
-    Calibration Management:
-        For calibration management (list, view, backup, etc.), use the separate
-        lerobot_calibrate tool:
-
-        # List available calibrations
-        lerobot_calibrate(action="list")
-
-        # View specific calibration
-        lerobot_calibrate(action="view", device_type="robots",
-                         device_model="so101_follower", device_id="orange_arm")
+    Calibration:
+        Calibrating an arm is LeRobot's own procedure, run from the shell -
+        ``lerobot-find-port`` to identify the bus, ``lerobot-setup-motors`` to
+        assign motor IDs, then ``lerobot-calibrate`` to record the homing
+        offsets and travel limits. The resulting JSON lives under
+        ``HF_LEROBOT_CALIBRATION`` and a session here reads it through LeRobot;
+        the interactive prompt LeRobot shows when a device has none is answered
+        by ``auto_accept_calibration`` below.
 
     Args:
         action: Action to perform (start, stop, list, status, replay)
@@ -895,7 +999,8 @@ def lerobot_teleoperate(
         robot_type: Robot type identifier
         robot_port: Serial port for single-arm robots
         robot_id: Robot instance identifier
-        robot_cameras: Camera configuration dictionary
+        robot_cameras: Camera configuration dictionary (see Camera
+            Configuration Format above for the options and their domains)
         robot_left_arm_port: Left arm port for bimanual robots
         robot_right_arm_port: Right arm port for bimanual robots
 
@@ -968,7 +1073,8 @@ def lerobot_teleoperate(
             "command": "full_command_executed",
             "log_file": "/tmp/session.log",  # for background sessions
             "sessions": {...},  # for list action
-            "uptime": 123.45,  # session uptime in seconds
+            "uptime": 123.45,  # session uptime in seconds; None when the
+                               # record states no usable start time
             "is_running": true  # for status action
         }
     """
@@ -987,7 +1093,7 @@ def lerobot_teleoperate(
 
             # Generate session name if not provided
             if not session_name:
-                session_name = f"teleop_{int(time.time())}"
+                session_name = generate_session_name("teleop")
 
             # Check if session already exists
             if session_manager.get_session(session_name):
@@ -1044,11 +1150,11 @@ def lerobot_teleoperate(
 
             if background:
                 # Start in background
-                log_file = SESSION_DIR / f"{session_name}.log"
+                log_file = session_log_path(session_name)
 
                 if auto_accept_calibration:
                     # Start process with stdin for automatic calibration acceptance
-                    with open(log_file, "w") as f:
+                    with open(log_file, "w", encoding="utf-8") as f:
                         proc = subprocess.Popen(
                             cmd,
                             stdout=f,
@@ -1091,7 +1197,7 @@ def lerobot_teleoperate(
                     threading.Thread(target=auto_respond, daemon=True).start()
                 else:
                     # Start normally without stdin handling
-                    with open(log_file, "w") as f:
+                    with open(log_file, "w", encoding="utf-8") as f:
                         proc = subprocess.Popen(
                             cmd, stdout=f, stderr=subprocess.STDOUT, text=True, start_new_session=True
                         )
@@ -1103,6 +1209,9 @@ def lerobot_teleoperate(
                     "command": " ".join(cmd),
                     "log_file": str(log_file),
                     "start_time": time.time(),
+                    # The identity half of the pid, captured now: the pid alone
+                    # stops naming this process the moment it exits.
+                    PID_STARTED_SINCE_BOOT: process_started_since_boot(proc.pid),
                     "background": True,
                     "robot_type": robot_type,
                     "teleop_type": teleop_type,
@@ -1139,7 +1248,7 @@ def lerobot_teleoperate(
                 }
             else:
                 # Start in foreground
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
                 return {
                     "status": "success" if result.returncode == 0 else "error",
@@ -1174,10 +1283,18 @@ def lerobot_teleoperate(
                 return {"status": "error", "content": [{"text": f"Session '{session_name}' not found"}]}
 
             pid = session_info.get("pid")
-            if not pid:
-                return {"status": "error", "content": [{"text": f"No PID found for session '{session_name}'"}]}
-
-            pid_int = int(pid)
+            pid_int = recorded_pid(session_info)
+            if pid_int is None:
+                # Not a pid, so there is no process this verb could be about. The
+                # signals below would go to whatever ``int()`` of it happened to
+                # name - pid 1 for ``true``, and a live stranger for ``4321.5``.
+                return unusable_pid_result(session_name, pid)
+            if psutil.pid_exists(pid_int) and not session_is_running(session_info):
+                # The pid exists but no longer holds the process this record was
+                # written for, so the session is over and the signals below would
+                # go to a stranger.
+                session_manager.remove_session(session_name)
+                return reused_pid_result(session_name, pid_int)
             try:
                 # Capture the process identity before signalling anything: psutil
                 # records the creation time here, so the escalation and the
@@ -1237,17 +1354,16 @@ def lerobot_teleoperate(
 
             if sessions:
                 for name, info in sessions.items():
-                    uptime = time.time() - info.get("start_time", 0)
-                    uptime_min = uptime / 60
+                    _, uptime_text = session_uptime(info)
                     pid = info.get("pid")
-                    is_running = pid and psutil.pid_exists(pid)
+                    is_running = session_is_running(info)
 
                     content_lines.extend(
                         [
                             f"**{name}**",
                             f"   - Action: {info.get('action', 'Unknown')}",
                             f"   - PID: {pid}",
-                            f"   - Uptime: {uptime_min:.1f} min",
+                            f"   - Uptime: {uptime_text}",
                             f"   - Status: {'Running' if is_running else 'Stopped'}",
                             f"   - Robot: {info.get('robot_type', 'Unknown')}",
                             f"   - Teleop: {info.get('teleop_type', 'Unknown')}",
@@ -1274,16 +1390,14 @@ def lerobot_teleoperate(
                 return {"status": "error", "content": [{"text": f"Session '{session_name}' not found"}]}
 
             pid = session_info.get("pid")
-            start_time: float = float(session_info.get("start_time") or 0)
-            uptime = time.time() - start_time
-            uptime_min = uptime / 60
-            is_running = pid and psutil.pid_exists(int(pid))
+            uptime, uptime_text = session_uptime(session_info)
+            is_running = session_is_running(session_info)
 
             content_lines = [
                 f"**Session Status: `{session_name}`**",
                 f"PID: {pid}",
                 f"Action: {session_info.get('action', 'Unknown')}",
-                f"Uptime: {uptime_min:.1f} min",
+                f"Uptime: {uptime_text}",
                 f"Status: {'Running' if is_running else 'Stopped'}",
                 f"Robot: {session_info.get('robot_type', 'Unknown')}",
                 f"Teleop: {session_info.get('teleop_type', 'Unknown')}",
@@ -1347,7 +1461,7 @@ def lerobot_teleoperate(
                 return {"status": "error", "content": [{"text": f"Replay command build failed: {str(e)}"}]}
 
             # Execute replay
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
             content_lines = [
                 "**Episode Replay Complete**",

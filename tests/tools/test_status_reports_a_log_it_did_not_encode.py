@@ -38,8 +38,11 @@ from typing import Any, NamedTuple
 
 import pytest
 
-import strands_robots.tools.lerobot_teleoperate as tele_mod
-import strands_robots.tools.lerobot_train as train_mod
+pytest.importorskip("psutil")
+
+import strands_robots.tools.lerobot_teleoperate as tele_mod  # noqa: E402
+import strands_robots.tools.lerobot_train as train_mod  # noqa: E402
+from strands_robots.tools import _process_stop  # noqa: E402
 
 
 class Tool(NamedTuple):
@@ -77,7 +80,7 @@ def _seed(tool: Tool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: byte
     """One live session whose log file holds ``log``. Returns (name, pid)."""
     session_dir = tmp_path / ".sessions"
     session_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(tool.module, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(_process_stop, "SESSION_DIR", session_dir)
 
     pid = os.getpid()
     assert tool.module.psutil.pid_exists(pid), "premise: the test process must exist"

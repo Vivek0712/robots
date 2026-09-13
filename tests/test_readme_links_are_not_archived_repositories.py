@@ -129,7 +129,7 @@ def _github_repository(url: str) -> str | None:
         return None
 
     # Trailing sentence punctuation first, so a clone URL's `.git` is still the
-    # suffix when it is stripped: `VERA.git` -> `VERA`, `robots-sim.` -> `robots-sim`.
+    # suffix when it is stripped: `mink.git` -> `mink`, `robots-sim.` -> `robots-sim`.
     repo = repo.rstrip(".,;:!?").removesuffix(".git")
     if not repo:
         return None
@@ -175,8 +175,9 @@ def test_the_sweep_reads_the_readmes_real_links() -> None:
     found = _readme_repositories()
 
     # A floor rather than the exact count, so removing a link is not a failure.
-    # The README names 9 repositories across 14 github.com URLs as of #3192.
-    assert len(found) >= 8, f"the sweep lost most of the README's links, found {len(found)}: {sorted(found)}"
+    # The 120-line README names 5 repositories (badges, hero links, the harness
+    # SDK and this repo); the detailed link lists moved to the docs pages.
+    assert len(found) >= 4, f"the sweep lost most of the README's links, found {len(found)}: {sorted(found)}"
     for expected in ("strands-labs/robots", "huggingface/lerobot", "google-deepmind/mujoco"):
         assert expected in found, f"the sweep lost a known README link: {expected}"
 
@@ -208,8 +209,8 @@ class TestTheRepositoryExtractor:
             # A deep path still names the repository it is inside.
             ("https://github.com/strands-labs/robots/blob/main/LICENSE", "strands-labs/robots"),
             ("https://github.com/strands-labs/robots/issues/2062", "strands-labs/robots"),
-            # A clone URL, as the README's VERA link is written.
-            ("https://github.com/sizhe-li/VERA.git", "sizhe-li/vera"),
+            # A clone URL, as a README dependency link may be written.
+            ("https://github.com/kevinzakka/mink.git", "kevinzakka/mink"),
             # GitHub account and repository names are case-insensitive.
             ("https://github.com/NVIDIA/Isaac-GR00T", "nvidia/isaac-gr00t"),
             ("https://GitHub.com/Strands-Labs/Robots-Sim", "strands-labs/robots-sim"),

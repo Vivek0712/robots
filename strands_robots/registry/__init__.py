@@ -33,13 +33,14 @@ Architecture (this package re-exports the public API of its sibling modules):
     - ``policies.json`` - policy providers (shorthands/urls inside each entry).
 """
 
+from ._overlay import parse_user_robots, user_registry_source
 from .discovery import (
     descriptions_module,
     discover_robot,
     is_discoverable,
     list_discoverable,
 )
-from .loader import invalidate_cache, reload
+from .loader import invalidate_cache, normalize_robot_name, reload
 from .policies import (
     build_policy_kwargs,
     get_policy_provider,
@@ -63,10 +64,8 @@ from .robots import (
 )
 from .user_registry import (
     list_user_robots,
-    parse_user_robots,
     register_robot,
     unregister_robot,
-    user_registry_source,
 )
 
 __all__ = [
@@ -101,6 +100,7 @@ __all__ = [
     "user_registry_source",
     "parse_user_robots",
     # Utilities
+    "normalize_robot_name",
     "reload",
     "invalidate_cache",
 ]

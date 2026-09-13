@@ -34,12 +34,13 @@ r.run()              # serve on Device Connect (blocks until Ctrl+C)
 
 Ctrl+C releases the robot before the process exits. `.run()` is the only entry point that holds a robot for the life of a process, so the interrupt handler is the only teardown it gets: it calls the instance's `cleanup()`, which on hardware reaches the driver's own `disconnect()` — where torque disable and gripper release live — and closes the motors bus and every camera. The exit itself stays abrupt (`cleanup()` drains the task executor, and a wedged rollout must not turn one Ctrl+C into a process that never exits), so the release runs under a 5 s budget on a background thread. It prints `<peer-id> stopped.` only when the release finished; a teardown that times out or raises is reported as `<peer-id> is exiting WITHOUT a completed shutdown: …` so an operator is never told the arm is safe when it may still be holding torque. A released driver then *stays* released: `disconnect()` drops the driver's handle to the hardware link, so a movement RPC that arrives after the teardown is refused with `… link not connected` rather than reaching the wire and reporting success.
 
-Because the mesh is stopped *for* Device Connect, a bring-up that fails leaves the process on no transport at all — so `.run()` logs the cause (naming the extra when that is what is missing) and prints `<peer-id> is NOT online` instead of announcing a device that is not there. It keeps running, so a broker that comes back is not a lost process.
+Because the mesh is stopped *for* Device Connect, a bring-up that fails leaves the process on no transport at all — so `.run()` logs the cause (naming the extra when that is what is missing) and prints `<peer-id> is NOT online` instead of announcing a device that is not there. It keeps running, so a broker that comes back is not a lost process — except when the `[device-connect]` extra itself is missing: nothing inside the process can install it, so that case releases the robot and exits 1 with the install command.
 
 !!! warning "Secure by default"
-    Device Connect does not enable unencrypted transport implicitly. To run authenticated + encrypted, point it at a bundled credentials file (`MESSAGING_CREDENTIALS_FILE` — a single `*.creds.json` with the CA, cert and key) — this works **broker-less (D2D) or brokered**, they're independent choices. For a quick trial on a **trusted, isolated LAN** you can instead skip auth (a warning is logged while active):
+    `.run()` refuses to start on a transport nobody authenticates: with no credentials configured it exits the bring-up with an error naming both remedies instead of coming online in plaintext. To run authenticated + encrypted, point it at a bundled credentials file (`MESSAGING_CREDENTIALS_FILE` — a single `*.creds.json` with the CA, cert and key) or a `tls/` endpoint — this works **broker-less (D2D) or brokered**, they're independent choices. For a quick trial on a **trusted, isolated LAN** you can instead skip auth (a warning is logged while active) — and then restrict who may drive the robot, because on a plaintext transport a caller's id is whatever it claims:
     ```bash
     export DEVICE_CONNECT_ALLOW_INSECURE=true
+    export DEVICE_CONNECT_RPC_ALLOW=my-agent   # matches STRANDS_ROBOT_MESH_AGENT_ID on the agent side
     ```
     See [Environment variables](#environment-variables) for both paths.
 
@@ -50,7 +51,7 @@ Each robot is wrapped as a Device Connect device by a `DeviceDriver` adapter:
 | Driver | Wraps | Exposes |
 |--------|-------|---------|
 | `SimulationDeviceDriver` | a MuJoCo `Simulation` | `execute`, `getFeatures`, `getStatus`, `reset`, `step`, `stop` |
-| `RobotDeviceDriver` | a hardware `Robot` | the same RPC surface, driving real servos |
+| `RobotDeviceDriver` | a hardware `Robot` **or a native driver** | the same RPC surface, driving real servos |
 | `ReachyMiniDriver` | a Pollen Reachy Mini | device-native RPCs (`look`, `nod`, …) over Zenoh / WebSocket |
 
 `stop` reports what it halted rather than asserting that it did. On a simulation
@@ -58,10 +59,22 @@ it routes every robot through the simulation's own `stop_policy` and answers wit
 the rollouts that really were in flight (`stopped`) and any that refused
 (`not_stopped`, under `status="error"`), so an idle simulation and a halted
 rollout are different answers and either can be checked against
-`list_policies_running`. A simulation with nothing to halt answers
+`list_policies_running`, which is a `SimEngine` verb and so answers whichever
+backend the driver is holding. A simulation with nothing to halt answers
 `status="success"` with an empty `stopped` list — never an error, because a peer
 reported as "did not stop" when it had nothing to stop is the false alarm that
 teaches an operator to ignore the warning.
+
+`getState` reports joint positions for either kind of robot. A lerobot robot is a
+*wrapper* holding the device that owns the motor bus, while a native driver
+([`driver="strands"`](getting-started/robot-factory.md)) owns its bus directly and
+so *is* that device — `Robot(mode="real")` attaches Device Connect to both, and the
+RPC resolves which one to read through the same resolution the mesh state topic
+uses. The read goes through the shared motor-bus lock, so it waits its turn behind
+an in-flight rollout, teleop write or mesh probe rather than colliding with it, and
+it reads the motors directly: a robot whose camera is failing still reports where
+its joints are. A robot that can answer no joint read at all is reported without a
+`joints` key rather than as an error.
 
 ### Published state events
 
@@ -122,6 +135,9 @@ Because the safety gates run *above* dispatch, Device Connect inherits the same 
 !!! danger "Human-in-the-loop on actuation"
     The actuation actions — `tell`, `send`, `stop`, `broadcast`, `emergency_stop`, `rpc` — are gated behind an out-of-band operator approval (`tool_context.interrupt`), so they run only inside a Strands agent loop where a human approves. Called from a bare script they **fail closed**. Read-only `peers` works anywhere. Approval is delivered outside the LLM's tool arguments, so prompt injection can't smuggle it. The gated set is configurable via `STRANDS_MESH_HITL_ACTIONS`.
 
+!!! warning "A stop is graded by the device's answer, not by delivery"
+    A device answers its `stop` RPC with an envelope, so an authorization refusal or a `stop_policy` that could not halt a rollout arrives as a *delivered reply* rather than as a transport error. `stop` and `emergency_stop` both read that reply: a device reporting it did not stop makes the result `status="error"` naming the device and its answer, audits the verdict as a failure, and logs at `CRITICAL`. A reply that reports no verdict either way is not read as a refusal, so an unreachable device stays a gap rather than a claimed stop.
+
 ## Architecture
 
 ```mermaid
@@ -165,7 +181,7 @@ You rarely touch more than one or two of these. Grouped by what they control:
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `MESSAGING_CREDENTIALS_FILE` | unset | **The one var to enable mTLS.** A single `*.creds.json` bundling CA + cert + key. Works D2D or brokered. |
-| `DEVICE_CONNECT_ALLOW_INSECURE` | unset (secure) | `true`/`1`/`yes` = skip auth/encryption; every other spelling is secure. **Trusted, isolated LAN only**; logs a warning. The string vocabulary is this variable's - the `allow_insecure=` argument must be a boolean and refuses a string, since `"false"` is truthy. |
+| `DEVICE_CONNECT_ALLOW_INSECURE` | unset (secure) | `true`/`1`/`yes` = skip auth/encryption; every other spelling is secure. **Trusted, isolated LAN only**; logs a warning. The string vocabulary is this variable's - the `allow_insecure=` argument must be a boolean and refuses a string, since `"false"` is truthy. The argument **outranks** this variable, and the posture it resolves to is what the allowlist advisory below follows - so a device brought up with `allow_insecure=True` and this variable unset is still reported as insecure. |
 
 `ReachyMiniDriver` reaches its robot over a second link the variables above do not
 cover: the Reachy Mini daemon's own REST / WebSocket interface. That link is
@@ -183,8 +199,8 @@ only `REACHY_DAEMON_TLS` encrypts, so they are only useful together.
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `STRANDS_MESH_HITL_ACTIONS` | built-in set | Which actions need operator (human-in-the-loop) approval. |
-| `DEVICE_CONNECT_RPC_ALLOW` | allow all | Caller allowlist for state-mutating RPCs (`execute`/`stop`/`step`/`reset`); `*` globs. |
-| `DEVICE_CONNECT_ESTOP_ALLOW` | inherits `DEVICE_CONNECT_RPC_ALLOW` | Caller allowlist for `emergencyStop`. Unset - or holding no entry after stripping, so `""`, `" "` and `","` all count - falls back to the RPC allowlist. |
+| `DEVICE_CONNECT_RPC_ALLOW` | **nobody** (unset refuses every state-mutating RPC) | Caller allowlist for state-mutating RPCs (`execute`/`stop`/`step`/`reset`); `*` globs; a literal `*` allows every named caller and logs a warning. Set it before the device will act. |
+| `DEVICE_CONNECT_ESTOP_ALLOW` | inherits `DEVICE_CONNECT_RPC_ALLOW` | Caller allowlist for `emergencyStop`. Unset - or holding no entry after stripping, so `""`, `" "` and `","` all count - falls back to the RPC allowlist. With neither set, a *named* caller may still stop the robot (stopping never gets harder than moving); an anonymous one may not. |
 | `STRANDS_ROBOT_MESH_AGENT_ID` | anonymous | Caller id the agent presents — **required** when a device sets an allowlist (else it's denied). |
 
 #### Other

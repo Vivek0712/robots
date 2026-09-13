@@ -21,14 +21,8 @@ import pytest
 mj = pytest.importorskip("mujoco")
 
 from strands_robots.simulation.mujoco import backend as backend_mod  # noqa: E402
-from strands_robots.simulation.mujoco.backend import _can_render  # noqa: E402
-
-requires_gl = pytest.mark.skipif(
-    not _can_render(),
-    reason="No OpenGL context available (headless without EGL/OSMesa)",
-)
-
 from strands_robots.simulation.mujoco.simulation import Simulation  # noqa: E402
+from tests.simulation.mujoco._gl_probe import requires_gl  # noqa: E402
 
 # Test robot XML
 
@@ -1160,6 +1154,14 @@ class TestPolicyExecution:
         # caller can invoke them without reading the source.
         assert "robot_name" in methods["stop_policy"]
         assert "-> dict" in methods["list_policies_running"]
+
+        # start_policy's own entry says WHICH of the two implementations this
+        # engine has. The base surface describes its synchronous passthrough, so
+        # an entry inherited unchanged would advertise the wrong engine here --
+        # the one place a caller looks to tell a 0.001s call from a 3s one.
+        assert "background" in methods["start_policy"]
+        assert "non-blocking" in methods["start_policy"]
+        assert "synchronous" not in methods["start_policy"]
 
         # The advertisement is only useful if the methods it names are real and
         # invocable: list before start reports none, stop is idempotent.

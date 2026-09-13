@@ -15,12 +15,19 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 import torch
 
-from ...utils import name_list_error, positive_count_error, positive_finite_number_error
+from ...utils import (
+    boolean_flag_error,
+    free_camera_routing_rank,
+    name_list_error,
+    positive_count_error,
+    positive_finite_number_error,
+)
 from .. import Policy, align_action_values, chunk_count_error
 from .._log_safety import sanitize_log_value
 from .._state_keys import drop_velocity_siblings
@@ -31,7 +38,7 @@ from .embodiment import (
     observed_state_keys,
     state_key_remedy,
 )
-from .processor import ProcessorBridge
+from .processor import POSTPROCESSOR_CONFIG, PREPROCESSOR_CONFIG, ProcessorBridge
 from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_hub
 
 logger = logging.getLogger(__name__)
@@ -145,6 +152,45 @@ def _merge_obs_rename(base: dict[str, str], override: dict[str, str | None] | No
 # kinova_gen3 is joint_1..joint_7), which is why the run, not the prefix, is
 # what identifies a placeholder.
 _GENERIC_STATE_KEY_PREFIX = "joint_"
+
+
+def _route_camera_key_map(base: dict[str, str], camera_key_map: Mapping[str, str] | None) -> dict[str, str]:
+    """Route an explicit ``camera_key_map`` over an embodiment's ``obs_rename``.
+
+    ``camera_key_map`` is the first rung of camera routing for every other
+    router in this class (:meth:`LerobotLocalPolicy._resolve_camera_targets`,
+    :meth:`LerobotLocalPolicy._to_lerobot_observation` and
+    :meth:`LerobotLocalPolicy._synthesized_camera_renames` all resolve it before
+    any name match), so the declarative path has to honor it too: the only
+    difference between those routers and this one is whether the checkpoint
+    ships a preprocessor and whether an ``embodiment`` is declared, and a camera
+    binding may not depend on either.
+
+    The replacement is scoped by rename TARGET, not by source key. An
+    embodiment declares ``{"front": "observation.images.image"}``; a caller who
+    maps their own camera onto that same feature means *instead of* ``front``,
+    not *as well as* - two sources feeding one target would let whichever the
+    pipeline renamed last win. So every declared source whose target a
+    ``camera_key_map`` entry claims is dropped before the entries are added.
+
+    An entry naming an image feature the model does not declare is left in the
+    merged map so ``EmbodimentMap.validate`` refuses it by name, matching the
+    ``camera_key_map routes camera ... but the policy does not declare it``
+    refusal the other two routers raise.
+
+    Args:
+        base: The embodiment's declared ``obs_rename`` map.
+        camera_key_map: Caller mapping of runtime camera name -> image feature.
+
+    Returns:
+        The routed rename map; a copy of ``base`` when no map is given.
+    """
+    if not camera_key_map:
+        return dict(base)
+    claimed = set(camera_key_map.values())
+    merged = {src: dst for src, dst in base.items() if dst not in claimed}
+    merged.update(camera_key_map)
+    return merged
 
 
 def _undeclared_image_feature_error(
@@ -369,9 +415,14 @@ class LerobotLocalPolicy(Policy):
             default) adopts the model config value, else 10.0.
         camera_key_map: Optional explicit mapping of robot/sim camera name
             (e.g. "top") to the policy's declared image feature key
-            (e.g. "observation.images.top"). When omitted, cameras are
-            routed by exact short-name match and then by declared order
-            with a warning on mismatch.
+            (e.g. "observation.images.top"). It is the first rung of camera
+            routing on every path, including a declared ``embodiment``: an
+            entry claiming an image feature replaces the source key the
+            embodiment declares for that feature, so a scene whose cameras are
+            named for the scene routes without renaming them. When omitted,
+            cameras are routed by the embodiment's ``obs_rename``, then by
+            exact short-name match and then by declared order with a warning on
+            mismatch.
         strict_keys: When True, raise (instead of warning + a degraded
             binding) wherever a key cannot be bound by name. It governs BOTH
             halves of the key binding, not cameras alone:
@@ -393,7 +444,11 @@ class LerobotLocalPolicy(Policy):
             actuator, so padding TRAVELS those joints to zero. Enable only when
             the consumer needs a fixed-width action dict and zero is a
             meaningful target for every key it pads. Either way the dim
-            mismatch itself is reported once via ``diagnose_action_dim``.
+            mismatch itself is reported once via ``diagnose_action_dim``. A
+            boolean, checked rather than read by truthiness - it selects a
+            posture rather than scaling a quantity, so a truthy spelling of off
+            (``"false"``, ``"no"``, ``"0"``) is refused rather than selecting
+            the padding posture the word asks to skip.
     """
 
     def __init__(
@@ -475,13 +530,22 @@ class LerobotLocalPolicy(Policy):
         # When True, raise instead of routing cameras positionally if their
         # names cannot be matched to the policy's declared image keys (and no
         # camera_key_map covers them). Defaults to False (positional fallback
-        # with a warning), preserving zero-config ergonomics.
+        # with a warning), preserving zero-config ergonomics. Checked like
+        # ``pad_short_actions`` below: it selects a posture, and a truthy
+        # spelling of *off* ("false") would otherwise select the strict one.
+        if error := boolean_flag_error(strict_keys, "strict_keys", "lerobot_local"):
+            raise ValueError(error)
         self.strict_keys = strict_keys
         # When the model emits fewer action values than the robot declares
         # actuator keys, False (the default) omits the unmatched actuators so
         # they hold position; True commands them 0.0, which on an absolute-
         # position action space travels them to zero. See align_action_values.
-        self.pad_short_actions = bool(pad_short_actions)
+        # Checked rather than coerced with bool(): the two values select
+        # postures, and bool() is where "false" - a spelling of the omitting
+        # default - became the padding posture that moves those actuators.
+        if error := boolean_flag_error(pad_short_actions, "pad_short_actions", "lerobot_local"):
+            raise ValueError(error)
+        self.pad_short_actions = pad_short_actions
         # Routing-degradation telemetry. The heuristic (non-declarative)
         # remap path can keep a run alive while silently producing
         # meaningless inputs - a camera routed to an arbitrary model image
@@ -498,7 +562,10 @@ class LerobotLocalPolicy(Policy):
         # process level and shared by later instances with the same load
         # key (see _MODEL_CACHE). Set False to force a private load (e.g.
         # concurrent rollouts of the same checkpoint that must not share
-        # per-episode model state).
+        # per-episode model state). A posture as well, so checked the same way:
+        # "false" would otherwise share the model it asks not to share.
+        if error := boolean_flag_error(cache_model, "cache_model", "lerobot_local"):
+            raise ValueError(error)
         self.cache_model = cache_model
         # MolmoAct2-specific knobs. MolmoAct2 SO-100/101 checkpoints are
         # transformers-native (no lerobot draccus `type`), so they take a
@@ -533,7 +600,6 @@ class LerobotLocalPolicy(Policy):
         # embodiment / image_keys were incompatible with the model's declared
         # features, so the bridge was discarded (see _load_processor_bridge).
         self._embodiment_config_failed = False
-        self._processor_inert_reason: str | None = None
         self._tokenizer: Any = None
         # Refused where the caller's value arrives, and before any checkpoint is
         # downloaded: the tokenizer reads this as a slice bound over the encoded
@@ -582,12 +648,21 @@ class LerobotLocalPolicy(Policy):
             if error:
                 raise ValueError(error)
         self._rtc_max_guidance_weight = rtc_max_guidance_weight
+        # The previous chunk as it was handed to the consumer - LeRobot's
+        # ``ActionQueue.original_queue``. The prefix the denoiser receives is a
+        # SLICE of this taken at the next inference, once the number of steps the
+        # consumer still has pending is known; see _rtc_unexecuted_prefix.
         self._rtc_prev_chunk: torch.Tensor | None = None
-        # Absolute-coordinate copy of the leftover tail, populated ONLY for
+        # Absolute-coordinate copy of that chunk, populated ONLY for
         # relative-action flow policies so the next chunk can re-express it
         # against the current robot state (see _predict_with_rtc). Stays None
         # for absolute-action policies, whose frame does not move.
         self._rtc_prev_chunk_abs: torch.Tensor | None = None
+        # Actions the consumer was expected to execute from that chunk before
+        # re-querying (its execution horizon). With the overlap reported at the
+        # next inference this is LeRobot's ``ActionQueue.last_index``: the
+        # consumption index the prefix is sliced from.
+        self._rtc_prev_chunk_horizon: int = 0
         # Lazily-resolved (once) preprocessor steps + helper used to re-anchor a
         # relative-action RTC prefix to LeRobot parity. All stay None unless an
         # enabled RelativeActionsProcessorStep is present in the pipeline.
@@ -740,6 +815,7 @@ class LerobotLocalPolicy(Policy):
         # Clear RTC state
         self._rtc_prev_chunk = None
         self._rtc_prev_chunk_abs = None
+        self._rtc_prev_chunk_horizon = 0
         self._rtc_action_queue.clear()
         self._rtc_latency_history.clear()
         self._rtc_last_inference_time = 0.0
@@ -1093,8 +1169,11 @@ class LerobotLocalPolicy(Policy):
           warning below still fires so a raw-action checkpoint is not mistaken for
           a frozen policy.
         * ``_configure_embodiment`` raises ``ValueError``: the pipeline loaded and
-          was ACTIVE, but the caller's embodiment / ``image_keys`` are incompatible
-          with the model's declared features. Discarding it silently degrades a
+          was ACTIVE, but the caller's DECLARED embodiment cannot be configured onto
+          it - either the embodiment / ``image_keys`` are incompatible with the
+          model's declared features, or the active bridge carries no preprocessor
+          for the rename + pack-state steps to be injected into (a checkpoint
+          shipping only ``policy_postprocessor.json``). Discarding it silently degrades a
           WORKING normalization pipeline to the raw flow AND misdirects the
           downstream "no policy_postprocessor.json" diagnostic (the checkpoint
           shipped one - it was discarded here). Surface the real cause as a
@@ -1106,7 +1185,6 @@ class LerobotLocalPolicy(Policy):
         caller error that should abort the load loudly.
         """
         self._embodiment_config_failed = False
-        self._processor_inert_reason = None
         if not (self.use_processor and self.pretrained_name_or_path):
             return
 
@@ -1118,7 +1196,6 @@ class LerobotLocalPolicy(Policy):
                 policy_type=self.policy_type,
                 policy_config=getattr(self._policy, "config", None),
                 revision=self.revision,
-                norm_tag=self._molmoact2_norm_tag,
             )
         except (FileNotFoundError, ValueError, ImportError) as exc:
             # Processor bridge is optional - models work without it via the raw
@@ -1161,12 +1238,8 @@ class LerobotLocalPolicy(Policy):
                     self._processor_bridge = None
                     self._embodiment_config_failed = True
             else:
-                # An inactive bridge is normally benign - the checkpoint ships no
-                # processor configs and no recognized stats file. When it instead
-                # carries a reason (a caller argument put reachable pipelines out
-                # of reach), keep that reason so the report below can name it; the
-                # bridge itself is still discarded, it applies nothing either way.
-                self._processor_inert_reason = self._processor_bridge.inert_reason
+                # An inactive bridge is benign: the checkpoint ships no processor
+                # configs, so there is genuinely nothing to apply.
                 self._processor_bridge = None
                 logger.debug("No processor configs found, using raw obs/action flow")
 
@@ -1181,23 +1254,21 @@ class LerobotLocalPolicy(Policy):
         # misleading "no policy_postprocessor.json" message for that case.
         if self.use_processor and not self._embodiment_config_failed:
             bridge = self._processor_bridge
-            inert_reason = self._processor_inert_reason
-            if inert_reason:
-                # The pipelines were within reach and a caller-supplied argument
-                # put them out of reach. Report THAT, not the generic missing-
-                # postprocessor message below, whose remedy (supply the
-                # checkpoint's postprocessor) does not address it - the same
-                # accurate-cause rule the embodiment-config failure follows.
-                logger.warning(
-                    "lerobot_local: %s loaded WITHOUT normalization: %s "
-                    "Until it is corrected, observation.state reaches the policy "
-                    "un-normalized and predicted actions reach the robot without "
-                    "unnormalization -- if the arm barely moves or reaches an "
-                    "out-of-distribution pose, this is why.",
-                    self.pretrained_name_or_path or "<model>",
-                    inert_reason,
+            # Stats present at the wrong width raise from inside LeRobot's
+            # broadcast on the FIRST inference - after the rollout started and
+            # the robot was commanded - naming neither the feature nor either
+            # width. Both widths are known here, so refuse now and name them.
+            mismatched = [] if bridge is None else bridge.mismatched_normalization_widths()
+            if mismatched:
+                raise ValueError(
+                    f"lerobot_local: {self.pretrained_name_or_path or '<model>'} was given "
+                    f"normalization stats that do not match the widths the checkpoint "
+                    f"declares: {mismatched}. LeRobot would raise from the tensor broadcast "
+                    f"on the first inference instead. Supply stats whose width matches the "
+                    f"checkpoint's declared features (they are usually the stats of the "
+                    f"dataset this checkpoint was trained on, for the same robot)."
                 )
-            elif bridge is None or not bridge.has_postprocessor:
+            if bridge is None or not bridge.has_postprocessor:
                 logger.warning(
                     "lerobot_local: %s loaded WITHOUT an action postprocessor "
                     "(no policy_postprocessor.json). Actions are emitted in the "
@@ -1220,6 +1291,15 @@ class LerobotLocalPolicy(Policy):
                 # reaches the model raw and actions reach the robot un-unnormalized
                 # while has_postprocessor stays True. Detect and warn, matching the
                 # no-silent-passthrough intent of the missing-postprocessor case.
+                # Supplying those stats is only half the remedy: they are in the
+                # units the dataset was recorded in (SO-arm = servo degrees,
+                # gripper RANGE_0_100), so a caller packing a MuJoCo state in
+                # RADIANS also needs the embodiment's state_units/action_units.
+                # Measured on lerobot/smolvla_base's so100 stats (std
+                # [26.4, 52.4, 49.9, 37.0, 59.4, 19.0]): the full so101 joint
+                # range spans 0.07-0.15 sigma packed as radians and 3.8-8.3 sigma
+                # packed as degrees, so the stats-only remedy leaves
+                # observation.state a near-constant. The warning names both.
                 inert = bridge.inert_normalization_features()
                 if inert:
                     logger.warning(
@@ -1236,7 +1316,14 @@ class LerobotLocalPolicy(Policy):
                         "state normalization lives in the preprocessor's "
                         "'normalizer_processor' step and action unnormalization in the "
                         "postprocessor's 'unnormalizer_processor' step, so naming only one "
-                        "leaves the other inert. If the arm reaches an out-of-distribution "
+                        "leaves the other inert. Stats also carry the UNITS the dataset was "
+                        "recorded in -- an SO-arm dataset is servo degrees with the gripper in "
+                        "0..100, a MuJoCo state is radians -- so a caller whose state speaks "
+                        "other units owes the unit half too, via the embodiment's "
+                        "state_units/action_units ('degrees') and joint_mids (mid-centering); "
+                        "with stats alone the robot's whole joint range normalizes into a "
+                        "fraction of one sigma and observation.state reaches the model as a "
+                        "near-constant. If the arm reaches an out-of-distribution "
                         "pose or ignores proprioception, this is why.",
                         self.pretrained_name_or_path or "<model>",
                         inert,
@@ -1462,10 +1549,12 @@ class LerobotLocalPolicy(Policy):
 
         Resolution: the model needs every declared image feature populated, so
         for each image rename TARGET (``observation.images.*``) at least one of
-        its source keys must be present in ``observation_keys``. A caller-
-        supplied ``obs_rename_override`` is merged over the embodiment's
-        ``obs_rename`` first, so an explicit override that maps a present camera
-        onto the feature satisfies the check.
+        its source keys must be present in ``observation_keys``. The caller's own
+        camera bindings are routed over the embodiment's ``obs_rename`` first -
+        ``camera_key_map`` (routing rung 1, see :func:`_route_camera_key_map`)
+        and then ``obs_rename_override`` - so an explicit binding that maps a
+        present camera onto the feature satisfies the check rather than being
+        refused with a remedy it already used.
 
         The converse is also checked: an explicit ``image_keys=`` replaces the
         feature list that would be derived from those same rename targets (it is
@@ -1556,7 +1645,14 @@ class LerobotLocalPolicy(Policy):
         except Exception:  # noqa: BLE001 - unknown/odd spec; create_policy reports it
             return
 
-        obs_rename = _merge_obs_rename(embodiment.obs_rename, policy_config.get("obs_rename_override"))
+        # ``camera_key_map`` is routing rung 1 (see :func:`_route_camera_key_map`),
+        # so it is applied before the availability check below: a caller who
+        # bound their cameras with it has already answered the question this
+        # check asks, and refusing them would name a remedy they used.
+        obs_rename = _merge_obs_rename(
+            _route_camera_key_map(embodiment.obs_rename, policy_config.get("camera_key_map")),
+            policy_config.get("obs_rename_override"),
+        )
 
         # Group source keys by the image feature TARGET they feed. A target is
         # satisfied when ANY of its sources is present in the observation, so an
@@ -1589,9 +1685,10 @@ class LerobotLocalPolicy(Policy):
             f"are in the runtime observation, which provides {sorted(obs)}. Either:\n"
             f"  (a) rename your sim cameras to one of {expected} "
             f"(e.g. sim.add_camera(name={expected[0]!r}, ...)), or\n"
-            f"  (b) pass policy_config={{'obs_rename_override': "
-            f"{{'<your_camera_name>': '{missing_features[0]}'}}}} to map an existing "
-            f"camera onto the model's image feature without renaming it."
+            f"  (b) pass policy_config={{'camera_key_map': "
+            f"{{'<your_camera_name>': '{missing_features[0]}'}}}} (or the equivalent "
+            f"'obs_rename_override') to map an existing camera onto the model's image "
+            f"feature without renaming it."
         )
 
     def _synthesized_camera_renames(self) -> dict[str, str]:
@@ -1641,13 +1738,25 @@ class LerobotLocalPolicy(Policy):
 
         1. Resolves ``self._embodiment_spec`` (name / dict / EmbodimentMap), or
            synthesises a trivial map from ``robot_state_keys`` for back-compat.
-        2. Validates the map against the model's declared input/output features
-           (fail-fast on dim or key mismatch).
+        2. Routes ``camera_key_map`` and then ``obs_rename_override`` over the
+           map's declared ``obs_rename``, and validates the result against the
+           model's declared input/output features (fail-fast on dim or key
+           mismatch).
         3. Injects ``rename_map`` + a ``strands_pack_state`` step into the
            preprocessor pipeline via :meth:`ProcessorBridge.apply_embodiment`.
 
         If no embodiment is declared AND no ``robot_state_keys`` are set, this is
         a no-op and the policy uses the legacy heuristic remap path.
+
+        Raises:
+            ValueError: A DECLARED embodiment could not be configured - its keys do
+                not match the model's declared features, or the bridge carries no
+                preprocessor for step 3 to inject into. Both leave the caller's map
+                unapplied while the action side keeps converting, so the load path
+                is told rather than left to half-apply it. A map synthesised from
+                ``robot_state_keys`` is exempt from the second case: it carries
+                native units and the keys the legacy path already binds.
+            RuntimeError: The embodiment *spec* itself is malformed (bad name/dict).
         """
         from .embodiment import EmbodimentMap, load_embodiment
 
@@ -1675,20 +1784,59 @@ class LerobotLocalPolicy(Policy):
         except ValueError as exc:
             raise RuntimeError(f"Failed to load embodiment {spec!r}: {exc}") from exc
 
-        # Merge any caller-supplied obs_rename override OVER the embodiment's
-        # declared renames so custom sim camera names route onto the model's
-        # image features without renaming cameras. Override entries win.
-        if self._obs_rename_override:
+        # Route the caller's own camera bindings over the embodiment's declared
+        # renames so custom sim camera names reach the model's image features
+        # without renaming cameras. ``camera_key_map`` is applied first (routing
+        # rung 1, honored identically by the other routers - see
+        # :func:`_route_camera_key_map`), then ``obs_rename_override`` over that:
+        # the override is the last word because it is the only spelling that can
+        # DROP a declared rename (a falsy value), so a caller already relying on
+        # it keeps exactly the map they had.
+        if self.camera_key_map or self._obs_rename_override:
             from dataclasses import replace
 
-            merged = _merge_obs_rename(embodiment.obs_rename, self._obs_rename_override)
+            merged = _merge_obs_rename(
+                _route_camera_key_map(embodiment.obs_rename, self.camera_key_map),
+                self._obs_rename_override,
+            )
             embodiment = replace(embodiment, obs_rename=merged)
 
         # Fail-fast validation against the model's declared features.
         embodiment.validate(self._input_features, self._output_features)
 
-        # Inject into the pipeline (rename_map + pack-state step).
+        # A declared embodiment needs a preprocessor to be injected INTO.
+        # ``apply_embodiment`` installs the rename map and the pack-state step on
+        # the PREprocessor pipeline, and ``ProcessorBridge.from_pretrained`` skips
+        # a pipeline whose config the checkpoint omits - so a checkpoint shipping
+        # only ``policy_postprocessor.json`` leaves the bridge ACTIVE with nothing
+        # to configure, and ``apply_embodiment`` returns having applied none of it.
+        #
+        # That is not a degraded version of what the caller asked for. The legacy
+        # path composes ``observation.state`` in the SIM's own units (radians for a
+        # MuJoCo arm) and binds cameras by name/position rather than by the declared
+        # ``obs_rename``, while ``_tensor_to_action_dicts`` still converts the
+        # returned action with ``model_action_to_sim`` - so exactly half of a
+        # ``*_units="degrees"`` embodiment (so100 / so101) is applied. Refuse, and
+        # let the caller's own error path fall back to the raw obs/action flow with
+        # both halves consistent.
+        #
+        # Only a DECLARED spec is refused: the map synthesised from
+        # ``robot_state_keys`` above carries native units and the same keys the
+        # legacy path already binds, so leaving that one unapplied drops nothing.
         assert self._processor_bridge is not None
+        if self._embodiment_spec is not None and not self._processor_bridge.has_preprocessor:
+            raise ValueError(
+                f"embodiment {embodiment.name!r} was declared, but this checkpoint ships "
+                f"no {PREPROCESSOR_CONFIG} (only {POSTPROCESSOR_CONFIG}), so there is no "
+                "preprocessor pipeline to inject it into. Its obs_rename, state_keys, "
+                "dim_policy and state_units all run as preprocessor steps and none of them "
+                "would apply, while the action side would still convert with "
+                f"action_units={embodiment.action_units!r}. Use a checkpoint that ships a "
+                "preprocessor, or drop embodiment= and let the raw obs/action flow bind the "
+                "observation."
+            )
+
+        # Inject into the pipeline (rename_map + pack-state step).
         self._processor_bridge.apply_embodiment(embodiment, input_features=self._input_features)
 
         self._embodiment = embodiment
@@ -1705,11 +1853,17 @@ class LerobotLocalPolicy(Policy):
         """Initialize RTC if the loaded policy supports it.
 
         RTC is supported by flow-matching policies that implement
-        ``predict_action_chunk(**kwargs)``. It requires the policy to have
-        an ``rtc_config`` on its config.
+        ``predict_action_chunk(**kwargs)`` and whose config class declares an
+        ``rtc_config`` field: SmolVLA, Pi0 and Pi0.5 do, ACT and Diffusion do
+        not. The field's VALUE is an inference-time choice rather than a
+        training artifact, so every public checkpoint ships it as ``None``.
 
-        Auto-detection: if ``rtc_enabled=None`` (default), RTC is enabled
-        when the model's config has ``rtc_config.enabled=True``.
+        ``rtc_enabled=None`` (the default) auto-detects and therefore enables
+        RTC only for a checkpoint saved with ``rtc_config.enabled=True``.
+        ``rtc_enabled=True`` constructs the config the caller asked for and
+        hands it to lerobot's ``init_rtc_processor()``; a policy whose config
+        declares no ``rtc_config`` field is warned about and falls back to
+        ``select_action()``.
         """
         if not self._loaded or self._policy is None:
             return
@@ -1739,6 +1893,31 @@ class LerobotLocalPolicy(Policy):
             # Auto-detect: use model's rtc_config.enabled
             self._rtc_enabled = rtc_config is not None and getattr(rtc_config, "enabled", False)
         elif self._rtc_requested is True:
+            if (
+                rtc_config is None
+                and config is not None
+                and hasattr(config, "rtc_config")
+                and hasattr(self._policy, "init_rtc_processor")
+            ):
+                # A flow-matching policy whose checkpoint ships ``rtc_config=None``
+                # - every public SmolVLA/Pi0 checkpoint does, RTC is an inference
+                # time choice - so construct the config the caller asked for and
+                # let lerobot build its processor from it (``init_rtc_processor``
+                # also pushes the processor into the already-built model).
+                from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+                overrides: dict[str, Any] = {"enabled": True}
+                if self._rtc_execution_horizon is not None:
+                    overrides["execution_horizon"] = self._rtc_execution_horizon
+                if self._rtc_max_guidance_weight is not None:
+                    overrides["max_guidance_weight"] = self._rtc_max_guidance_weight
+                rtc_config = RTCConfig(**overrides)
+                config.rtc_config = rtc_config
+                self._policy.init_rtc_processor()
+                logger.info(
+                    "RTC requested and policy '%s' shipped no rtc_config - constructed one.",
+                    type(self._policy).__name__,
+                )
             if rtc_config is None:
                 # User explicitly asked for RTC, but this policy has no rtc_config.
                 # This means it's not a flow-matching policy - warn and disable.
@@ -1965,6 +2144,65 @@ class LerobotLocalPolicy(Policy):
         )
         self._rtc_reanchor_degraded_warned = True
 
+    def _rtc_unexecuted_prefix(self, inference_delay: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The previous chunk from the observation tick on - the RTC prefix.
+
+        LeRobot fixes what ``prev_chunk_left_over`` means in
+        ``ActionQueue.get_left_over()``, which its inference loop snapshots
+        immediately before denoising::
+
+            idx_before = queue.get_action_index()
+            prev_actions = queue.get_left_over()    # original_queue[last_index:]
+
+        ``original_queue`` is the previous chunk with its own inference delay
+        already dropped - exactly what :meth:`_predict_with_rtc` hands its
+        consumer and stores in ``_rtc_prev_chunk`` - and ``last_index`` is how
+        much of it the robot has executed. Row 0 of the result is therefore the
+        action applied on the tick right after the observation, and row *i* the
+        action applied on the tick the new chunk's row *i* lands on. That index
+        alignment is the mechanism: ``RTCProcessor.denoise_step`` builds
+        ``get_prefix_weights(inference_delay, execution_horizon, T)``, pinning
+        weight 1.0 across ``[0, inference_delay)`` - the steps that elapse
+        *during* this inference - and blending ``[inference_delay,
+        execution_horizon)`` toward the prefix.
+
+        ``inference_delay`` supplies the consumption index, because the two are
+        the same number seen from either end: the runtime reports the steps of
+        the current chunk still pending (``set_rtc_observed_delay``), so the
+        consumer has executed ``horizon - delay`` of the ``horizon`` actions it
+        was handed. Cutting there is what keeps the frozen region pinned to the
+        actions the robot really executes while this inference runs; a prefix cut
+        past the horizon named rows the robot would not reach for another
+        ``delay`` ticks, so the denoiser froze the new chunk onto actions that
+        were never applied - and on the async path that is every seam.
+
+        Args:
+            inference_delay: Control steps that elapse during this inference -
+                equivalently, actions of the previous chunk still pending when
+                its observation was captured.
+
+        Returns:
+            ``(prefix, absolute_prefix)`` cut at the same index, either element
+            ``None`` when it is unavailable: no previous chunk yet (first
+            inference of an episode), a chunk the consumer has fully drained, or
+            an absolute copy that was never populated (absolute-action policies,
+            which need no re-anchoring).
+        """
+        chunk = self._rtc_prev_chunk
+        if chunk is None or chunk.shape[0] == 0:
+            return None, None
+        # A delay past the horizon is only reachable on the wall-clock fallback
+        # (the counted path never exceeds the chunk it handed out): the estimate
+        # claims more steps elapse than the consumer had actions for, so it has
+        # stalled on the chunk's last action. The prefix cannot describe ticks
+        # from before the chunk began, so anchor at its first row rather than
+        # indexing off its front.
+        start = max(0, self._rtc_prev_chunk_horizon - max(0, inference_delay))
+        if start >= chunk.shape[0]:
+            return None, None
+        absolute = self._rtc_prev_chunk_abs
+        return chunk[start:], None if absolute is None else absolute[start:]
+
     def _predict_with_rtc(self, batch: dict[str, Any]) -> torch.Tensor:
         """Run inference using predict_action_chunk with RTC kwargs.
 
@@ -2038,23 +2276,26 @@ class LerobotLocalPolicy(Policy):
         # On the first chunk prev_chunk_left_over is None and lerobot returns
         # early, so the value is harmless there.
         rtc_kwargs: dict[str, Any] = {"inference_delay": inference_delay}
-        # Relative-action policies: re-express the leftover tail against the
-        # CURRENT robot state instead of carrying a stale-frame prefix. The
-        # leftover is kept in absolute coordinates (_rtc_prev_chunk_abs);
-        # LeRobot's reanchor helper subtracts the live cached state and
-        # re-normalizes so the model receives a correctly anchored prefix.
-        # Absolute-action policies fall through to the verbatim leftover.
-        prev_chunk = self._rtc_prev_chunk
+        # Cut the previous chunk at the action the consumer has reached, so the
+        # prefix describes the ticks this inference overlaps (see
+        # _rtc_unexecuted_prefix).
+        prev_chunk, prev_chunk_abs = self._rtc_unexecuted_prefix(inference_delay)
+        # Relative-action policies: re-express that prefix against the CURRENT
+        # robot state instead of carrying a stale-frame one. The prefix's
+        # absolute coordinates come from the same slice; LeRobot's reanchor
+        # helper subtracts the live cached state and re-normalizes so the model
+        # receives a correctly anchored prefix. Absolute-action policies fall
+        # through to the verbatim prefix.
         if (
             self._rtc_relative_step is not None
             and self._rtc_reanchor_fn is not None
-            and self._rtc_prev_chunk_abs is not None
-            and self._rtc_prev_chunk_abs.numel() > 0
+            and prev_chunk_abs is not None
+            and prev_chunk_abs.numel() > 0
         ):
             current_state = self._rtc_relative_step.get_cached_state()
             if current_state is not None:
                 prev_chunk = self._rtc_reanchor_fn(
-                    prev_actions_absolute=self._rtc_prev_chunk_abs,
+                    prev_actions_absolute=prev_chunk_abs,
                     current_state=current_state,
                     relative_step=self._rtc_relative_step,
                     normalizer_step=self._rtc_normalizer_step,
@@ -2092,41 +2333,38 @@ class LerobotLocalPolicy(Policy):
         if action_chunk.dim() == 3 and action_chunk.shape[0] == 1:
             action_chunk = action_chunk.squeeze(0)
 
-        # Store leftover for next RTC call (unconsumed portion of this chunk).
-        # The consumer executes ``execution_horizon`` actions before re-querying
-        # (see Policy.execution_horizon / resolve_chunk_length), so the tail past
-        # that point - shifted by the steps already burned during inference - is
-        # what carries into the next chunk as ``prev_chunk_left_over``. Keying
-        # this on the full trained chunk (actions_per_step) emptied the tail
-        # whenever the chunk was consumed whole, so cross-chunk blending never
-        # engaged.
-        exec_horizon = self._rtc_execution_horizon or self.actions_per_step
-        steps_to_consume = min(inference_delay + max(1, int(exec_horizon)), action_chunk.shape[0])
-        if steps_to_consume < action_chunk.shape[0]:
-            leftover_model = action_chunk[steps_to_consume:].detach()
-            self._rtc_prev_chunk = leftover_model
-            # For relative-action policies, also stash the leftover in absolute
-            # robot coordinates so the NEXT call can re-anchor it against the new
-            # state. None for absolute-action policies (no frame shift to undo).
-            self._rtc_prev_chunk_abs = self._absolute_rtc_leftover(leftover_model)
-        else:
-            self._rtc_prev_chunk = None
-            self._rtc_prev_chunk_abs = None
-
         # Skip delay steps - they correspond to time spent during inference
         usable_start = min(inference_delay, action_chunk.shape[0] - 1)
         usable_actions = action_chunk[usable_start:]
+
+        # Keep the chunk exactly as the consumer receives it, which is LeRobot's
+        # ``ActionQueue.original_queue`` (``original_actions[delay:]``, set by
+        # ``_replace_actions_queue``). Which part of it becomes the next prefix
+        # is NOT knowable here: it depends on how far the consumer has drained
+        # this chunk when the next observation is captured, and that count only
+        # arrives with that inference (set_rtc_observed_delay). Pre-slicing it
+        # here to the tail past the execution horizon was that guess, and it was
+        # wrong by the overlap on every async seam - see
+        # _rtc_unexecuted_prefix.
+        self._rtc_prev_chunk = usable_actions.detach()
+        # For relative-action policies, also stash the chunk in absolute robot
+        # coordinates so the NEXT call can re-anchor the prefix it cuts from it
+        # against the new state. None for absolute-action policies (no frame
+        # shift to undo). The conversion is element-wise per action, so slicing
+        # it later matches slicing the model-space copy.
+        self._rtc_prev_chunk_abs = self._absolute_rtc_leftover(self._rtc_prev_chunk)
+        self._rtc_prev_chunk_horizon = max(1, int(self._rtc_execution_horizon or self.actions_per_step))
 
         # Log RTC details at debug level - throttled to once every 2s regardless of Hz
         _now = time.monotonic()
         if _now - self._rtc_last_log_time >= 2.0:
             self._rtc_last_log_time = _now
             logger.debug(
-                "RTC: chunk=%s, delay=%d, usable_start=%d, leftover=%s, avg_latency=%.3fs",
+                "RTC: chunk=%s, delay=%d, usable_start=%d, prefix=%s, avg_latency=%.3fs",
                 action_chunk.shape,
                 inference_delay,
                 usable_start,
-                self._rtc_prev_chunk.shape if self._rtc_prev_chunk is not None else None,
+                None if prev_chunk is None else tuple(prev_chunk.shape),
                 sum(self._rtc_latency_history) / len(self._rtc_latency_history),
             )
 
@@ -2226,9 +2464,9 @@ class LerobotLocalPolicy(Policy):
                 # A standard lerobot preprocessor pipeline ends in
                 # AddBatchDimension + Device steps that batch every tensor and
                 # move it to the policy device, so _fixup is a no-op there. But a
-                # MINIMAL pipeline does not: the norm_stats.json fallback builds
-                # ``DataProcessorPipeline(steps=[normalizer])`` only (no batch /
-                # device step), so without this the model receives an unbatched
+                # MINIMAL pipeline -- one carrying a normalizer but no batch /
+                # device step -- does not, so without this the model receives an
+                # unbatched
                 # ``observation.state`` (D,) alongside a (1, C, H, W) image -> a
                 # torch.stack rank mismatch inside select_action. _fixup is
                 # idempotent (it leaves already-batched, already-CHW, already-on-
@@ -2250,7 +2488,13 @@ class LerobotLocalPolicy(Policy):
         else:
             batch = self._build_observation_batch(observation, instruction)
 
-        with torch.inference_mode():
+        # ``no_grad`` rather than ``inference_mode``: lerobot's RTC guidance
+        # (``RTCProcessor.denoise_step``) re-enables autograd inside the denoiser
+        # to take ``torch.autograd.grad`` against the prefix error, which an
+        # inference-mode tensor cannot do ("element 0 of tensors does not
+        # require grad"). The non-RTC paths are unaffected: ``predict_action_chunk``
+        # / ``select_action`` already run under lerobot's own ``@torch.no_grad``.
+        with torch.no_grad():
             assert self._policy is not None
             self._policy.eval()
             # RTC uses predict_action_chunk() directly with cross-chunk guidance;
@@ -2621,18 +2865,36 @@ class LerobotLocalPolicy(Policy):
         image_items = [(k, v) for k, v in observation_dict.items() if isinstance(v, np.ndarray) and v.ndim >= 2]
         used_feats: set[str] = set()
         unmatched_imgs = []
-        for k, v in image_items:
-            mapped = self.camera_key_map.get(k) if self.camera_key_map else None
-            if mapped is not None:
+        # 1a) The explicit map is applied over the WHOLE observation before any
+        #     exact-name match runs. Resolving it inside the single loop below
+        #     instead would make the precedence depend on observation order: a
+        #     camera that happens to be iterated earlier and matches a declared
+        #     key by name would claim the slot the caller bound by hand, and the
+        #     mapped camera would then be dropped for having no free slot left.
+        #     ``_resolve_camera_targets`` resolves the map in its own first pass
+        #     for the same reason, and the two routers have to agree - the only
+        #     difference between them is whether the checkpoint ships a
+        #     preprocessor, which is not something a camera binding may depend on.
+        mapped_sources: set[str] = set()
+        if self.camera_key_map:
+            for k, v in image_items:
+                mapped = self.camera_key_map.get(k)
+                if mapped is None:
+                    continue
                 if mapped not in declared_img_feats:
                     raise ValueError(
                         f"camera_key_map routes camera '{k}' to image key '{mapped}', "
                         "but the policy does not declare it. Declared image keys: "
                         f"{sorted(declared_img_feats)}."
                     )
+                mapped_sources.add(k)
                 if mapped not in used_feats:
                     out[mapped] = v
                     used_feats.add(mapped)
+        # 1b) Exact-name match, then positional fill, for the cameras the
+        #     explicit map did not already route.
+        for k, v in image_items:
+            if k in mapped_sources:
                 continue
             prefixed = f"observation.images.{k}"
             if prefixed in self._input_features and prefixed not in used_feats:
@@ -2652,7 +2914,13 @@ class LerobotLocalPolicy(Policy):
                 used_feats.add(k)
             else:
                 unmatched_imgs.append((k, v))
-        # Fill any remaining declared image slots, in declaration order.
+        # Fill any remaining declared image slots, in declaration order, with
+        # the backend's own free view ranked behind every camera the caller
+        # added - the same ordering ``_resolve_camera_targets`` applies, because
+        # the only difference between the two routers is whether the checkpoint
+        # ships a preprocessor, which is not something a camera binding may
+        # depend on.
+        unmatched_imgs.sort(key=lambda item: free_camera_routing_rank(item[0]))
         free_feats = [f for f in declared_img_feats if f not in used_feats]
         if self.strict_keys and unmatched_imgs and free_feats:
             raise ValueError(
@@ -2791,7 +3059,8 @@ class LerobotLocalPolicy(Policy):
         """Build batch from observation dict already in LeRobot format (observation.* keys).
 
         Converts each value to the appropriate tensor format:
-        - Images (HWC uint8) → CHW float32 [0, 1] with batch dim
+        - Images (HWC uint8) → CHW float32 [0, 1] with batch dim, for a
+          ``np.uint8`` array and a ``torch.uint8`` tensor alike
         - State vectors → float32 with batch dim
         - Scalars → float32 tensor with batch dim
 
@@ -2824,6 +3093,16 @@ class LerobotLocalPolicy(Policy):
                 # HWC → CHW: LeRobot expects channel-first image layout
                 if is_image and tensor.dim() == 3 and tensor.shape[-1] in (1, 3, 4):
                     tensor = tensor.permute(2, 0, 1)
+                # uint8 images are [0, 255] - normalize to float32 [0, 1], the
+                # same conversion the ndarray branch below and
+                # :meth:`_canonicalize_obs_images` apply. ``torch.uint8`` is the
+                # dtype signal for an unscaled frame exactly as ``np.uint8`` is,
+                # and without this the frame reaches the model as Byte: lerobot's
+                # image resize then raises "upsample_bilinear2d_out_frame not
+                # implemented for 'Byte'", which names neither the observation
+                # key nor the conversion the caller is missing.
+                if is_image and tensor.dtype == torch.uint8:
+                    tensor = tensor.float() / 255.0
                 # Add batch dimension (required by policy.select_action)
                 if is_image and tensor.dim() == 3:
                     tensor = tensor.unsqueeze(0)
@@ -2945,6 +3224,17 @@ class LerobotLocalPolicy(Policy):
                 unmatched.append(cam)
 
         # 3) Positional fallback into the remaining declared slots (loud).
+        #    The free view a backend registers for itself ranks behind every
+        #    camera the caller added (``free_camera_routing_rank``): it is FIRST
+        #    in the observation, so filling the slots in observation order gave
+        #    slot 0 to a debug view of the whole scene and, once the slots ran
+        #    out, dropped one of the caller's real cameras to seat it. That is
+        #    the outcome the exact-name rung on the sibling router already names
+        #    as the reason it binds by name. The rank leaves the real cameras in
+        #    their existing relative order, so it decides only which camera a
+        #    guess picks, and it does not drop the free view - a scene whose only
+        #    camera is the free view still fills the slot it filled before.
+        unmatched.sort(key=free_camera_routing_rank)
         free = [feat for feat in targets if feat not in used]
         if self.strict_keys and unmatched and free:
             raise ValueError(

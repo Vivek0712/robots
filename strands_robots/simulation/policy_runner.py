@@ -33,13 +33,17 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import functools
 import logging
 import math
 import numbers
 import os
 import random
+import sys
 import time
+import uuid
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -48,13 +52,29 @@ import numpy as np
 from strands_robots._async_utils import _resolve_coroutine
 from strands_robots.dataset_recorder import RecordingFrameError
 from strands_robots.policies.base import collect_required_bodies, resolve_chunk_length
+from strands_robots.rendering.video import require_clip_encoder
+from strands_robots.simulation.observers import (
+    SCHEMA_VERSION as _OBSERVER_SCHEMA_VERSION,
+)
+from strands_robots.simulation.observers import (
+    ActionResolution,
+    LegacyHookOutcome,
+    RunPolicyEnded,
+    RunPolicyEvent,
+    RunPolicyObserver,
+    RunPolicyOutcome,
+    RunPolicyStarted,
+    RunPolicyStep,
+    StoppedReason,
+)
 from strands_robots.utils import (
     non_negative_whole_number_error,
+    optional_callable_error,
     positive_count_error,
     positive_finite_number_error,
     positive_whole_number_error,
     process_rss_mb,
-    require_optional,
+    refusal_container_repr,
 )
 
 if TYPE_CHECKING:
@@ -125,7 +145,8 @@ def set_eval_seed(seed: int) -> None:
     installs that don't have torch (e.g. ``policy_provider="mock"``
     smoke tests).
     """
-    # Local import: base.py imports this module at module level, so reaching the
+    # Local import: ``simulation.base`` imports this module at module level, so
+    # reaching the
     # shared domain from here has to stay deferred - the same convention this
     # module already uses for simulation.benchmark / .recording / .predicates.
     from strands_robots.simulation.base import MAX_EVAL_SEED, randomization_seed_error
@@ -165,11 +186,63 @@ def set_eval_seed(seed: int) -> None:
 
 # Hook signature: called every control step after send_action.
 # on_frame(step_idx, observation, action) -> None
+#
+# NOTE: this is the BACKEND-OWNED hook, not a general observation seam. There is
+# exactly one per rollout and ``SimEngine.run_policy`` fills it from
+# ``_make_run_policy_hook`` (cancellation + trajectory + mesh + dataset
+# recording), so a caller supplying their own does not add observation - it
+# removes all of that. Read-only consumers belong on the ``observer`` lane
+# instead; see :mod:`strands_robots.simulation.observers`.
 OnFrame = Callable[[int, dict[str, Any], dict[str, Any]], None]
 
 # Success function: called after each step during evaluate().
 # success_fn(observation) -> bool
 SuccessFn = Callable[[dict[str, Any]], bool]
+
+#: Largest ``k`` reported by :func:`pass_hat_k`. Beyond a handful of consecutive
+#: attempts the estimate is dominated by its own variance on the episode counts an
+#: evaluation actually runs, and a reader who needs more can compute it from
+#: ``n_success`` and ``episodes_completed``, which are both in the same result.
+_PASS_HAT_K_MAX = 8
+
+
+def pass_hat_k(n_completed: int, n_success: int, k_max: int = _PASS_HAT_K_MAX) -> dict[int, float]:
+    """Probability that ``k`` attempts drawn without replacement all succeed.
+
+    A success rate answers "how often does this work". It does not answer "can I
+    rely on it", and for anything driven repeatedly those are different questions:
+    a policy at 60% has a roughly 8% chance of clearing five consecutive attempts.
+    Reporting only the mean invites a deployment decision the mean does not
+    support.
+
+    Estimated as ``C(c, k) / C(n, k)`` for ``c`` successes out of ``n`` completed
+    attempts, which is the unbiased probability that a uniformly drawn ``k``-subset
+    of the attempts observed is all successes. Deliberately not ``success_rate **
+    k``: that form assumes the attempts are independent, and evaluation attempts on
+    one policy and one scene are correlated by construction (a systematic grasp
+    offset fails every attempt, not a fixed fraction of them), so it reports a
+    reliability the run never demonstrated. The subset form makes no independence
+    claim; it only describes the attempts that were run.
+
+    Args:
+        n_completed: Attempts that ran to a verdict. ``k`` above this is undefined
+            rather than zero - a run of 3 attempts says nothing about 5 in a row -
+            so those keys are absent instead of present and misleading.
+        n_success: Attempts among them that succeeded.
+        k_max: Largest ``k`` to report, clamped to ``n_completed``.
+
+    Returns:
+        ``{k: probability}`` for each ``k`` from 1 up to ``min(k_max,
+        n_completed)``. Empty when no attempt completed, since there is nothing to
+        draw a subset from. ``k=1`` equals the success rate by construction, and is
+        included as the anchor that makes the rest of the row readable.
+    """
+    if n_completed <= 0:
+        return {}
+    upper = min(k_max, n_completed)
+    return {
+        k: (0.0 if n_success < k else math.comb(n_success, k) / math.comb(n_completed, k)) for k in range(1, upper + 1)
+    }
 
 
 def _criterion_verdict(
@@ -292,6 +365,25 @@ _VIDEO_KEY_ALIASES: dict[str, tuple[str, ...]] = {
 _VIDEO_ACCEPTED_KEYS: tuple[str, ...] = tuple(sorted(key for aliases in _VIDEO_KEY_ALIASES.values() for key in aliases))
 
 
+def _video_values_agree(first: Any, second: Any) -> bool:
+    """Whether two spellings of one ``video`` field carry the same value.
+
+    Args:
+        first: Value carried by the earlier-listed spelling.
+        second: Value carried by the later one.
+
+    Returns:
+        ``True`` when the two are equal, so resolving the field discards
+        nothing. A pair whose equality is not a single truth value (an array)
+        counts as disagreeing: the discard would be real either way, and naming
+        both keys is the answer a caller can act on.
+    """
+    try:
+        return bool(first == second)
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """Configuration for optional MP4 recording during :meth:`PolicyRunner.run`.
@@ -339,8 +431,10 @@ class VideoConfig:
     def _pick(d: dict[str, Any], field: str, default: Any = None) -> Any:
         """First present, non-``None`` value among ``field``'s accepted keys.
 
-        Looks the canonical key up first, then the legacy aliases, so
-        ``{"path": ..., "output_path": ...}`` resolves to the canonical one.
+        Looks the canonical key up first, then the legacy aliases. Two
+        spellings that carry DIFFERENT values are refused by
+        :meth:`_alias_conflict_error` before this runs, so no value reachable
+        here is discarded.
         Membership - not truthiness - decides: a caller-supplied ``0`` is
         returned as ``0`` (and rejected by :meth:`validation_error`) instead of
         collapsing into ``default`` the way an ``or`` chain would.
@@ -379,6 +473,40 @@ class VideoConfig:
         return positive_whole_number_error(value, key, "video")
 
     @classmethod
+    def _alias_conflict_error(cls, d: dict[str, Any]) -> str | None:
+        """Error text when two spellings of one field carry different values.
+
+        :meth:`_pick` resolves a field by taking the first spelling that carries
+        a value, so a dict naming two of them honors one and discards the other
+        - the silent drop this schema exists to refuse, reached through keys it
+        accepts. A camera named twice recorded the rollout from one of the two
+        views under ``status="success"``; a path named twice wrote one file and
+        left the other absent. Two spellings carrying the SAME value discard
+        nothing and are accepted.
+
+        Args:
+            d: The caller's video-config dict, already known to hold only
+                accepted keys.
+
+        Returns:
+            A message naming both spellings and their values, or ``None`` when
+            no field is spelled twice with a disagreement.
+        """
+        for field, aliases in _VIDEO_KEY_ALIASES.items():
+            carried = [(key, d[key]) for key in aliases if d.get(key) is not None]
+            if len(carried) < 2:
+                continue
+            winner, kept = carried[0]
+            for key, value in carried[1:]:
+                if not _video_values_agree(kept, value):
+                    return (
+                        f"video: {winner!r} and {key!r} are both spellings of {field}, and they "
+                        f"disagree ({kept!r} vs {value!r}); {winner!r} wins, so {key!r} would be "
+                        "discarded. Pass one spelling of it."
+                    )
+        return None
+
+    @classmethod
     def validation_error(cls, d: Any) -> str | None:
         """Error text when ``d`` is not a video config this class can honor.
 
@@ -388,8 +516,13 @@ class VideoConfig:
         leaves ``path`` unset and the rollout reports ``status="success"``
         with no MP4 anywhere, and ``{"path": p, "resolution": [320, 240]}``
         records at the default 640x480 while the caller believes otherwise.
-        This rejects any key outside the accepted set (with a closest-match
-        hint) and any known key whose value cannot be honored.
+        Two accepted spellings of one field are the same drop wearing an
+        accepted key: ``{"camera": "top", "camera_name": "wrist"}`` recorded
+        from ``top`` while the caller had also named ``wrist``, and ``{"path":
+        a, "output_path": b}`` wrote ``a`` and left ``b`` absent. This rejects
+        any key outside the accepted set (with a closest-match hint), any pair
+        of spellings that disagree about one field, and any known key whose
+        value cannot be honored.
 
         Args:
             d: The caller's ``video`` argument. ``None`` (recording off) and an
@@ -414,6 +547,12 @@ class VideoConfig:
             close = difflib.get_close_matches(str(key).lower(), _VIDEO_ACCEPTED_KEYS, n=1, cutoff=0.7)
             hint = f" Did you mean {close[0]!r}?" if close else ""
             return f"video: unknown key {key!r}.{hint} Accepted keys: {accepted}."
+        # Two spellings of one field: the collision is reported rather than
+        # resolved, for the reason an unknown key is. Ahead of the per-field
+        # domains below, because those grade the value that WINS - run after a
+        # collision they would pass over the discarded one in silence.
+        if error := cls._alias_conflict_error(d):
+            return error
         for field in ("path", "camera"):
             value = cls._pick(d, field)
             if value is not None and not isinstance(value, str):
@@ -566,12 +705,22 @@ class _RolloutVideoWriter:
                 ],
             }
 
-        imageio = require_optional(
-            "imageio",
-            pip_install="imageio imageio-ffmpeg",
-            extra="sim-mujoco",
-            purpose="video recording",
-        )
+        # Through the shared owner rather than a local ``imageio`` probe: the
+        # writer below passes libx264 knobs, so this rollout needs the MP4
+        # plugin ``imageio`` leaves optional, not merely ``imageio``. Probing
+        # only the latter accepted an install where ``get_writer`` then routed
+        # the ``.mp4`` to another plugin and rejected ``quality`` as a
+        # ``TypeError``, which reached the caller as "Policy failed: ..." beside
+        # a 0-byte MP4.
+        #
+        # Returned as this method's error envelope, like every other setup
+        # failure above it: an absent encoder is a fact about the install, and
+        # the rollout is what the caller asked for - it can proceed without the
+        # recording only if it is told, and told before the loop runs.
+        try:
+            imageio = require_clip_encoder(resolved, purpose="video recording")
+        except ImportError as exc:
+            return None, {"status": "error", "content": [{"text": f"video recording: {exc}"}]}
         os.makedirs(os.path.dirname(os.path.abspath(resolved)), exist_ok=True)
         # A rollout renders at most one frame per applied control step, so the
         # video cannot carry more than ``control_frequency`` unique frames per
@@ -702,7 +851,7 @@ def _validate_action_key_map(action_key_map: Any) -> dict[str, Any] | None:
 
     if isinstance(action_key_map, str | bytes):
         return _error(
-            f"action_key_map must be a list of action keys, not a bare string (got {action_key_map!r}); "
+            f"action_key_map must be a list of action keys, not a bare string (got {refusal_container_repr(action_key_map)}); "
             "a string is consumed one character per action index."
         )
     if not isinstance(action_key_map, list | tuple):
@@ -731,6 +880,71 @@ class CooperativeStop(BaseException):
     stopped-early success result (``stopped_early=True``) rather than
     propagating as an uncaught exception.
     """
+
+
+def query_policy_chunk(
+    policy: Policy,
+    observation: dict[str, Any],
+    observed_delay: int = 0,
+    *,
+    instruction: str,
+    policy_kwargs: dict[str, Any],
+    action_horizon: int,
+    inference_ms: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve ONE action chunk from ``policy`` for ``observation``.
+
+    The single chunk-acquisition seam for every rollout loop in this module -
+    :meth:`PolicyRunner.run`, :meth:`PolicyRunner.evaluate`,
+    :meth:`PolicyRunner._evaluate_with_spec` and :class:`_ChunkPipeline`. Three
+    hand-rolled copies of this body existed before, so a fix applied to one
+    silently missed the others.
+
+    Never truncates below the policy's own intended chunk size: a model trained
+    for N-step open-loop replay (``policy.actions_per_step == N``) must have its
+    full chunk consumed, because clamping to a smaller ``action_horizon`` drops
+    the tail of every chunk and forces an out-of-distribution re-query.
+    :func:`~strands_robots.policies.base.resolve_chunk_length` is the single
+    source of truth for that re-query interval.
+
+    ``observed_delay`` tells latency-sensitive (RTC) providers how many control
+    steps elapse between ``observation`` being captured and the FIRST action of
+    the returned chunk being applied, so they slice the chunk seam by an exact
+    integer instead of a non-reproducible wall-clock estimate. A synchronous
+    loop pauses the world during inference, so the delay is 0; the async
+    pipeline supplies the count of still-pending steps of the chunk currently
+    executing. The ``set_rtc_observed_delay`` call and the ``get_actions`` call
+    happen on the SAME thread (the prefetch worker, or the consumer) and at most
+    one inference is ever in flight, so this never races.
+
+    Args:
+        policy: Policy to query.
+        observation: Observation the chunk is inferred from.
+        observed_delay: Control steps between ``observation`` being captured and
+            the first action of the returned chunk being applied. 0 whenever the
+            world is paused across inference.
+        instruction: Natural-language instruction forwarded to the policy.
+        policy_kwargs: Per-call goal payload forwarded verbatim to
+            ``get_actions``.
+        action_horizon: Caller's requested re-query interval, raised to the
+            policy's own chunk size by ``resolve_chunk_length``.
+        inference_ms: When supplied, the inference wall-time in milliseconds is
+            appended. ``list.append`` is atomic under the GIL, so a prefetch
+            worker appending never races a consumer reading the list after
+            ``shutdown(wait=True)``. ``None`` records no timing.
+
+    Returns:
+        The chunk truncated to the resolved length. May be EMPTY - each caller
+        decides whether that is fatal, because the answer differs by entry
+        point (a rollout cannot proceed without actions, while a benchmark
+        episode advances one physics step and re-queries).
+    """
+    policy.set_rtc_observed_delay(observed_delay)
+    _t_infer = time.perf_counter()
+    actions = _resolve_coroutine(policy.get_actions(observation, instruction, **policy_kwargs))
+    if inference_ms is not None:
+        inference_ms.append((time.perf_counter() - _t_infer) * 1000.0)
+    return list(actions[: resolve_chunk_length(policy, action_horizon)])
 
 
 class _ChunkPipeline:
@@ -785,6 +999,16 @@ class _ChunkPipeline:
         self.chunks_acquired = 0
         self.prefetch_hits = 0
         self.prefetch_blocks = 0
+        #: Index of the just-yielded action within its chunk. ``> 0`` means the
+        #: yielded observation was already used for an earlier action of the
+        #: same chunk, which is what "reused" means to a consumer's telemetry.
+        self.chunk_index = 0
+        #: Control steps between the yielded observation being captured and the
+        #: just-yielded action being applied. ``0`` means the observation IS the
+        #: live pre-action state, so a recording consumer needs no refresh.
+        #: Distinct from ``chunk_index``: the first action of a PREFETCHED chunk
+        #: is not reused, yet its observation is already several steps old.
+        self.observation_age_steps = 0
         self._executor: Any = None
 
     def __enter__(self) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
@@ -807,7 +1031,12 @@ class _ChunkPipeline:
             self.chunks_acquired += 1
             if not chunk:
                 raise RuntimeError("policy returned an empty action chunk; cannot run rollout")
-            for action in chunk:
+            for index, action in enumerate(chunk):
+                self.chunk_index = index
+                # The chunk-start observation is the live pre-action state for
+                # the FIRST action only; action ``index`` is applied that many
+                # control steps after the observation was captured.
+                self.observation_age_steps = index
                 yield observation, action
 
     def _iter_async(self) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
@@ -844,9 +1073,15 @@ class _ChunkPipeline:
         if not cur_chunk:
             raise RuntimeError("policy returned an empty action chunk; cannot run rollout")
         idx = 0
+        # Age the CURRENT chunk's observation already carried when the chunk
+        # arrived: 0 for a synchronously queried chunk (the world was paused
+        # across inference), and the prefetch's observed_delay for a chunk that
+        # was inferred mid-execution of its predecessor.
+        cur_obs_base_age = 0
         prefetch_trigger = max(1, len(cur_chunk) // 2)
         prefetch: Future[list[dict[str, Any]]] | None = None
         prefetch_obs: dict[str, Any] | None = None
+        prefetch_obs_base_age = 0
 
         while True:
             if idx >= len(cur_chunk):
@@ -854,14 +1089,17 @@ class _ChunkPipeline:
                     cur_chunk = _swap_in(prefetch)
                     if prefetch_obs is not None:
                         cur_obs = prefetch_obs
+                        cur_obs_base_age = prefetch_obs_base_age
                     prefetch = None
                     prefetch_obs = None
+                    prefetch_obs_base_age = 0
                     self.chunks_acquired += 1
                 else:
                     # Chunk too short to have triggered a prefetch -> one
                     # synchronous re-query.
                     cur_obs = self._observation_fn()
                     cur_chunk = self._query_chunk(cur_obs, 0)
+                    cur_obs_base_age = 0
                     self.chunks_acquired += 1
                 if not cur_chunk:
                     # Drop-and-requery: a prefetched chunk arriving empty (a
@@ -871,6 +1109,7 @@ class _ChunkPipeline:
                     logger.warning("async-RTC chunk arrived empty; falling back to one synchronous re-query.")
                     cur_obs = self._observation_fn()
                     cur_chunk = self._query_chunk(cur_obs, 0)
+                    cur_obs_base_age = 0
                     self.chunks_acquired += 1
                     if not cur_chunk:
                         raise RuntimeError(
@@ -883,14 +1122,123 @@ class _ChunkPipeline:
 
             if prefetch is None and idx >= prefetch_trigger:
                 prefetch_obs = self._observation_fn()
-                # The prefetched chunk first applies after the remaining steps of
-                # the current chunk drain - a known integer independent of how
-                # long inference actually takes in wall-clock time.
-                observed_delay = max(0, len(cur_chunk) - prefetch_trigger)
+                # The prefetched chunk first applies once the REMAINING steps of
+                # the current chunk drain - a known integer, independent of how
+                # long inference actually takes in wall-clock time (a slow
+                # inference just stalls the loop; the robot does not advance past
+                # the chunk end while waiting). Expressed against ``idx`` rather
+                # than ``prefetch_trigger`` so it stays the remaining-step count
+                # by construction, not only on the step the trigger fires.
+                observed_delay = max(0, len(cur_chunk) - idx)
+                prefetch_obs_base_age = observed_delay
                 prefetch = self._executor.submit(self._query_chunk, prefetch_obs, observed_delay)
 
+            self.chunk_index = idx
+            self.observation_age_steps = cur_obs_base_age + idx
             yield cur_obs, cur_chunk[idx]
             idx += 1
+
+
+_LifecycleCloser = Callable[[BaseException], None]
+_run_lifecycle_closer: ContextVar[_LifecycleCloser | None] = ContextVar("policy_runner_lifecycle_closer", default=None)
+
+
+class _PreservePrimaryObserverEscape:
+    """Suppress a secondary observer-dispatch escape without hiding it.
+
+    Used only while another exception is already unwinding ``run``. Returning
+    ``True`` from ``__exit__`` keeps the original exception primary; its note and
+    the log preserve the secondary failure for diagnosis while the surrounding
+    ``finally`` continues propagating the primary exception.
+    """
+
+    def __init__(self, primary: BaseException, event_name: str) -> None:
+        self._primary = primary
+        self._event_name = event_name
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        secondary: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        if secondary is None:
+            return False
+        BaseException.add_note(
+            self._primary,
+            f"{self._event_name} observer dispatch also raised "
+            f"{type(secondary).__name__}; the original exception was preserved.",
+        )
+        logger.error(
+            "%s observer dispatch raised while propagating %s; preserving the original exception",
+            self._event_name,
+            type(self._primary).__name__,
+            exc_info=(type(secondary), secondary, secondary.__traceback__),
+        )
+        return True
+
+
+def _close_started_lifecycle_on_escape[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """Close an opened observer lifecycle when ``run`` escapes by raising.
+
+    The rollout body handles its cooperative and ordinary operational failures,
+    but result assembly intentionally happens afterwards and may itself raise.
+    A per-invocation context variable lets this outermost boundary reach the
+    local idempotent closer without storing mutable run state on ``PolicyRunner``
+    (the same runner may be used concurrently or recursively).
+    """
+
+    @functools.wraps(func)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        token = _run_lifecycle_closer.set(None)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            # ``sys.exception()`` exposes the exception currently propagating
+            # through this finally block without catching it. That preserves its
+            # identity and traceback and avoids turning this lifecycle boundary
+            # into another broad exception handler.
+            error = sys.exception()
+            try:
+                if error is not None:
+                    closer = _run_lifecycle_closer.get()
+                    if closer is not None:
+                        # Keep the propagating exception primary even if terminal
+                        # observer dispatch raises a second one. The context
+                        # manager records that secondary failure and suppresses
+                        # only it.
+                        with _PreservePrimaryObserverEscape(error, "RunPolicyEnded"):
+                            closer(error)
+            finally:
+                _run_lifecycle_closer.reset(token)
+
+    return wrapped
+
+
+# Telemetry keys of the chunk-prefetch pipeline. The ``rtc_*`` spellings are
+# kept for one release: the pipeline overlaps inference with execution for ANY
+# chunk-emitting policy, RTC or not, so an ACT rollout reporting
+# ``rtc_async_enabled=true`` read as "RTC ran" when nothing blended a seam.
+_PREFETCH_KEY_RENAMES: dict[str, str] = {
+    "rtc_async_enabled": "chunk_prefetch_enabled",
+    "rtc_chunks_acquired": "chunk_prefetch_chunks_acquired",
+    "rtc_prefetch_hits": "chunk_prefetch_hits",
+    "rtc_prefetch_blocks": "chunk_prefetch_blocks",
+    "rtc_avg_inference_ms": "avg_inference_ms",
+    "rtc_max_inference_ms": "max_inference_ms",
+}
+
+
+def _with_prefetch_keys(block: dict[str, Any], policy: Any) -> dict[str, Any]:
+    """Add the ``chunk_prefetch_*`` names next to the legacy ``rtc_*`` ones and
+    ``policy_rtc_enabled`` (the policy's own ``supports_rtc``), which is the only
+    key that says whether real-time chunking blended the seams."""
+    block.update({new: block[old] for old, new in _PREFETCH_KEY_RENAMES.items() if old in block})
+    block["policy_rtc_enabled"] = bool(getattr(policy, "supports_rtc", False))
+    return block
 
 
 class PolicyRunner:
@@ -1231,6 +1579,7 @@ class PolicyRunner:
         return None
 
     # run(): blocking policy execution
+    @_close_started_lifecycle_on_escape
     def run(
         self,
         robot_name: str,
@@ -1244,6 +1593,7 @@ class PolicyRunner:
         fast_mode: bool = False,
         video: VideoConfig | None = None,
         on_frame: OnFrame | None = None,
+        observer: RunPolicyObserver | None = None,
         max_onframe_failures: int | None = None,
         control_substeps: int | None = None,
         policy_kwargs: dict[str, Any] | None = None,
@@ -1301,6 +1651,42 @@ class PolicyRunner:
                 after every ``send_action``. Public extension point - backends
                 layer in recording / telemetry / graceful-stop via this hook
                 without subclassing the runner.
+
+                This is the hook the BACKEND owns. There is one per rollout and
+                :meth:`~strands_robots.simulation.base.SimEngine.run_policy`
+                fills it from ``_make_run_policy_hook``, so passing one here
+                replaces cooperative cancellation, the trajectory mirror, mesh
+                step telemetry and dataset recording rather than adding to them.
+                Read-only consumers want ``observer``.
+            observer: Optional read-only rollout observer. Receives one
+                :class:`~strands_robots.simulation.observers.RunPolicyStarted`,
+                one :class:`~strands_robots.simulation.observers.RunPolicyStep`
+                per completed ``send_action`` call, and one
+                :class:`~strands_robots.simulation.observers.RunPolicyEnded` -
+                and reports what ``on_frame``'s signature cannot carry: the
+                backend's complete per-key ``send_action`` verdict (or
+                ``unknown`` on a coarse error), authoritative
+                ``observation_age_steps`` plus the narrower chunk-reuse flag,
+                and what the legacy hook did (including on the step it aborted,
+                which the legacy terminal count excludes). Must be ``None`` or
+                callable; another value raises ``ValueError`` before clocks,
+                ids, policy work, inference, or actions.
+
+                Additive and independent: it does not consume the backend's hook
+                slot, and installing one changes neither the actions applied, the
+                result payload's existing fields, nor the number of observations
+                sampled. Called synchronously on this thread, so a blocking
+                observer blocks the robot; payloads are borrowed rather than
+                copied. Ordinary ``Exception`` values and ``CooperativeStop``
+                are contained, so they never alter the rollout outcome or reach
+                the ``max_onframe_failures`` watchdog, which exists for a
+                recorder losing dataset frames rather than a visualiser that
+                cannot draw. Each contained failure is counted and reported as
+                ``observer_failures`` in the result json. Process-control and
+                cancellation ``BaseException`` classes propagate; if one is
+                already unwinding the rollout, it remains primary if terminal
+                observer dispatch raises another. See
+                :mod:`strands_robots.simulation.observers`.
             policy_kwargs: Optional per-call goal payload forwarded verbatim to
                 every ``policy.get_actions(obs, instruction, **policy_kwargs)``
                 call. This is the local-sim analogue of the mesh ``tell()``
@@ -1435,13 +1821,16 @@ class PolicyRunner:
             ``rtc_prefetch_hits``, ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms``,
             ``rtc_max_inference_ms``) so latency masking is provable from the
             payload instead of from logs. It also carries the per-actuator
-            resolution stats - ``action_resolution_rate`` (a
-            ``{actuator_name: fraction_of_steps_driven}`` map) and
-            ``partial_action_failure_rate`` (the mean fraction of the robot's
-            DOF never driven; ``0.0`` == every actuator moved every step,
-            ``~0.83`` == only 1 of 6 actuators ever moved) - so a rollout that
-            silently drives only a subset of the robot's joints is visible
-            instead of looking like a clean ``success`` with a zero success-rate.
+            resolution stats - ``action_resolution_rate`` (an
+            ``{actuator_name: fraction_of_resolution-known_steps_driven}`` map)
+            and ``partial_action_failure_rate`` (the mean fraction of the robot's
+            DOF not confirmed driven across those known steps; ``0.0`` == every
+            actuator confirmed on every known step, ``~0.83`` == only 1 of 6).
+            Coarse backend errors are excluded from those denominators rather
+            than fabricated as misses and remain visible in ``action_errors``
+            and the result text. This makes a rollout that silently drives only
+            a subset of the robot's joints visible instead of looking like a
+            clean ``success`` with a zero success-rate.
 
             Fail-fast: if EVERY action step in the opening probe window
             (``_FAIL_FAST_PROBE_STEPS``, currently 3) drives zero actuators -
@@ -1454,6 +1843,19 @@ class PolicyRunner:
             is operational and runs to completion, surfaced via
             ``partial_action_failure_rate``.
         """
+        # Validate the observer before every rollout side effect. In particular,
+        # a direct caller must not get a UUID/clock anchor, a Started dispatch,
+        # policy reset/inference or an action from a value that cannot be called.
+        if observer_error := optional_callable_error(observer, "observer", "PolicyRunner.run"):
+            raise ValueError(observer_error)
+        # The legacy hook carries the same domain, for a sharper reason: an
+        # exception from it is counted against the consecutive-failure watchdog,
+        # so a value that is not callable at all spent five applied actions
+        # before aborting the episode with "aborting silent dataset corruption"
+        # - a message about a recorder, for a caller mistake visible here.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "PolicyRunner.run"):
+            raise ValueError(hook_error)
+
         # A single rollout draws the policy's stochastic ops (VLA action-
         # chunk sampling, diffusion noise) from the unmanaged global RNG, so the
         # same scene + policy grasps on one run and misses on the next. When a
@@ -1467,7 +1869,7 @@ class PolicyRunner:
         # structured envelope to read a refusal from. Same shared rule as
         # SimEngine._validate_seed, raised rather than returned because raising
         # is this layer's contract.
-        # Local import: base.py imports PolicyRunner at module level, so
+        # Local import: ``simulation.base`` imports PolicyRunner at module level, so
         # reaching the shared domain from here has to stay deferred - the
         # same convention this module already uses for
         # simulation.benchmark / simulation.recording / simulation.predicates.
@@ -1560,30 +1962,36 @@ class PolicyRunner:
 
         # RTC telemetry, reported in the result json so latency masking is
         # provable without grepping logs. inference_ms collects every
-        # get_actions wall-time (both paths); the prefetch hit/block counters and
-        # chunks_acquired are async-only (0 on the synchronous path). list.append
-        # is atomic under the GIL, so the worker thread appending an inference
-        # time never races the main thread reading the list after shutdown(wait).
+        # get_actions wall-time (both paths); the prefetch hit/block counters are
+        # async-only. list.append is atomic under the GIL, so the worker thread
+        # appending an inference time never races the main thread reading the
+        # list after shutdown(wait).
         inference_ms: list[float] = []
-        rtc_chunks_acquired = 0
-        rtc_prefetch_hits = 0
-        rtc_prefetch_blocks = 0
+        # The chunk pipeline owns the acquisition counters. It is constructed
+        # with the rollout loop below and read back through this binding, so one
+        # source of truth serves both the success and the error payload and a
+        # rollout that dies mid-flight still reports the chunks it acquired.
+        # ``None`` means the loop was never reached (a pre-flight refusal).
+        _pipeline: _ChunkPipeline | None = None
 
         def _rtc_telemetry() -> dict[str, Any]:
             # The async-RTC telemetry block, merged into every result json
             # (success and error) so latency masking is provable from the
-            # structured payload without grepping logs. On the synchronous path
-            # the prefetch counters stay 0 and only the inference timings carry
-            # information.
+            # structured payload without grepping logs. A chunk is acquired on
+            # BOTH paths, so ``rtc_chunks_acquired`` counts on both; only the
+            # prefetch hit/block counters are async-exclusive.
             _n = len(inference_ms)
-            return {
-                "rtc_async_enabled": bool(async_rtc),
-                "rtc_chunks_acquired": rtc_chunks_acquired,
-                "rtc_prefetch_hits": rtc_prefetch_hits,
-                "rtc_prefetch_blocks": rtc_prefetch_blocks,
-                "rtc_avg_inference_ms": round(sum(inference_ms) / _n, 3) if _n else 0.0,
-                "rtc_max_inference_ms": round(max(inference_ms), 3) if _n else 0.0,
-            }
+            return _with_prefetch_keys(
+                {
+                    "rtc_async_enabled": bool(async_rtc),
+                    "rtc_chunks_acquired": _pipeline.chunks_acquired if _pipeline is not None else 0,
+                    "rtc_prefetch_hits": _pipeline.prefetch_hits if _pipeline is not None else 0,
+                    "rtc_prefetch_blocks": _pipeline.prefetch_blocks if _pipeline is not None else 0,
+                    "rtc_avg_inference_ms": round(sum(inference_ms) / _n, 3) if _n else 0.0,
+                    "rtc_max_inference_ms": round(max(inference_ms), 3) if _n else 0.0,
+                },
+                policy,
+            )
 
         # Video recording lifecycle (path validation + camera probe + writer)
         # lives in _RolloutVideoWriter so run() and evaluate() record identically.
@@ -1605,7 +2013,7 @@ class PolicyRunner:
         # default (the loop ran its full horizon); the CooperativeStop handler
         # re-tags it "cancelled", a fired stop_when re-tags it "predicate",
         # and every error return reports "error".
-        stopped_reason = "budget"
+        stopped_reason: StoppedReason = "budget"
         stop_predicate_fired = False
         # T26: skip camera rendering when the policy does not need images.
         _skip_images = not getattr(policy, "requires_images", True)
@@ -1641,6 +2049,189 @@ class PolicyRunner:
         # this they fall back to a hardcoded rate and mis-blend the chunk
         # seam at any other frequency.
         policy.set_control_frequency(control_frequency)
+
+        # Read-only observer lane. Everything below is inert when ``observer is
+        # None``: the counters stay at zero, ``_emit_event`` returns immediately,
+        # and no clock, id or sim-time read is performed - so a rollout that did
+        # not ask for the lane pays for nothing but that one identity check.
+        #
+        # ``uuid4`` rather than a counter because a run_id has to be unique
+        # across the sequential rollouts of a multi-episode ``run_policy`` AND
+        # across the concurrent ones of ``start_policy`` on different robots,
+        # and only one of those is visible from here.
+        _obs_run_id = uuid.uuid4().hex if observer is not None else ""
+        _obs_seq = 0
+        _obs_failures = 0
+        _obs_started = False
+        # Completed ``send_action`` calls. Deliberately NOT ``step_count``: that
+        # one is incremented after the legacy hook, so it excludes a call whose
+        # action the hook cancelled or lost a dataset frame on. A coarse backend
+        # error may leave physical application unknown, which is why the event's
+        # resolution is authoritative rather than this count.
+        _applied_actions = 0
+        # One (wall, monotonic) anchor for the whole rollout. Event ORDER comes
+        # from the monotonic clock so an NTP correction or a ``date -s`` mid-
+        # rollout cannot reorder the stream, and the wall-clock label is derived
+        # from the anchor rather than re-read, so it cannot disagree with it.
+        _obs_anchor_utc_ns = time.time_ns() if observer is not None else 0
+        _obs_anchor_mono_ns = time.monotonic_ns() if observer is not None else 0
+
+        def _emit_event(build: Callable[[int, int, int], RunPolicyEvent]) -> None:
+            """Dispatch one observer event with explicit exception boundaries.
+
+            Ordinary exceptions and ``CooperativeStop`` are counted and
+            contained. Process-control and cancellation ``BaseException``
+            classes propagate so observer dispatch can terminate the call.
+
+            ``build`` receives ``(event_seq, monotonic_ns, utc_ns)`` and returns
+            the event, so the sequence and both clocks are assigned in one place
+            and a caller cannot get them out of step.
+
+            The sequence number is consumed BEFORE dispatch, so an event whose
+            observer raised leaves a visible hole rather than silently renumbering
+            the ones after it.
+
+            Naming ``CooperativeStop`` is the reason this helper exists at all:
+            it is a ``BaseException`` precisely so a hook's broad
+            ``except Exception`` cannot swallow a cancellation, so without it
+            here an observer could raise one and cancel a rollout it is only
+            supposed to watch. The tuple is the smallest superset that does
+            that job. ``except BaseException`` would also have done it, and it
+            covered three more signals that are not an observer's to absorb:
+            ``GeneratorExit`` and ``asyncio.CancelledError`` were counted as
+            observer telemetry failures and dropped, on the same reasoning that
+            already re-raises ``KeyboardInterrupt`` / ``SystemExit`` just below.
+            None of those four is an ``Exception`` subclass, so this tuple lets
+            them propagate by construction; the explicit re-raise is kept as a
+            guard against a future widening of the clause under it.
+            """
+            nonlocal _obs_seq, _obs_failures
+            if observer is None:
+                return
+            seq = _obs_seq
+            _obs_seq += 1
+            mono = time.monotonic_ns()
+            utc = _obs_anchor_utc_ns + (mono - _obs_anchor_mono_ns)
+            try:
+                observer(build(seq, mono, utc))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except (CooperativeStop, Exception) as e:
+                _obs_failures += 1
+                logger.warning(
+                    "run_policy observer raised on event %d (%d failure(s) so far); "
+                    "the rollout is unaffected and the stream now has a hole: %r",
+                    seq,
+                    _obs_failures,
+                    e,
+                )
+
+        def _emit_ended(
+            *,
+            outcome: RunPolicyOutcome,
+            stopped_reason: StoppedReason,
+            error: BaseException | None = None,
+        ) -> None:
+            """Close the observer lifecycle. Idempotent, and a no-op if never opened.
+
+            Clearing ``_obs_started`` is what makes "exactly one Ended per
+            Started" a property of the code rather than of the call sites: the
+            terminal assembly has three exits and the error handler a fourth, and
+            a second call from any of them is dropped here instead of emitting a
+            duplicate close.
+
+            A rollout refused in pre-flight never opened a lifecycle, so there is
+            nothing to close and this returns immediately - which is what lets a
+            consumer treat an unmatched Started as a real anomaly.
+            """
+            nonlocal _obs_started
+            if not _obs_started:
+                return
+            _obs_started = False
+            _emit_event(
+                lambda seq, mono, utc: RunPolicyEnded(
+                    schema_version=_OBSERVER_SCHEMA_VERSION,
+                    run_id=_obs_run_id,
+                    event_seq=seq,
+                    monotonic_ns=mono,
+                    utc_ns=utc,
+                    outcome=outcome,
+                    stopped_reason=stopped_reason,
+                    applied_actions=_applied_actions,
+                    legacy_steps_used=step_count,
+                    action_errors=_action_errors,
+                    elapsed_s=time.monotonic() - start_mono,
+                    error_type=type(error).__name__ if error is not None else None,
+                    # Truncated: the full traceback is already in the log via
+                    # ``logger.exception``, and an event is not the place to ship
+                    # an unbounded string to a socket.
+                    error_message=str(error)[:512] if error is not None else None,
+                    observer_failures=_obs_failures,
+                )
+            )
+
+        def _emit_step(
+            *,
+            observation: dict[str, Any],
+            action: dict[str, Any],
+            observation_is_chunk_reused: bool,
+            observation_age_steps: int,
+            action_resolution: ActionResolution,
+            applied_action_keys: tuple[str, ...],
+            unresolved_action_keys: tuple[str, ...],
+            legacy_hook_outcome: LegacyHookOutcome,
+            primary_error: BaseException | None,
+        ) -> None:
+            """Emit one Step event.
+
+            Named rather than written as a ``lambda`` at the call site because
+            that call site is a ``finally`` block, and ``py/exit-from-finally``
+            reads a lambda body's implicit return as a ``return`` leaving the
+            block it sits in. That block contains no ``return`` / ``break`` /
+            ``continue`` of its own, so the report was about the closure's
+            position rather than about any control flow, and moving the closure
+            out of the block is what answers it. It also leaves the ``finally``
+            holding a single call, which is the shape :func:`_emit_ended`
+            already has.
+
+            The three values read from the enclosing scope - the applied-action
+            index, the elapsed duration and the sim clock - stay inside the
+            closure so they are still sampled when the event is built rather
+            than when this is called; ``_emit_event`` invokes the builder
+            synchronously, so both read the same values either way.
+            """
+
+            def build_step(seq: int, mono: int, utc: int) -> RunPolicyStep:
+                return RunPolicyStep(
+                    schema_version=_OBSERVER_SCHEMA_VERSION,
+                    run_id=_obs_run_id,
+                    event_seq=seq,
+                    monotonic_ns=mono,
+                    utc_ns=utc,
+                    applied_action_index=_applied_actions - 1,
+                    legacy_step_index=step_count,
+                    observation=observation,
+                    action=action,
+                    observation_is_chunk_reused=observation_is_chunk_reused,
+                    observation_age_steps=observation_age_steps,
+                    action_resolution=action_resolution,
+                    applied_action_keys=applied_action_keys,
+                    unresolved_action_keys=unresolved_action_keys,
+                    elapsed_s=time.monotonic() - start_mono,
+                    sim_time_s=self._cached_sim_time(),
+                    legacy_hook_outcome=legacy_hook_outcome,
+                )
+
+            if primary_error is None:
+                _emit_event(build_step)
+            else:
+                # The call site explicitly proves the legacy hook did not
+                # complete. Do not use ambient ``sys.exception()`` here: a run
+                # invoked inside a caller's unrelated ``except`` inherits that
+                # handled exception even though no hook failure is unwinding.
+                with _PreservePrimaryObserverEscape(primary_error, "RunPolicyStep"):
+                    _emit_event(build_step)
+
         # Initialize BEFORE try so CooperativeStop never sees unbound names.
         # ``time.monotonic()``: the only thing derived from this base is how
         # long the rollout ran, and a duration is measured rather than
@@ -1652,6 +2243,10 @@ class PolicyRunner:
         # future reader does not reach for ``time.time()`` again.
         start_mono = time.monotonic()
         step_count = 0
+        # Bound before ``try`` for the same reason ``step_count`` is: the terminal
+        # observer event reports it, and setup inside the try (substep derivation,
+        # actuator discovery) can raise before the loop assigns it.
+        _action_errors = 0  # count send_action failures (unresolved keys)
         # Bound before the rollout so the ``except CooperativeStop`` handler and
         # the ``_apply`` closure never see an unbound name, the same reason
         # ``start_mono`` is bound above.
@@ -1701,6 +2296,33 @@ class PolicyRunner:
 
                     ticker = pacing_resources.enter_context(_Ticker(1.0 / control_frequency))
 
+                # Open the observer lifecycle. Emitted here rather than at the top of
+                # ``run`` so it describes a rollout that will actually begin: every
+                # pre-flight refusal above (horizon, seed, RTC deadline, callback
+                # limit, video path) has already raised or returned, so a caller can
+                # rely on "a Started is always followed by an Ended".
+                _obs_started = observer is not None
+                if _obs_started:
+                    _run_lifecycle_closer.set(
+                        lambda error: _emit_ended(outcome="error", stopped_reason="error", error=error)
+                    )
+                _emit_event(
+                    lambda seq, mono, utc: RunPolicyStarted(
+                        schema_version=_OBSERVER_SCHEMA_VERSION,
+                        run_id=_obs_run_id,
+                        event_seq=seq,
+                        monotonic_ns=mono,
+                        utc_ns=utc,
+                        robot_name=robot_name,
+                        policy=type(policy).__name__,
+                        instruction=instruction,
+                        control_frequency=float(control_frequency),
+                        action_horizon=int(action_horizon),
+                        total_steps=int(total_steps),
+                        async_rtc=bool(async_rtc),
+                    )
+                )
+
                 # Control-rate substepping: a position-servo robot needs the physics
                 # to advance for the FULL control period (1/control_frequency) after
                 # each action so the joints actually track the commanded target
@@ -1718,7 +2340,6 @@ class PolicyRunner:
                     control_frequency,
                     n_substeps,
                 )
-                _action_errors = 0  # count send_action failures (unresolved keys)
                 # Per-actuator resolution tracking (issue #165). Init a counter to 0
                 # for EVERY robot actuator so a never-driven joint surfaces as
                 # resolution_rate 0.0 in the result rather than being absent from the
@@ -1729,8 +2350,11 @@ class PolicyRunner:
                 except Exception:  # noqa: BLE001 - stats are best-effort, never fatal
                     _robot_actuators = []
                 _actuator_resolved: dict[str, int] = dict.fromkeys(_robot_actuators, 0)
+                _known_resolution_steps = 0
                 _total_failure_steps = 0
+                _coarse_failure_steps = 0
                 _last_unresolved: list[str] = []
+                _last_coarse_error = ""
 
                 onframe_failure_limit = (
                     max_onframe_failures if max_onframe_failures is not None else _MAX_CONSECUTIVE_ONFRAME_FAILURES
@@ -1741,97 +2365,188 @@ class PolicyRunner:
                 # the async-RTC pipeline so they send, record, count and pace
                 # identically - only the chunk-ACQUISITION strategy differs between
                 # the two paths.
-                def _apply(observation: dict[str, Any], action_dict: dict[str, Any]) -> None:
+                def _apply(
+                    observation: dict[str, Any],
+                    action_dict: dict[str, Any],
+                    *,
+                    observation_is_chunk_reused: bool = False,
+                    observation_age_steps: int = 0,
+                ) -> None:
                     nonlocal step_count, _action_errors, consecutive_onframe_failures
-                    nonlocal _total_failure_steps, _last_unresolved
+                    nonlocal _total_failure_steps, _coarse_failure_steps, _last_unresolved
+                    nonlocal _last_coarse_error, _applied_actions, _known_resolution_steps
 
                     _send_result = self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
+                    # ``send_action`` has returned. Count the call here rather than
+                    # beside ``step_count`` below so the tally survives a legacy hook
+                    # that aborts this step; the resolution records whether physical
+                    # application is known.
+                    _applied_actions += 1
                     _is_error = isinstance(_send_result, dict) and _send_result.get("status") == "error"
                     # Resolve which of the robot's actuators this step actually drove
-                    # and which emitted keys no actuator could absorb. On the success
-                    # path send_action returns no json block, so every emitted key
-                    # resolved; on the error path the block enumerates applied /
-                    # unresolved keys.
-                    _unresolved: list[str] = []
+                    # only when the backend gives a COMPLETE per-key breakdown. A
+                    # coarse rejection can still feed the operational fail-fast below,
+                    # but it cannot prove which keys reached physical state.
+                    _applied: list[Any] = []
+                    _unresolved: list[Any] = []
+                    _has_complete_breakdown = False
                     if _is_error:
                         _action_errors += 1
                         _json = _extract_result_json(_send_result)
-                        if _json is not None:
-                            _unresolved = list(_json.get("unresolved_keys", []))
-                            _applied = list(_json.get("applied", []))
-                        else:
-                            # Error without a per-key breakdown (e.g. missing world,
-                            # vector length mismatch): treat the whole step as a
-                            # 100% failure so it counts toward the fail-fast probe.
-                            _applied = []
-                            if isinstance(action_dict, dict):
-                                _unresolved = list(action_dict.keys())
+                        if _json is not None and isinstance(action_dict, dict):
+                            _raw_applied = _json.get("applied")
+                            _raw_unresolved = _json.get("unresolved_keys")
+                            if isinstance(_raw_applied, (list, tuple)) and isinstance(_raw_unresolved, (list, tuple)):
+                                _candidate_applied = list(_raw_applied)
+                                _candidate_unresolved = list(_raw_unresolved)
+                                _emitted_keys = set(action_dict)
+                                try:
+                                    _applied_keys = set(_candidate_applied)
+                                    _unresolved_keys = set(_candidate_unresolved)
+                                except TypeError:
+                                    pass
+                                else:
+                                    _has_complete_breakdown = (
+                                        len(_applied_keys) == len(_candidate_applied)
+                                        and len(_unresolved_keys) == len(_candidate_unresolved)
+                                        and _applied_keys.isdisjoint(_unresolved_keys)
+                                        and _applied_keys | _unresolved_keys == _emitted_keys
+                                    )
+                                    if _has_complete_breakdown:
+                                        _applied = _candidate_applied
+                                        _unresolved = _candidate_unresolved
+                        if not _has_complete_breakdown:
+                            _coarse_failure_steps += 1
+                            if isinstance(_send_result, dict):
+                                _last_coarse_error = "; ".join(
+                                    str(block["text"])
+                                    for block in _send_result.get("content", [])
+                                    if isinstance(block, dict) and "text" in block
+                                )
                     elif isinstance(action_dict, dict):
                         _applied = list(action_dict)
                     else:
                         # A numeric vector binds positionally to every joint.
                         _applied = list(_robot_actuators)
-                    for _name in _applied:
-                        if _name in _actuator_resolved:
-                            _actuator_resolved[_name] += 1
-                    # A step is a 100%-failure when the policy emitted keys but NONE
-                    # resolved to an actuator (the robot did not move at all). A
-                    # PARTIAL failure (some keys resolve) is operational and runs to
-                    # completion -- reported via partial_action_failure_rate.
-                    if _is_error and not _applied:
+                    # Explicit all-unresolved breakdowns and coarse atomic refusals
+                    # both make a rollout operationally dead and feed the existing
+                    # probe. Only the former proves that no key was applied; coarse
+                    # errors remain ``unknown`` in observer telemetry.
+                    if _is_error and (not _has_complete_breakdown or not _applied):
                         _total_failure_steps += 1
                         if _unresolved:
-                            _last_unresolved = _unresolved
+                            _last_unresolved = [str(key) for key in _unresolved]
 
-                    if on_frame is not None:
-                        try:
-                            on_frame(step_count, observation, action_dict)
-                            consecutive_onframe_failures = 0
-                        except CooperativeStop:
-                            # Backend (e.g. MuJoCo) signalled a graceful stop.
-                            raise
-                        except RecordingFrameError:
-                            # A frame the dataset recorder could not write is data
-                            # loss, not telemetry: the episode on disk is already
-                            # shorter than this rollout. Never counted against the
-                            # telemetry tolerance below, which resets on every
-                            # success and so would let an intermittent recorder
-                            # failure truncate the dataset without ever tripping.
-                            raise
-                        except Exception as e:
-                            # on_frame is user-provided telemetry - never fatal
-                            # *per call*. But if it fails on every step, a 500-
-                            # step episode completes "successfully" with zero
-                            # frames recorded and the dataset is silently empty.
-                            # Count consecutive failures and fail the episode
-                            # after ``onframe_failure_limit`` in a row. See GH #117.
-                            consecutive_onframe_failures += 1
-                            logger.warning(
-                                "on_frame hook failed (%d/%d consecutive): %s",
-                                consecutive_onframe_failures,
-                                onframe_failure_limit,
-                                e,
+                    # The legacy hook runs inside a ``try/finally`` whose ONLY purpose
+                    # is the observer emission below. Nothing about the hook's own
+                    # behaviour changes: each ``except`` re-raises exactly what it
+                    # raised before, so the exception type, its traceback and its
+                    # ``__cause__`` reach the outer handler unchanged - the ``finally``
+                    # merely runs first. That is what lets the lane report the step a
+                    # cancellation or a lost dataset frame aborts on, which the legacy
+                    # accounting below (``step_count += 1``) deliberately excludes.
+                    _legacy_outcome: LegacyHookOutcome = "absent"
+                    _legacy_hook_completed = False
+                    try:
+                        if on_frame is not None:
+                            try:
+                                on_frame(step_count, observation, action_dict)
+                                consecutive_onframe_failures = 0
+                                _legacy_outcome = "ok"
+                            except CooperativeStop:
+                                # Backend (e.g. MuJoCo) signalled a graceful stop.
+                                _legacy_outcome = "cancelled"
+                                raise
+                            except RecordingFrameError:
+                                # A frame the dataset recorder could not write is data
+                                # loss, not telemetry: the episode on disk is already
+                                # shorter than this rollout. Never counted against the
+                                # telemetry tolerance below, which resets on every
+                                # success and so would let an intermittent recorder
+                                # failure truncate the dataset without ever tripping.
+                                _legacy_outcome = "recording_error"
+                                raise
+                            except Exception as e:
+                                # on_frame is user-provided telemetry - never fatal
+                                # *per call*. But if it fails on every step, a 500-
+                                # step episode completes "successfully" with zero
+                                # frames recorded and the dataset is silently empty.
+                                # Count consecutive failures and fail the episode
+                                # after ``onframe_failure_limit`` in a row. See GH #117.
+                                _legacy_outcome = "error"
+                                consecutive_onframe_failures += 1
+                                logger.warning(
+                                    "on_frame hook failed (%d/%d consecutive): %s",
+                                    consecutive_onframe_failures,
+                                    onframe_failure_limit,
+                                    e,
+                                )
+                                if consecutive_onframe_failures >= onframe_failure_limit:
+                                    raise RuntimeError(
+                                        f"on_frame hook failed {onframe_failure_limit} times in a row; "
+                                        f"aborting episode to avoid silent dataset corruption. "
+                                        f"Last error: {e!r}"
+                                    ) from e
+                        _legacy_hook_completed = True
+                    finally:
+                        if observer is not None:
+                            # Normalise the backend's answer once, here, so no consumer
+                            # has to parse a ``send_action`` envelope to learn whether
+                            # the robot moved. "partial" is the case a single aggregate
+                            # error count hides: the step IS an error and the robot DID
+                            # move, so a rollout can look healthy while driving one
+                            # joint of six.
+                            if not _is_error:
+                                _resolution: ActionResolution = "full"
+                            elif not _has_complete_breakdown:
+                                _resolution = "unknown"
+                            elif _applied:
+                                _resolution = "partial"
+                            else:
+                                _resolution = "none"
+                            _emit_step(
+                                observation=observation,
+                                action=action_dict,
+                                observation_is_chunk_reused=observation_is_chunk_reused,
+                                observation_age_steps=observation_age_steps,
+                                action_resolution=_resolution,
+                                applied_action_keys=tuple(str(k) for k in _applied),
+                                unresolved_action_keys=tuple(str(k) for k in _unresolved),
+                                legacy_hook_outcome=_legacy_outcome,
+                                primary_error=None if _legacy_hook_completed else sys.exception(),
                             )
-                            if consecutive_onframe_failures >= onframe_failure_limit:
-                                raise RuntimeError(
-                                    f"on_frame hook failed {onframe_failure_limit} times in a row; "
-                                    f"aborting episode to avoid silent dataset corruption. "
-                                    f"Last error: {e!r}"
-                                ) from e
 
                     step_count += 1
+                    # Aggregate action-health rates retain the legacy completed-step
+                    # boundary (a hook-aborted call is excluded). A coarse answer is
+                    # excluded too: empty applied keys mean "unknown" there, not a
+                    # measured miss. Structured partial/none and successful answers
+                    # are resolution-known and form the denominator.
+                    if not _is_error or _has_complete_breakdown:
+                        _known_resolution_steps += 1
+                        for _name in _applied:
+                            if _name in _actuator_resolved:
+                                _actuator_resolved[_name] += 1
 
-                    # Fail fast: if EVERY step of the opening probe window drove zero
-                    # actuators, the policy's output keys cannot match this robot, so
-                    # the rollout is structurally dead -- raise now instead of running
-                    # the remaining steps (and inference / recording I/O). Once any
-                    # step resolves a key, _total_failure_steps < step_count forever
-                    # and this never fires.
+                    # Fail fast when every opening probe step either explicitly
+                    # resolved no keys or was atomically refused without a complete
+                    # breakdown. The coarse case is operationally just as dead, but
+                    # does not justify claiming which physical state changed.
                     if step_count >= _FAIL_FAST_PROBE_STEPS and _total_failure_steps == step_count:
                         try:
                             _valid = self.sim.robot_action_keys(robot_name)
                         except Exception:  # noqa: BLE001
                             _valid = _robot_actuators
+                        if _coarse_failure_steps:
+                            raise RuntimeError(
+                                f"All of the first {step_count} action steps were rejected on "
+                                f"'{robot_name}' without confirming any applied actuator; physical "
+                                f"application is unknown for {_coarse_failure_steps} coarse error(s). "
+                                f"Last backend error: {_last_coarse_error or 'unavailable'}. "
+                                f"Explicit unresolved keys: {_last_unresolved}. Valid actuator/joint "
+                                f"names: {_valid}. Inspect the expected keys via "
+                                f"sim.get_features(robot_name='{robot_name}')."
+                            )
                         raise RuntimeError(
                             f"All of the first {step_count} action steps had 100% "
                             f"unresolved keys on '{robot_name}' -- the robot has not "
@@ -1882,200 +2597,86 @@ class PolicyRunner:
                         logger.info("stop_when fired at step %d; ending rollout early", step_count)
                     return fired
 
-                def _query_chunk(observation: dict[str, Any], observed_delay: int = 0) -> list[dict[str, Any]]:
-                    # Resolve ONE action chunk from the policy. Never truncate below
-                    # the policy's own intended chunk size: a model trained for
-                    # N-step open-loop replay (policy.actions_per_step == N) must
-                    # have its full chunk consumed; clamping to a smaller
-                    # action_horizon drops the tail of every chunk and forces an
-                    # out-of-distribution re-query (see LerobotLocalPolicy
-                    # auto-detect of config.n_action_steps).
-                    #
-                    # Tell the policy how many control steps elapse between this
-                    # observation and the first application of the returned chunk so
-                    # latency-sensitive providers (RTC) slice the chunk-seam by an
-                    # EXACT integer instead of a non-reproducible wall-clock
-                    # estimate. The synchronous loop pauses the world during
-                    # inference (delay 0); the async pipeline supplies the count of
-                    # still-pending steps of the chunk currently executing. The set
-                    # and the get_actions call happen on the SAME thread (the worker
-                    # for a prefetch, the main thread otherwise), and at most one
-                    # inference is ever in flight, so this never races.
-                    policy.set_rtc_observed_delay(observed_delay)
-                    _t_infer = time.perf_counter()
-                    coro_or_result = policy.get_actions(observation, instruction, **_policy_kwargs)
-                    actions = _resolve_coroutine(coro_or_result)
-                    # Record inference wall-time (ms) for both the sync and async
-                    # paths. Under async this runs on the prefetch worker; list
-                    # append is atomic under the GIL so the read after
-                    # shutdown(wait=True) sees every entry.
-                    inference_ms.append((time.perf_counter() - _t_infer) * 1000.0)
-                    _chunk = resolve_chunk_length(policy, action_horizon)
-                    return list(actions[:_chunk])
+                # ONE chunk-acquisition seam for the whole module, so a fix to
+                # chunk resolution or to the RTC delay contract lands on every
+                # rollout entry point at once.
+                _acquire_chunk = functools.partial(
+                    query_policy_chunk,
+                    policy,
+                    instruction=instruction,
+                    policy_kwargs=_policy_kwargs,
+                    action_horizon=action_horizon,
+                    inference_ms=inference_ms,
+                )
 
-                if async_rtc:
-                    # Async chunk pipeline: overlap inference for chunk N+1 with the
-                    # EXECUTION of chunk N. While the current chunk drains we fire
-                    # the next get_actions() on a single background worker using a
-                    # mid-execution ("horizon-shifted") observation, then atomically
-                    # swap it in when the current chunk runs out. A policy whose
-                    # inference latency is <= the chunk's execution time pays
-                    # (almost) zero visible stall at the seam - exactly how an async
-                    # real-time controller hides latency on real hardware. RTC
-                    # policies blend the seam internally via their own prev-chunk
-                    # state, so the runner only schedules the overlap (it never
-                    # touches the policy's RTC machinery). The policy is invoked from
-                    # AT MOST one thread at a time (a new prefetch is only submitted
-                    # after the previous one has been consumed), and the sim is only
-                    # ever touched from THIS thread, so there is no MuJoCo data race.
-                    from concurrent.futures import Future, ThreadPoolExecutor
-                    from concurrent.futures import TimeoutError as FuturesTimeout
-
-                    def _swap_in(fut: Future[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-                        # Block on the prefetched chunk at the seam. A prefetch HIT
-                        # means inference already finished (the seam is invisible); a
-                        # BLOCK means we still have to wait because inference ran
-                        # slower than the chunk's execution - the seam was starved,
-                        # which is the actionable "tune prefetch_trigger / shorten
-                        # the chunk" signal, so log it. A hard timeout turns a stuck
-                        # model into a structured error instead of an unbounded sim
-                        # hang.
-                        nonlocal rtc_prefetch_hits, rtc_prefetch_blocks
-                        if fut.done():
-                            rtc_prefetch_hits += 1
-                        else:
-                            rtc_prefetch_blocks += 1
-                            logger.warning(
-                                "async-RTC seam starvation: prefetched chunk was not ready at the "
-                                "swap point (inference slower than chunk execution). Blocking on it; "
-                                "consider a shorter chunk or an earlier prefetch_trigger."
-                            )
-                        try:
-                            return fut.result(timeout=rtc_inference_timeout_s)
-                        except FuturesTimeout as e:
-                            raise RuntimeError(
-                                f"async-RTC prefetch exceeded rtc_inference_timeout_s="
-                                f"{rtc_inference_timeout_s}s; policy inference is stuck. Raise the "
-                                f"timeout or check the policy/server."
-                            ) from e
-
-                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc-prefetch")
-                    try:
-                        cur_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                        cur_chunk = _query_chunk(cur_obs)
-                        rtc_chunks_acquired += 1
-                        if not cur_chunk:
-                            raise RuntimeError("policy returned an empty action chunk; cannot run rollout")
-                        idx = 0
-                        prefetch_trigger = max(1, len(cur_chunk) // 2)
-                        prefetch: Future[list[dict[str, Any]]] | None = None
-                        prefetch_obs: dict[str, Any] | None = None
-
-                        while step_count < total_steps:
-                            if idx >= len(cur_chunk):
-                                # Current chunk drained -> swap in the next chunk.
-                                if prefetch is not None:
-                                    cur_chunk = _swap_in(prefetch)
-                                    if prefetch_obs is not None:
-                                        cur_obs = prefetch_obs
-                                    prefetch = None
-                                    prefetch_obs = None
-                                else:
-                                    # Chunk was too short to trigger a prefetch;
-                                    # fall back to a synchronous re-query.
-                                    cur_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                                    cur_chunk = _query_chunk(cur_obs)
-                                rtc_chunks_acquired += 1
-                                if not cur_chunk:
-                                    # Drop-and-requery: a prefetched chunk arriving
-                                    # empty (a transient policy hiccup) degrades to
-                                    # ONE synchronous re-query before we give up,
-                                    # rather than killing an otherwise-healthy
-                                    # rollout on a single empty result.
-                                    logger.warning(
-                                        "async-RTC chunk arrived empty; falling back to one "
-                                        "synchronous re-query before erroring."
-                                    )
-                                    cur_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                                    cur_chunk = _query_chunk(cur_obs)
-                                    rtc_chunks_acquired += 1
-                                    if not cur_chunk:
-                                        raise RuntimeError(
-                                            "policy returned an empty action chunk twice (prefetch + "
-                                            "synchronous re-query); cannot continue rollout"
-                                        )
-                                idx = 0
-                                prefetch_trigger = max(1, len(cur_chunk) // 2)
-                                continue
-
-                            # Fire the next inference once we are ~50% through the
-                            # current chunk, on a fresh mid-chunk observation.
-                            if prefetch is None and idx >= prefetch_trigger:
-                                prefetch_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                                # The prefetched chunk first applies after the
-                                # remaining steps of the current chunk drain - a
-                                # known integer, independent of how long inference
-                                # actually takes in wall-clock time (a slow inference
-                                # just stalls the loop; the robot does not advance
-                                # past the chunk end while waiting).
-                                observed_delay = max(0, len(cur_chunk) - prefetch_trigger)
-                                prefetch = executor.submit(_query_chunk, prefetch_obs, observed_delay)
-
-                            # When recording, the chunk observation (the initial
-                            # query obs, or a horizon-shifted prefetch obs after a
-                            # swap) is stale for the step being applied; refresh it
-                            # so the recorded frame is time-aligned (see the
-                            # _record_per_step_obs note above). Inference is
-                            # unaffected - it already consumed cur_obs to produce
-                            # this chunk.
-                            if _record_per_step_obs:
-                                step_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                            else:
-                                step_obs = cur_obs
-                            _apply(step_obs, cur_chunk[idx])
-                            idx += 1
-                            # Semantic early return: checked after EVERY applied
-                            # action, so the stop lands within one control step of
-                            # the world reaching the condition - the rest of the
-                            # in-flight chunk (and any prefetched chunk) is
-                            # dropped; the executor shutdown below joins the
-                            # in-flight prefetch worker. The None guard is hoisted
-                            # so the no-clause hot path pays no per-step call.
-                            if stop_when is not None and _stop_when_fired():
-                                break
-                    finally:
-                        # Wait for any in-flight inference so no background thread
-                        # touches the policy/sim after run() returns (the caller may
-                        # immediately reset() or destroy() the world).
-                        executor.shutdown(wait=True)
-                else:
+                # ONE chunk pipeline for both acquisition strategies, shared with
+                # evaluate(). Synchronous: query, fully drain the chunk, re-query.
+                # Async-RTC: while the current chunk drains, fire the next
+                # get_actions() on a single background worker from a mid-chunk
+                # ("horizon-shifted") observation and swap it in at the seam, so a
+                # policy whose inference latency is <= the chunk's execution time
+                # pays almost no visible stall - exactly how an async real-time
+                # controller hides latency on real hardware. RTC policies blend
+                # the seam internally, so the runner only schedules the overlap.
+                # Only ACQUISITION differs between the two: sending, recording,
+                # counting, pacing and the stop clause below are shared, because
+                # both drive the same ``_apply``. The policy is invoked from at
+                # most one thread at a time and the sim is only ever touched from
+                # THIS thread, so there is no MuJoCo data race. The pipeline is an
+                # unbounded iterator, so the step budget is enforced here and the
+                # context manager joins any in-flight prefetch on the way out -
+                # including when the stop clause breaks mid-chunk.
+                _pipeline = _ChunkPipeline(
+                    _acquire_chunk,
+                    lambda: self._observe(robot_name, skip_images=_skip_images, bodies=_bodies),
+                    async_rtc=bool(async_rtc),
+                    rtc_inference_timeout_s=rtc_inference_timeout_s,
+                )
+                with _pipeline as chunks:
                     while step_count < total_steps:
-                        observation = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                        chunk = _query_chunk(observation)
-                        for chunk_idx, action_dict in enumerate(chunk):
-                            if step_count >= total_steps:
-                                break
-                            # The chunk-start observation is the correct pre-action
-                            # state for the first action only. When recording,
-                            # refresh it before each SUBSEQUENT action so the
-                            # recorded frame is time-aligned (see the
-                            # _record_per_step_obs note above). chunk_idx == 0 reuses
-                            # the freshly-queried observation (no re-render, sim has
-                            # not stepped yet). Inference is unaffected.
-                            if _record_per_step_obs and chunk_idx > 0:
-                                step_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
-                            else:
-                                step_obs = observation
-                            _apply(step_obs, action_dict)
-                            # Semantic early return: checked after EVERY applied
-                            # action (same cadence as the benchmark eval loop), so
-                            # the remaining actions of the chunk are dropped as
-                            # soon as the condition holds. The None guard is
-                            # hoisted so the no-clause hot path pays no per-step
-                            # call.
-                            if stop_when is not None and _stop_when_fired():
-                                break
-                        if stop_predicate_fired:
+                        # Pull only when the budget still has room for the action.
+                        # A ``for`` loop over the iterator would advance it first
+                        # and so pay one WHOLE extra inference at the end of every
+                        # rollout whose budget ends on a chunk boundary - a real
+                        # GPU forward pass for an action that can never be applied.
+                        # Both hand-rolled loops this replaces tested the budget
+                        # before re-querying; keeping that is what makes the
+                        # collapse behaviour-preserving.
+                        try:
+                            chunk_obs, action_dict = next(chunks)
+                        except StopIteration:  # pragma: no cover - unbounded iterator
+                            break
+                        # An observation OLDER than the action being applied would
+                        # write a time-misaligned recorded frame, so refresh it.
+                        # ``observation_age_steps == 0`` means the yielded
+                        # observation is still the live pre-action state (the
+                        # first action after a synchronous query, when the sim has
+                        # not stepped since), so no re-render is needed. Inference
+                        # is unaffected either way - it already consumed the chunk
+                        # observation to produce this action.
+                        _age = _pipeline.observation_age_steps
+                        if _record_per_step_obs and _age > 0:
+                            step_obs = self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
+                        else:
+                            step_obs = chunk_obs
+                        _apply(
+                            step_obs,
+                            action_dict,
+                            # "Reused" is about the OBSERVATION having already
+                            # driven an earlier action of this chunk, which is
+                            # ``chunk_index``; a prefetched chunk's first action
+                            # is not reused even though its observation is
+                            # already ``_age`` steps old.
+                            observation_is_chunk_reused=_pipeline.chunk_index > 0 and not _record_per_step_obs,
+                            observation_age_steps=0 if _record_per_step_obs else _age,
+                        )
+                        # Semantic early return: checked after EVERY applied
+                        # action, so the stop lands within one control step of the
+                        # world reaching the condition - the rest of the in-flight
+                        # chunk (and any prefetched chunk) is dropped. The None
+                        # guard is hoisted so the no-clause hot path pays no
+                        # per-step call.
+                        if stop_when is not None and _stop_when_fired():
                             break
 
             except CooperativeStop:
@@ -2085,11 +2686,19 @@ class PolicyRunner:
                 if vwriter is not None:
                     vwriter.close()
                 logger.exception("PolicyRunner.run failed")
+                _emit_ended(outcome="error", stopped_reason="error", error=e)
+                _error_json: dict[str, Any] = {
+                    **_rtc_telemetry(),
+                    "stopped_reason": "error",
+                    "steps_used": step_count,
+                }
+                if observer is not None:
+                    _error_json["observer_failures"] = _obs_failures
                 return {
                     "status": "error",
                     "content": [
                         {"text": f"Policy failed: {e}"},
-                        {"json": {**_rtc_telemetry(), "stopped_reason": "error", "steps_used": step_count}},
+                        {"json": _error_json},
                     ],
                 }
 
@@ -2198,23 +2807,26 @@ class PolicyRunner:
             payload["video_fps"] = vwriter.write_fps if wrote_video else None
         payload.update(_rtc_telemetry())
 
-        # Per-actuator resolution stats (issue #165): the fraction of steps each
-        # of the robot's actuators was actually driven. A joint stuck at 0.0
-        # means the policy never produced a key that resolved to it (wrong name /
-        # missing DOF), so a caller can see exactly which actuators the policy is
-        # and is not driving -- not just a single aggregate error count.
-        if step_count > 0 and _robot_actuators:
+        # Per-actuator resolution stats (issue #165): fractions over the steps
+        # whose backend answer establishes physical application. Coarse errors
+        # are excluded from this denominator rather than fabricated as misses;
+        # ``action_errors`` and the human diagnostic still expose them.
+        if _known_resolution_steps > 0 and _robot_actuators:
             action_resolution_rate = {
-                name: round(_actuator_resolved.get(name, 0) / step_count, 4) for name in _robot_actuators
+                name: round(_actuator_resolved.get(name, 0) / _known_resolution_steps, 4) for name in _robot_actuators
             }
-            # Aggregate: the mean fraction of the robot's DOF NOT driven across
-            # the rollout. 0.0 == every actuator driven every step; ~0.83 == only
-            # 1 of 6 actuators ever moved. This is per-actuator coverage, distinct
-            # from action_errors (a step-level status count): a policy that drives
-            # 1 of 6 joints every step returns status=success with action_errors=0
-            # yet a partial_action_failure_rate of ~0.83.
+            # Aggregate: the mean fraction of the robot's DOF NOT confirmed
+            # driven across resolution-known steps. 0.0 == every actuator was
+            # confirmed driven on every known step; ~0.83 == only 1 of 6 was.
+            # This is per-actuator coverage, distinct from action_errors (a
+            # step-level backend-error count): a policy that drives 1 of 6 joints
+            # every step returns status=success with action_errors=0 yet a
+            # partial_action_failure_rate of ~0.83.
             _driven = sum(_actuator_resolved.get(n, 0) for n in _robot_actuators)
-            partial_action_failure_rate = round(1.0 - _driven / (len(_robot_actuators) * step_count), 4)
+            partial_action_failure_rate = round(
+                1.0 - _driven / (len(_robot_actuators) * _known_resolution_steps),
+                4,
+            )
             payload["action_resolution_rate"] = action_resolution_rate
             payload["partial_action_failure_rate"] = partial_action_failure_rate
             # Promote a high-but-not-total under-actuation to the human text so a
@@ -2229,28 +2841,45 @@ class PolicyRunner:
             payload["action_resolution_rate"] = {}
             payload["partial_action_failure_rate"] = 0.0
 
-        # If EVERY step was a TOTAL failure (the policy emitted keys but none
-        # resolved to an actuator), the robot never moved -- report this as an
-        # error rather than a false success. This mirrors the fail-fast probe
-        # and must key off ``_total_failure_steps``, NOT ``_action_errors``:
-        # ``_action_errors`` also counts PARTIAL steps (some keys resolve, the
-        # robot moves), so a policy that drives valid keys plus one extra
-        # unresolved key every step (e.g. a 7-DOF-trained policy on a 6-DOF arm)
-        # would otherwise be misreported as "the robot did not move". A partial
-        # rollout is operational -- surfaced via partial_action_failure_rate.
+        # A rollout where every step either explicitly resolved no key or was
+        # coarsely refused is not a usable success. For coarse errors, preserve
+        # the operational no-drive fail-fast without asserting that physical
+        # state is known.
         if _total_failure_steps >= step_count and step_count > 0:
-            text += (
-                f"\n\nALL {step_count} action steps had 100% unresolved keys "
-                f"-- the robot did not move. Check that the policy's output keys "
-                f"match the robot's actuator names."
-            )
+            if _coarse_failure_steps:
+                text += (
+                    f"\n\nALL {step_count} action steps failed to confirm an applied actuator; "
+                    f"physical application is unknown for {_coarse_failure_steps} coarse "
+                    f"backend error(s). Last backend error: "
+                    f"{_last_coarse_error or 'unavailable'}."
+                )
+            else:
+                text += (
+                    f"\n\nALL {step_count} action steps had 100% unresolved keys "
+                    f"-- the robot did not move. Check that the policy's output keys "
+                    f"match the robot's actuator names."
+                )
             # An error result always reports stopped_reason="error": the
             # rollout may have run its full budget, but the outcome is not a
             # retryable "budget" completion.
             payload["stopped_reason"] = "error"
+            _emit_ended(outcome="error", stopped_reason="error")
+            if observer is not None:
+                payload["observer_failures"] = _obs_failures
             return {"status": "error", "content": [{"text": text}, {"json": payload}]}
         if _action_errors > 0:
-            text += f"\n\n{_action_errors}/{step_count} action steps had unresolved keys."
+            if _coarse_failure_steps == 0:
+                text += f"\n\n{_action_errors}/{step_count} action steps had unresolved keys."
+            elif _coarse_failure_steps == _action_errors:
+                text += f"\n\n{_action_errors}/{step_count} action steps reported coarse backend errors."
+            else:
+                text += f"\n\n{_action_errors}/{step_count} action steps had unresolved keys or coarse backend errors."
+        _emit_ended(outcome="success", stopped_reason=stopped_reason)
+        # Read AFTER the terminal event so a failure dispatching that event is
+        # included too - the payload is the number a caller checks, so it must be
+        # the complete one.
+        if observer is not None:
+            payload["observer_failures"] = _obs_failures
         return {"status": "success", "content": [{"text": text}, {"json": payload}]}
 
     # replay(): replay a LeRobotDataset episode
@@ -2288,7 +2917,10 @@ class PolicyRunner:
                 non-numeric one is rejected with a structured error before the
                 dataset is downloaded. Refused rather than coerced because the
                 index selects which trajectory reaches the actuators.
-            root: Optional local dataset root override.
+            root: Local dataset directory. When omitted it is resolved from
+                ``repo_id`` by the rule recording writes through, so an id that
+                is itself a path replays the directory it recorded to
+                (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
             speed: Playback speed multiplier (1.0 = real time). Must be a
                 positive, finite number (any real scalar, including a NumPy
                 scalar such as ``np.float32(2.0)``); a non-positive,
@@ -2647,9 +3279,14 @@ class PolicyRunner:
             success_fn: Legacy success predicate (see above).
             spec: :class:`BenchmarkProtocol` to drive the eval. When
                 provided, overrides the ``success_fn`` path.
-            seed: Master RNG seed. Each episode derives a child RNG from it,
-                so evaluations are reproducible within a process. Only used
-                when ``spec`` is provided.
+            seed: Master RNG seed. Each episode derives a child seed from it,
+                so evaluations are reproducible within a process. Used on BOTH
+                routes: the ``success_fn`` path draws the same per-episode seeds
+                from the same master RNG and forwards each to ``policy.reset``,
+                which this entry used to say it did not. Every episode record in
+                the result reports the ``seed`` its attempt ran on, so a single
+                failing episode can be replayed on its own; it is ``None`` for an
+                unseeded eval, which draws no per-episode seed at all.
             action_horizon: Max actions consumed per policy call before
                 requerying the observation, as in :meth:`run`. Clamped up to the
                 policy's own chunk length when it emits more.
@@ -2726,7 +3363,28 @@ class PolicyRunner:
             ``rtc_avg_inference_ms``, ``rtc_max_inference_ms``) so inference
             cost and latency masking are provable from the payload. When
             ``spec`` is used, it also contains ``cumulative_reward`` and
-            ``avg_reward`` fields per episode and aggregate.
+            ``avg_reward`` fields per episode and aggregate, plus
+            ``max_step_reward`` per episode and ``avg_max_step_reward`` in the
+            aggregate: the peak single-step reward, kept beside the running total
+            because the total is partly a step count, so on a dense-reward task a
+            long flailing attempt out-totals a short one that nearly finished.
+            ``max_step_reward`` is ``None`` for an attempt that ended before any
+            step was scored, and ``avg_max_step_reward`` averages only the
+            attempts that scored one (``None`` when none did) rather than reading
+            an unscored attempt as a peak of zero.
+
+            ``pass_hat_k`` maps ``k`` (as a string, since the payload is JSON) to
+            the probability that ``k`` attempts drawn from those run are all
+            successes - see :func:`pass_hat_k`. It answers whether a policy can be
+            relied on repeatedly, which ``success_rate`` does not: at a 60% rate,
+            five consecutive attempts succeed about 8% of the time. Keys above
+            ``episodes_completed`` are absent rather than ``0.0``, because a short
+            run has not measured a long streak and a zero would read as though it
+            had. Reported on BOTH routes, unlike the reward fields above: it is
+            derived from ``n_success`` and ``episodes_completed``, which the
+            ``success_fn`` path reports too, so it needs no ``spec``. Absent
+            altogether when no success criterion was in force, since every attempt
+            then counts as a failure for a reason unrelated to the policy.
 
             Every payload carries ``success_measured`` (bool): ``True`` when a
             success criterion was in force (a ``spec`` or a non-``None``
@@ -2751,7 +3409,7 @@ class PolicyRunner:
         """
         # Refuse before any frame reaches the engine's open recording.
         self._reject_recording_rate_mismatch(control_frequency, "PolicyRunner.evaluate")
-        # Local import: base.py imports PolicyRunner at module level, so
+        # Local import: ``simulation.base`` imports PolicyRunner at module level, so
         # reaching the shared domain from here has to stay deferred - the
         # same convention this module already uses for
         # simulation.benchmark / simulation.recording / simulation.predicates.
@@ -2778,6 +3436,13 @@ class PolicyRunner:
         # entry point would have refused.
         if horizon_error := positive_count_error(action_horizon, "action_horizon", "PolicyRunner.evaluate"):
             raise ValueError(horizon_error)
+        # The caller's telemetry hook, on the same domain as run()'s and refused
+        # for the reason the eval loop cannot: a hook exception there is
+        # best-effort telemetry, logged and never fatal, so a value that is not
+        # callable at all was reported once per frame and the evaluation still
+        # returned a success rate the hook had watched none of.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "PolicyRunner.evaluate"):
+            raise ValueError(hook_error)
         # The two bounds of this method's own episode loop, on the same shared
         # domain and raised for the same reason. A horizon outside the domain
         # degrades a rollout; a LOOP BOUND outside it removes the evaluation
@@ -2918,23 +3583,15 @@ class PolicyRunner:
         def _observation_fn() -> dict[str, Any]:
             return self._observe(robot_name, skip_images=_skip_images, bodies=_bodies)
 
-        def _query_chunk(observation: dict[str, Any], observed_delay: int = 0) -> list[dict[str, Any]]:
-            # Tell latency-sensitive (RTC) policies how many control steps
-            # elapse between this observation and the first application of the
-            # returned chunk so they slice the chunk-seam by an EXACT integer
-            # instead of a wall-clock estimate. The synchronous path pauses the
-            # world during inference (delay 0); the async pipeline supplies the
-            # count of still-pending steps of the chunk currently executing.
-            policy.set_rtc_observed_delay(observed_delay)
-            _t_infer = time.perf_counter()
-            actions = _resolve_coroutine(policy.get_actions(observation, instruction, **_policy_kwargs))
-            inference_ms.append((time.perf_counter() - _t_infer) * 1000.0)
-            # resolve_chunk_length is the single source of truth for the
-            # re-query interval (respects RTC + execution_horizon). Consuming the
-            # FULL chunk before re-querying matches run() and _evaluate_with_spec
-            # (#168); truncating to a smaller horizon would force an
-            # out-of-distribution re-query of chunk-predicting VLAs.
-            return list(actions[: resolve_chunk_length(policy, action_horizon)])
+        # One chunk-acquisition seam, shared with run() and _evaluate_with_spec.
+        _acquire_chunk = functools.partial(
+            query_policy_chunk,
+            policy,
+            instruction=instruction,
+            policy_kwargs=_policy_kwargs,
+            action_horizon=action_horizon,
+            inference_ms=inference_ms,
+        )
 
         results: list[dict[str, Any]] = []
         # #191 - monotonic global step index handed to ``on_frame`` so a
@@ -3000,7 +3657,12 @@ class PolicyRunner:
                 # re-runs at the same master seed. Forwarded to ``policy.reset``
                 # too, because a service-mode policy samples in another process
                 # that ``set_eval_seed`` cannot reach. Best-effort, like every
-                # other ``reset`` call site.
+                # other ``reset`` call site. Bound to ``None`` first so the
+                # episode record below reports the seed on every route through
+                # the loop: an unseeded eval draws none (a master RNG is
+                # deliberately not built from entropy here), and ``None`` says
+                # that rather than naming a seed the episode never ran on.
+                episode_seed: int | None = None
                 if master_rng is not None:
                     episode_seed = master_rng.randint(0, 2**31 - 1)
                     set_eval_seed(episode_seed)
@@ -3022,7 +3684,7 @@ class PolicyRunner:
                     # data race. The context manager joins the worker on exit even
                     # when we break mid-chunk on success.
                     pipeline = _ChunkPipeline(
-                        _query_chunk,
+                        _acquire_chunk,
                         _observation_fn,
                         async_rtc=True,
                         rtc_inference_timeout_s=rtc_inference_timeout_s,
@@ -3047,7 +3709,7 @@ class PolicyRunner:
                 else:
                     while steps < max_steps:
                         observation = _observation_fn()
-                        chunk = _query_chunk(observation, 0)
+                        chunk = _acquire_chunk(observation, 0)
                         rtc_chunks_acquired += 1
 
                         if not chunk:
@@ -3084,7 +3746,7 @@ class PolicyRunner:
                         if success:
                             break
 
-                results.append({"episode": ep, "steps": steps, "success": success})
+                results.append({"episode": ep, "steps": steps, "success": success, "seed": episode_seed})
                 # #708 - roll the attached recorder over to a new episode so the
                 # dataset records per-episode boundaries rather than collapsing
                 # every rollout into one mega-episode.
@@ -3130,14 +3792,17 @@ class PolicyRunner:
         success_rate = n_success / max(n_completed, 1)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         _n_infer = len(inference_ms)
-        rtc_telemetry = {
-            "rtc_async_enabled": bool(async_rtc),
-            "rtc_chunks_acquired": rtc_chunks_acquired,
-            "rtc_prefetch_hits": rtc_prefetch_hits,
-            "rtc_prefetch_blocks": rtc_prefetch_blocks,
-            "rtc_avg_inference_ms": round(sum(inference_ms) / _n_infer, 3) if _n_infer else 0.0,
-            "rtc_max_inference_ms": round(max(inference_ms), 3) if _n_infer else 0.0,
-        }
+        rtc_telemetry = _with_prefetch_keys(
+            {
+                "rtc_async_enabled": bool(async_rtc),
+                "rtc_chunks_acquired": rtc_chunks_acquired,
+                "rtc_prefetch_hits": rtc_prefetch_hits,
+                "rtc_prefetch_blocks": rtc_prefetch_blocks,
+                "rtc_avg_inference_ms": round(sum(inference_ms) / _n_infer, 3) if _n_infer else 0.0,
+                "rtc_max_inference_ms": round(max(inference_ms), 3) if _n_infer else 0.0,
+            },
+            policy,
+        )
 
         return {
             "status": "error" if recording_save_error is not None else "success",
@@ -3167,6 +3832,20 @@ class PolicyRunner:
                         "stopped_early": stopped_early,
                         "recording_save_error": recording_save_error,
                         "n_success": n_success,
+                        # Derived from ``n_success`` and ``episodes_completed``, both
+                        # reported here, rather than from a reward - so the reliability
+                        # figure belongs to this route as much as to the spec one, which
+                        # is where it shipped. Omitted entirely when no success criterion
+                        # was in force: every attempt then counts as a failure for a
+                        # reason unrelated to the policy, and a row of zeros would read
+                        # as measured unreliability rather than an unasked question. That
+                        # is the same rule that makes keys above ``episodes_completed``
+                        # absent rather than ``0.0``.
+                        **(
+                            {"pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()}}
+                            if success_measured
+                            else {}
+                        ),
                         "avg_steps": round(avg_steps, 1),
                         "max_steps": max_steps,
                         "policy_load_time_s": round(float(getattr(policy, "load_time_s", 0.0)), 3),
@@ -3399,6 +4078,14 @@ class PolicyRunner:
                 failure = False
                 steps = 0
                 cumulative_reward = 0.0
+                # Peak single-step reward, kept beside the running total because the
+                # two answer different questions on a failed attempt: the total says
+                # how much shaped reward accrued over however many steps ran, so a
+                # long flailing episode can out-total a short one that nearly
+                # finished. The peak says how close the attempt ever came. ``None``
+                # until a step scores, so an attempt that ended before ``on_step``
+                # ran reports "no step was scored" rather than a fabricated 0.0.
+                max_step_reward: float | None = None
                 last_info: dict[str, Any] = {}
 
                 for _ in range(max_steps):
@@ -3418,8 +4105,19 @@ class PolicyRunner:
                             "status": "error",
                             "content": [{"text": f"augment_observation failed in {spec_name}: {e}"}],
                         }
-                    coro_or_result = policy.get_actions(observation, effective_instruction, **(policy_kwargs or {}))
-                    actions = _resolve_coroutine(coro_or_result)
+                    # The same chunk-acquisition seam run()/evaluate() use. A
+                    # spec eval is always synchronous (async_rtc is refused
+                    # alongside a spec, for reproducibility), so the policy is
+                    # TOLD the delay is exactly 0 instead of being left to infer
+                    # a seam offset from wall clock.
+                    actions = query_policy_chunk(
+                        policy,
+                        observation,
+                        0,
+                        instruction=effective_instruction,
+                        policy_kwargs=policy_kwargs or {},
+                        action_horizon=action_horizon,
+                    )
 
                     # #168: consume up to ``action_horizon`` actions
                     # per inference. Default ``action_horizon=8`` matches NVIDIA's
@@ -3439,8 +4137,7 @@ class PolicyRunner:
                         # Degenerate policy - advance physics so loop terminates.
                         self.sim.step(n_steps=1)
                     else:
-                        _chunk = resolve_chunk_length(policy, action_horizon)
-                        for action_in_chunk in actions[:_chunk]:
+                        for action_in_chunk in actions:
                             if steps >= max_steps:
                                 break
                             action_applied = dict(action_in_chunk)
@@ -3493,7 +4190,11 @@ class PolicyRunner:
                                     "status": "error",
                                     "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
                                 }
-                            cumulative_reward += float(info.reward)
+                            step_reward = float(info.reward)
+                            cumulative_reward += step_reward
+                            max_step_reward = (
+                                step_reward if max_step_reward is None else max(max_step_reward, step_reward)
+                            )
                             last_info = dict(info.info) if info.info else {}
                             if info.done:
                                 stop_episode = True
@@ -3526,7 +4227,9 @@ class PolicyRunner:
                                 "status": "error",
                                 "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
                             }
-                        cumulative_reward += float(info.reward)
+                        step_reward = float(info.reward)
+                        cumulative_reward += step_reward
+                        max_step_reward = step_reward if max_step_reward is None else max(max_step_reward, step_reward)
                         last_info = dict(info.info) if info.info else {}
                         if info.done:
                             break
@@ -3548,6 +4251,7 @@ class PolicyRunner:
                         "success": success,
                         "failure": failure,
                         "cumulative_reward": round(cumulative_reward, 4),
+                        "max_step_reward": (None if max_step_reward is None else round(max_step_reward, 4)),
                         "seed": episode_seed,
                         "info": last_info,
                     }
@@ -3591,6 +4295,12 @@ class PolicyRunner:
         success_rate = n_success / max(n_completed, 1)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         avg_reward = sum(r["cumulative_reward"] for r in results) / max(n_completed, 1)
+        # Averaged over the attempts that actually scored a step. An attempt that
+        # ended before ``on_step`` ran carries ``None`` and is excluded rather than
+        # counted as 0.0, which would drag the peak toward zero for a reason that has
+        # nothing to do with how close any attempt came.
+        _peaks = [r["max_step_reward"] for r in results if r["max_step_reward"] is not None]
+        avg_max_step_reward = round(sum(_peaks) / len(_peaks), 4) if _peaks else None
 
         return {
             "status": "error" if recording_save_error is not None else "success",
@@ -3621,6 +4331,8 @@ class PolicyRunner:
                         "n_failure": n_failure,
                         "avg_steps": round(avg_steps, 1),
                         "avg_reward": round(avg_reward, 4),
+                        "avg_max_step_reward": avg_max_step_reward,
+                        "pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()},
                         "max_steps": max_steps,
                         "seed": seed,
                         "benchmark_class": spec_name,
@@ -3639,38 +4351,56 @@ class PolicyRunner:
 
     # Helpers
 
-    def _maybe_sim_time(self) -> float | None:
-        """Best-effort read of sim time from any backend that exposes it.
+    def _cached_sim_time(self) -> float | None:
+        """Read a cached finite simulation clock without backend I/O.
 
-        Tries two paths:
-          1. ``sim._world.sim_time`` - fast path for backends that keep a
-             structured world object (MuJoCo, and any other backend using
-             ``strands_robots.simulation.models.SimWorld``).
-          2. ``sim.get_state()`` fallback for backends that only expose the
-             status-dict shape. If the dict's ``json`` block (or top level)
-             has a ``sim_time`` key, we return it.
+        Prefer ``sim._world.sim_time`` for structured-world backends, then the
+        engine-level ``sim._sim_time`` used by Isaac-like implementations. Step
+        observer telemetry uses this helper because ``get_state`` may synchronize
+        a remote backend or mutate a test double, putting hidden work on every
+        control step.
         """
         world = getattr(self.sim, "_world", None)
-        if world is not None:
-            t = getattr(world, "sim_time", None)
-            if isinstance(t, (int, float)):
-                return float(t)
+        candidates = (getattr(world, "sim_time", None), getattr(self.sim, "_sim_time", None))
+        for value in candidates:
+            if isinstance(value, numbers.Real) and not isinstance(value, bool):
+                numeric = float(value)
+                if math.isfinite(numeric):
+                    return numeric
+        return None
+
+    def _maybe_sim_time(self) -> float | None:
+        """Best-effort terminal sim time, preserving the legacy state fallback.
+
+        The final result is assembled once per rollout, so backends without a
+        cached clock retain the established ``get_state`` lookup. Per-Step
+        observer events use :meth:`_cached_sim_time` and never take this path.
+        """
+        cached = self._cached_sim_time()
+        if cached is not None:
+            return cached
 
         get_state = getattr(self.sim, "get_state", None)
-        if get_state is None:
+        if not callable(get_state):
             return None
         try:
             state = get_state()
         except Exception:
             return None
-        if isinstance(state, dict):
-            if "sim_time" in state:
-                return float(state["sim_time"])
-            for blk in state.get("content", []):
-                if isinstance(blk, dict) and isinstance(blk.get("json"), dict):
-                    t = blk["json"].get("sim_time")
-                    if isinstance(t, (int, float)):
-                        return float(t)
+        if not isinstance(state, dict):
+            return None
+
+        candidates: list[Any] = [state.get("sim_time")]
+        content = state.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("json"), dict):
+                    candidates.append(block["json"].get("sim_time"))
+        for value in candidates:
+            if isinstance(value, numbers.Real) and not isinstance(value, bool):
+                numeric = float(value)
+                if math.isfinite(numeric):
+                    return numeric
         return None
 
     def _require_default_robot(self) -> str:
@@ -3692,12 +4422,14 @@ class PolicyRunner:
             # scored every episode a failure - while still working against a
             # test double that returns the bare mapping.
             #
-            # Imported inside the method, not at module level: base.py imports
-            # this module at import time and predicates.py imports base under
+            # Imported inside the method, not at module level: ``simulation.base``
+            # imports this module at import time and ``simulation.predicates``
+            # imports base under
             # TYPE_CHECKING, so a module-level edge from here to predicates
             # closes a loop that CodeQL's py/unsafe-cyclic-import walks - it
-            # does not honour the guard (see the #191 note on base.py's import
-            # of this module). No runtime cycle exists either way, and base.py
+            # does not honour the guard (see the #191 note on the import
+            # of this module in ``simulation.base``). No runtime cycle exists
+            # either way, and ``simulation.base``
             # reaches into predicates the same way from
             # ``_stop_when_unresolved_error``.
             from strands_robots.simulation.predicates import make_predicate
@@ -3714,6 +4446,11 @@ class PolicyRunner:
 __all__ = [
     "PolicyRunner",
     "OnFrame",
+    "RunPolicyEnded",
+    "RunPolicyEvent",
+    "RunPolicyObserver",
+    "RunPolicyStarted",
+    "RunPolicyStep",
     "SuccessFn",
     "CooperativeStop",
     "TrajectoryStep",

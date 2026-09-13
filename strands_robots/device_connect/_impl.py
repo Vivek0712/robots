@@ -9,8 +9,11 @@ those names only when it also brings the extra that supplies them.
 
 ``resolve_allow_insecure`` is pure Python and could live in a stdlib-only
 module. It stays here so the behavioural pin travels with the two entry points
-it guards -- one import path per public name, one place to change the vocabulary
-its refusal quotes. The tests exercise it through
+it guards -- one import path per public name. The string vocabulary it parses is
+owned by the stdlib-only sibling ``_authz``, which needs the same answer for its
+own fallback and cannot import this module (that would drag
+``device_connect_edge`` into a module the native Reachy driver loads), so the
+constant lives there and both readers import it. The tests exercise it through
 ``strands_robots.device_connect.resolve_allow_insecure`` rather than reaching
 into this private module, so pushing the module load a level deeper does not
 change what the suite grades.
@@ -23,10 +26,12 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from device_connect_edge import DeviceRuntime
 
+from strands_robots.device_connect._authz import INSECURE_TRUE, insecure_env_opts_in
 from strands_robots.device_connect.robot_driver import RobotDeviceDriver
 from strands_robots.device_connect.sim_driver import SimulationDeviceDriver
 from strands_robots.utils import is_boolean
@@ -38,8 +43,6 @@ __all__ = [
     "init_device_connect_sync",
     "resolve_allow_insecure",
 ]
-
-_INSECURE_TRUE = ("true", "1", "yes")
 
 
 def resolve_allow_insecure(
@@ -92,7 +95,7 @@ def resolve_allow_insecure(
             raise ValueError(
                 f"allow_insecure must be a bool or None, got {explicit!r}. A string "
                 "spelling is read only from DEVICE_CONNECT_ALLOW_INSECURE, where "
-                f"{_INSECURE_TRUE} opt in and anything else is secure; passed as this "
+                f"{INSECURE_TRUE} opt in and anything else is secure; passed as this "
                 "argument a non-empty string is truthy, so 'false' would enable insecure "
                 "transport rather than refuse it."
             )
@@ -105,8 +108,55 @@ def resolve_allow_insecure(
                 "caller that has already resolved a boolean should pass it as the explicit "
                 "argument instead, where it is checked rather than parsed."
             )
-        return env_value.lower() in _INSECURE_TRUE
+        return insecure_env_opts_in(env_value)
     return False
+
+
+_TLS_ENV = (
+    "MESSAGING_CREDENTIALS_FILE",
+    "NATS_CREDENTIALS_FILE",
+    "MESSAGING_TLS_CA_FILE",
+    "MESSAGING_TLS_CERT_FILE",
+    "MESSAGING_TLS_KEY_FILE",
+    "NATS_TLS_CA_FILE",
+    "NATS_TLS_CERT_FILE",
+    "NATS_TLS_KEY_FILE",
+)
+_TLS_SCHEMES = ("tls", "quic", "zenoh+tls", "mqtts", "ssl")
+
+#: The endpoint variables ``device_connect_edge`` itself reads for a non-NATS
+#: backend, so a TLS endpoint configured through the environment counts here
+#: exactly where it counts there. ``NATS_URL`` / ``NATS_URLS`` are absent
+#: deliberately: that backend short-circuits below.
+_ENDPOINT_ENV = ("ZENOH_CONNECT", "ZENOH_LISTEN", "MESSAGING_URLS")
+
+
+def transport_is_authenticated(backend: str, urls: list[str] | None, env: Mapping[str, str] = os.environ) -> bool:
+    """Whether anything will authenticate and encrypt this transport.
+
+    ``device_connect_edge`` checks that only for NATS: its
+    ``DeviceRuntime._validate_startup_config`` returns before every check when
+    ``self._messaging_backend not in (None, "nats")`` (``device.py:810`` in
+    0.2.5), and its Zenoh adapter never reads ``allow_insecure`` at all. So on
+    the default ``zenoh`` backend nothing stands between ``allow_insecure=False``
+    and the network, and a device with no credentials comes online in plaintext
+    while believing it is secure.
+
+    Args:
+        backend: The resolved messaging backend, e.g. ``"zenoh"`` or ``"nats"``.
+        urls: The endpoints passed to the runtime, or ``None`` for D2D
+            discovery, in which case only the environment can carry one.
+        env: The environment to read, defaulting to the process's own.
+
+    Returns:
+        ``True`` when the backend validates itself (NATS), when credentials or
+        TLS material are configured, or when an endpoint asks for a TLS scheme;
+        ``False`` when the transport would be plaintext.
+    """
+    if backend == "nats" or any(env.get(name) for name in _TLS_ENV):
+        return True
+    endpoints = list(urls or []) + [u for name in _ENDPOINT_ENV for u in (env.get(name) or "").split(",")]
+    return any(e.strip().split("://")[0].split("/")[0].lower() in _TLS_SCHEMES for e in endpoints if e.strip())
 
 
 async def init_device_connect(
@@ -167,6 +217,14 @@ async def init_device_connect(
     # var - and we log a prominent warning whenever it is active so an insecure
     # deployment is never silent.
     allow_insecure = resolve_allow_insecure(allow_insecure, os.environ.get("DEVICE_CONNECT_ALLOW_INSECURE"))
+    if not allow_insecure and not transport_is_authenticated(messaging_backend, urls):
+        raise RuntimeError(
+            f"Device Connect refused to start {device_id}: backend '{messaging_backend}' has no TLS configured, so "
+            "the device would be online on the LAN unencrypted and any peer could call execute/stop on it. Either "
+            "point it at credentials (MESSAGING_CREDENTIALS_FILE=<bundle>.creds.json, or a tls/ endpoint), or opt in "
+            "for a trusted isolated network with DEVICE_CONNECT_ALLOW_INSECURE=true and restrict callers with "
+            "DEVICE_CONNECT_RPC_ALLOW=<caller-id,...>"
+        )
 
     if allow_insecure:
         logger.warning(
@@ -220,6 +278,20 @@ def init_device_connect_sync(
     returns immediately - matching the Zenoh mesh ``init_mesh()`` pattern.
     The runtime stays alive as long as the process (daemon thread).
 
+    That outliving is the *successful* outcome, and it is the only one with
+    something to serve. A bring-up that produced no runtime -- because it raised,
+    or because it finished without returning one -- left the loop and the thread
+    unreachable from the caller: the pair is adopted onto the runtime below, on
+    the success path only. Parking that thread in
+    ``run_forever`` anyway left an idle loop -- and the epoll and self-pipe
+    descriptors it holds -- alive for the life of the process, once per failed
+    attempt, so a caller retrying an unreachable broker accumulated one parked
+    thread and three descriptors per try with no way to reach any of them. The
+    bring-up thread therefore closes its own loop and returns whenever the
+    holder is empty, and this call waits
+    :data:`~strands_robots.device_connect._LOOP_JOIN_TIMEOUT_S` for it, so the
+    failure the caller is handed also means the machinery is gone.
+
     Same parameters as :func:`init_device_connect`.
 
     Raises:
@@ -229,6 +301,9 @@ def init_device_connect_sync(
         TimeoutError: If the bring-up does not finish within the wrapper's
             budget. The runtime is not returned in that case, so the caller
             is never handed ``None`` in place of a ``DeviceRuntime``.
+        RuntimeError: If the bring-up finished without returning a runtime.
+            Nothing came up, so this is a failed bring-up like any other, and
+            it is reported as one rather than returned as an empty success.
     """
     loop = asyncio.new_event_loop()
     ready = threading.Event()
@@ -261,6 +336,20 @@ def init_device_connect_sync(
     def _run():
         asyncio.set_event_loop(loop)
         loop.run_until_complete(_start())
+        if runtime_holder[0] is None:
+            # No runtime came up, so nothing will ever be served on this loop,
+            # and the caller never receives it either (it is adopted onto the
+            # runtime below, which does not exist on this path). The gate is the
+            # holder rather than the recorded exception because a bring-up can
+            # leave the holder empty without raising, and that route has exactly
+            # as little to serve as the one that raised. Release it here rather
+            # than cross-thread: this is the thread that owns the loop, so the
+            # close cannot race a runner, and there is no window in which a stop
+            # scheduled from outside is consumed by the ``run_until_complete``
+            # above and leaves ``run_forever`` running with no one left to stop
+            # it. Returning also retires the thread.
+            loop.close()
+            return
         loop.run_forever()
 
     thread = threading.Thread(target=_run, daemon=True, name="device-connect-runtime")
@@ -276,10 +365,30 @@ def init_device_connect_sync(
     _timeout = _pkg._INIT_TIMEOUT_S
     started = ready.wait(timeout=_timeout)
 
+    def _await_release() -> None:
+        """Wait for the bring-up thread to release the loop it owns.
+
+        ``_run`` closes the loop and returns whenever no runtime came up, so
+        waiting here means the failure the caller is handed is over an
+        already-released loop rather than one closing behind its back. A thread
+        that outlasts the budget is reported rather than raised over: the
+        caller's failure names the cause better than a slow release, and hiding
+        it behind this one would lose it.
+        """
+        thread.join(timeout=_pkg._LOOP_JOIN_TIMEOUT_S)
+        if thread.is_alive():
+            logger.warning(
+                "init_device_connect_sync: the bring-up thread did not return within "
+                "%.1fs of a bring-up that produced no runtime, so the loop it ran on is "
+                "still open; a callback from the partial bring-up is still running on it.",
+                _pkg._LOOP_JOIN_TIMEOUT_S,
+            )
+
     # The recorded failure first: ``_start``'s ``finally`` sets the event on both
     # paths, so a bring-up that failed inside the budget arrives with ``started``
     # true and its own exception, which names the cause better than the budget.
     if error_holder[0] is not None:
+        _await_release()
         raise error_holder[0]
     if not started:
         raise TimeoutError(
@@ -289,9 +398,21 @@ def init_device_connect_sync(
         )
 
     runtime = runtime_holder[0]
-    if runtime is not None:
-        runtime._loop = loop
-        runtime._thread = thread
+    if runtime is None:
+        # A bring-up that finished without building a runtime is a failed
+        # bring-up: this call promises a ``DeviceRuntime``, and handing back the
+        # empty holder instead is the one outcome a caller cannot act on -- the
+        # foreground runner's status line reports "see the warning above" for a
+        # missing runtime, and on this route nothing logged one.
+        _await_release()
+        raise RuntimeError(
+            "init_device_connect_sync: the Device Connect bring-up finished without "
+            "returning a runtime, so there is nothing to serve. init_device_connect "
+            "returns the runtime it started; a substitute standing in for it must do "
+            "the same."
+        )
+    runtime._loop = loop
+    runtime._thread = thread
     return runtime
 
 

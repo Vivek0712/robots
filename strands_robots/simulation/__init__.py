@@ -86,6 +86,17 @@ from strands_robots.simulation.models import (
     SimWorld,
     TrajectoryStep,
 )
+from strands_robots.simulation.observers import (
+    ActionResolution,
+    LegacyHookOutcome,
+    RunPolicyEnded,
+    RunPolicyEvent,
+    RunPolicyObserver,
+    RunPolicyOutcome,
+    RunPolicyStarted,
+    RunPolicyStep,
+    StoppedReason,
+)
 from strands_robots.simulation.predicates import (
     PREDICATE_REGISTRY,
     make_predicate,
@@ -103,9 +114,9 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # triggers an omni/isaacsim import.
     "IsaacSimulation": ("strands_robots.simulation.isaac.simulation", "IsaacSimulation"),
     "IsaacConfig": ("strands_robots.simulation.isaac.config", "IsaacConfig"),
-    "_configure_gl_backend": ("strands_robots.simulation.mujoco.backend", "_configure_gl_backend"),
+    "_configure_gl_backend": ("strands_robots._mujoco_gl", "_configure_gl_backend"),
     "_ensure_mujoco": ("strands_robots.simulation.mujoco.backend", "_ensure_mujoco"),
-    "_is_headless": ("strands_robots.simulation.mujoco.backend", "_is_headless"),
+    "_is_headless": ("strands_robots._mujoco_gl", "_is_headless"),
 }
 
 
@@ -130,6 +141,16 @@ __all__ = [
     "SimCamera",
     "SimWorld",
     "TrajectoryStep",
+    # Read-only rollout observability (light - stdlib dataclasses only)
+    "ActionResolution",
+    "LegacyHookOutcome",
+    "RunPolicyOutcome",
+    "StoppedReason",
+    "RunPolicyStarted",
+    "RunPolicyStep",
+    "RunPolicyEnded",
+    "RunPolicyEvent",
+    "RunPolicyObserver",
     # MuJoCo scene builder (MjSpec-based, replaces MJCFBuilder)
     "SpecBuilder",
     # Model registry

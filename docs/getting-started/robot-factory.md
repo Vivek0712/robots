@@ -42,7 +42,14 @@ resolve_name("franka")    # 'panda'
 resolve_name("g1")        # 'unitree_g1'
 ```
 
-Case-insensitive, hyphens/underscores interchangeable. Full alias map in `registry/robots.json`.
+Case-insensitive, hyphens/underscores interchangeable. That fold is
+`registry.normalize_robot_name`, and it is the rule the registry is keyed by, not
+just the rule queries pass through: a canonical name is stored folded and an
+alias is keyed folded, so an alias declared `"My-Arm"` answers `my_arm`,
+`MY-ARM` and `My-Arm` alike. Two aliases that fold to one key are therefore one
+alias, and `register_robot` refuses an alias that folds onto another robot's name
+or alias rather than letting it resolve to that robot. Full alias map in
+`registry/robots.json`.
 
 ## Real hardware
 
@@ -50,11 +57,26 @@ Case-insensitive, hyphens/underscores interchangeable. Full alias map in `regist
 robot = Robot(
     "so100",
     mode="real",
-    cameras={"wrist": {"type": "opencv", "index_or_path": "/dev/video0"}},
+    cameras={
+        "wrist": {"type": "opencv", "index_or_path": "/dev/video0"},
+        "top": {"type": "intelrealsense", "serial_number_or_name": "819312071961"},
+    },
     port="/dev/tty.usbserial-A50285BI",
     control_frequency=50.0,
 )
 ```
+
+Each `cameras` entry is a serialized lerobot `CameraConfig`, so `type` is resolved
+against lerobot's own choice registry - the same registry the robot name itself is
+resolved against. Every backend lerobot ships is therefore attachable
+(`opencv`, `intelrealsense`, `zmq`, `reachy2_camera`), as is any installed
+`lerobot_camera_*` plugin, and the remaining keys are the fields of the class the
+`type` resolves to. Note the registered name for Intel RealSense is
+`intelrealsense`, not `realsense`; an unregistered `type` raises `ValueError`
+listing the registered ones. `fps`, `width` and `height` are common to every
+backend and default to 30/640/480 when unset - a vendor SDK the backend needs
+(`pyrealsense2` for `intelrealsense`) is required when the device is opened, not
+when the config is built.
 
 `control_frequency` (Hz) sets the control loop's per-action period,
 `1 / control_frequency` - the only throttle between two servo commands. It must be a
@@ -130,6 +152,23 @@ members it is missing, so a half-built driver fails at the line that registers i
 than on the first agent call. `port=` stays polymorphic - a serial path, an IP address or a
 URL - because only the driver knows how to read it.
 
+`baud_rate=` does not stay polymorphic. Every surface that opens a serial bus - the Feetech
+and Dynamixel drivers, `FeetechBus`, and the `baudrate` of `serial_tool` and `pose_tool` -
+holds it to one domain, a positive integer, and refuses anything else by name at
+construction. pyserial takes the speed through its own `int()` and refuses only a negative,
+so an ungraded value is *applied*: `2.7` opens the port at 2 baud, and `0` opens it
+successfully at a speed no servo answers, after which every read times out exactly as an
+unplugged arm does. A refusal at the line that states the speed is the only place that
+reads as a caller mistake rather than as broken hardware.
+
+The read window is the same shape. `timeout=` - on `FeetechBus`, and on `FeetechDriver`, which
+forwards a caller's window to it - is how long a read waits for a servo's reply, and it is held
+to a positive finite number at construction. pyserial takes `0`, `nan`, `inf` and `None`
+verbatim, and each of them leaves the read looking at an empty buffer that the retry loop cannot
+tell from a servo that never answered, so a healthy arm reports as motors that did not reply. A
+keyword a driver *records* instead of forwarding fails the same way one layer earlier: the caller
+lengthens the window, the bus opens at its default, and nothing says so.
+
 A driver has **two** ways to halt its robot and they are not the same contract. `stop_task()`
 returns a status envelope and decides an outcome, so that is what a caller reads. `stop()` is
 the lifecycle hook and is annotated `-> None`, so it carries no verdict at all - which makes
@@ -138,6 +177,47 @@ delegates to a halt verb must therefore read that verb's envelope and log a non-
 naming what may still be moving; `strands_robots.drivers.halt_failure_detail` reads the
 reason out of one. Discarding it returns from shutdown reporting the robot as stopped on the
 one surface that has no way to say otherwise.
+
+A driver that decodes its own telemetry decides, field by field, whether a reading exists. The
+convention is to read every field as `getattr(msg, name, None)` and coerce it, because a *typed*
+default is a well-formed value: a firmware that renames a field would publish a plausible constant
+rather than an absence. `strands_robots.drivers.base` owns that coercion -- `telemetry_float`,
+`telemetry_int`, `telemetry_float_list`, `telemetry_int_list` -- so the answer does not depend on
+which driver asked. Each returns `None` for anything that is not a reading, including a `bool`
+(`float(True)` is `1.0`, indistinguishable from a real one-percent pack) and a bytes-like value
+(`str`, `bytes`, `bytearray`, `memoryview` all iterate, so a raw buffer would otherwise decode as a
+vector of the wrong length). The vector readers are all-or-nothing and return a fresh list, so a
+caller mutating the envelope does not race the callback thread's next write.
+
+The rule covers the scalars a decoder sends back out, not only the ones it publishes. The Unitree
+`mode_machine` is read from `rt/lowstate` and echoed on every `LowCmd_`, and the firmware drops a
+frame whose layout id does not match the one it announced -- so an id that came from something other
+than a number is a write the robot silently ignores. A bare `int()` is the wrong coercion for that:
+`int(True)` is `1` and `int(False)` is `0`, both valid uint8 ids, so a flag on the field would be
+indistinguishable from a reading. `telemetry_int` refuses both. A float is still truncated, because
+that is the shared answer and a decoder stricter than its sibling on a value both accept is the
+drift these functions exist to prevent.
+
+A refused scalar leaves the cached value at the last reading that parsed, rather than clearing it.
+That matters when a gate reads the cache: `mode_machine` gates every G1 motion write and its refusal
+reads "lowstate has not delivered yet", which one unreadable frame should not make true of a robot
+whose lowstate is arriving.
+
+The coercion has to be *per field* for that to hold at the frame level too. A decoder that builds its
+whole record inside one `try` loses every field a message carried because one of them stopped reading,
+and the staleness that leaves behind looks like a dropped wire rather than one renamed field. The
+record keeps the key either way and lets the value be `None`, so a consumer asking for a field always
+gets an answer and the answer can be "the robot did not report this"; a frame in which *nothing* read
+is simply not cached, for the same reason a refused scalar does not clear its own cache.
+
+The rule matters most where a reading is also a *command* source. `BoosterDriver.send_action` holds
+every uncommanded upper-body joint at its last observed position, so the T1's `joints` vector is what
+the next `LowCmd` writes. A defaulted `0.0` there is finite and full-width, clears the "is this a
+frame" guards, gets cached, and gets commanded -- eight arm joints driven to exactly zero from a frame
+that carried no positions at all. Reporting the absence instead reaches the refusal the driver already
+spells for a robot that has reported nothing yet. All-or-nothing matters for the same reason: `held_q`
+is indexed by slot, so a vector short one element would renumber every slot after the gap and hold the
+wrong joint at each of them.
 
 Asking for a driver that is not there is refused, never quietly substituted:
 
@@ -189,6 +269,28 @@ arrives from a system package rather than an index.
 The same reason arrives as `connect_error` in `get_status`, so a mesh peer for a Mini
 whose transport will not load is still constructible and still reports why it is not
 connected.
+
+A bring-up that reaches the daemon but whose real-time link never finishes its
+handshake is reported the same way, and the link is not left behind. The driver
+cancels the handshake and asks the link to stop before returning, so nothing stays
+subscribed to a Mini the caller has just been told it is not connected to:
+
+```python
+>>> Robot("reachy_mini", mode="real").connect_eagerly()
+"link to reachy-a.local:8000 did not finish its handshake within 10s"
+```
+
+The reason names the budget that expired rather than the timeout's own message,
+which is empty.
+
+Either way the loop the bring-up opened is closed, not merely stopped. The link runs
+on a background asyncio loop, and `loop.stop()` only asks it to return from
+`run_forever` - the selector and self-pipe it opened are released by `loop.close()`.
+So teardown waits for that thread (up to 5s) and then closes the loop, on the success
+path through `cleanup()` and on both give-up paths, rather than leaving one open loop
+per connect cycle for the garbage collector to complain about later. A thread that
+outlasts the wait keeps its loop, because closing a running loop raises, and that
+outcome is logged instead of reported as a teardown that finished.
 
 `hardware.driver` is optional and validated when the registry loads: a value that is not a
 driver name is refused there, naming the robot, rather than being read as "no preference".

@@ -3,12 +3,10 @@
 The single home for the generic differential-IK solver wrapper
 (:class:`MinkIKBridge`) and the end-effector frame auto-discovery heuristic
 (:func:`discover_ee_frame`) that were previously duplicated per policy provider
-(:mod:`strands_robots.policies.cosmos3.sim_ik` and
-:mod:`strands_robots.policies.vera.sim_ik` each carried a copy of the bridge;
-the discovery heuristic lived in :mod:`strands_robots.policies.vera.ee_frame`).
-Those modules now re-export from here, keeping their provider-specific decode
-glue (action-chunk semantics) in place - a change to one model's action
-semantics still cannot break the other, because only the model-agnostic solver
+(:mod:`strands_robots.policies.cosmos3.sim_ik` carried its own copy of the
+bridge). That module now re-exports from here, keeping its provider-specific
+decode glue (action-chunk semantics) in place - a change to one model's action
+semantics cannot reach another provider, because only the model-agnostic solver
 wrapper is shared.
 
 :class:`MinkIKBridge` wraps `mink <https://github.com/kevinzakka/mink>`_, a
@@ -41,6 +39,7 @@ from ..utils import (
     pose_vector_error,
     positive_count_error,
     positive_finite_number_error,
+    refusal_repr,
 )
 
 if TYPE_CHECKING:
@@ -119,7 +118,7 @@ def _damping_error(value: Any, context: str) -> str | None:
     if float(value) < 0.0:
         return (
             f"{context}: damping must be >= 0 (0.0 is the undamped solve); a negative value makes the "
-            f"QP cost matrix indefinite, got {value!r}."
+            f"QP cost matrix indefinite, got {refusal_repr(value)}."
         )
     return None
 

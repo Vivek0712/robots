@@ -22,8 +22,7 @@ documented triple was neither injective nor total:
 
 The fix measures ``seed`` against
 :func:`~strands_robots.utils.non_negative_whole_number_error`, the shared domain
-:func:`strands_robots.transforms.base.derive_variant_seed` already applies to
-the other seed in the package that is spread into a stream key. Deliberately
+for a seed that is spread into a stream key. Deliberately
 scoped two ways, and both boundaries are pinned below: the domain is applied
 only on the ``"rough"`` branch, because the seed-independent kinds use no rng
 and must not be refused for a value they never read; and no upper bound is
@@ -73,7 +72,11 @@ ACCEPTED: tuple[tuple[str, Any], ...] = (
     ("far_above_a_32_bit_stream_range", 10**30),
 )
 
-RESOLUTION = 8
+# At or above every kind's minimum grid, so no cell here is ever refused for a
+# resolution the kind cannot draw - the subject of this file is the seed. Read
+# from the module rather than fixed at 8, which a pyramid cannot express: eight
+# cells hold four concentric rings, not the five plateaus the kind declares.
+RESOLUTION = max(terrain.TERRAIN_MIN_RESOLUTION.values())
 
 
 class TestASeedOutsideTheDomainIsRefused:

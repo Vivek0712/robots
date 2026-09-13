@@ -59,7 +59,7 @@ def test_audit_flags_reintroduced_mimicgen(tmp_path):
         'version = "0"\n'
         'dependencies = ["numpy>=1.24"]\n'
         "[project.optional-dependencies]\n"
-        'vera-sim = ["mimicgen==1.0.0", "mujoco>=3.5.0"]\n',
+        'sim = ["mimicgen==1.0.0", "mujoco>=3.5.0"]\n',
         encoding="utf-8",
     )
     findings = audit_deps.audit(pyproject, check_pypi=False)
@@ -75,8 +75,8 @@ def test_git_and_self_reference_deps_are_excluded(tmp_path):
         'version = "0"\n'
         'dependencies = ["numpy>=1.24"]\n'
         "[project.optional-dependencies]\n"
-        'vera = ["vera @ git+https://github.com/sizhe-li/VERA.git"]\n'
-        'all = ["x[vera]"]\n',
+        'gitdep = ["gitdep @ git+https://example.invalid/acme/gitdep.git"]\n'
+        'all = ["x[gitdep]"]\n',
         encoding="utf-8",
     )
     deps = audit_deps.collect_pypi_dependencies(pyproject)
@@ -115,11 +115,11 @@ def test_audit_flags_direct_reference_dependency(tmp_path):
         'version = "0"\n'
         'dependencies = ["numpy>=1.24"]\n'
         "[project.optional-dependencies]\n"
-        'vera = ["vera @ git+https://github.com/sizhe-li/VERA.git"]\n',
+        'gitdep = ["gitdep @ git+https://example.invalid/acme/gitdep.git"]\n',
         encoding="utf-8",
     )
     findings = audit_deps.audit(pyproject, check_pypi=False)
-    assert any("DIRECT REFERENCE" in f and "vera" in f for f in findings), findings
+    assert any("DIRECT REFERENCE" in f and "gitdep" in f for f in findings), findings
 
 
 def test_direct_reference_check_ignores_extras_specifiers_and_markers(tmp_path):
@@ -162,6 +162,8 @@ import tomllib  # noqa: E402
 import pytest  # noqa: E402
 from packaging.requirements import Requirement  # noqa: E402
 from packaging.version import Version  # noqa: E402
+
+from tests._blocked_module import blocked  # noqa: E402
 
 
 def _lerobot_extra_requirement() -> Requirement:
@@ -273,20 +275,16 @@ def test_ruff_bound_is_consistent_across_pyproject() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phantom `==` version-pin guard + the vera-sim / lerobot-0.6 fork invariant.
+# Phantom `==` version-pin guard.
 #
-# `robomimic==0.5.0` was pinned in the [vera-sim] extra, but robomimic's highest
-# PyPI release is 0.3.0 -- v0.5.0 exists only as an ARISE-Initiative GitHub tag.
-# The pin was thus unresolvable forever (it wedged `uv lock`, freezing uv.lock at
-# a months-old lerobot 0.5.1 resolution and hiding vla_jepa/molmoact2/lerobot.rl)
-# AND a dependency-confusion vector (whoever publishes robomimic 0.5.0 to PyPI
-# gets installed). A phantom `==` version differs from a nonexistent NAME, so the
-# name-existence audit missed it; check_pinned_versions_exist closes that gap.
-#
-# Separately, [vera-sim] pins gymnasium==0.29.1, mutually exclusive with
-# lerobot>=0.6.0 (gymnasium>=1.1.1). uv resolves all extras jointly, so absent a
-# fork declaration that pin drags the WHOLE resolution below lerobot 0.6. The
-# [tool.uv].conflicts entries fork vera-sim away from the lerobot-0.6 extras.
+# `robomimic==0.5.0` was once pinned in an evaluation extra, but robomimic's
+# highest PyPI release is 0.3.0 -- v0.5.0 exists only as an ARISE-Initiative
+# GitHub tag. The pin was thus unresolvable forever (it wedged `uv lock`,
+# freezing uv.lock at a months-old lerobot 0.5.1 resolution and hiding
+# vla_jepa/molmoact2/lerobot.rl) AND a dependency-confusion vector (whoever
+# publishes robomimic 0.5.0 to PyPI gets installed). A phantom `==` version
+# differs from a nonexistent NAME, so the name-existence audit missed it;
+# check_pinned_versions_exist closes that gap.
 
 
 def test_pinned_version_check_flags_phantom_version():
@@ -326,42 +324,6 @@ def test_pinned_version_check_ignores_ranges_and_inconclusive():
         )
         == []
     )
-
-
-def test_vera_sim_has_no_phantom_robomimic_pin():
-    """The live [vera-sim] extra must not pin robomimic (a phantom `==` version).
-
-    robomimic must be a source install (documented in the extra), never a PyPI
-    pin, so the unresolvable/confusion-prone `robomimic==0.5.0` cannot return.
-    """
-    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
-    vera_sim = data["project"]["optional-dependencies"]["vera-sim"]
-    offenders = [spec for spec in vera_sim if Requirement(spec).name == "robomimic"]
-    assert offenders == [], f"robomimic must not be a PyPI pin in [vera-sim]: {offenders}"
-
-
-def test_vera_sim_is_forked_away_from_lerobot06_extras():
-    """[tool.uv].conflicts must fork [vera-sim] from the lerobot-0.6 extras.
-
-    [vera-sim]'s gymnasium==0.29.1 is mutually exclusive with lerobot>=0.6.0
-    (gymnasium>=1.1.1). Without a conflict declaration uv resolves all extras
-    jointly and that single pin drags the whole lock below lerobot 0.6 (the
-    regression that froze uv.lock at lerobot 0.5.1). Each lerobot-0.6 extra must
-    be declared as conflicting with vera-sim so uv forks the resolution instead.
-    """
-    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
-    conflicts = data.get("tool", {}).get("uv", {}).get("conflicts", [])
-    forked = set()
-    for pair in conflicts:
-        extras = {member.get("extra") for member in pair}
-        if "vera-sim" in extras:
-            forked |= extras - {"vera-sim"}
-    for extra in ("lerobot", "lerobot-async", "molmoact2", "all"):
-        assert extra in forked, (
-            f"[tool.uv].conflicts must fork vera-sim from the '{extra}' extra so "
-            f"its gymnasium 0.29 pin cannot drag the lock below lerobot 0.6; "
-            f"forked pairs found: {sorted(forked)}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -476,14 +438,11 @@ def test_ik_install_hints_name_only_declared_extras() -> None:
     solver, so following it is sufficient.
     """
     from strands_robots.policies.cosmos3 import sim_ik as cosmos3_sim_ik
-    from strands_robots.policies.vera import sim_ik as vera_sim_ik
     from strands_robots.simulation import ik as shared_ik
 
     hints = {
         "shared install": shared_ik._DEFAULT_INSTALL_HINT,
         "shared no-backend": shared_ik._DEFAULT_NO_BACKEND_MSG,
-        "vera install": vera_sim_ik._install_hint(),
-        "vera no-backend": vera_sim_ik._NO_BACKEND_MSG,
         "cosmos3 install": cosmos3_sim_ik._install_hint(),
         "cosmos3 no-backend": cosmos3_sim_ik._NO_BACKEND_MSG,
     }
@@ -508,11 +467,8 @@ def test_ik_install_hints_name_only_declared_extras() -> None:
 # ---------------------------------------------------------------------------
 # Every extra a reader is told to install must be an extra that exists.
 #
-# History: docs/policies/vera.md led its install section with
-# ``pip install 'strands-robots[vera]'`` -- an extra that pyproject.toml explains
-# at length can never exist, because VERA ships only as a git repository and PyPI
-# rejects metadata carrying a VCS reference. A further site named ``[isaac]``
-# for what is really ``sim-isaac``.
+# History: a provider page led its install section with an extra that could never
+# exist, and a further site named ``[isaac]`` for what is really ``sim-isaac``.
 #
 # The failure mode is silent in the worst direction: pip does NOT fail on an
 # unknown extra, and on a current pip it no longer even warns. Measured on pip
@@ -541,8 +497,8 @@ def test_ik_install_hints_name_only_declared_extras() -> None:
 # this project's own docs names one of this project's extras by construction, so
 # the bare spelling is unambiguous there and is swept by
 # ``test_install_extra_table_columns_name_only_declared_extras`` below. The
-# policy catalogue is exactly such a column, and it is where the ``[vera]`` row in
-# the history above survived the page fix.
+# policy catalogue is exactly such a column, and it is where a stale row in the
+# history above survived the page fix.
 _EXTRA_MENTION_RE = re.compile(r"strands[-_]robots\[([^\]\s]+)\]")
 
 # A token that can be an extra name at all. Anything else caught by the mention
@@ -708,12 +664,16 @@ def _declared_dependency_floors() -> dict[str, str]:
 
 
 def _version_key(raw: str) -> tuple[int, ...]:
-    """Order a release string by its numeric components.
+    """Read a release string as its numeric components, in order.
 
-    ``numpy>=2`` and ``numpy>=1.21.0`` are both written in the tree, so the
-    comparison pads rather than requiring equal arity: ``2`` sorts above
-    ``1.21.0``. A non-numeric component ends the read (``2.*``, ``1.0rc1``),
-    which keeps a pre-release from sorting above the release it precedes.
+    A non-numeric component ends the read (``2.*``, ``1.0rc1``), which keeps a
+    pre-release from sorting above the release it precedes.
+
+    The tuple is only as long as the string has components, so two keys are
+    comparable only once padded to a common width, which
+    :func:`_names_a_lower_release` does. Comparing them raw orders a key below
+    every longer key it is a prefix of, and ``numpy>=2`` and ``numpy>=1.21.0``
+    are both written in the tree.
     """
     parts: list[int] = []
     for component in raw.split("."):
@@ -722,6 +682,26 @@ def _version_key(raw: str) -> tuple[int, ...]:
             break
         parts.append(int(digits.group()))
     return tuple(parts)
+
+
+def _names_a_lower_release(written: str, floor: str) -> bool:
+    """Whether ``written`` names a release below ``floor``.
+
+    PEP 440 reads an absent release component as zero, so ``1.21`` and
+    ``1.21.0`` are one release, and a bound written either way admits exactly
+    the same environments -- ``pip install "numpy>=1.21"`` refuses 1.20.99 just
+    as ``>=1.21.0`` does. Padding to a common width is what makes an
+    abbreviation compare equal to the floor it abbreviates; comparing the parsed
+    keys raw ordered ``(1, 21)`` below ``(1, 21, 0)``, which reported every
+    declared floor as undercut by its own shorter spelling.
+    """
+    written_key, floor_key = _version_key(written), _version_key(floor)
+    width = max(len(written_key), len(floor_key))
+
+    def padded(key: tuple[int, ...]) -> tuple[int, ...]:
+        return key + (0,) * (width - len(key))
+
+    return padded(written_key) < padded(floor_key)
 
 
 def _below_floor_bounds(text: str, floors: dict[str, str]) -> list[tuple[str, str, str]]:
@@ -733,17 +713,16 @@ def _below_floor_bounds(text: str, floors: dict[str, str]) -> list[tuple[str, st
 
     Returns:
         One entry per written bound sitting below the declared floor. A bound at
-        or above the floor is not reported: several sites state a stricter
-        requirement of their own on purpose (the VERA websocket client needs
-        ``numpy>=1.24``, the Cosmos 3 wire path ``numpy>=2``), and those are
-        correct rather than drifted.
+        or above the floor is not reported: a site may state a stricter
+        requirement of its own on purpose (the Cosmos 3 wire path needs
+        ``numpy>=2``), and that is correct rather than drifted.
     """
     stale: list[tuple[str, str, str]] = []
     for name, written in _WRITTEN_BOUND_RE.findall(text):
         floor = floors.get(_normalize_extra(name))
         if floor is None:
             continue
-        if _version_key(written) < _version_key(floor):
+        if _names_a_lower_release(written, floor):
             stale.append((name, written, floor))
     return stale
 
@@ -797,10 +776,21 @@ def test_written_version_bounds_are_not_below_the_declared_floor() -> None:
         # Below the floor: reported, with the floor it undercuts.
         ('pip install "strands-agents>=1.0"', [("strands-agents", "1.0", "1.7.0")]),
         ('pip install "strands-agents>=0.1"', [("strands-agents", "0.1", "1.7.0")]),
+        # Below the floor in a component the floor spells and the bound does
+        # not: the padding must not read the absent component as "no verdict".
+        ("pip install 'numpy>=1.20'", [("numpy", "1.20", "1.21.0")]),
         # At the floor, and above it: a stricter local requirement is correct.
         ('pip install "strands-agents>=1.7.0,<2.0.0"', []),
         ("pip install 'numpy>=1.24'", []),
         ("composes with numpy>=2", []),
+        # At the floor, written without its trailing zeros. PEP 440 reads the
+        # absent component as zero, so these name the floor itself rather than
+        # something below it.
+        ('pip install "strands-agents>=1.7"', []),
+        ("pip install 'numpy>=1.21'", []),
+        # And the same release spelled longer than the floor is not above it
+        # either, so it stays unreported for the same reason.
+        ("pip install 'numpy>=1.21.0.0'", []),
         # A distribution the manifest does not declare sets no floor to be below.
         ('pip install "gradio>=4,<7"', []),
         # A longer name is not read as a bound on its tail.
@@ -815,6 +805,41 @@ def test_the_written_bound_rule_can_both_accept_and_reject(line: str, expected: 
     """
     floors = {"strands-agents": "1.7.0", "numpy": "1.21.0"}
     assert _below_floor_bounds(line, floors) == expected
+
+
+def test_a_declared_floor_written_without_its_trailing_zeros_is_not_read_as_undercutting_itself() -> None:
+    """Every declared floor, abbreviated, must be read as that floor.
+
+    A release bound may be written without its trailing zeros -- ``numpy>=1.21``
+    and ``numpy>=1.21.0`` are one release under PEP 440, and pip resolves them
+    identically -- so prose and install lines across the tree spell floors both
+    ways. Reading the abbreviation as an undercut is a false report on the one
+    axis this sweep exists to police, and it fires on *every* declared
+    dependency rather than some unusual corner:
+
+        numpy: floor 1.21.0, written >=1.21 -> reported as below 1.21.0
+
+    The live manifest is the fixture so the cell cannot go stale against a floor
+    that gains or loses a component.
+    """
+    floors = _declared_dependency_floors()
+    assert floors, "no lower bound read from [project.dependencies]; the manifest reader has drifted"
+
+    graded = 0
+    for name, floor in floors.items():
+        components = floor.split(".")
+        # Drop trailing zero components one at a time: 1.21.0 -> 1.21, and
+        # 8.0.0 -> 8.0 -> 8. Each is the same release as the floor.
+        for width in range(len(components) - 1, 0, -1):
+            if any(part != "0" for part in components[width:]):
+                break
+            abbreviated = ".".join(components[:width])
+            graded += 1
+            assert _below_floor_bounds(f'pip install "{name}>={abbreviated}"', floors) == [], (
+                f"{name}>={abbreviated} names the declared floor {floor} itself, not a release below it"
+            )
+
+    assert graded >= len(floors), f"only {graded} abbreviations graded for {len(floors)} declared floors"
 
 
 # Headers that mean "the extra you install". A column merely containing the word
@@ -953,26 +978,6 @@ def test_the_install_extra_cell_rule_can_both_accept_and_reject() -> None:
         for _, name in _install_extra_cells("| Extra | Pulls in |\n|---|---|\n| `nope` | x |\n| `lerobot` | y |\n")
     }
     assert outcomes == {True, False}
-
-
-def test_the_policy_catalogue_names_no_vera_extra() -> None:
-    """VERA is the provider with no extra, so its row must not name one.
-
-    ``pyproject.toml`` says at length that a ``vera`` extra can never exist - it
-    would need a direct reference to the upstream git repository, which
-    ``test_pyproject_has_no_direct_reference_dependency`` separately forbids.
-    ``vera-sim`` exists and is a different thing: the gymnasium / robosuite
-    evaluation stack, declared in conflict with the lerobot extras, so it is not
-    the provider's install either.
-    """
-    extras = _declared_extras()
-    assert "vera" not in extras
-    assert "vera-sim" in extras
-    overview = (_REPO_ROOT / "docs" / "policies" / "overview.md").read_text(encoding="utf-8")
-    row = next(line for line in overview.splitlines() if line.startswith("| [`vera`]"))
-    cells = [cell.strip() for cell in row.strip("|").split("|")]
-    assert "`vera`" not in cells[2], f"the install-extra cell names an extra: {cells[2]!r}"
-    assert "none" in cells[2].lower(), f"the cell should say there is none: {cells[2]!r}"
 
 
 def test_require_optional_call_sites_name_declared_extras() -> None:
@@ -1154,10 +1159,10 @@ def test_environment_coverage_is_compatible_with_numba_robosuite() -> None:
 # rather than an override for a measured reason. A constraint bounds a version
 # and fails the resolution loudly when something genuinely requires less; an
 # override *replaces* the conflicting requirement and resolves in silence.
-# Measured on this manifest with ``gymnasium>=1.1.1``, which the ``[vera-sim]``
-# extra contradicts by pinning ``gymnasium==0.29.1``:
+# Measured on a manifest with ``gymnasium>=1.1.1`` against an extra that
+# contradicted it by pinning ``gymnasium==0.29.1``:
 #
-#   as a constraint -> `uv lock` exits 1: "Because strands-robots[vera-sim]
+#   as a constraint -> `uv lock` exits 1: "Because strands-robots[<extra>]
 #                      depends on gymnasium==0.29.1 and gymnasium>=1.1.1 ...
 #                      requirements are unsatisfiable"
 #   as an override  -> `uv lock` exits 0: "Updated gymnasium v0.29.1 -> v1.3.0"
@@ -1286,9 +1291,9 @@ def test_each_security_floor_names_the_advisory_it_clears() -> None:
 def test_the_security_floors_are_constraints_and_not_overrides() -> None:
     """These must bound the version, never replace the requirement.
 
-    An override silently discards a conflicting requirement - measured on this
-    manifest, ``gymnasium>=1.1.1`` as an override resolves cleanly while the
-    ``[vera-sim]`` extra's ``gymnasium==0.29.1`` is dropped without a word. As a
+    An override silently discards a conflicting requirement - measured on a
+    manifest carrying a ``gymnasium==0.29.1`` pin, ``gymnasium>=1.1.1`` as an
+    override resolves cleanly while that pin is dropped without a word. As a
     constraint the same floor fails the resolution and names the conflict. A
     security floor that hides "a dependency asked for a vulnerable version" has
     removed the signal it exists to raise.
@@ -1707,26 +1712,14 @@ def test_the_rclpy_refusals_name_the_step_that_supplies_it() -> None:
     """Both rclpy refusals must point at sourcing a distro, not at installing it.
 
     Asserted on the messages the two production sites really raise, with the
-    import forced to fail so the check holds whether or not the interpreter
-    running the suite happens to have a ROS 2 distro sourced.
+    import made to fail so the check holds whether or not the interpreter
+    running the suite has a ROS 2 distro sourced. That takes ``blocked``, not a
+    ``sys.meta_path`` finder: an import consults ``sys.modules`` first and only
+    reaches the finders when it misses, so a finder refusing ``rclpy`` is
+    bypassed entirely once anything in the session has imported it, and the
+    refusal under test never runs.
     """
-    from strands_robots import utils
-
-    class _BlockRclpy:
-        """Meta-path finder that makes ``import rclpy`` fail."""
-
-        def find_spec(self, name: str, path: object = None, target: object = None) -> None:
-            """Refuse ``rclpy`` and defer every other name to the real finders."""
-            if name == "rclpy" or name.startswith("rclpy."):
-                raise ImportError("rclpy blocked for this test")
-            return None
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(sys, "meta_path", [_BlockRclpy(), *sys.meta_path])
-        # A fresh cache, restored on exit: require_optional short-circuits on a
-        # module it has already resolved.
-        patch.setattr(utils, "_lazy_modules", {})
-
+    with blocked("rclpy"):
         from strands_robots.hardware_robot import Robot
         from strands_robots.ros_telemetry import RosTelemetryBridge
 

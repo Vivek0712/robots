@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import sys
 import time
 from typing import Any
 
@@ -29,6 +30,7 @@ from strands_robots.drivers.ur import (
     SERVOJ_GAIN,
     SERVOJ_LOOKAHEAD_TIME,
     URDriver,
+    _Rollout,
 )
 from tests.mocks.ur_rtde import (
     MEASURED_Q,
@@ -49,6 +51,29 @@ def _connected(fake: FakeRTDE, **kwargs: object) -> URDriver:
     return driver
 
 
+def _reachable_setpoint() -> dict[str, float]:
+    """A setpoint one step off the measured pose, so the step gate admits it."""
+    return {name: q + 0.001 for name, q in zip(JOINT_NAMES, MEASURED_Q, strict=True)}
+
+
+def _rollout(driver: URDriver, policy: Any) -> _Rollout:
+    """One rollout the test starts itself, so a stop can be placed exactly.
+
+    ``run_policy`` owns the thread it starts, which is what the cells above
+    drive. Two of the loop's exits are decided in the window between a stop and
+    the next setpoint, and placing a stop inside that window needs a reference
+    to the rollout before it runs.
+    """
+    return _Rollout(
+        driver=driver,
+        policy=policy,
+        instruction="",
+        duration=30.0,
+        n_steps=None,
+        period=1.0 / 200.0,
+    )
+
+
 class TestConnecting:
     """Reachability, and the mode interrogation that decides usability."""
 
@@ -62,6 +87,53 @@ class TestConnecting:
         driver = _connected(fake_rtde)
         assert driver.connect_eagerly() is None
         assert len(fake_rtde.controls) == 1, "a second connect must not open a second interface"
+
+    def test_a_controller_that_does_not_answer_the_receive_side_is_reported_by_address(
+        self, monkeypatch: pytest.MonkeyPatch, fake_rtde: FakeRTDE
+    ) -> None:
+        """An unreachable controller is a reason the caller can read, not a traceback.
+
+        The control side is not dialled at all: the receive interface is what
+        decides reachability, so a failure there ends the attempt.
+        """
+
+        def refuse(host: str, frequency: float | None = None) -> object:
+            raise OSError(f"no route to {host}")
+
+        monkeypatch.setattr("rtde_receive.RTDEReceiveInterface", refuse)
+        driver = URDriver(tool_name="ur5e", port=HOST)
+
+        reason = driver.connect_eagerly()
+
+        assert reason is not None
+        assert "did not answer RTDE receive" in reason
+        assert HOST in reason and "no route to" in reason
+        assert not driver.is_connected
+        assert fake_rtde.controls == [], "an arm that did not answer must not be dialled for control"
+
+    def test_a_control_side_that_refuses_releases_the_receive_side_it_opened(
+        self, monkeypatch: pytest.MonkeyPatch, fake_rtde: FakeRTDE
+    ) -> None:
+        """The half-open attempt is closed rather than left on the controller.
+
+        The receive interface is only recorded on the driver once BOTH sides
+        open, so one left connected here is unreachable afterwards: the driver
+        reports not-connected, and ``cleanup`` releases what it recorded.
+        """
+
+        def refuse(host: str, frequency: float | None = None) -> object:
+            raise OSError("control port busy")
+
+        monkeypatch.setattr("rtde_control.RTDEControlInterface", refuse)
+        driver = URDriver(tool_name="ur5e", port=HOST)
+
+        reason = driver.connect_eagerly()
+
+        assert reason is not None
+        assert "did not answer RTDE control" in reason
+        assert "control port busy" in reason
+        assert not driver.is_connected
+        assert fake_rtde.receive.disconnected, "the receive interface this attempt opened must be released"
 
     def test_a_protective_stopped_controller_is_refused_before_control_opens(
         self, monkeypatch: pytest.MonkeyPatch, fake_rtde: FakeRTDE
@@ -313,6 +385,85 @@ class TestRollingOutAPolicy:
         assert envelope["status"] == "error"
         assert quoted in text_of(envelope)
 
+    def test_a_wall_clock_budget_ends_the_rollout_when_the_clock_runs_out(self, fake_rtde: FakeRTDE) -> None:
+        """``duration`` is an exit reason of its own, and not a refusal.
+
+        A rollout given no step budget ends on its clock, and an operator
+        polling the status has to be able to tell that from the arm turning a
+        setpoint away.
+        """
+        driver = _connected(fake_rtde, control_frequency=200.0)
+
+        def hold(observation: dict[str, float]) -> dict[str, float]:
+            return {"elbow_joint": observation["elbow_joint"]}
+
+        assert driver.run_policy(hold, duration=0.05)["status"] == "success"
+        _wait_for_exit(driver)
+
+        snapshot = json_of(driver.get_task_status())
+        assert snapshot["exit_reason"] == "duration"
+        assert snapshot["refusal"] is None, "a budget that ran out is not a refusal"
+        assert snapshot["steps"] >= 1, "the loop must step before its clock runs out"
+
+    def test_a_policy_that_raises_ends_the_rollout_naming_the_exception(self, fake_rtde: FakeRTDE) -> None:
+        """A policy fault is reported, and it does not reach the wire.
+
+        The loop catches it broadly on purpose - a policy's exceptions are not
+        enumerable - so the class and the message are what identify the fault to
+        whoever polls the status.
+        """
+        driver = _connected(fake_rtde, control_frequency=200.0)
+
+        def boom(observation: dict[str, float]) -> dict[str, float]:
+            raise RuntimeError("the planner lost its goal")
+
+        assert driver.run_policy(boom, n_steps=3)["status"] == "success"
+        _wait_for_exit(driver)
+
+        snapshot = json_of(driver.get_task_status())
+        assert snapshot["exit_reason"] == "policy"
+        assert "RuntimeError" in snapshot["refusal"]
+        assert "the planner lost its goal" in snapshot["refusal"]
+        assert snapshot["steps"] == 0
+        assert fake_rtde.control.servoj_calls == [], "a policy that raised commanded nothing"
+
+    def test_a_rollout_stopped_before_its_first_step_commands_nothing(self, fake_rtde: FakeRTDE) -> None:
+        """The stop is read at the top of the loop, before the first setpoint."""
+        driver = _connected(fake_rtde, control_frequency=200.0)
+        rollout = _rollout(driver, lambda observation: _reachable_setpoint())
+
+        rollout.request_stop()
+        rollout.start()
+
+        assert rollout.join(5.0), "the loop did not exit"
+        snapshot = rollout.snapshot()
+        assert snapshot["exit_reason"] == "stopped"
+        assert snapshot["steps"] == 0
+        assert fake_rtde.control.servoj_calls == [], "a stopped rollout must not write one setpoint first"
+
+    def test_a_stop_during_a_write_ends_the_rollout_at_that_tick(self, fake_rtde: FakeRTDE) -> None:
+        """The setpoint already going out is the last one - the tick does not write again.
+
+        The stop is armed from the rollout thread one statement before
+        ``send_action``, so it lands past the loop's pre-write re-read and inside
+        the mode gate's round trip: the write completes and is counted, and the
+        pacing tick answers the stop instead of pacing another step.
+        """
+        driver = _connected(fake_rtde, control_frequency=200.0)
+
+        def policy(observation: dict[str, float]) -> dict[str, float]:
+            fake_rtde.receive.on_next_mode_read = rollout.request_stop
+            return _reachable_setpoint()
+
+        rollout = _rollout(driver, policy)
+        rollout.start()
+
+        assert rollout.join(5.0), "the loop did not exit"
+        snapshot = rollout.snapshot()
+        assert snapshot["exit_reason"] == "stopped"
+        assert snapshot["steps"] == 1, "the setpoint already on the wire is counted"
+        assert len(fake_rtde.control.servoj_calls) == 1, "the tick after a stop must not command another step"
+
 
 class TestStopping:
     """The halt paths, and what they report."""
@@ -542,3 +693,84 @@ def _wait_for_exit(driver: URDriver, timeout: float = 5.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("the rollout did not finish within its budget")
+
+
+def _refused_for_the_axis_count(envelope: dict[str, Any]) -> bool:
+    """Whether this envelope is the axis-count refusal, rather than any error."""
+    return envelope["status"] == "error" and "six-axis" in text_of(envelope)
+
+
+def _reason_without_the_verb(envelope: dict[str, Any]) -> str:
+    """The refusal text with the leading ``<verb>: `` prefix dropped."""
+    return text_of(envelope).split(": ", 1)[1]
+
+
+class TestTheAxisCountRuleHoldsOnEverySurface:
+    """A controller whose vectors are not six wide is refused by every verb.
+
+    ``joints`` and ``joint_velocities`` are named by zipping the controller's
+    answer against :data:`JOINT_NAMES`, so a width that is not six cannot be
+    named: a shorter vector loses its last joints and a longer one has the
+    extra element truncated away. That second case is the one that cannot be
+    recognised afterwards - six named joints from a seven-axis read are
+    byte-identical in shape to a genuine six-axis read - which is why the read
+    surfaces have to answer it the same way the command path does.
+    """
+
+    @pytest.mark.parametrize("axes", [5, 6, 7])
+    def test_the_read_and_the_command_path_refuse_the_same_controllers(self, fake_rtde: FakeRTDE, axes: int) -> None:
+        """One controller, one verdict - whichever verb asks it."""
+        driver = _connected(fake_rtde)
+        fake_rtde.receive.q = [0.1 * (index + 1) for index in range(axes)]
+
+        by_state = _refused_for_the_axis_count(driver.state())
+        by_command = _refused_for_the_axis_count(driver.send_action({"elbow_joint": 0.1}))
+
+        assert by_state == by_command == (axes != 6)
+
+    def test_both_verbs_state_the_rule_in_the_same_words(self, fake_rtde: FakeRTDE) -> None:
+        """One rule, so one sentence - not two that can drift apart."""
+        driver = _connected(fake_rtde)
+        fake_rtde.receive.q = [0.0] * 7
+
+        assert _reason_without_the_verb(driver.state()) == _reason_without_the_verb(
+            driver.send_action({"elbow_joint": 0.1})
+        )
+
+    def test_a_truncated_read_is_not_published_as_the_arms_pose(self, fake_rtde: FakeRTDE) -> None:
+        """The mesh keeps the last pose it could name, not six of seven joints."""
+        driver = _connected(fake_rtde)
+        assert driver.get_observation() == dict(zip(JOINT_NAMES, MEASURED_Q, strict=True))
+        fake_rtde.receive.q = [9.0] * 7
+
+        assert driver.state()["status"] == "error"
+        assert driver.get_observation() == dict(zip(JOINT_NAMES, MEASURED_Q, strict=True))
+
+    def test_a_wrong_width_from_the_first_read_publishes_no_joints(
+        self, fake_rtde: FakeRTDE, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Priming on connect must not seed the mesh with an unnameable read."""
+        module = sys.modules["rtde_receive"]
+        build = module.RTDEReceiveInterface
+
+        def seven_axis(host: str, frequency: float | None = None) -> Any:
+            interface = build(host, frequency)
+            interface.q = [9.0] * 7
+            return interface
+
+        monkeypatch.setattr(module, "RTDEReceiveInterface", seven_axis)
+        driver = URDriver(tool_name="ur5e", port=HOST)
+        assert driver.connect_eagerly() is None
+
+        assert driver.get_observation() == {}
+
+    def test_the_velocity_register_is_held_to_the_same_rule(self, fake_rtde: FakeRTDE) -> None:
+        """A velocity vector disagreeing with the position one is not reported."""
+        driver = _connected(fake_rtde)
+        fake_rtde.receive.qd = [0.0] * 5
+
+        envelope = driver.state()
+
+        assert envelope["status"] == "error"
+        assert "5 joint velocities" in text_of(envelope)
+        assert "six-axis" in text_of(envelope)

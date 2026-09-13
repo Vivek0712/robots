@@ -272,7 +272,13 @@ are clamped to `max_speed`; holds longer
 than `max_duration` are rejected loudly rather than silently truncated. The
 `linear`/`angular`/`duration`/`count` values themselves are checked against the
 same shared domains the differential-drive bridges use, so an unusable value is
-refused with identical text on every transport. The
+refused with identical text on every transport. A pair the steering geometry
+cannot execute is refused for the same reason: below the rest threshold
+(1e-3 m/s) the bicycle model maps any command to the zero servo pair, so
+`drive(linear=0.0, angular=1.0)` - a rotate in place, which this platform cannot
+do - would otherwise leave as byte-identical to `stop()` and report success for a
+heading change that never happened. Give a turn a linear speed to travel at, or
+call `stop()`; `drive(0, 0)` still means rest, because that is what it asked for. The
 stock platform publishes no odometry, so there is deliberately no
 `get_pose`.
 
@@ -310,7 +316,7 @@ internal `rclpy` node that publishes, per robot, after every `step()`:
 | Topic | Type | Content |
 |-------|------|---------|
 | `/<robot>/joint_states` | `sensor_msgs/msg/JointState` | joint names + positions |
-| `/<robot>/<camera>/image_raw` | `sensor_msgs/msg/Image` (`rgb8`) | one frame per attached camera |
+| `/<robot>/<camera>/image_raw` | `sensor_msgs/msg/Image` (`rgb8`) | one frame per attached camera. `<robot>`/`<camera>` are sanitised into ROS 2 name tokens, so a camera named `0` publishes on `/<robot>/camera_0/image_raw` - ROS 2 forbids a token starting with a digit |
 
 ```python
 from strands_robots.simulation import Simulation
@@ -392,7 +398,9 @@ arm_ro = Robot("so101", mode="real", ros2_bridge=True, ros2_commands=False)
 
 # rclpy-free: run the SAME bridge over pure cyclonedds (no sourced ROS 2
 # distro). Byte-identical topics; type coverage bounded by the IDL bundle.
-arm_rtps = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps")
+# Telemetry-only: on this transport the inbound command surface refuses to
+# start without a dds_security_config or the explicit opt-out (see below).
+arm_rtps = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps", ros2_commands=False)
 ```
 
 External ROS 2 nodes - rviz, nav2, or the agent's own `use_ros` calls - then see
@@ -417,6 +425,16 @@ be driven. Only a boolean names either posture - `ros2_bridge` and
 `"false"` is refused rather than reading as the truthy value it is and opening
 the surface it asks to close. A daemon thread spins the node so inbound commands are serviced
 concurrently with publishing, and it is torn down cleanly on `cleanup()`/`stop()`.
+That teardown is best-effort: a node destroyed on a context another
+component already shut down is reported at WARNING and `cleanup()` carries
+on to disconnect the motors bus and the cameras, because a bridge that will
+not release must not leave the serial port held or the arm energised. The same
+rule holds one level in, where the bridge releases two things - its node handle
+and, when it was this bridge that called `rclpy.init()`, the process-wide
+context: a failure releasing one no longer skips the other, so a node that
+refuses to be destroyed does not leave the participant on the domain for the
+life of the process. A context that itself refuses to shut down is logged at
+warning, because nothing after it retries.
 
 Because the inbound `joint_command` topic drives the physical arm, two guards
 harden it (both threaded through `Robot()`):

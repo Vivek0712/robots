@@ -62,10 +62,12 @@ from typing import Any
 
 import numpy as np
 
+from strands_robots.locomotion_envelope import target_velocity_component_error
+from strands_robots.policies._log_safety import sanitize_log_value
 from strands_robots.policies.base import Policy
-from strands_robots.utils import finite_number_error, require_optional, sequence_length
+from strands_robots.utils import boolean_flag_error, finite_number_error, require_optional, sequence_length
 
-from .config import WBCConfig
+from .config import _DEFAULT_CMD_SCALE, WBCConfig
 from .control import compute_targets, pd_control, projected_gravity
 from .observation import ObservationHistory, build_single_frame
 
@@ -190,7 +192,11 @@ class WBCPolicy(Policy):
             directory.
         walk: When ``True`` (default) load and prefer the walk policy
             (``walk_policy_path``) for forward locomotion. When ``False`` only
-            the main policy is loaded/used.
+            the main policy is loaded/used. A boolean, checked rather than read
+            by truthiness - it selects a posture rather than scaling a
+            quantity, so a truthy spelling of off (``"false"``, ``"no"``,
+            ``"0"``) is refused rather than selecting the locomotion posture
+            the word asks to skip.
         target_velocity: Optional constructor-time default locomotion command
             ``[vx, vy, omega]`` (m/s, m/s, rad/s). Used when a call supplies no
             ``target_velocity`` kwarg - this is how a *static* walk works
@@ -202,7 +208,12 @@ class WBCPolicy(Policy):
             construction. Assignment is the only route: ``**kwargs`` below
             absorbs unknown keywords, so a session passed to this constructor is
             dropped. Production callers leave this ``False`` so a missing
-            checkpoint fails loudly at construction.
+            checkpoint fails loudly at construction. Checked with
+            :func:`~strands_robots.utils.boolean_flag_error` like ``walk``: it
+            selects a posture, and read by truthiness a string spelling of
+            ``False`` selected the seam, so the eager load the caller asked for
+            was skipped and the missing checkpoint surfaced only at the first
+            ``get_actions`` - as a refusal advising the value they had passed.
         **kwargs: Forward-compatibility absorber for the smart-string / registry
             resolution path. Per the #300 contract, providers MUST ignore
             unknown kwargs rather than raising.
@@ -210,7 +221,8 @@ class WBCPolicy(Policy):
     Raises:
         RuntimeError: If ``onnxruntime`` is missing, or a checkpoint file is
             absent, when ``allow_missing_models`` is ``False``.
-        ValueError: If the resolved config dimensions are inconsistent.
+        ValueError: If ``walk`` or ``allow_missing_models`` is not a boolean,
+            or the resolved config dimensions are inconsistent.
     """
 
     def __init__(
@@ -222,7 +234,19 @@ class WBCPolicy(Policy):
         allow_missing_models: bool = False,
         **kwargs: Any,
     ) -> None:
-        self._walk = bool(walk)
+        # Checked rather than coerced with bool(): the two values select
+        # postures - load and prefer the walk policy, or run the balance policy
+        # alone - and bool() is where "false", a spelling of the balance-only
+        # posture, became the locomotion one. See boolean_flag_error.
+        if error := boolean_flag_error(walk, "walk", "WBCPolicy"):
+            raise ValueError(error)
+        # Same domain for the seam flag in the same signature. Read by
+        # truthiness, "false" took the `allow_missing_models` branch below, so
+        # the eager load this spelling asks for was skipped and the refusal
+        # arrived one call later, naming the value the caller had passed.
+        if error := boolean_flag_error(allow_missing_models, "allow_missing_models", "WBCPolicy"):
+            raise ValueError(error)
+        self._walk = walk
         self._robot_state_keys: list[str] = []
         self._warned_no_velocity = False
         self._default_command = self._validate_velocity(target_velocity) if target_velocity is not None else None
@@ -412,7 +436,10 @@ class WBCPolicy(Policy):
         """
         self._history.reset()
         self._prev_action = np.zeros(self._config.num_actions, dtype=np.float64)
-        logger.debug("WBCPolicy.reset: cleared observation history + prev_action (seed=%r)", seed)
+        logger.debug(
+            "WBCPolicy.reset: cleared observation history + prev_action (seed=%s)",
+            sanitize_log_value(repr(seed)),
+        )
 
     async def get_actions(
         self, observation_dict: dict[str, Any], instruction: str, **kwargs: Any
@@ -523,10 +550,8 @@ class WBCPolicy(Policy):
         command = np.zeros(c, dtype=np.float64)
 
         # Slots [0:3]: velocity * cmd_scale (clamp the slice to whatever fits).
-        cmd_scale = np.asarray(self._config.cmd_scale, dtype=np.float64).ravel()
         n_vel = min(3, c)
-        scale = cmd_scale[:n_vel] if cmd_scale.shape[0] >= n_vel else np.ones(n_vel)
-        command[:n_vel] = raw_velocity[:n_vel] * scale
+        command[:n_vel] = raw_velocity[:n_vel] * self._velocity_scale(n_vel)
 
         # Slot [3]: target base height (per-call ``height`` overrides the config).
         if c > 3:
@@ -546,6 +571,45 @@ class WBCPolicy(Policy):
             command[4 : 4 + n_rpy] = rpy[:n_rpy]
 
         return command, raw_velocity
+
+    def _velocity_scale(self, n_vel: int) -> np.ndarray:
+        """Resolve the first ``n_vel`` components of the ``cmd_scale`` factor.
+
+        A component the config does not supply resolves from
+        :data:`~strands_robots.policies.wbc.config._DEFAULT_CMD_SCALE` - this
+        module's single owner of the upstream velocity scale - and not from a
+        bare ``1.0``, for the reason
+        :func:`~strands_robots.policies.wbc.observation.build_single_frame`
+        resolves an omitted ``obs_scales`` key from ``_DEFAULT_OBS_SCALES``: a
+        second fallback number scales the command block by something no table
+        states. Here that lands hardest on ``omega``, whose documented scale is
+        ``0.5``, so a unit fallback commands a yaw rate DOUBLE the one asked for
+        while ``vx``/``vy`` arrive halved - a wrong command rather than an error,
+        in the observation's first ``command_dim`` entries, which a dense network
+        carries to all ``num_actions`` joint targets.
+
+        :meth:`WBCConfig.__post_init__` completes an empty ``cmd_scale`` from the
+        same table, so a config built through it states every component and this
+        resolution is the identity. It is what answers for a config object
+        assembled AROUND that constructor - the input class the sibling fallback
+        in ``build_single_frame`` exists for.
+
+        Shared with :meth:`WBCGaitPolicy._resolve_command`, whose command block
+        scales the same velocity triple, so the two blocks cannot be built with
+        different scales.
+
+        Args:
+            n_vel: How many velocity components the command block has room for.
+                At most three, the width of the scale table.
+
+        Returns:
+            An ``(n_vel,)`` float64 array of scale factors.
+        """
+        cmd_scale = np.asarray(self._config.cmd_scale, dtype=np.float64).ravel()
+        return np.array(
+            [cmd_scale[i] if i < cmd_scale.shape[0] else _DEFAULT_CMD_SCALE[i] for i in range(n_vel)],
+            dtype=np.float64,
+        )
 
     def _extract_state(self, observation_dict: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Pull (qj, dqj, base_ang_vel, base_quat) out of the observation dict.
@@ -1024,7 +1088,16 @@ class WBCPolicy(Policy):
 
     @staticmethod
     def _validate_velocity(tv: Any) -> np.ndarray:
-        """Validate a ``[vx, vy, omega]`` locomotion command (finite, len>=3)."""
+        """Validate a ``[vx, vy, omega]`` locomotion command (finite, len>=3, in envelope).
+
+        Every component is held to :mod:`strands_robots.locomotion_envelope`
+        - the bound the mesh applies before dispatch - so a caller that reaches
+        this policy without the mesh (a local script, a future hardware
+        dispatch that forwards ``policy_kwargs``) meets the same refusal
+        (F-005). Refused, not clamped: the value is multiplied by
+        ``cmd_scale`` straight into the observation, and a clamped sprint is
+        still a command the caller did not make.
+        """
         try:
             arr = np.asarray(tv, dtype=np.float64).ravel()
         except (TypeError, ValueError) as e:
@@ -1034,6 +1107,8 @@ class WBCPolicy(Policy):
         for i, v in enumerate(arr):
             if math.isnan(v) or math.isinf(v):
                 raise ValueError(f"target_velocity[{i}]={v!r} must be finite")
+            if error := target_velocity_component_error(i, float(v), "WBCPolicy"):
+                raise ValueError(error)
         return arr
 
     @staticmethod

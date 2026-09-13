@@ -57,9 +57,172 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from strands_robots.utils import non_negative_count_error
+from strands_robots.utils import declared_count, non_negative_count_error
 
 logger = logging.getLogger(__name__)
+
+
+def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
+    """Read episode-level ground truth from a LeRobot v3 dataset on disk.
+
+    Parses every ``meta/episodes/**/*.parquet`` file under ``root`` and returns
+    the recorded episode index set plus per-episode frame counts. This is the
+    parquet source of truth used by :meth:`~strands_robots.simulation.base.SimEngine.verify_dataset_episodes`
+    to confirm a recording session produced the number of distinct episodes the
+    caller intended (rather than one merged ``episode_index=0`` mega-episode).
+
+    Pure ``pyarrow`` read - it does NOT import ``lerobot`` or instantiate a
+    ``LeRobotDataset`` (which would re-validate/scan the whole dataset). Reads
+    only the lightweight episode metadata parquet.
+
+    Args:
+        root: Dataset root directory (the dir that contains ``meta/``).
+
+    Returns:
+        Dict with:
+          - ``episode_indices``: sorted list of distinct ``episode_index`` values.
+          - ``total_episodes``: number of distinct episodes (``len`` of above).
+          - ``total_frames``: sum of per-episode ``length`` (0 if unavailable).
+            A dataset whose episodes all recorded 0 frames also sums to 0, so
+            read ``frames_per_episode`` to tell "no lengths" from "no frames".
+          - ``frames_per_episode``: per-episode frame counts aligned to
+            ``episode_indices``. Empty when no episode carried a usable
+            ``length`` (the column is absent, or every value is null); a
+            recorded ``0`` is a frame count and is reported as one.
+          - ``info_total_episodes``: the ``total_episodes`` recorded in
+            ``meta/info.json`` (``None`` if that file is absent or unreadable, or
+            if it declares no usable count - see ``info_problems``). Returned
+            alongside the parquet truth so callers can cross-check the two
+            metadata sources for agreement - a healthy dataset has
+            ``info_total_episodes == total_episodes``.
+          - ``info_problems``: one message per ``meta/info.json`` declaration
+            that is present but is not a count (empty list for a healthy
+            dataset). A cross-check must fail on these rather than read the
+            ``None`` count as an absent header, which is agreement.
+          - ``unreadable_files``: ``"<path relative to root>: <error>"`` for
+            every ``meta/episodes`` parquet that could not be read (empty list
+            for a healthy dataset). A partially-corrupt dataset - one truncated
+            file out of twenty, the usual outcome of an interrupted sync or hub
+            download - still yields the episode truth of the readable files, so
+            callers can localise the damage instead of seeing zero episodes.
+            The episode counts above cover ONLY the readable files, so any
+            non-empty ``unreadable_files`` means the totals are a lower bound
+            and the dataset must not be certified as complete.
+
+    Raises:
+        ImportError: If ``pyarrow`` is not installed.
+        FileNotFoundError: If no ``meta/episodes`` parquet exists under ``root``
+            (no episode was ever flushed - the dataset is empty/unfinalized).
+        ValueError: If every ``meta/episodes`` parquet is unreadable, so there
+            is no episode ground truth at all. The message lists each file and
+            its read error.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as e:  # pragma: no cover - pyarrow ships with lerobot
+        raise ImportError("read_dataset_episode_indices requires pyarrow (installed with the lerobot extra).") from e
+
+    root_path = Path(root)
+    parquet_files = sorted((root_path / "meta" / "episodes").glob("**/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"No meta/episodes parquet under {root_path}. The dataset is empty or was "
+            "never finalized (episodes are flushed to parquet at stop_recording/finalize)."
+        )
+
+    pairs: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    unreadable_files: list[str] = []
+    readable_files = 0
+    saw_length = False
+    for pf in parquet_files:
+        # A corrupt / truncated / foreign parquet raises ArrowInvalid (a
+        # ValueError subclass); an unreadable one raises OSError. Damage is
+        # usually confined to a few files (interrupted rsync, partial hub
+        # download), so record which file failed and keep reading the rest -
+        # aborting the whole read here would report zero episodes for a dataset
+        # that is mostly intact and hide which file is actually broken.
+        try:
+            table = pq.read_table(pf)
+        except (ValueError, OSError) as e:
+            unreadable_files.append(f"{pf.relative_to(root_path)}: {e}")
+            continue
+        readable_files += 1
+        cols = table.column_names
+        if "episode_index" not in cols:
+            continue
+        data = table.to_pydict()
+        ep_indices = data["episode_index"]
+        lengths = data.get("length")
+        for i, ep in enumerate(ep_indices):
+            ep_int = int(ep)
+            if ep_int in seen:
+                continue
+            seen.add(ep_int)
+            recorded = lengths[i] if lengths is not None else None
+            saw_length = saw_length or recorded is not None
+            length = int(recorded) if recorded is not None else 0
+            pairs.append((ep_int, length))
+
+    if unreadable_files and readable_files == 0:
+        # Nothing readable at all: there is no ground truth to return, so this
+        # is a hard read failure rather than a partial one.
+        detail = "; ".join(unreadable_files)
+        raise ValueError(f"No readable meta/episodes parquet under {root_path}: {detail}")
+
+    pairs.sort(key=lambda p: p[0])
+    episode_indices = [p[0] for p in pairs]
+    frames_per_episode = [p[1] for p in pairs]
+    # Availability is whether a length was READ, not whether one was positive.
+    # A recorded 0 is a frame count - it is the zero-length episode
+    # verify_dataset's check 2 exists to flag - so scoring availability as
+    # ``any(f > 0 ...)`` reported the dataset whose every episode is empty as
+    # the dataset that carries no lengths at all, and that check reads an empty
+    # list as "nothing to compare" and does not run. The report was therefore
+    # non-monotonic in the damage: ``[5, 0, 0]`` named its two empty episodes
+    # while ``[0, 0, 0]`` passed. A column that is present but wholly null
+    # stays unavailable - a null length is unknown, not zero.
+
+    # Read meta/info.json total_episodes as a second, independent metadata
+    # source. A healthy LeRobot dataset has info.json.total_episodes equal to
+    # the distinct episode count in the parquet; a mismatch means the dataset
+    # is internally inconsistent (e.g. an interrupted finalize), which
+    # verify_dataset_episodes surfaces. Absent/corrupt info.json -> None (the
+    # parquet remains the ground truth and is still reported).
+    # The declared count is graded by its one owner (``declared_count``) rather
+    # than coerced here. A header that declares something which is NOT a count is
+    # a third outcome, distinct from both a matching count and an absent header,
+    # so it is reported in ``info_problems`` instead of collapsing into the
+    # absent case - which a cross-check reads as agreement, the parquet being the
+    # sole truth then. Coercing instead was silently destructive both ways:
+    # ``int(2.5)`` is ``2``, the very count a two-episode parquet holds, and
+    # ``int(1e400)`` raises ``OverflowError`` out of this documented "unknown".
+    info_total_episodes: int | None = None
+    info_problems: list[str] = []
+    info_path = root_path / "meta" / "info.json"
+    if info_path.is_file():
+        try:
+            with info_path.open(encoding="utf-8") as f:
+                raw_total = json.load(f)["total_episodes"]
+        except (OSError, ValueError, KeyError, TypeError):
+            # Absent key, or a file no reader can parse: the documented unknown,
+            # indistinguishable from an absent header, and reported by
+            # verify_dataset's own meta/info.json check.
+            pass
+        else:
+            info_total_episodes = declared_count(raw_total)
+            if info_total_episodes is None:
+                info_problems.append(f"meta/info.json total_episodes={raw_total!r} is not an episode count")
+
+    return {
+        "episode_indices": episode_indices,
+        "total_episodes": len(episode_indices),
+        "total_frames": sum(frames_per_episode) if saw_length else 0,
+        "frames_per_episode": frames_per_episode if saw_length else [],
+        "info_total_episodes": info_total_episodes,
+        "info_problems": info_problems,
+        "unreadable_files": unreadable_files,
+    }
 
 
 def verify_dataset(
@@ -72,7 +235,7 @@ def verify_dataset(
     """Verify the episode integrity of a LeRobot dataset on disk.
 
     Reads the canonical ``meta/episodes/**/*.parquet`` (via
-    :func:`strands_robots.dataset_recorder.read_dataset_episode_indices`) and,
+    :func:`read_dataset_episode_indices`) and,
     when present, ``meta/info.json``, then runs the integrity checks described
     in the module docstring.
 
@@ -112,8 +275,6 @@ def verify_dataset(
             ``check_stats`` is False or the dataset carries no stats).
           - ``problems``: list of human-readable failure strings (empty on pass).
     """
-    from strands_robots.dataset_recorder import read_dataset_episode_indices
-
     root_path = Path(root)
     report: dict[str, Any] = {
         "status": "error",
@@ -211,17 +372,32 @@ def verify_dataset(
             declared = json.loads(info_json_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             problems.append(f"could not read meta/info.json: {e}")
-        decl_eps = declared.get("total_episodes")
-        decl_frames = declared.get("total_frames")
+        # Both headers are graded by their one owner rather than an inline type
+        # test, and a declaration that is not a count is REPORTED rather than
+        # passed over: a header no writer could have produced is exactly the
+        # metadata drift this check exists to find, and the inline test skipped
+        # it silently (``true`` even compared equal to a one-episode parquet).
+        raw_eps = declared.get("total_episodes")
+        raw_frames = declared.get("total_frames")
+        decl_eps = declared_count(raw_eps)
+        decl_frames = declared_count(raw_frames)
         report["info_total_episodes"] = decl_eps
         report["info_total_frames"] = decl_frames
-        if isinstance(decl_eps, int) and decl_eps != info["total_episodes"]:
+        for key, raw, decl in (("total_episodes", raw_eps, decl_eps), ("total_frames", raw_frames, decl_frames)):
+            if key in declared and decl is None:
+                problems.append(f"meta/info.json {key}={raw!r} is not a count - metadata is corrupt")
+        if decl_eps is not None and decl_eps != info["total_episodes"]:
             problems.append(
                 f"meta/info.json total_episodes={decl_eps} disagrees with parquet "
                 f"({info['total_episodes']} distinct episode(s)) - metadata/parquet drift"
             )
-        # Frame totals only meaningful when parquet carries per-episode lengths.
-        if isinstance(decl_frames, int) and info["total_frames"] and decl_frames != info["total_frames"]:
+        # Frame totals only meaningful when parquet carries per-episode lengths,
+        # and that availability is ``frames_per_episode`` rather than the total
+        # being non-zero: a parquet whose every episode recorded 0 frames sums
+        # to 0, so gating on the total read the worst dataset in this class as
+        # one carrying no lengths and dropped the comparison on exactly the
+        # header that claims frames the dataset does not hold.
+        if decl_frames is not None and info["frames_per_episode"] and decl_frames != info["total_frames"]:
             problems.append(
                 f"meta/info.json total_frames={decl_frames} disagrees with parquet ({info['total_frames']} frame(s))"
             )
@@ -334,9 +510,17 @@ def _verify_video_files(root_path: Path, *, known_unreadable: frozenset[str] = f
         return 0, []
     try:
         info = json.loads(info_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         # An unreadable info.json is already surfaced by the info.json drift
-        # check; do not double-report it here.
+        # check; do not double-report it here. "Unreadable" is that check's
+        # ``ValueError`` and not the narrower ``json.JSONDecodeError``, because
+        # reading this file has more ways to fail than holding something that is
+        # not JSON: bytes the declared encoding does not describe raise
+        # ``UnicodeDecodeError``, and a number longer than
+        # ``sys.get_int_max_str_digits`` raises a plain ``ValueError``. Both are
+        # exactly the truncated / partially-synced file this checker exists to
+        # report, and naming only the JSON one aborted the whole report - every
+        # problem already found included - on the corruption it was looking for.
         return 0, []
 
     features = info.get("features")

@@ -39,7 +39,22 @@ observation vector from named `get_observation` keys and the step reward from
 any reward terms you pass (each a `Callable[[SimEngine], float]`). It uses the holosoma
 `actor_obs_keys` / `critic_obs_keys` split: the actor sees only deployable
 observations, while the critic may additionally see privileged simulation-only
-keys (asymmetric actor-critic).
+keys (asymmetric actor-critic). The critic observation is `actor_obs_keys`
+followed by each `critic_obs_keys` entry not already among them, so naming a
+privileged key adds to what the critic sees rather than replacing it, repeating
+an actor key adds nothing, and both `None` and `[]` leave the critic symmetric:
+
+```python
+env = SimEnv(
+    engine,
+    actor_obs_keys=["Elbow", "Elbow.vel"],   # what the deployed policy sees
+    critic_obs_keys=["Jaw"],                 # privileged, sim-only, additional
+    reward_terms=[elbow_reach_reward],
+    action_dim=6,
+)
+assert env.actor_obs_keys == ["Elbow", "Elbow.vel"]           # num_actor_obs  == 2
+assert env.critic_obs_keys == ["Elbow", "Elbow.vel", "Jaw"]   # num_critic_obs == 3
+```
 
 ```python
 import strands_robots as sr
@@ -123,6 +138,31 @@ the Newton backend's floating base is a joint with no commandable scalar. `SimEn
 sizes `num_actions` from the same list, so `len(action_keys) == num_actions`
 always holds. Pass `action_dim` to `SimEnv` to override the width.
 
+### Deploying the checkpoint
+
+The pair is deployable through the policy factory: `create_policy("rl",
+checkpoint_dir=...)` loads it and presents the trained actor as an ordinary
+[`Policy`](../policies/rl.md), so it drives a robot through the same
+`run_policy` / `eval_policy` path as every other provider.
+
+```python
+result = create_trainer("ppo").train(spec)
+
+sim.run_policy(
+    robot_name="so101",
+    policy_provider="rl",
+    policy_config={"checkpoint_dir": result.checkpoint_dir},
+    duration=10.0,
+)
+```
+
+The provider reads `provider` to rebuild the right architecture (the three
+backends' actors differ in output width and squash), binds `actor_obs_keys` by
+name in the trained order, and restores the observation normalizer frozen. To
+read the actor without the policy wrapper - for a custom control loop -
+`strands_robots.training.rl.load_deployable_actor(checkpoint_dir)` returns a
+`DeployableActor` whose `act(obs)` is the deterministic command.
+
 `PpoTrainer` trains fine on CPU (its `hardware_floor` declares no GPU
 requirement); MuJoCo stepping dominates, not the network.
 
@@ -135,6 +175,17 @@ The learner device is authoritative: on a GPU host `setup()` reconciles the
 device as the network (no cross-device tensor mismatch and no per-step
 host-to-device copies). Pass `device="cpu"` explicitly to keep everything on
 CPU even on a GPU machine.
+
+`validate()` refuses a `device` no torch build can parse, before `setup()` builds
+anything, on the same domain the `lerobot_train` tool and `LerobotTrainer` apply
+to the value they hand to lerobot. Only the *spelling* is graded, never
+availability: `device="cuda"` on a CPU-only host is a valid spec, because a
+queued or containerised run is written on one machine and executed on another. A
+non-string is refused without consulting torch at all -- `torch.device(1)`
+constructs on any host and then fails at the first `.to()` with `CUDA error:
+invalid device ordinal`, so asking torch about an ordinal would make one spec
+launch on a multi-GPU box and abort on a single-GPU one. Leaving `device` unset
+(or falsy) still selects the documented default above.
 
 ## FastSAC
 
@@ -173,6 +224,35 @@ The off-policy fields on `RLTrainSpec` (`buffer_size`, `batch_size`,
 `alpha_lr`, `target_entropy`) are read only by SAC; on-policy PPO ignores them.
 `target_entropy` defaults to `-num_actions` (the SAC heuristic) when left
 `None`. Like PPO, `FastSacTrainer` trains fine on CPU.
+
+The three fields of the temperature block are each preflighted, on two different
+domains. `init_alpha` (the temperature's starting value) and `alpha_lr` (the rate
+that moves it) must be positive and finite, because the first reaches
+`torch.log` and the second is an optimizer's learning rate. `target_entropy` -
+the constant the temperature is optimized *toward* - is instead any **finite real
+of either sign**, checked against the same shared domain as the on-policy loss
+weights: the field defaults to `-num_actions`, so every reading of it is negative
+and no endpoint is decidable, while a value that is not a finite real has no
+reading at all. Over a 40-timestep run, `validate()` used to return `[]` for all
+of them: `nan`, `inf` and `-inf` made `alpha_loss` non-finite, and since `alpha`
+scales the entropy term of both the critic's TD target and the actor loss, the
+next rollout raised `ValueError` from inside `torch.distributions.Normal` about a
+tensor of `nan` policy means - naming that distribution's parameter rather than
+the field, after the env, both networks and a full rollout had been built.
+`target_entropy=True` was worse than a crash: `bool` is an `int` subclass, so it
+is a target entropy of `+1.0` where the field's own default is `-6.0` for that
+env, and the run reported `status="success"` while checkpointing
+`log_alpha == -0.0018031001091003418` against the honored run's
+`-0.001801646314561367` - it demonstrably drove the temperature somewhere else. A
+list or a dict raised `TypeError` out of the `float()` coercion in `setup`.
+
+`None` is exempt from that domain rather than refused by it: unlike `init_alpha`
+and `alpha_lr`, which are annotated `float` with concrete defaults, this field is
+annotated `float | None` and its `None` is the documented request for the
+heuristic. And the check is not conditioned on `autotune_alpha` even though only
+the tuning branch spends the value, because the coercion that reads it is
+unconditional - with tuning off a list raises the same `TypeError`, while `nan`
+reaches a successful run that simply never spends it.
 
 ## BaseRLAlgo
 
@@ -238,6 +318,54 @@ separately rather than against that shared domain, because the accepted sets
 differ: PPO parallelizes and accepts any count `>= 1`, while the MuJoCo-backed
 FastSAC is single-env and requires exactly `1`.
 
+Those three factors and `buffer_size` also have to *reach* `learning_starts`, and
+on the two off-policy backends `validate()` checks that they do. The threshold is
+the replay fill the first gradient step waits for, and two counts bound the fill a
+run ever reaches: the step budget it collects,
+`max(1, total_timesteps // steps) * steps`, and the ring buffer's own capacity.
+Either below the threshold takes **zero** gradient steps for the whole run.
+Both halves of that contract - the threshold's own domain plus
+`learning_starts >= batch_size`, and whether the threshold is ever reached - are
+one shared rule rather than a copy in each off-policy backend, so the two report
+them identically.
+`learning_starts >= batch_size` does not cover it - that relation sizes the first
+batch, not the wait for it - so `total_timesteps=20` against
+`learning_starts=32`, and `buffer_size=8` against `learning_starts=16`, each
+returned `[]` from `validate()` and then `status="success"` with a written
+checkpoint and an exported `policy.pt`: the randomly initialized network `setup`
+built, since nothing had trained it. Both are plain positive integers that pass
+every per-field domain, and `buffer_size=1` is the same one-slot buffer as
+`buffer_size=True` - which the count domain already refuses for exactly this
+outcome. Each short count is now reported on its own, naming the threshold it
+cannot reach, so a caller sees every value it has to raise. The relation is asked
+only of counts: a non-count in any operand is left to the gate that names that
+field, rather than described as an unreachable threshold.
+
+`hidden_dims` must be a sequence of positive integer layer widths, checked by
+`validate()` on all three RL backends - each builds every network it trains by
+expanding the same field (the on-policy actor and critic; off-policy the actor,
+its Polyak target and all four Q heads). Nothing judged the widths, and
+`nn.Linear` does not either: a width of **zero** is a legal layer. `torch` only
+warns ("Initializing zero-element tensors is a no-op"), the layer emits an empty
+activation, and the layer after it therefore emits its bias alone - so the
+network's output stops being a function of the observation. Measured over a full
+`train()` on each backend, `hidden_dims=(16, 0)` returned a **bit-identical
+action** for an all-zero observation and an all-`50` one, while `train()`
+reported `status="success"` with a real `actor_loss` and exported
+`policy.pt` + `policy_meta.json`: a deployable checkpoint whose actor commands
+one fixed action in every state the robot can reach. A negative or non-integer
+width instead raised out of `torch` after the environment, the networks and the
+optimizers were built, and `np.int64` trained to completion and then lost the run
+at the save, because `save_checkpoint` JSON-encodes the field.
+
+The **empty** sequence stays accepted: it is the honest spelling of a linear
+policy (input straight to the output layer), and its action still varies with the
+observation. So the domain is per element rather than on the length, and a
+problem names the offending index (`hidden_dims[1] must be a positive integer`).
+A value that is not a sequence of widths at all - a bare `int`, `None`, a `str`,
+or a one-shot generator, which would be consumed by the first network built and
+leave every later critic a different shape - is refused as a whole.
+
 `gamma` must be a finite number in the closed interval `[0, 1]`, checked by
 `validate()` on both backends. It is the one coefficient both of them read (PPO
 discounts the GAE recursion with it, FastSAC its target-Q bootstrap) and a
@@ -267,6 +395,21 @@ to an infinity on the first step, and because the temperature multiplies the
 log-probability in the actor loss the resulting checkpoint holds non-finite
 parameters. Both previously reported success. It is inert when
 `autotune_alpha=False`, which builds no temperature optimizer.
+
+The three RL posture flags - `normalize_obs` on every backend,
+`normalize_advantage` on PPO, `autotune_alpha` on FastSAC - are `bool`s on the
+same shared domain as `TrainSpec.resume` and `streaming`, checked by the
+`validate()` of each backend that reads them and by no other. Each selects a
+posture rather than scaling a quantity, and each was read by truthiness where it
+is spent (`... if spec.normalize_obs else None`, `if spec.normalize_advantage:`,
+`if self.autotune_alpha:`), so the spellings a caller reaches for to opt out -
+`"false"`, `"no"`, `"0"` - selected the affirmative branch, and `0` or `None`
+selected the negative one without being a declared spelling of it. Every one
+previously passed `validate()`. `autotune_alpha` is checked **ahead of** the
+`alpha_lr` check it gates, and that check reads the rate only once the flag is a
+usable `True`: `autotune_alpha="false", alpha_lr=-1.0` used to be refused as
+`alpha_lr` - the rate of an optimizer the caller had asked not to build - and is
+now refused as the flag.
 
 `init_alpha` - the temperature that rate moves - must be a positive finite
 number, checked by the same `validate()`. FastSAC stores the temperature's
@@ -330,6 +473,42 @@ successful, deployable run whose objective was not the configured one:
 `clamp(ratio, -inf, inf)` returns the ratio unchanged, so it is the field's only
 spelling of *do not clip* - and the two bounds share one domain helper rather
 than a copy each.
+
+`log_interval` must be a whole number of iterations, checked by `validate()` on
+all three backends. **It is the RL run's checkpoint cadence, not a logging one**:
+no RL module emits a progress log, and the field is read in exactly one
+expression - `it % log_interval == 0` - which decides whether `save_checkpoint`
+runs for that iteration. So it answers for an RL run what
+[`TrainSpec.save_freq`](overview.md) answers for a supervised one
+(RL reads this field and ignores that one), and it takes the same shared
+step-cadence domain, because the modulus judges the value no more than lerobot's
+does. Measured on the loop over 20 iterations, against the `[1, 6, 11, 16, 20]`
+an `int` cadence of `5` writes:
+
+| `log_interval` | Checkpoints written | Reading |
+|---|---|---|
+| `5` | 5, at 1/6/11/16/20 | the requested schedule |
+| `True` | **20** | a modulus of one - one every iteration |
+| `2.5` | 5, at 1/6/11/16/20 | the schedule of `5`, not of `2.5` |
+| `0.3` | **2**, at 1 and 20 | the periodic checkpoints are gone |
+| `nan` | **1**, at 20 | silently the *disabled* mode |
+| `inf` | **2**, at 1 and 20 | ditto |
+| `"5"` | **0** | `TypeError` out of `train()`, after `setup` |
+| `0` | 1, at 20 | the supported "no intermediate checkpoints" mode |
+| `-5` | 5, at 1/6/11/16/20 | the cadence of its magnitude |
+
+`nan` is the worst of them: it satisfies the truthiness guard, never satisfies
+the modulus, and so a long run that asked to checkpoint every few iterations
+keeps only its final one - under `status="success"`. For RL those intermediate
+checkpoints are not a convenience: return is non-monotonic in training, so the
+deployable policy is often an earlier iteration, and a run that silently kept
+only its last cannot be recovered without training again.
+
+Only the *type* is graded, so this domain has no floor: `0` disables the periodic
+checkpoints and leaves the end-of-run fallback to write exactly one final
+checkpoint. A negative is accepted for the same reason and is *not* the disabled
+mode here - unlike lerobot's `save_freq > 0` test, this loop guards on bare
+truthiness - so which spelling disables is the loop's business, not the domain's.
 
 ## Worked example
 

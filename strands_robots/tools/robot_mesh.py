@@ -47,7 +47,7 @@ from strands import tool
 from strands.types.tools import ToolContext
 
 from strands_robots.mesh import security as _security
-from strands_robots.mesh.core import mesh_disabled_by_env
+from strands_robots.mesh.core import _reports_failure_to_stop, mesh_disabled_by_env
 from strands_robots.tools._hitl_audit import log_operator_response
 from strands_robots.utils import finite_number_error, positive_count_error, positive_finite_number_error
 
@@ -499,6 +499,55 @@ def _ok(text: str) -> dict[str, Any]:
     return {"status": "success", "content": [{"text": text}]}
 
 
+def _stop_not_confirmed(envelope: Any, budget: float) -> str | None:
+    """Why a single-target ``stop`` envelope does not confirm the stop, or ``None``.
+
+    ``Mesh.send`` answers with one of three shapes, and the ``stop`` branch
+    used to read none of them - only a *raised* ``send`` reached the error
+    path. The peer's ``{"type": "response", "result": ...}`` carries the
+    handler's own return, graded with
+    :func:`~strands_robots.mesh.core._reports_failure_to_stop`, the one owner
+    of the "did it say no" rule. The peer's ``{"type": "error", ...}`` is a
+    lockout, a replay or an authorization rejection and carries no ``result``
+    at all. ``{"status": "timeout"}`` and ``{"status": "error", ...}`` are
+    ``send``'s own verdicts - nothing answered inside *budget*, or a
+    precondition was refused before anything was published. The last three are
+    this branch's own reading because they are ``send``'s envelope contract
+    rather than a handler's return, which the shared rule deliberately does
+    not model.
+
+    A timeout is a failure HERE and stays out of the shared rule on purpose.
+    For one named peer, no answer inside the budget is a stop the caller cannot
+    claim happened, and ``status="success"`` over it is the affirmative lie the
+    stop verb exists to stop telling. ``emergency_stop`` keeps counting a
+    silent peer as a gap rather than a refusal (see
+    :func:`~strands_robots.mesh.core._peers_that_did_not_stop`), so widening
+    the shared rule would change the fleet-wide count on both paths.
+
+    Args:
+        envelope: What ``Mesh.send`` returned.
+        budget: The wait the send was given, so a timeout can name it.
+
+    Returns:
+        A one-line reason carrying the answer, or ``None`` when the envelope
+        does not report a failure. A shape carrying no verdict either way is
+        ``None`` too, for the reason the shared rule gives: a false "did not
+        stop" on the safety path trains operators to ignore the warning.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("status") == "timeout":
+        return f"no answer within {budget:g}s"
+    # json.dumps escapes a line break inside a peer's error text, so the reason
+    # cannot split the CRITICAL record it is rendered into (py/log-injection).
+    if envelope.get("type") == "error" or _reports_failure_to_stop(envelope):
+        return json.dumps(envelope, default=str)[:600]
+    result = envelope.get("result")
+    if isinstance(result, dict) and _reports_failure_to_stop(result):
+        return json.dumps(result, default=str)[:600]
+    return None
+
+
 # ── Numeric-option domain ──────────────────────────────────────────────────
 #
 # Which of the two numeric options each action actually consumes. Scoped per
@@ -568,6 +617,68 @@ def _numeric_option_error(action: str, *, timeout: Any, limit: Any) -> str | Non
         if error:
             return error
     return None
+
+
+def _decoded_command_body(command: str, label: str) -> dict[str, Any]:
+    """Decode a caller-supplied JSON command body into the mapping the wire takes.
+
+    ``command`` is free text an agent writes, so :func:`json.loads` has three
+    distinct failure modes here and only the first is a
+    :class:`json.JSONDecodeError`:
+
+    * Malformed syntax - the ordinary case.
+    * A number wider than :func:`sys.get_int_max_str_digits` (4300 digits by
+      default). That is well-formed JSON - RFC 8259 bounds no range - which this
+      build cannot construct an ``int`` for, so :mod:`json` raises a plain
+      :class:`ValueError`, outside the subclass every call site narrowed to.
+    * A document nested past the interpreter stack, which :mod:`json`'s
+      recursive-descent scanner reports as :class:`RecursionError` - a
+      :class:`RuntimeError`, outside :class:`ValueError` entirely. The same class
+      :func:`strands_robots.mesh._acl_config._parse_json5` converts, for the same
+      reason: a refusal that leaves its boundary takes the path, the reason and
+      the remedy with it.
+
+    Both of the latter escaped the four sites that used to parse a body inline.
+    On the two pre-pass sites in :func:`robot_mesh` that is an exception raised
+    past the tool's own ``{"status": "error"}`` envelope, and no audit row for a
+    ``broadcast`` or ``send`` that never reached the wire - while every refusal
+    beside them writes one. On the two Device Connect sites the dispatcher's
+    outermost handler absorbs it and reports a caller's malformed body as a
+    transport error.
+
+    Each cause gets its own wording. Reusing "is not valid JSON" for the other
+    two would send the operator hunting a syntax error that is not there, which
+    is the distinction the ACL loader's refusals already draw.
+
+    Args:
+        command: The JSON text the caller supplied. Non-empty; callers refuse an
+            empty body with their own action-specific message first.
+        label: How to name the parameter in a refusal - ``"command"``, or
+            ``"rpc params (command)"`` for the device-native RPC body.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        ValueError: *command* does not decode to a JSON object. The message
+            names *label* and the cause, so a caller can hand it straight to
+            :func:`_err` without adding a second layer of prose.
+    """
+    try:
+        parsed = json.loads(command)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # Nesting depth, not length: the payload size cap does not bound this,
+        # and the scanner runs out of stack long before a body gets large.
+        raise ValueError(f"{label} is nested too deeply to parse; flatten the body") from exc
+    except ValueError as exc:
+        # Reached only by the int_max_str_digits limit above - JSONDecodeError,
+        # the other ValueError json.loads raises, is handled first.
+        raise ValueError(f"{label} holds a number too wide for this build to read: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must decode to a JSON object (dict)")
+    return parsed
 
 
 # ── #10: robot-less gateway mesh ───────────────────────────────────────────
@@ -651,8 +762,17 @@ def _stop_gateway_mesh() -> None:
     stop it: every other one is closed by the ``Robot`` or ``Simulation`` that
     built it. So it held an open session plus its heartbeat and state threads,
     and stayed advertised to the fleet as a live peer, until the interpreter
-    died. Registered with :mod:`atexit`, matching the session singleton's own
-    teardown.
+    died.
+
+    Registered with :mod:`atexit`, which runs after the interpreter has joined
+    every non-daemon thread. That is late enough only because this hook does
+    not own the session: the gateway rides the
+    :func:`~strands_robots.mesh.session.get_session` singleton, and it is that
+    singleton's teardown -- registered on the *pre-join* hook for exactly this
+    reason -- which closes the transport and so ends the non-daemon threads
+    zenoh serves subscriber callbacks from. Every thread this hook's own
+    ``Mesh.stop`` ends is a daemon, so dropping the cached gateway here is
+    bookkeeping the interpreter does not wait on.
     """
     with _GATEWAY_LOCK:
         gateway = _GATEWAY.pop("mesh", None)
@@ -825,7 +945,16 @@ def _dc_ensure_connected() -> None:
     # set DEVICE_CONNECT_ALLOW_INSECURE=true process-wide, silently downgrading
     # every connection in the process. Insecure mode is now strictly opt-in by
     # the operator. If they have opted in, surface a warning so it is visible.
-    if os.environ.get("DEVICE_CONNECT_ALLOW_INSECURE", "").lower() in ("true", "1", "yes"):
+    #
+    # The environment variable is the whole question on this path, unlike the
+    # device side: this connector takes no ``allow_insecure`` argument, so there
+    # is no higher-precedence source to consult. What it borrows is the
+    # vocabulary - which spellings opt in is decided once, in the module that
+    # owns the variable, so this warning cannot come to disagree with the
+    # posture the device side resolves.
+    from strands_robots.device_connect._authz import insecure_env_opts_in  # noqa: PLC0415 - lazy on purpose
+
+    if insecure_env_opts_in(os.environ.get("DEVICE_CONNECT_ALLOW_INSECURE")):
         logger.warning(
             "DEVICE_CONNECT_ALLOW_INSECURE is enabled - agent-side Device "
             "Connect traffic is unencrypted and unauthenticated. Use only on "
@@ -965,11 +1094,9 @@ def _device_connect_dispatch(
             if not command:
                 return _DCResult(_err("send requires command (JSON string)"))
             try:
-                cmd = json.loads(command)
-            except json.JSONDecodeError as exc:
-                return _DCResult(_err(f"command is not valid JSON: {exc}"))
-            if not isinstance(cmd, dict):
-                return _DCResult(_err("command must decode to a JSON object (dict)"))
+                cmd = _decoded_command_body(command, "command")
+            except ValueError as exc:
+                return _DCResult(_err(str(exc)))
             try:
                 cmd = _security.validate_command(cmd)
             except _security.ValidationError as exc:
@@ -992,12 +1119,9 @@ def _device_connect_dispatch(
             rpc_params: dict[str, Any] = {}
             if command:
                 try:
-                    parsed = json.loads(command)
-                except json.JSONDecodeError as exc:
-                    return _DCResult(_err(f"rpc params (command) is not valid JSON: {exc}"))
-                if not isinstance(parsed, dict):
-                    return _DCResult(_err("rpc params (command) must decode to a JSON object (dict)"))
-                rpc_params = parsed
+                    rpc_params = _decoded_command_body(command, "rpc params (command)")
+                except ValueError as exc:
+                    return _DCResult(_err(str(exc)))
             try:
                 func_name, rpc_params = _security.validate_device_rpc(function, rpc_params)
             except _security.ValidationError as exc:
@@ -1017,21 +1141,60 @@ def _device_connect_dispatch(
             # already-validated positive finite budget, not a guard: min() would
             # pass nan straight through (min(nan, 5.0) is nan).
             result = conn.invoke(target, "stop", _with_identity({}), timeout=min(timeout, 5.0))
-            r = result.get("result", result)
+            r = result.get("result", result) if isinstance(result, dict) else result
+            # Graded with the rule Mesh.emergency_stop reads (_reports_failure_to_stop),
+            # as the fleet-wide branch below is: an authz refusal or a stop_policy
+            # that could not halt a rollout arrives as status="error" inside a
+            # DELIVERED reply, not as a raised invoke. Counting delivery returned
+            # the refusal under status="success" and audited it as ok=True, so an
+            # agent branching on the envelope proceeded as if the arm had halted.
+            if isinstance(r, dict) and _reports_failure_to_stop(r):
+                answer = json.dumps(r, default=str)
+                logger.critical(
+                    "[safety] stop over Device Connect: %r reported it did NOT stop: %s",
+                    target,
+                    answer[:600],
+                )
+                _audit_tool_action(action, target, False, f"reported it did NOT stop: {answer[:600]}")
+                return _DCResult(_err(f"Stop {target}: reported it did NOT stop: {answer[:1500]}"))
             _audit_tool_action(action, target, True, "")
             return _DCResult(_ok(f"Stop {target}: {json.dumps(r, default=str)}"))
 
         if action == "emergency_stop":
             devices = conn.list_devices()
-            stopped = 0
+            stopped: list[str] = []
+            # Graded with the rule Mesh.emergency_stop reads (_reports_failure_to_stop):
+            # a device answers its stop RPC with an envelope, and an authz refusal
+            # or a stop_policy that could not halt a rollout comes back as
+            # status="error" inside a DELIVERED reply, not as a raised invoke.
+            # Counting delivery told the operator every device stopped while the
+            # device itself had just said it did not. An unreachable device stays
+            # a gap in the count rather than a refusal, as on the mesh path.
+            refused: dict[str, Any] = {}
             for d in devices:
+                device_id = str(d.get("device_id", "?"))
                 try:
-                    conn.invoke(d["device_id"], "stop", _with_identity({}), timeout=3.0)
-                    stopped += 1
+                    result = conn.invoke(device_id, "stop", _with_identity({}), timeout=3.0)
                 except Exception:  # noqa: BLE001 - best-effort fan-out
-                    pass
-            _audit_tool_action(action, "*", True, f"stopped={stopped}/{len(devices)}")
-            return _DCResult(_ok(f"E-STOP: {stopped}/{len(devices)} devices stopped"))
+                    continue
+                r = result.get("result", result) if isinstance(result, dict) else result
+                if isinstance(r, dict) and _reports_failure_to_stop(r):
+                    refused[device_id] = r
+                else:
+                    stopped.append(device_id)
+            text = f"E-STOP: {len(stopped)}/{len(devices)} devices stopped"
+            if refused:
+                logger.critical(
+                    "[safety] emergency_stop over Device Connect: %d device(s) reported they did NOT stop: %s",
+                    len(refused),
+                    sorted(refused),
+                )
+                _audit_tool_action(
+                    action, "*", False, f"stopped={len(stopped)}/{len(devices)} refused={sorted(refused)}"
+                )
+                return _DCResult(_err(f"{text}; reported they did NOT stop: {json.dumps(refused, default=str)[:1500]}"))
+            _audit_tool_action(action, "*", True, f"stopped={len(stopped)}/{len(devices)}")
+            return _DCResult(_ok(text))
 
         if action == "broadcast":
             # Security hardening: dispatch the *validated* command that the
@@ -1180,13 +1343,10 @@ def robot_mesh(
             _audit_tool_action(action, "*", False, "missing command")
             return _err("broadcast requires command (JSON string)")
         try:
-            parsed = json.loads(command)
-        except json.JSONDecodeError as exc:
-            _audit_tool_action(action, "*", False, f"bad json: {exc}")
-            return _err(f"command is not valid JSON: {exc}")
-        if not isinstance(parsed, dict):
-            _audit_tool_action(action, "*", False, "command not a dict")
-            return _err("command must decode to a JSON object (dict)")
+            parsed = _decoded_command_body(command, "command")
+        except ValueError as exc:
+            _audit_tool_action(action, "*", False, f"bad command body: {exc}")
+            return _err(str(exc))
         try:
             validated_broadcast_cmd = _security.validate_command(parsed)
         except _security.ValidationError as exc:
@@ -1200,13 +1360,10 @@ def robot_mesh(
             _audit_tool_action(action, target, False, "missing command")
             return _err("send requires command (JSON string)")
         try:
-            parsed = json.loads(command)
-        except json.JSONDecodeError as exc:
-            _audit_tool_action(action, target, False, f"bad json: {exc}")
-            return _err(f"command is not valid JSON: {exc}")
-        if not isinstance(parsed, dict):
-            _audit_tool_action(action, target, False, "command not a dict")
-            return _err("command must decode to a JSON object (dict)")
+            parsed = _decoded_command_body(command, "command")
+        except ValueError as exc:
+            _audit_tool_action(action, target, False, f"bad command body: {exc}")
+            return _err(str(exc))
         try:
             validated_send_cmd = _security.validate_command(parsed)
         except _security.ValidationError as exc:
@@ -1487,13 +1644,24 @@ def robot_mesh(
         if not target:
             _audit_tool_action(action, target, False, "missing target")
             return _err("stop requires target")
+        # Capped at 5s so a stop cannot hang - a cap over an already-validated
+        # positive finite budget, not a guard (min(nan, 5.0) is nan).
+        budget = min(timeout, 5.0)
         try:
-            # Capped at 5s so a stop cannot hang - a cap over an already-validated
-            # positive finite budget, not a guard (min(nan, 5.0) is nan).
-            result = mesh.send(target, {"action": "stop"}, timeout=min(timeout, 5.0))
+            result = mesh.send(target, {"action": "stop"}, timeout=budget)
         except Exception as exc:  # noqa: BLE001
             _audit_tool_action(action, target, False, f"dispatch error: {type(exc).__name__}: {exc}")
             return _err(f"[stop -> {target}] dispatch error: {type(exc).__name__}: {exc}")
+        # ``send`` returns an envelope for every outcome it does not raise for,
+        # and the receiving peer has already audited a refused stop as
+        # ``command_refused`` on its side. Reading only "did send raise" made
+        # this end of the same turn record ``ok=True`` over a lockout rejection,
+        # a timeout and a handler that said it did not stop.
+        reason = _stop_not_confirmed(result, budget)
+        if reason is not None:
+            logger.critical("[safety] stop -> %r: the peer did NOT confirm the stop: %s", target, reason)
+            _audit_tool_action(action, target, False, f"did not stop: {reason}")
+            return _err(f"[stop -> {target}] did NOT stop: {reason}")
         _audit_tool_action(action, target, True, "")
         return _ok(f"[stop -> {target}] {json.dumps(result, default=str)[:600]}")
 
@@ -1555,7 +1723,8 @@ def robot_mesh(
         # subscribing to every peer's stream (the cross-peer telemetry-leak
         # this surface exists to close). Require a literal peer id BEFORE
         # interpolating, mirroring the ``_REPO_TAG_RE`` shape-validation
-        # pattern in ``gr00t_inference.py`` for the same class of attack.
+        # pattern in ``strands_robots.tools.gr00t_inference`` for the same
+        # class of attack.
         if not _PEER_ID_RE.match(target):
             _audit_tool_action(action, target, False, "watch target not a literal peer id")
             return _err(

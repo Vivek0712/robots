@@ -4,6 +4,19 @@ description: Error → fix table for the most common gotchas across install, sim
 
 # Troubleshooting
 
+## Diagnose first
+
+`doctor` checks the Python version, which extras are importable, GPU/CUDA,
+serial permissions, the MuJoCo GL backend, HuggingFace auth and a sim smoke
+test, then prints a pass/fail table:
+
+```bash
+strands-robots doctor            # or: python -m strands_robots doctor
+```
+
+`strands-robots --help` lists the commands the package ships: `doctor` and
+`verify-dataset`.
+
 ## Install
 
 | Symptom | Likely cause | Fix |
@@ -24,7 +37,7 @@ description: Error → fix table for the most common gotchas across install, sim
 |---------|--------------|-----|
 | `GLXBadFBConfig` (Linux) | Missing OSMesa | `sudo apt install libosmesa6-dev` + `export MUJOCO_GL=osmesa` |
 | Black frames from `render(...)` | Headless, no GL backend | `export MUJOCO_GL=osmesa` (Linux) or `=egl` |
-| Rendering very slow (~100x), warning `rendering on a CPU software rasterizer` | `MUJOCO_GL=egl` but no GPU EGL vendor ICD registered, so EGL falls back to Mesa `llvmpipe` (CPU) | On an NVIDIA host the library auto-registers the vendor ICD: when `libEGL_nvidia` is installed but no NVIDIA ICD is present, it stages one in `~/.strands_robots/egl_vendor.d/` and points glvnd at it via `__EGL_VENDOR_LIBRARY_FILENAMES` (no root needed) before importing mujoco. If the warning persists, ensure `NVIDIA_DRIVER_CAPABILITIES` includes `graphics`, or register the ICD system-wide: write `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` = `{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}`. Set `__EGL_VENDOR_LIBRARY_FILENAMES` yourself to opt out. Verify with `GL_RENDERER` (should report the NVIDIA GPU, not `llvmpipe`). |
+| Rendering very slow (~100x), warning `rendering on a CPU software rasterizer` | `MUJOCO_GL=egl` but NVIDIA's EGL vendor does not answer, so EGL falls back to Mesa `llvmpipe` (CPU) | On an NVIDIA host the library auto-registers the vendor ICD: when `libEGL_nvidia` is installed but no NVIDIA ICD is present, it stages one in `~/.strands_robots/egl_vendor.d/` and points glvnd at it via `__EGL_VENDOR_LIBRARY_FILENAMES` (no root needed) before importing mujoco. If the warning persists, ensure `NVIDIA_DRIVER_CAPABILITIES` includes `graphics`, or register the ICD system-wide: write `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` = `{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}`. Set `__EGL_VENDOR_LIBRARY_FILENAMES` yourself to opt out. If an NVIDIA ICD *is* already registered and `libEGL_nvidia` *is* installed, a missing ICD is not the cause - the driver is installed but unreachable from this process, so check `nvidia-smi` works here (a container can expose `/dev/nvidia*` and still deny opening it via the device cgroup, which glvnd can only report as this fallback). The warning names whichever of these three causes is still standing. Verify with `GL_RENDERER` (should report the NVIDIA GPU, not `llvmpipe`). |
 | `Robot("foo")` raises ValueError | Unknown name | Check `list_robots("all")`; or pass `urdf_path=...` |
 | `add_robot` refuses with `is registered but its model file is not on disk` | The name is correct - the registry knows the robot, its MJCF is just not present on any asset search path | Do what the refusal names. It prints the `<dir>/<model_xml>` it looked for and every path it searched. An entry it reports as `auto_download=false` (`google_robot`, `trossen_wxai`) never fetches its own asset - place the file there yourself, under `STRANDS_ASSETS_DIR`. Any other entry is fetchable: `download_assets(robots="<name>")` |
 | Sim hangs on `create_world` | Asset download | Wait - first call downloads MJCF, then cached |
@@ -35,17 +48,17 @@ description: Error → fix table for the most common gotchas across install, sim
 | `add_robot` raises after `load_scene` | Scene XML overrides world | Use `add_robot` before `load_scene` |
 | `add_robot` refuses with `has no single index to drive it by` | The MJCF declares a multi-control actuator - mujoco 3.12 gave `<pid>` two controls (`input="pos vel"`) and `<orientation>` up to four, so the model compiles with more control slots than actuators. This backend addresses an actuator by its control index, which such an actuator has no single value for | Do what the refusal names. It prints each wide actuator and the control slots it owns, so the MJCF line is findable. Replace it with a single-control actuator (`<position>`, `<motor>`, `<velocity>`, `<intvelocity>`, `<general>`), or drive that joint outside this backend. The refused add leaves the scene exactly as it was, so a corrected model reuses the same robot name |
 | `render(output_path=...)` refuses with `is outside the sandbox` | `output_path` resolved outside the render sandbox (`~/.strands_robots/renders`, or `STRANDS_ROBOTS_RENDER_ROOT`). Artifact sinks confine LLM-supplied paths | Write under the sandbox (a bare filename like `frame.png` is placed INTO it). A *relative* path with a directory part (`views/front.png`) is resolved against the process CWD, so it is refused; that refusal quotes the sandbox-anchored spelling to pass instead. Or set the variable the refusal names - `STRANDS_ROBOTS_RENDER_ALLOW_ABS=1` for `render`, `STRANDS_ROBOTS_VIDEO_ALLOW_ABS=1` for the video/recording sinks under `STRANDS_ROBOTS_VIDEO_ROOT` |
-| `move_to` refuses with `is unreachable ... The same target solves to ... once the N degree(s) of freedom move_to does not command are free too` | The target needs motion `move_to` does not produce. It drives the arm's position servos only, so a mobile base, a floating pelvis or any unactuated joint is not available to the solve - and 35 of the shipped sim robots have one | Move those degrees of freedom first (drive the base to the work area), then call `move_to`. The refusal's `uncommanded_joints_moved` names them and `unrestricted_ik_residual_m` is what the whole robot could reach |
+| `move_to` refuses with `is unreachable ... The same target solves to ... once the N degree(s) of freedom move_to does not command are free too` | The target needs motion `move_to` does not produce. It drives the end-effector frame the refusal names with position servos only, so a mobile base, a floating pelvis or any unactuated joint is not available to the solve - and 35 of the shipped sim robots have one | Move those degrees of freedom first (drive the base to the work area), then call `move_to`. The refusal's `uncommanded_joints_moved` names them and `unrestricted_ik_residual_m` is what the whole robot could reach |
 
 ## Hardware
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `PermissionError: /dev/ttyUSB0` | Not in `dialout` group | `sudo usermod -aG dialout $USER` + re-login |
-| Arm twitches at startup | Stale calibration | Re-run `lerobot_calibrate` |
+| Arm twitches at startup | Stale calibration | Re-run `lerobot-calibrate` |
 | Camera frames black | Wrong `index_or_path` | `lerobot_camera(action="list")` |
 | Servo error mid-rollout | Velocity limit | Bump `control_frequency` or relax calibration limits |
-| `Robot("so100", mode="real")` raises | Calibration missing | Run `lerobot_calibrate` first |
+| `Robot("so100", mode="real")` raises | Calibration missing | Run `lerobot-calibrate` first |
 | Real robot moves wrong way | Joint mapping mismatch | Verify `data_config` matches recording |
 
 ## Policies
@@ -62,7 +75,9 @@ description: Error → fix table for the most common gotchas across install, sim
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `start_recording` fails: lerobot missing | `[lerobot]` not installed | `uv pip install "strands-robots[lerobot]"` |
+| `start_recording` / `DatasetRecorder.create` fails: `lerobot is not installed` | `[lerobot]` not installed | `uv pip install "strands-robots[lerobot]"` |
+| `lerobot X is installed, but 'pyarrow' (or `datasets`, `pandas`, `av`, `torchcodec`), which its dataset stack needs, is not` | lerobot is installed **without** its `[dataset]` extra. Installing lerobot again does not pull those in | `uv pip install "lerobot[dataset]"` |
+| `...importing its dataset stack failed ... a conflict between installed packages` | Nothing is missing (commonly a `pandas` built against a different `numpy`), so no install of lerobot or its extra fixes it | Reconcile the conflicting packages |
 | Need MP4 without LeRobot | - | Use `start_cameras_recording` / `stop_cameras_recording` |
 | Empty MP4 files | Stopped before any frames | Check `get_recording_status()` frame count |
 | Push fails | Not logged into HF | `hf auth login` (the `huggingface-cli` entry point is not published at the declared `huggingface_hub>=1.5` floor) |
@@ -83,7 +98,7 @@ description: Error → fix table for the most common gotchas across install, sim
 |---------|--------------|-----|
 | Agent picks wrong action | Tool spec confusion | Rephrase instruction; check `robot.tool_spec` |
 | `Agent(tools=[robot])` errors | `strands-agents` missing | `uv pip install strands-agents` |
-| Agent hangs | Long-running action | Use `start_policy` instead of `run_policy` |
+| Agent hangs | Long-running action | Bound the rollout: `run_policy(n_steps=...)`, or `stop_when={'predicate': ...}` to end it on a world state. On MuJoCo `start_policy` also returns immediately; on the other backends it is a blocking passthrough, so it is not the fix there |
 | Bedrock/Anthropic auth fails | Provider credentials | See [Strands Agents docs](https://strandsagents.com/) |
 
 Bug reports: [GitHub issues](https://github.com/strands-labs/robots/issues) - include `pip show strands-robots`, Python + OS, minimal repro, full stack trace.

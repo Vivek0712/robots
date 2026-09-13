@@ -26,11 +26,6 @@ from strands_robots.training.factory import (
     list_trainers,
     register_trainer,
 )
-from strands_robots.training.reward import (
-    compute_rabc_weights,
-    load_reward_model,
-    reward_progress,
-)
 
 __all__ = [
     "Trainer",
@@ -40,9 +35,6 @@ __all__ = [
     "register_trainer",
     "list_trainers",
     "import_trainer_class",
-    "compute_rabc_weights",
-    "load_reward_model",
-    "reward_progress",
 ]
 
 
@@ -66,6 +58,15 @@ def _load_fast_sac_trainer() -> type[Trainer]:
 
 
 register_trainer("fast_sac", _load_fast_sac_trainer)
+
+
+def _load_fast_td3_trainer() -> type[Trainer]:
+    from strands_robots.training.rl.fast_td3 import FastTd3Trainer
+
+    return FastTd3Trainer
+
+
+register_trainer("fast_td3", _load_fast_td3_trainer)
 
 
 # Register the SageMaker managed-job transport. Auto-discovery would resolve

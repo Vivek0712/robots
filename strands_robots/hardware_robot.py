@@ -11,6 +11,23 @@ Features:
 - Stop functionality to interrupt running tasks
 - Connection state management with proper error handling
 - Policy abstraction for any VLA provider
+
+Operator approval: this class is the ``mode="real"`` half of
+:func:`strands_robots.Robot`, so every ``execute`` or ``start`` the agent tool
+dispatches drives real actuators. Both stop for a human BEFORE the rollout is
+dispatched, through the same decision path the ROS transports and the serial
+tool use (:func:`~strands_robots.tools._command_gate.gate_motion`):
+``STRANDS_ROBOT_COMMAND_ALLOW`` (comma-separated ``execute``/``start``, or
+``*``) pre-approves, ``BYPASS_TOOL_CONSENT=true`` lifts the gate with a WARNING,
+otherwise the operator is asked through the agent's interrupt and, with no
+agent reachable, the call is refused and nothing is dispatched. The dashboard's
+:class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook` may already
+have asked; a grant it deposited for this exact call is spent instead of asking
+twice. ``status`` and ``stop`` are never gated - stopping must not get harder -
+and the simulation tool is a different class that never touches hardware.
+Before this gate the README's first path to metal, ``Agent(tools=[Robot("so100",
+mode="real")])``, dispatched unasked while the same robot commanded through
+``robot_mesh`` was gated (F-011, CWE-862).
 """
 
 from __future__ import annotations
@@ -33,19 +50,23 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from strands.interrupt import InterruptException
 from strands.tools.tools import AgentTool
-from strands.types._events import ToolResultEvent
-from strands.types.tools import ToolResult, ToolSpec, ToolUse
+from strands.types._events import ToolInterruptEvent, ToolResultEvent
+from strands.types.tools import ToolContext, ToolResult, ToolSpec, ToolUse
 
 from strands_robots._serial_discovery import describe_serial_candidates, scan_serial_devices
 from strands_robots.bus_access import read_observation, write_action
 from strands_robots.ros_telemetry import ROS2_SYSTEM_INSTALL_HINT
 from strands_robots.teleop_mixin import TeleopMixin, _stop_reported_stopped
+from strands_robots.tools._command_gate import gate_motion
 from strands_robots.utils import (
     boolean_flag_error,
+    camera_token_error,
     dds_domain_id_error,
     positive_count_error,
     positive_finite_number_error,
+    refusal_repr,
     require_optional,
     tcp_port_error,
 )
@@ -57,6 +78,14 @@ if TYPE_CHECKING:
     from .policies import Policy
 
 logger = logging.getLogger(__name__)
+
+# The agent-tool actions that dispatch a rollout to real actuators. ``status``
+# and ``stop`` only read or halt, so they are never gated.
+MOTION_ACTIONS = frozenset({"execute", "start"})
+
+# Pre-approve motion actions by name (comma-separated, ``*`` for all) for
+# headless runs. Read by the shared gate, which also honours BYPASS_TOOL_CONSENT.
+COMMAND_ALLOW_ENV = "STRANDS_ROBOT_COMMAND_ALLOW"
 
 
 # Remedy for a missing ``rclpy`` when the caller asked for the rclpy transport.
@@ -130,64 +159,171 @@ _FORWARDABLE_KWARGS = (
 # ---------------------------------------------------------------------------
 #
 # ``Robot(..., cameras={"front": {...}})`` describes each camera with a
-# free-form dict whose keys are the fields of lerobot's camera config
-# dataclass. The accepted vocabulary is therefore derived from
-# ``dataclasses.fields()`` rather than hand-picked: a hand-picked list leaves
-# every field it forgets unreachable (no caller can set it at all) and silently
-# discards every key it does not recognise, so a typo like ``heigth=1080``
-# reports success having configured the default resolution.
+# free-form dict. That dict is a serialized lerobot ``CameraConfig``: ``type``
+# is draccus' own choice discriminator (``CameraConfig.type`` returns
+# ``get_choice_name(cls)``) and every other key is a field of the dataclass that
+# discriminator selects. So both halves of the vocabulary are derived, never
+# hand-picked:
+#
+#   - the set of accepted ``type`` values is ``CameraConfig.get_known_choices()``
+#     -- the same draccus ``ChoiceRegistry`` lookup ``_create_minimal_config``
+#     already uses for ``robot_type``, and the one ``make_cameras_from_configs``
+#     dispatches on. A camera backend lerobot ships or a vendor plugin registers
+#     is therefore attachable the day it lands, with no mapping to maintain here.
+#   - the set of accepted option keys is ``dataclasses.fields()`` of the
+#     resolved class. A hand-picked list leaves every field it forgets
+#     unreachable (no caller can set it at all) and silently discards every key
+#     it does not recognise, so a typo like ``heigth=1080`` reports success
+#     having configured the default resolution.
 #
 # ``strands_robots`` supplies its own defaults for the three fields lerobot
 # leaves as ``None`` (meaning "whatever the device negotiates") so an
-# unconfigured camera has a predictable, documented stream. Every other field
-# keeps lerobot's own default.
+# unconfigured camera has a predictable, documented stream. Those three are
+# declared on the ``CameraConfig`` base, so they are fields of every registered
+# choice and the defaults apply to a RealSense exactly as they do to a webcam.
+# Every other field keeps lerobot's own default.
 #
 # Invariant: every key here must be a field lerobot still declares. If one is
-# renamed upstream the stale key reaches ``OpenCVCameraConfig(**options)`` and
-# fails loudly for every camera rather than being silently dropped -- and the
-# test suite asserts the containment directly, so the drift is caught before a
+# renamed upstream the stale key reaches the config constructor and fails
+# loudly for every camera rather than being silently dropped -- and the test
+# suite asserts the containment directly, so the drift is caught before a
 # release rather than at an operator's ``Robot()`` call.
-_OPENCV_CAMERA_DEFAULTS: dict[str, Any] = {"fps": 30, "width": 640, "height": 480}
+_CAMERA_STREAM_DEFAULTS: dict[str, Any] = {"fps": 30, "width": 640, "height": 480}
 
 # ``type`` selects which camera backend to build. It is consumed by the
-# dispatch below, not forwarded to the config dataclass.
+# registry lookup below, not forwarded to the config dataclass.
 _CAMERA_TYPE_KEY = "type"
 
 
-def _build_camera_config(camera_name: str, config: Any) -> Any:
-    """Build the lerobot camera config for one entry of a ``cameras`` dict.
+@functools.cache
+def _ensure_lerobot_cameras_registered() -> None:
+    """Import every camera backend subpackage so CameraConfig is populated.
+
+    The mirror of :func:`_ensure_lerobot_robots_registered`, and for the same
+    reason: each backend registers its config via
+    ``@CameraConfig.register_subclass`` at module-import time, but
+    ``lerobot.cameras.__init__`` deliberately does not import them -- it says so
+    in a comment, to avoid pulling backend-specific dependencies into every
+    ``import lerobot``. Until they are imported ``CameraConfig`` has *no*
+    registered choices at all, so a registry lookup that skips this step reports
+    every camera type as unknown.
+
+    Walks ``lerobot.cameras`` with ``pkgutil`` so a backend lerobot adds in a
+    future release needs no change here, then registers third-party
+    ``lerobot_camera_*`` distributions through lerobot's own plugin loader.
+
+    Idempotent via ``@functools.cache`` -- the first call walks the tree,
+    subsequent calls are dict lookups.
+    """
+    try:
+        import lerobot.cameras as _lr_cameras
+    except ImportError as exc:
+        # Mirrors the robot walk: lerobot wholly absent is expected on
+        # sim-only hosts (debug), while lerobot present but
+        # ``lerobot.cameras`` unimportable is a partial install worth a
+        # warning. Either way the caller gets a clean "Unsupported camera
+        # type" naming the choices that did register.
+        try:
+            import lerobot  # noqa: F401  (probe-only)
+        except ImportError:
+            logger.debug("lerobot not installed: %s", exc)
+        else:
+            logger.warning(
+                "lerobot is installed but lerobot.cameras is not importable (partial install?): %s",
+                exc,
+            )
+        return
+
+    for _, sub_name, is_pkg in pkgutil.iter_modules(_lr_cameras.__path__):
+        if not is_pkg:
+            continue
+        full_name = f"{_lr_cameras.__name__}.{sub_name}"
+        try:
+            importlib.import_module(full_name)
+        except (ImportError, OSError) as exc:
+            # A backend whose SDK is absent (``pyrealsense2``, ``reachy2_sdk``)
+            # or whose ``__init__`` probes the OS. It simply does not appear in
+            # the choice registry, which is the correct outcome: naming it later
+            # raises "Unsupported camera type" listing what is available.
+            # ``(ImportError, OSError)`` is the canonical narrow pair for a
+            # hardware-probing import per AGENTS.md > Review Learnings (#86).
+            logger.debug("[hardware_robot] skip %s: %s", full_name, exc)
+
+    _ensure_lerobot_plugins_registered()
+
+
+def _resolve_camera_config_class(camera_name: str, cam_type: Any) -> type:
+    """Resolve a camera ``type`` to the lerobot config class it names.
 
     Args:
-        camera_name: The key this camera was registered under. Named in every
-            error so a multi-camera rig reports which entry is at fault.
-        config: The per-camera options. Accepted keys are the declared fields
-            of lerobot's ``OpenCVCameraConfig`` plus ``type``, which selects
-            the camera backend (``opencv`` is the only one implemented).
+        camera_name: The key this camera was registered under, named in the
+            refusal so a multi-camera rig reports which entry is at fault.
+        cam_type: The requested ``type`` value, as the caller spelled it.
 
     Returns:
-        The constructed ``OpenCVCameraConfig``.
+        The registered ``CameraConfig`` subclass for ``cam_type``.
 
     Raises:
-        ValueError: If ``config`` is not a mapping, names an unimplemented
-            camera ``type``, carries a key that is not a declared field, omits
-            a field that has no default, or holds a value lerobot's own config
-            validation refuses. An unknown key is refused rather than dropped
-            per AGENTS.md > Review Learnings (#86): a silently discarded option
-            reports success while the camera streams at the default.
+        ValueError: If ``cam_type`` is not a registered choice. The refusal
+            lists every choice that did register and, when the spelling is
+            close to one of them, names it -- lerobot registers Intel RealSense
+            as ``intelrealsense``, so the obvious guess ``realsense`` is a
+            dead end without the suggestion.
     """
-    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.cameras.configs import CameraConfig
 
-    if not isinstance(config, Mapping):
+    _ensure_lerobot_cameras_registered()
+    try:
+        return cast(type, CameraConfig.get_choice_class(cam_type))
+    except (KeyError, TypeError):
+        # KeyError: not a registered choice. TypeError: an unhashable value
+        # (a list, a dict) can never be a registry key, so it is the same
+        # refusal rather than a traceback out of the registry's dict lookup.
+        known = sorted(CameraConfig.get_known_choices())
+        close = difflib.get_close_matches(str(cam_type), known, n=1, cutoff=0.7)
+        hint = f" Did you mean {close[0]!r}?" if close else ""
+        # ``from None`` -- the registry's KeyError is an internal detail of
+        # draccus; suppress the chained traceback for a cleaner error.
         raise ValueError(
-            f"Camera {camera_name!r} config must be a mapping of option name to value, "
-            f"got {type(config).__name__}: {config!r}."
-        )
+            f"Unsupported camera type for camera {camera_name!r}: {cam_type!r}.{hint} "
+            f"Known lerobot camera types: {known}."
+        ) from None
 
-    cam_type = config.get(_CAMERA_TYPE_KEY, "opencv")
-    if cam_type != "opencv":
-        raise ValueError(f"Unsupported camera type: {cam_type}")
 
-    fields = {f.name: f for f in dataclasses.fields(OpenCVCameraConfig)}
+def _camera_option_vocabulary(camera_name: str, config: Mapping[str, Any]) -> tuple[type, dict[str, Any]]:
+    """Resolve the config class one camera entry names and the options it may state.
+
+    The one owner of the camera option vocabulary. ``type`` selects the class
+    through lerobot's ``CameraConfig`` choice registry, and the options an entry
+    may then name are that class's declared dataclass fields - so a backend
+    lerobot adds, or a field it renames, is admitted here by construction rather
+    than by a list kept in step by hand. Every surface that accepts the
+    serialized ``cameras`` shape reads it from here: the ``Robot`` factory
+    constructs the config, and ``lerobot_teleoperate`` renders the same entry
+    into the ``--robot.cameras`` argv of a detached subprocess, where an option
+    the class does not declare would be refused minutes later in that process's
+    log rather than here.
+
+    Args:
+        camera_name: The key this camera was registered under, named in every
+            refusal so a multi-camera rig reports which entry is at fault.
+        config: The per-camera options, already known to be a mapping.
+
+    Returns:
+        The resolved ``CameraConfig`` subclass and its declared fields by name.
+
+    Raises:
+        ValueError: If ``type`` is not a registered camera backend, or the entry
+            names an option the resolved class does not declare. An unknown
+            option is refused rather than dropped per AGENTS.md > Review
+            Learnings (#86): a silently discarded option reports success while
+            the camera streams at the default. The suggestion is drawn from the
+            resolved class's own fields: an ``index_or_path`` sent to a
+            RealSense is a real mistake, and pointing at
+            ``serial_number_or_name`` is what makes it fixable.
+    """
+    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
     accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
 
     unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
@@ -200,33 +336,77 @@ def _build_camera_config(camera_name: str, config: Any) -> Any:
         hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
         raise ValueError(
             f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
-            f"OpenCVCameraConfig accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
+            f"{ConfigClass.__name__} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
             f"the camera backend). (If this is a typo, fix it.)"
         )
+    return ConfigClass, fields
+
+
+def _build_camera_config(camera_name: str, config: Any) -> Any:
+    """Build the lerobot camera config for one entry of a ``cameras`` dict.
+
+    Args:
+        camera_name: The key this camera was registered under. Named in every
+            error so a multi-camera rig reports which entry is at fault.
+        config: The per-camera options. ``type`` selects the camera backend
+            from lerobot's ``CameraConfig`` choice registry (default
+            ``opencv``); every other accepted key is a declared field of the
+            config class that choice resolves to.
+
+    Returns:
+        An instance of the ``CameraConfig`` subclass the requested ``type``
+        names, ready for ``lerobot.cameras.make_cameras_from_configs``.
+
+    Raises:
+        ValueError: If ``camera_name`` is not a bare token
+            (:func:`~strands_robots.utils.camera_token_error`), or if ``config``
+            is not a mapping, names a camera ``type`` lerobot does not register,
+            carries a key that is not a declared field of the resolved class,
+            omits a field that has no default, or holds a value lerobot's own
+            config validation refuses. An unknown key is refused rather than
+            dropped per AGENTS.md > Review Learnings (#86): a silently discarded
+            option reports success while the camera streams at the default.
+    """
+    # The name is graded before the options because it is what every consumer
+    # keys this camera's frames by -- a mesh topic level, an S3 object key, a
+    # dataset feature key -- so no option is worth checking under a name none of
+    # them can carry. ``lerobot_teleoperate`` holds its ``robot_cameras`` to the
+    # same rule at the same point, through the same owner.
+    if (name_err := camera_token_error("Robot(cameras=...)", "camera name", camera_name)) is not None:
+        raise ValueError(name_err)
+    if not isinstance(config, Mapping):
+        raise ValueError(
+            f"Camera {camera_name!r} config must be a mapping of option name to value, "
+            f"got {type(config).__name__}: {config!r}."
+        )
+
+    ConfigClass, fields = _camera_option_vocabulary(camera_name, config)
+    class_name = ConfigClass.__name__
+    accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
 
     missing = sorted(
         name
         for name, field in fields.items()
         if name not in config
-        and name not in _OPENCV_CAMERA_DEFAULTS
+        and name not in _CAMERA_STREAM_DEFAULTS
         and field.default is dataclasses.MISSING
         and field.default_factory is dataclasses.MISSING
     )
     if missing:
         raise ValueError(
-            f"Camera {camera_name!r} is missing required option(s): {missing}. OpenCVCameraConfig accepts: {accepted}."
+            f"Camera {camera_name!r} is missing required option(s): {missing}. {class_name} accepts: {accepted}."
         )
 
     # strands defaults first so an explicitly configured value always wins.
-    options = {**_OPENCV_CAMERA_DEFAULTS, **{name: config[name] for name in fields if name in config}}
+    options = {**_CAMERA_STREAM_DEFAULTS, **{name: config[name] for name in fields if name in config}}
     try:
-        return OpenCVCameraConfig(**options)
+        return ConfigClass(**options)
     except (TypeError, ValueError) as exc:
         # Names the camera, which lerobot's own message cannot: its
         # ``__post_init__`` validation (e.g. a 3-character ``fourcc``) raises
         # with no idea which entry of the ``cameras`` dict it came from.
         raise ValueError(
-            f"Failed to construct OpenCVCameraConfig for camera {camera_name!r}: {exc}. Options: {options}"
+            f"Failed to construct {class_name} for camera {camera_name!r}: {exc}. Options: {options}"
         ) from exc
 
 
@@ -375,9 +555,24 @@ def _ensure_lerobot_robots_registered() -> None:
             # genuine bugs in driver registration code.
             logger.debug("[hardware_robot] skip %s: %s", full_name, exc)
 
-    # Pick up third-party plugins (``lerobot_robot_*`` distributions) via
-    # lerobot's own loader if available -- lets external robot vendors
-    # expose drivers without any strands_robots involvement.
+    _ensure_lerobot_plugins_registered()
+
+
+@functools.cache
+def _ensure_lerobot_plugins_registered() -> None:
+    """Import every installed third-party lerobot plugin distribution.
+
+    lerobot's own loader imports every distribution whose name starts with one
+    of its plugin prefixes (``lerobot_robot_``, ``lerobot_camera_``,
+    ``lerobot_teleoperator_``, ...), and each of those registers itself into the
+    matching :class:`draccus.ChoiceRegistry` as an import side effect. One call
+    therefore populates every registry at once, which is why this is a single
+    cached helper rather than a per-kind step: a vendor camera and a vendor
+    robot arrive from the same import, so registering one kind while the caller
+    happens to be resolving the other would leave the second unreachable.
+
+    Idempotent via ``@functools.cache``.
+    """
     try:
         from lerobot.utils.import_utils import register_third_party_plugins
     except ImportError:
@@ -456,6 +651,14 @@ class Robot(TeleopMixin, AgentTool):
             robot: LeRobot Robot instance, RobotConfig, or robot type string
             cameras: Camera configuration dict:
                 {"wrist": {"type": "opencv", "index_or_path": "/dev/video0", "fps": 30}}
+                Each key names one camera and must be a bare token of letters,
+                digits, ``_`` or ``-``: it is the identity every consumer keys
+                that camera's frames by - a level of the mesh topic they are
+                published on, a segment of the S3 key they are offloaded to, and
+                the ``observation.images.<name>`` feature key a recording writes
+                them under - so a name carrying punctuation any of those reserves
+                is refused here
+                (:func:`~strands_robots.utils.camera_token_error`).
             action_horizon: Actions consumed from each inferred policy chunk
                 before re-querying. Must be a positive integer - it is a lower
                 bound on the chunk slice the task loop applies
@@ -622,6 +825,13 @@ class Robot(TeleopMixin, AgentTool):
         # hint that the operator who set ros2_bridge=True actually needs to see.
         # require_optional caches the
         # module, so the real bridge construction in _init_ros_bridge pays nothing.
+        # The two posture flags are graded first: ``"false"`` is truthy, so read
+        # here by truthiness it would run the rclpy probe and, on a box without a
+        # sourced distro, tell a caller who asked for no bridge to install ROS 2.
+        # _init_ros_bridge grades them again for callers that enter there.
+        for flag_name, flag_value in (("ros2_bridge", ros2_bridge), ("ros2_commands", ros2_commands)):
+            if error := boolean_flag_error(flag_value, flag_name, type(self).__name__):
+                raise ValueError(error)
         if ros2_bridge:
             self._check_ros2_bridge_deps(ros2_transport=ros2_transport)
 
@@ -1044,9 +1254,10 @@ class Robot(TeleopMixin, AgentTool):
         missing ``remote_ip`` would point a network robot's caller at the wrong
         bus entirely.
 
-        Each entry of ``cameras`` follows the same contract, resolved against
-        the fields of lerobot's ``OpenCVCameraConfig`` -- see
-        :func:`_build_camera_config`.
+        Each entry of ``cameras`` follows the same contract twice over: its
+        ``type`` is resolved against lerobot's ``CameraConfig`` choice registry
+        and its remaining keys against the fields of the class that resolves to
+        -- see :func:`_build_camera_config`.
 
         Forwarded values are otherwise passed through as given, because their
         accepted domains are robot-specific. ``max_relative_target`` is the
@@ -1685,7 +1896,7 @@ class Robot(TeleopMixin, AgentTool):
                 logger.info(f"Using policy: {policy_provider} on {policy_host}:{policy_port}")
 
             # Real-Time Chunking contract (mirror PolicyRunner._run_policy_rollout
-            # in strands_robots/simulation/policy_runner.py): tell the policy the
+            # in ``strands_robots.simulation.policy_runner``): tell the policy the
             # control rate ONCE before the rollout so RTC-capable providers
             # (pi0/pi0.5/SmolVLA/MolmoAct2) convert their inference latency into a
             # correct count of action steps and blend chunk seams identically to
@@ -1695,7 +1906,7 @@ class Robot(TeleopMixin, AgentTool):
 
             # Clear per-episode policy state before the rollout, mirroring the
             # per-episode reset PolicyRunner performs in
-            # strands_robots/simulation/policy_runner.py. A caller may drive one
+            # ``strands_robots.simulation.policy_runner``. A caller may drive one
             # policy object through several tasks (that is the documented
             # ``run_policy(policy_object=...)`` usage), and Policy.reset exists
             # to clear exactly the state that must not cross that boundary -
@@ -1958,7 +2169,7 @@ class Robot(TeleopMixin, AgentTool):
         value is checked against
         :func:`~strands_robots.utils.tcp_port_error`, the shared domain whose
         docstring already names "the policy providers that dial one (``groot``,
-        ``moveit2``, ``cosmos3``, ``lerobot_async``, ``vera``)" - the very
+        ``moveit2``, ``cosmos3``, ``lerobot_async``)" - the very
         providers this path forwards to - so the same port cannot be accepted by
         the arm's task entry points and refused by the provider they hand it to.
 
@@ -2023,7 +2234,7 @@ class Robot(TeleopMixin, AgentTool):
                     {
                         "text": (
                             f"{method}: policy_provider={policy_provider!r} declares no policy_port, "
-                            f"so policy_port={policy_port!r} would not be read. Drop the port, or name "
+                            f"so policy_port={refusal_repr(policy_port)} would not be read. Drop the port, or name "
                             f"a provider that reads one ({', '.join(port_reading_providers())})."
                         )
                     }
@@ -2549,7 +2760,8 @@ class Robot(TeleopMixin, AgentTool):
         """Stop the current task, including one that is still connecting.
 
         This is the interrupt an operator (or the fleet ``{"action": "stop"}``
-        dispatch, via ``mesh/core.py``) reaches for, so it has to hold for a
+        dispatch, via :class:`~strands_robots.mesh.core.Mesh`) reaches for, so
+        it has to hold for a
         task in ANY stage that can still command the arm - not only the one
         stage whose status happens to be ``RUNNING``.
 
@@ -2627,7 +2839,7 @@ class Robot(TeleopMixin, AgentTool):
             "name": self.tool_name_str,
             "description": f"Universal robot control with async task execution ({self.robot}). "
             f"Actions: execute (blocking), start (async), status, stop. "
-            f"For execute/start actions: instruction and policy_port are required. "
+            f"For execute/start actions: instruction is required; policy_port when the provider dials a server. "
             f"For status/stop actions: no additional parameters needed.",
             "inputSchema": {
                 "json": {
@@ -2645,7 +2857,7 @@ class Robot(TeleopMixin, AgentTool):
                         },
                         "policy_port": {
                             "type": "integer",
-                            "description": "Policy service port (required for execute/start actions)",
+                            "description": "Policy service port. Required by groot and moveit2, read by the other server-dialing providers, refused for providers that build in process (mock, lerobot_local).",
                         },
                         "policy_host": {
                             "type": "string",
@@ -2679,9 +2891,81 @@ class Robot(TeleopMixin, AgentTool):
         """Create a ToolResult dict with the given tool_use_id merged into result."""
         return cast(ToolResult, {"toolUseId": tool_use_id, **result})
 
+    def _dashboard_grant(self, tool_input: Mapping[str, Any]) -> bool:
+        """Spend a grant the dashboard's motion hook deposited for this exact call.
+
+        The dashboard registers :class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook`
+        on its agent, which asks the operator before the tool runs and records a
+        one-shot grant keyed on what they were shown. Asking again here would be
+        the same question twice, so a grant is consumed and the call proceeds.
+        The dashboard extra may be absent, and a missing module must read as
+        "no grant", never as a crash: the gate below then asks the operator.
+
+        Args:
+            tool_input: The call as the hook saw it - the tool's own input dict.
+
+        Returns:
+            True when a grant for this exact call existed and was spent.
+        """
+        try:
+            from strands_robots.dashboard import agent_hitl
+        except ImportError:
+            return False
+        return bool(agent_hitl.consume_grant(self.tool_name_str, tool_input))
+
+    def _gate_motion(
+        self, action: str, tool_input: Mapping[str, Any], tool_use: ToolUse, invocation_state: Mapping[str, Any]
+    ) -> str | None:
+        """Operator approval for one ``execute``/``start``, before it is dispatched.
+
+        An ``AgentTool`` receives no ``tool_context`` argument; the SDK builds
+        one from the invoking agent for decorated tools, and this builds the
+        same object from the same two inputs so the shared gate can raise the
+        same interrupt. With no agent in ``invocation_state`` (a direct call,
+        a headless script) there is no operator to ask and the gate refuses.
+
+        Args:
+            action: ``"execute"`` or ``"start"``.
+            tool_input: The tool's input dict, shown to the operator and used to
+                match a dashboard grant.
+            tool_use: The tool-use request carrying ``toolUseId``.
+            invocation_state: The agent runtime's kwargs; ``"agent"`` when the
+                call came through an :class:`strands.Agent`.
+
+        Returns:
+            A refusal message, or None to let the dispatch proceed.
+
+        Raises:
+            InterruptException: When the operator has not answered yet; the
+                caller turns it into a ``ToolInterruptEvent`` exactly as the
+                SDK does for a decorated tool.
+        """
+        if self._dashboard_grant(tool_input):
+            return None
+        agent = invocation_state.get("agent")
+        tool_context: ToolContext | None = None
+        if agent is not None:
+            tool_context = ToolContext(tool_use=tool_use, agent=agent, invocation_state=dict(invocation_state))
+        instruction = str(tool_input.get("instruction", ""))
+        provider = tool_input.get("policy_provider", "groot")
+        host = tool_input.get("policy_host", "localhost")
+        port = tool_input.get("policy_port")
+        # ``tool`` is the fixed word "robot" so the interrupt id and the audit
+        # source read the same for every robot; the target names which one.
+        return gate_motion(
+            "robot",
+            action,
+            self.tool_name_str,
+            f"{action!r} drives the real robot {self.tool_name_str!r} with {instruction!r} "
+            f"(policy {provider} at {host}:{port}); it needs operator approval before it is dispatched.",
+            tool_context,
+            allow_env=COMMAND_ALLOW_ENV,
+            allow_match=lambda allowed: "*" in allowed or action in allowed,
+        )
+
     async def stream(
         self, tool_use: ToolUse, invocation_state: dict[str, Any], **kwargs: Any
-    ) -> AsyncGenerator[ToolResultEvent, None]:
+    ) -> AsyncGenerator[ToolResultEvent | ToolInterruptEvent, None]:
         """Stream robot task execution with async actions."""
         try:
             tool_use_id = tool_use.get("toolUseId", "")
@@ -2698,14 +2982,34 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for execute action"}],
+                                "content": [{"text": "instruction is required for execute action"}],
                             },
+                        )
+                    )
+                    return
+
+                # Ask the operator before anything is dispatched: a refused or
+                # unanswered call is exactly as inert as one that never happened.
+                try:
+                    refusal = self._gate_motion(action, input_data, tool_use, invocation_state)
+                except InterruptException as exc:
+                    yield ToolInterruptEvent(tool_use, [exc.interrupt])
+                    return
+                if refusal is not None:
+                    yield ToolResultEvent(
+                        self._make_tool_result(
+                            tool_use_id,
+                            {"status": "error", "content": [{"text": f"{self.tool_name_str}: {refusal}"}]},
                         )
                     )
                     return
@@ -2722,14 +3026,32 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for start action"}],
+                                "content": [{"text": "instruction is required for start action"}],
                             },
+                        )
+                    )
+                    return
+
+                try:
+                    refusal = self._gate_motion(action, input_data, tool_use, invocation_state)
+                except InterruptException as exc:
+                    yield ToolInterruptEvent(tool_use, [exc.interrupt])
+                    return
+                if refusal is not None:
+                    yield ToolResultEvent(
+                        self._make_tool_result(
+                            tool_use_id,
+                            {"status": "error", "content": [{"text": f"{self.tool_name_str}: {refusal}"}]},
                         )
                     )
                     return
@@ -2837,7 +3159,23 @@ class Robot(TeleopMixin, AgentTool):
                     )
 
             # Tear down the ROS 2 telemetry bridge if one was created.
-            self._shutdown_ros_bridge()
+            # Guarded like the mesh and teleop steps above, and for a stronger
+            # reason: this is the last step before the devices close, so a
+            # ``destroy_node()`` on a context another component already shut
+            # down would reach the handler at the bottom of this method and
+            # skip the disconnect entirely -- leaving the serial port held and
+            # the arm energised at its last commanded position, with nothing
+            # left that would close either. The sim engine already suppresses
+            # this same call; a software resource that will not release must
+            # not decide whether the physical ones do.
+            try:
+                self._shutdown_ros_bridge()
+            except Exception as ros_exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: ROS 2 bridge shutdown raised during cleanup: %s",
+                    self.tool_name_str,
+                    ros_exc,
+                )
 
             # Close the devices last, once every source of commands is down.
             # ``send_action`` re-opens the robot lazily on a command that finds
@@ -2872,6 +3210,14 @@ class Robot(TeleopMixin, AgentTool):
 
     def __del__(self) -> None:
         """Destructor to ensure cleanup."""
+        if not hasattr(self, "_shutdown_event"):
+            # ``__init__`` refused a kwarg (``action_horizon``,
+            # ``control_frequency``) before the executor and this latch were
+            # created, so the instance holds nothing to release. ``cleanup()``
+            # would raise on the first attribute it never reached and log that
+            # name as a cleanup failure beside the ValueError the caller was
+            # owed. A bring-up that fails after this point still cleans up.
+            return
         try:
             self.cleanup()
         except Exception:

@@ -13,17 +13,19 @@ Requires **Python >= 3.12**. Examples use [`uv`](https://docs.astral.sh/uv/) (`c
 | (none) | core only - Robot factory, registry, lazy imports | Inspect the catalog, write tools |
 | `[sim]` | `robot_descriptions>=1.23.0,<2.0.0` | Sim asset resolution without MuJoCo |
 | `[sim-mujoco]` | `sim` + `mujoco`, `imageio`, `imageio-ffmpeg` | Any `Robot()` with default `mode="sim"` |
-| `[lerobot]` | `lerobot>=0.6.1,<0.7.0` | `LerobotLocalPolicy` + dataset recording |
+| `[lerobot]` | `lerobot>=0.6.1,<0.7.0`, `psutil>=6.0.0,<8.0.0` | `LerobotLocalPolicy` + dataset recording + the `lerobot_train` / `lerobot_teleoperate` session tools |
 | `[groot-service]` | `pyzmq`, `msgpack` | `Gr00tPolicy` (ZMQ to a GR00T container) |
 | `[cosmos3-service]` | `msgpack`, `websockets>=17.0` | `Cosmos3Policy` (WebSocket to Cosmos 3 server) |
+| `[earthrover]` | `requests>=2.28.0,<3.0.0` | `Robot("earthrover", mode="real", driver="strands")` - HTTP to the earth-rovers-sdk |
+| `[ur]` | `ur-rtde>=1.6.0,<2.0.0` | `Robot("ur5e", mode="real", driver="strands")` - RTDE to a UR controller |
 | `[mesh]` | `eclipse-zenoh>=1.6.1,<2.0.0`, `json5` | Multi-robot mesh discovery + RPC |
 | `[mesh-iot]` | `mesh` + `awsiotsdk`, `awscrt`, `boto3` | AWS IoT Core transport for mesh |
-| `[all]` | 20 of the 32 extras - **not** a union. `[cosmos3-diffusers]`, `[cosmos3-service]`, `[cosmos3-sim]`, `[crazyflie]` (GPLv3), `[curobo]`, `[microduck]`, `[ros2]`, `[sim-gs]`, `[sim-isaac]`, `[sim-newton]` and `[vera-sim]` stay opt-in | Demos, CI, exploration |
+| `[all]` | 20 of the 32 extras - **not** a union. `[cosmos3-diffusers]`, `[cosmos3-service]`, `[cosmos3-sim]`, `[crazyflie]` (GPLv3), `[curobo]`, `[microduck]`, `[ros2]`, `[sim-gs]`, `[sim-isaac]`, `[sim-newton]` and `[ur]` (compiled binding) stay opt-in | Demos, CI, exploration |
 | `[dev]` | `pytest`, `pytest-cov`, `ruff`, `mypy`, `pytest-timeout` | Contributing |
 
 ```bash
 uv pip install "strands-robots[sim-mujoco]"                  # sim only
-uv pip install "strands-robots[all]"                         # the 20-extra bundle
+uv pip install "strands-robots[all]"                         # the 21-extra bundle
 uv pip install "strands-robots[sim-mujoco,cosmos3-service]"  # Cosmos 3
 uv pip install "strands-robots[sim-mujoco,lerobot,mesh]"     # pick and choose
 ```
@@ -106,6 +108,16 @@ from strands_robots import Robot
 ```
 
 ## Verify
+
+`doctor` checks this machine the way the runtime will read it - the interpreter
+and package, each extra, the GL backend, the torch/torchcodec pair, the GPU, the
+serial and Hub credentials, and the device-connect and mesh postures - and exits
+non-zero if any row fails:
+
+```bash
+python -m strands_robots doctor           # run every check
+python -m strands_robots doctor --list    # print the check names, probe nothing
+```
 
 ```python
 from strands_robots import Robot

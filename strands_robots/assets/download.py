@@ -30,7 +30,7 @@ from typing import Any
 from ..registry import get_robot
 from ..registry import list_robots as registry_list_robots
 from ..registry import resolve_name as resolve_robot_name
-from ..utils import get_assets_dir, get_search_paths, safe_join
+from ..utils import boolean_flag_error, get_assets_dir, get_search_paths, safe_join
 
 logger = logging.getLogger(__name__)
 
@@ -213,14 +213,14 @@ def _mjcf_missing_meshes(model_path: str | os.PathLike[str]) -> list[str]:
             check, and MuJoCo names it on the load that follows.
     """
     model_dir = os.path.dirname(os.path.abspath(os.fspath(model_path)))
-    main = Path(model_path).read_text()
+    main = Path(model_path).read_text(encoding="utf-8")
 
     # (fragment directory relative to model_dir, fragment text)
     fragments: list[tuple[str, str]] = [("", main)]
     for inc in _INCLUDE_RE.findall(main):
         inc_path = os.path.join(model_dir, inc)
         try:
-            text = Path(inc_path).read_text()
+            text = Path(inc_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         rel = os.path.relpath(os.path.dirname(os.path.abspath(inc_path)), model_dir)
@@ -240,7 +240,9 @@ def _needs_download(name: str, info: dict[str, Any] | None, force: bool = False)
 
     ``force`` re-fetches a model whose meshes are all present. A model with
     nothing missing is the only case ``force`` decides: a missing reference is
-    fetched either way.
+    fetched either way - which is why that case returns the flag itself, and why
+    :func:`download_robots` checks it against the boolean domain before calling
+    here rather than letting a non-boolean become this function's verdict.
     """
     if info is None:
         return False
@@ -251,7 +253,17 @@ def _needs_download(name: str, info: dict[str, Any] | None, force: bool = False)
     xml_file, asset_dir = asset["model_xml"], asset["dir"]
 
     for search_dir in get_search_paths():
-        model_path = search_dir / asset_dir / xml_file
+        try:
+            model_path = safe_join(search_dir, f"{asset_dir}/{xml_file}")
+        except ValueError:
+            # The resolver makes this same join
+            # (:func:`~strands_robots.assets.manager._resolve_candidates`) and
+            # yields no candidate for an entry that escapes its search path, so
+            # no file on disk can make this robot present. Fetch rather than
+            # report it as already there - the two readings of one entry are
+            # what :func:`_mjcf_missing_meshes` exists to keep together.
+            logger.warning("assets: path traversal blocked for %s: %r", name, f"{asset_dir}/{xml_file}")
+            return True
         if not model_path.exists():
             continue
         try:
@@ -307,35 +319,61 @@ _COPY_CLEAN_SKIP = frozenset({"README.md", "LICENSE", "CHANGELOG.md"})
 _COPY_CLEAN_SUFFIX = (".png", ".jpg", ".jpeg")
 
 
-def _copy_and_clean(src: Path, dst: Path, *, reject_symlinks: bool = False) -> None:
-    """Copy *src* tree to *dst*, skipping non-essential files at copy time.
+def _copy_external_tree(src: Path, dst: Path, *, drop_docs: bool = True) -> None:
+    """Copy the externally sourced tree *src* into *dst* without following its symlinks.
 
-    Previous implementation deleted matching files from *dst* after copytree,
-    which meant a user's own ``README.md`` in the destination could be wiped.
-    This version filters on read so only files from *src* are dropped.
+    Every tree this module copies into the asset cache comes from outside the
+    process - a shallow clone, or a ``robot_descriptions`` package that clones
+    the same upstream repositories on first import - so a symlinked entry inside
+    *src* is always skipped.  ``shutil.copytree`` defaults to ``symlinks=False``,
+    which *follows* a nested symlink, so a description carrying
+    ``robot_dir/assets -> /home/<user>/.ssh`` would copy host files into the
+    cache and the download would still report success.  The skip is
+    unconditional because no tree reaching here is trusted; a caller cannot ask
+    for the following behaviour.
+
+    Note this covers entries *inside* *src* only: ``shutil.copytree`` follows a
+    symlinked *src* root before the ignore callback runs, so callers must
+    validate the root separately (see :func:`safe_join` with
+    ``resolve_symlinks``).
+
+    Files are filtered on read rather than deleted from *dst* afterwards, so a
+    user's own ``README.md`` kept beside the assets is never wiped.
 
     Args:
-        src: Source tree to copy.
-        dst: Destination directory.
-        reject_symlinks: When ``True``, any symlinked entry inside *src* is
-            skipped at copy time.  Enable this when *src* is an untrusted or
-            externally sourced tree (e.g. a freshly cloned repository) whose
-            symlinks may point outside the tree.  The default ``symlinks=False``
-            behaviour of ``shutil.copytree`` *follows* nested symlinks, so a
-            malicious clone with ``robot_dir/cfg -> /etc`` would copy host files
-            into the asset cache without this guard.  Note this covers entries
-            *inside* *src* only: ``shutil.copytree`` follows a symlinked *src*
-            root before the ignore callback runs, so callers must validate the
-            root separately (see :func:`safe_join` with ``resolve_symlinks``).
+        src: Externally sourced tree to copy.
+        dst: Destination directory inside the asset cache.
+        drop_docs: When ``True`` (the clone routes), also skip the docs, preview
+            images and ``.git`` bookkeeping a description repository ships around
+            the model.  The ``robot_descriptions`` route passes ``False``: its
+            preferred path symlinks the installed package directory whole, and
+            the copy fallback taken when the cache cannot hold a symlink must
+            expose the same files that symlink would have.
     """
 
     def _ignore(dir_path: str, names: list[str]) -> list[str]:
-        skip = [
-            n for n in names if n in _COPY_CLEAN_SKIP or n.lower().endswith(_COPY_CLEAN_SUFFIX) or n.startswith(".git")
-        ]
-        if reject_symlinks:
-            parent = Path(dir_path)
-            skip.extend(n for n in names if (parent / n).is_symlink() and n not in skip)
+        skip = (
+            [
+                n
+                for n in names
+                if n in _COPY_CLEAN_SKIP or n.lower().endswith(_COPY_CLEAN_SUFFIX) or n.startswith(".git")
+            ]
+            if drop_docs
+            else []
+        )
+        parent = Path(dir_path)
+        links = [n for n in names if n not in skip and (parent / n).is_symlink()]
+        if links:
+            # Named rather than dropped quietly: an intra-tree link is skipped by
+            # the same rule as an escaping one, so a model that loses a file this
+            # way is diagnosable from the log instead of just being incomplete.
+            logger.warning(
+                "Skipping symlinked entries %s under %s: a symlink in an externally "
+                "sourced tree is not followed into the asset cache",
+                links,
+                dir_path,
+            )
+            skip.extend(links)
         return skip
 
     shutil.copytree(str(src), str(dst), dirs_exist_ok=True, ignore=_ignore)
@@ -374,8 +412,12 @@ def _download_via_robot_descriptions(robots: dict[str, dict], dest_dir: Path) ->
 
             dst = safe_join(dest_dir, asset_dir)
             if dst.is_symlink() and dst.resolve() == package_path.resolve():
-                # Validate existing symlink still has the expected XML
-                expected_xml = dst / info["asset"]["model_xml"]
+                # Validate existing symlink still has the expected XML.
+                # Joined through ``safe_join`` so the validation cannot be
+                # satisfied by a file outside the linked directory: raw, an
+                # absolute ``model_xml`` discards *dst* and any existing host
+                # file passes this check for a link that holds no model at all.
+                expected_xml = safe_join(dst, str(info["asset"]["model_xml"]))
                 if expected_xml.exists():
                     results[name] = "downloaded"
                     continue
@@ -389,10 +431,15 @@ def _download_via_robot_descriptions(robots: dict[str, dict], dest_dir: Path) ->
             try:
                 dst.symlink_to(package_path)
             except OSError:
-                shutil.copytree(str(package_path), str(dst), dirs_exist_ok=True)
+                # A cache that cannot hold a symlink (a FAT/exFAT card, or
+                # Windows without the privilege) takes the copy instead, and the
+                # installed package is an externally sourced tree exactly like a
+                # fresh clone - so it goes through the same owner, not a bare
+                # copytree that would follow a symlink out of the description.
+                _copy_external_tree(package_path, dst, drop_docs=False)
 
             # Validate: expected XML must exist in the linked/copied dir
-            expected_xml = dst / info["asset"]["model_xml"]
+            expected_xml = safe_join(dst, str(info["asset"]["model_xml"]))
             if not expected_xml.exists():
                 logger.warning(
                     "robot_descriptions module '%s' linked for %s but "
@@ -441,7 +488,7 @@ def _download_via_git(robots: dict[str, dict], dest_dir: Path) -> dict[str, str]
                 if not src.exists():
                     results[name] = f"failed: {asset_dir} not in menagerie"
                     continue
-                _copy_and_clean(src, safe_join(dest_dir, asset_dir), reject_symlinks=True)
+                _copy_external_tree(src, safe_join(dest_dir, asset_dir))
                 results[name] = "downloaded"
             except Exception as exc:
                 results[name] = f"failed: {exc}"
@@ -473,7 +520,7 @@ def _download_from_github(name: str, info: dict, dest_dir: Path) -> str:
             # from the registry entry, so both escape routes must be closed before
             # the copy: a lexical '../' component, and a subdir that is itself a
             # symlink out of the clone.  The nested-symlink filter in
-            # _copy_and_clean cannot cover the latter - copytree follows a
+            # _copy_external_tree cannot cover the latter - copytree follows a
             # symlinked *root* before the ignore callback runs.
             src = safe_join(Path(clone_dir), subdir, resolve_symlinks=True) if subdir else Path(clone_dir)
         except ValueError as exc:
@@ -483,7 +530,7 @@ def _download_from_github(name: str, info: dict, dest_dir: Path) -> str:
 
         dst = safe_join(dest_dir, asset_dir)
         try:
-            _copy_and_clean(src, dst, reject_symlinks=True)
+            _copy_external_tree(src, dst)
             return "downloaded"
         except Exception as exc:
             return f"failed: {exc}"
@@ -545,14 +592,17 @@ def download_robots(
             is refused rather than widened to all (see :exc:`ValueError` below).
         category: Filter by category (arm, humanoid, mobile, ...). Applied only
             when ``names`` is ``None``.
-        force: Re-download even if present.
+        force: Re-fetch a robot whose assets are already present, replacing the
+            cached directory. A posture, so it must be a boolean (see
+            :exc:`ValueError` below).
 
     Returns:
         Dict with downloaded/skipped/failed counts, names, and details.
 
     Raises:
         ValueError: If ``names`` is an empty selection, which asks for no robot
-            and cannot be honored as a request for every robot.
+            and cannot be honored as a request for every robot; or if ``force``
+            is not a boolean, which cannot be read as either posture.
     """
     # ``names`` selects a SUBSET of the sim robots the registry already lists, so it
     # is read by membership - the rule ``names`` is read by on the teleoperate path
@@ -574,8 +624,8 @@ def download_robots(
     # Only the emptiness verdict is taken here; the shape is deliberately NOT routed
     # through the shared ``name_list_error`` domain. This surface resolves each name
     # by membership into ``robots`` below, so a repeat resolves to its first
-    # occurrence and costs nothing - the same carve-out that keeps the WBC and
-    # MotionBricks providers out of that domain - and a mapping and a one-shot
+    # occurrence and costs nothing - the same carve-out that keeps the WBC
+    # provider out of that domain - and a mapping and a one-shot
     # iterator are each read exactly once here. Refusing them would reject calls
     # that are honored as written today.
     if names is not None and not names:
@@ -583,6 +633,32 @@ def download_robots(
             "download_robots(names=[]) selects no robot, so there is nothing to download. "
             "Pass names=None to download every sim robot, or name the subset to download."
         )
+
+    # ``force`` selects a POSTURE - re-fetch a model whose assets are already present,
+    # or leave it alone - so it is held to the shared boolean domain rather than read by
+    # truthiness. It is the third flag in this package to sit in front of a
+    # ``shutil.rmtree``, and the first two are why the rule exists: ``start_recording``'s
+    # ``overwrite`` deleted the caller's dataset and ``restore_calibrations``' overwrote a
+    # measurement of the hardware. Here the re-fetch removes the cached directory for a
+    # robot whose assets are present, and that directory is where a user's own files sit -
+    # ``_copy_external_tree`` filters on read rather than deleting afterwards precisely so
+    # a README or notes kept beside the assets are never touched, and this is the one path
+    # that does touch them.
+    #
+    # Measured on the shipped code, ``force="false"`` (also ``"no"``, ``"off"``, ``"0"``,
+    # ``1`` and ``math.nan``) was indistinguishable from ``force=True``: the present
+    # robot's cache directory was removed and re-fetched, a file kept beside its assets
+    # was gone, and the call reported ``downloaded: 1`` to a caller who had spelled the
+    # not-re-downloading of it. The falsy non-booleans - ``None``, ``0``, ``[]`` - took the
+    # skip branch without ever being a declared spelling of it.
+    #
+    # Refused here, alongside the selection above and ahead of ``get_user_assets_dir()``,
+    # so a refusal cannot arrive after the directory it was refusing to replace is gone.
+    # It is also what keeps :func:`_needs_download` honest: that function returns this
+    # flag as its own ``bool`` verdict for a model with nothing missing, so an unchecked
+    # value was returned from a surface declaring it returns a boolean.
+    if text := boolean_flag_error(force, "force", "download_robots"):
+        raise ValueError(text)
 
     dest_dir = get_user_assets_dir()
     # Filter None values - get_robot() can return None for unknown names

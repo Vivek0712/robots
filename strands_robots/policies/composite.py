@@ -19,7 +19,7 @@ rule, a child whose ENTIRE action dict is discarded by routing is refused: a
 composite in which one child reaches no actuator is the other child alone.
 
 This class composes joint groups in PARALLEL; it is not a cascade. A whole-body
-kinematic generator (Kimodo / MotionBricks) and a controller that tracks its
+kinematic generator (Kimodo) and a controller that tracks its
 reference drive the SAME joints and run in SERIES - the generator's targets are
 the controller's input, not a disjoint half of one action dict. No composite
 expresses that: a reference tracker has to consume the reference through its own
@@ -67,15 +67,19 @@ class CompositePolicy(Policy):
       every name it emits that the lower policy did not already claim - lower
       precedence).
 
-    An explicit group is EXCLUSIVE: the policy it names is the only one allowed to
-    command those joints. A defaulted ``lower_joints`` therefore still may not
-    command into an explicit ``upper_joints`` - that tick is refused, on every tick
-    alike, rather than resolved by whichever child emitted the name. Precedence
-    only decides between two DEFAULTED groups, where the caller declared no owner.
+    An explicit group is EXCLUSIVE, either way round: the policy it names is the
+    only one allowed to command those joints. A defaulted ``lower_joints`` may not
+    command into an explicit ``upper_joints``, and a defaulted ``upper_joints`` may
+    not command into an explicit ``lower_joints`` - that tick is refused, on every
+    tick alike, rather than resolved by whichever child emitted the name.
+    Precedence only decides between two DEFAULTED groups, where the caller
+    declared no owner.
 
     Routing that discards a child's ENTIRE action dict raises: the composite
     would otherwise silently be the surviving child alone. Two children that
     drive the same joint set cannot be composed, only cascaded (module docstring).
+    An observation subset that selects NOTHING raises for the mirror reason: a
+    child queried with an empty dict acts on no reading at all.
 
     The merged chunk length is the shorter of the two children's chunks, so the
     more frequently re-querying child sets the re-query cadence
@@ -87,17 +91,24 @@ class CompositePolicy(Policy):
         lower: Policy driving the lower joint group (e.g. legs+waist locomotion).
         upper: Policy driving the upper joint group (e.g. arms manipulation).
         lower_joints: Joint/actuator names the lower policy is authoritative for.
-            ``None`` (default) accepts every name the lower policy emits, minus
-            any that ``upper_joints`` assigns to the upper policy - commanding
-            into an explicit upper group is refused, not silently resolved.
+            Exclusive: no other child may command these, whichever names the lower
+            policy emits on a given tick. ``None`` (default) accepts every name the
+            lower policy emits, minus any that ``upper_joints`` assigns to the
+            upper policy - commanding into an explicit group is refused, not
+            silently resolved.
         upper_joints: Joint/actuator names the upper policy is authoritative for.
             Exclusive: no other child may command these, whichever names the upper
             policy emits on a given tick. ``None`` (default) accepts every upper
             name not already owned by the lower policy.
         lower_obs_keys: Observation keys to forward to the lower policy. ``None``
-            (default) forwards the full observation (children read by name).
+            (default) forwards the full observation (children read by name). A
+            subset that shares no key with the observation is refused rather
+            than forwarded as an empty dict - the names belong to whatever
+            produces the observation, so a subset written in the wrong namespace
+            would otherwise starve the child on every tick.
         upper_obs_keys: Observation keys to forward to the upper policy. ``None``
-            (default) forwards the full observation.
+            (default) forwards the full observation. Held to the same rule as
+            ``lower_obs_keys``.
 
     Raises:
         ValueError: If ``lower`` or ``upper`` is ``None``, or if ``lower_joints``
@@ -215,13 +226,15 @@ class CompositePolicy(Policy):
             child that owns that name.
 
         Raises:
-            ValueError: If either child returns an empty chunk, if routing
-                discards a child's entire action dict (the composite would be
-                the other child alone), or if the lower policy commands a joint
-                ``upper_joints`` assigns to the upper policy.
+            ValueError: If a configured observation subset shares no key with
+                the observation (the child would be queried blind), if either
+                child returns an empty chunk, if routing discards a child's
+                entire action dict (the composite would be the other child
+                alone), or if either child commands a joint the other child's
+                explicit joint group assigns to it.
         """
-        lower_obs = self._filter_obs(observation_dict, self._lower_obs_keys)
-        upper_obs = self._filter_obs(observation_dict, self._upper_obs_keys)
+        lower_obs = self._filter_obs(observation_dict, self._lower_obs_keys, "lower", self._lower)
+        upper_obs = self._filter_obs(observation_dict, self._upper_obs_keys, "upper", self._upper)
         lower_chunk, upper_chunk = await asyncio.gather(
             self._lower.get_actions(lower_obs, instruction, **kwargs),
             self._upper.get_actions(upper_obs, instruction, **kwargs),
@@ -248,7 +261,7 @@ class CompositePolicy(Policy):
         up = self._route(upper_action, self._upper_joints, exclude=None if self._upper_joints else set(lo))
         self._reject_discarded_child("lower", self._lower, lower_action, lo, self._lower_joints, set())
         self._reject_discarded_child("upper", self._upper, upper_action, up, self._upper_joints, set(lo))
-        self._reject_contested_upper_ownership(lo)
+        self._reject_contested_explicit_ownership(lower_action, upper_action)
         lo.update(up)
         return lo
 
@@ -305,51 +318,62 @@ class CompositePolicy(Policy):
             "upper_joints, or drive the whole body with a single policy."
         )
 
-    def _reject_contested_upper_ownership(self, lo: dict[str, Any]) -> None:
-        """Refuse a tick in which the lower policy commands an upper-owned joint.
+    def _reject_contested_explicit_ownership(self, lower_action: dict[str, Any], upper_action: dict[str, Any]) -> None:
+        """Refuse a tick in which one child commands a joint the other explicitly owns.
 
-        ``upper_joints`` names the joints the upper policy is authoritative for. A
-        defaulted ``lower_joints`` keeps every name the lower policy emits, so a
-        lower policy whose action space covers the whole robot (a whole-body
-        kinematic generator emits all 29 G1 joints) also commands the names the
-        caller assigned to the upper policy. Which value reached the actuator then
-        depended on whether the upper policy happened to emit that name on this
-        tick: when it did, the merge raised; when it did not, the lower policy's
-        value was written to a joint the caller had given away, with no error. One
-        configuration, two outcomes, chosen per tick by the upper policy's chunk
-        contents.
+        An explicit group names the joints one child is authoritative for, so the
+        other child may not command them. The child whose OWN group is defaulted
+        is the one that can: it keeps every name it emits, which includes the
+        names the caller assigned to its sibling. Which value then reached the
+        actuator depended on what the other child happened to emit on this tick -
+        when the two emitted sets overlapped the merge raised or precedence
+        arbitrated, and when they did not, the trespassing child's value was
+        written to a joint the caller had given away, with no error. One
+        configuration, two outcomes, chosen per tick by a chunk's contents.
 
-        Refusing on the condition that is actually ambiguous - the lower policy
-        commanding into an explicit upper group - is the same answer on every tick.
-        Dropping the lower policy's value instead would leave that joint on its
-        previous command with nothing to say so, which is the silent dropped
-        command this class raises on everywhere else.
+        Refusing on the condition that is actually ambiguous - a defaulted child
+        commanding into its sibling's explicit group - is the same answer on every
+        tick. Dropping that value instead would leave the joint on its previous
+        command with nothing to say so, which is the silent dropped command this
+        class raises on everywhere else.
 
-        Only an explicit ``upper_joints`` can be contested: with it defaulted the
-        upper dict is routed with the lower's names excluded, so the two dicts are
-        disjoint by construction and there is nothing to arbitrate.
+        Both directions are graded from what each child EMITTED, not from what
+        survived routing, precisely so the verdict does not depend on the other
+        child's chunk. Two explicit groups are disjoint by construction
+        (:meth:`__init__` refuses an overlap) and each child is routed inside its
+        own group, so neither can reach the other's joints; two defaulted groups
+        declare no owner, and there precedence still arbitrates.
 
         Args:
-            lo: The routed lower action dict for this tick.
+            lower_action: The lower policy's action dict for this tick.
+            upper_action: The upper policy's action dict for this tick.
 
         Raises:
-            ValueError: If the lower policy commanded any name ``upper_joints``
-                assigns to the upper policy.
+            ValueError: If the child with a defaulted group commanded any name the
+                other child's explicit group assigns to it.
         """
-        if self._upper_joints is None:
+        if self._lower_joints is None and self._upper_joints is not None:
+            trespasser, owner, group, emitted = "lower", "upper", self._upper_joints, lower_action
+        elif self._upper_joints is None and self._lower_joints is not None:
+            trespasser, owner, group, emitted = "upper", "lower", self._lower_joints, upper_action
+        else:
             return
-        contested = set(lo) & self._upper_joints
+        contested = set(emitted) & group
         if not contested:
             return
+        owner_policy, trespasser_policy = (self._upper, self._lower) if owner == "upper" else (self._lower, self._upper)
+        remedy = {
+            "lower": "lower_joints=WBC_G1_LEG_WAIST_JOINTS for a G1 locomotion policy",
+            "upper": "upper_joints=ARM_JOINTS for a G1 manipulation policy",
+        }[trespasser]
         raise ValueError(
-            f"CompositePolicy: upper_joints assigns joint(s) {sorted(contested)} to the upper "
-            f"policy '{self._upper.provider_name}', but the lower policy "
-            f"'{self._lower.provider_name}' also commanded them this tick. An explicit joint "
+            f"CompositePolicy: {owner}_joints assigns joint(s) {sorted(contested)} to the {owner} "
+            f"policy '{owner_policy.provider_name}', but the {trespasser} policy "
+            f"'{trespasser_policy.provider_name}' also commanded them this tick. An explicit joint "
             "group is exclusive - the policy that owns a name is the only one allowed to "
             "command it, whether or not the other child emits that name on a given tick. Set "
-            "lower_joints so the lower policy does not command into the upper group (e.g. "
-            "lower_joints=WBC_G1_LEG_WAIST_JOINTS for a G1 locomotion policy), or remove those "
-            "names from upper_joints."
+            f"{trespasser}_joints so the {trespasser} policy does not command into the {owner} "
+            f"group (e.g. {remedy}), or remove those names from {owner}_joints."
         )
 
     @staticmethod
@@ -366,12 +390,55 @@ class CompositePolicy(Policy):
             return {k: v for k, v in action.items() if k not in exclude}
         return dict(action)
 
-    @staticmethod
-    def _filter_obs(observation_dict: dict[str, Any], keys: set[str] | None) -> dict[str, Any]:
-        """Forward the full observation, or only ``keys`` when a subset is configured."""
+    def _filter_obs(
+        self, observation_dict: dict[str, Any], keys: set[str] | None, role: str, child: Policy
+    ) -> dict[str, Any]:
+        """The observation ``child`` is queried with: all of it, or only ``keys``.
+
+        Refuses a subset that selects nothing from an observation that has keys.
+        A child queried with an empty dict reads none of the state it acts on and
+        commands its joints from no information at all -- the observation-side
+        twin of the discarded action dict :meth:`_reject_discarded_child` already
+        refuses, and it is the mistake a key subset makes most easily, because
+        the names belong to whatever produced the observation: a MuJoCo world
+        names them after the robot's own joints (``"1"``, ``"1.vel"``), while a
+        LeRobot dataset spells the same reading ``"observation.state"``. One
+        subset written in the wrong namespace shares no key at all, so the child
+        is starved on every tick of every episode while the rollout reports
+        success.
+
+        Refused on the total miss rather than on any missing key, for the reason
+        :meth:`_reject_discarded_child` leaves a child that commanded nothing
+        alone: a partly satisfied subset still hands the child keys it asked for,
+        and whether it can act on those is its own contract (children read by
+        name). An observation with no keys at all is likewise left alone -- there
+        is nothing for the subset to have missed.
+
+        Args:
+            observation_dict: The observation the consumer produced this tick.
+            keys: ``child``'s configured key subset, or ``None`` for all of it.
+            role: The seat ``child`` occupies - ``"lower"`` or ``"upper"``.
+            child: The child policy about to be queried.
+
+        Returns:
+            The observation to pass to ``child``.
+
+        Raises:
+            ValueError: If ``keys`` shares no key with a non-empty observation.
+        """
         if keys is None:
             return observation_dict
-        return {k: v for k, v in observation_dict.items() if k in keys}
+        selected = {k: v for k, v in observation_dict.items() if k in keys}
+        if selected or not observation_dict:
+            return selected
+        raise ValueError(
+            f"CompositePolicy: the {role} policy '{child.provider_name}' would be queried with an "
+            f"empty observation - the {role}_obs_keys group {sorted(keys)} shares no key with the "
+            f"observation {sorted(observation_dict)}, so it would command its joints from no "
+            f"reading at all. Set {role}_obs_keys to keys the observation carries (they are named "
+            "by whatever produces it - a simulated world names them after the robot's own joints "
+            f"and cameras), or leave {role}_obs_keys unset to forward the whole observation."
+        )
 
 
 __all__ = ["CompositePolicy"]

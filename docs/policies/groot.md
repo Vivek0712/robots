@@ -11,12 +11,35 @@ uv pip install "strands-robots[groot-service]"
 ```python
 from strands_robots.policies import create_policy
 
-# Service mode (container running separately)
+# Service mode (Isaac-GR00T container running separately) - what the extra above installs for
 policy = create_policy("groot", port=5555, data_config="so100_dualcam")
+```
 
-# Local mode (load model in-process)        # requires GPU
+## In-process inference
+
+Two routes load a GR00T checkpoint in the caller's own process. They need
+different packages, and only one of them is declared by an extra.
+
+```python
+# lerobot's own GR00T N1.7, parity-tested against NVIDIA's implementation
+policy = create_policy(
+    "lerobot_local", policy_type="groot", pretrained_name_or_path="nvidia/GR00T-N1.7-3B"
+)
+
+# NVIDIA's Isaac-GR00T, loaded directly     # requires GPU + the gr00t package
 policy = create_policy("groot", model_path="/checkpoint", data_config="so100_dualcam", device="cuda")
 ```
+
+`model_path=` needs NVIDIA's `gr00t` package, which **no extra declares**: it
+installs from [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) and pins
+`transformers==4.57.3`, while lerobot needs `transformers>=5` for its Qwen3-VL
+backbone - so gr00t and lerobot cannot be imported in the same Python process
+([lerobot's own GR00T notes](https://github.com/huggingface/lerobot/blob/main/docs/source/policy_groot_README.md)
+state this). In an install that has lerobot - `strands-robots[all]` does -
+`lerobot_local` is the in-process route, and it brings RTC and the
+`ProcessorBridge` normalisation with it. `create_policy("groot",
+model_path=...)` in such an install refuses with both open routes named rather
+than an install instruction that cannot be followed.
 
 ## Parameters
 
@@ -28,8 +51,8 @@ Gr00tPolicy(
     model_path=None,                # set for local mode; None = service mode
     embodiment_tag="NEW_EMBODIMENT",
     device="cuda",                  # local mode only
-    groot_version=None,             # override auto-detection (N1.5/N1.6/N1.7)
-    strict=False,
+    groot_version=None,             # force "n1.5"/"n1.6"/"n1.7"; None = auto-detect
+    strict=False,                   # forwarded to the N1.6/N1.7 loader
     api_token=None,                 # fallback: GROOT_API_TOKEN env var
     observation_mapping=None,
     action_mapping=None,
@@ -37,6 +60,17 @@ Gr00tPolicy(
     strict_keys=False,             # raise instead of positional key-guessing
 )
 ```
+
+`strict` and `strict_keys` each select a posture rather than scaling a
+quantity, so a non-boolean is refused at construction in **either** mode -
+naming the parameter and the value given - rather than read by truthiness.
+Every non-empty string is truthy, so `strict_keys="false"` used to select the
+strict posture and then report it as `strict_keys=True`; `None` and `0` took
+the permissive branch while spelling neither. `True`, `False` and NumPy
+booleans are stored as given. The check is not scoped to local mode even though
+only local mode reads either flag, because local mode needs Isaac-GR00T
+installed: a caller composing a `policy_config` against a service-mode policy
+would otherwise get no answer until they moved to a GPU host.
 
 ## Strict key matching
 
@@ -54,7 +88,8 @@ policy = create_policy("groot", data_config="so100_dualcam",
 ```
 
 `strict_keys` defaults to `False` (positional fallback preserved) and is a
-no-op when an explicit mapping is supplied.
+no-op when an explicit mapping is supplied. A non-boolean is refused, so the
+`ValueError` above is only ever raised for a caller who really asked for it.
 
 Auto-inference is local-mode only, because it reads the checkpoint's modality
 configs and service mode cannot introspect the remote server. A service-mode
@@ -143,6 +178,13 @@ that had already exited is not a failure, but a port still held after both
 signals is: the result is then `{"status": "error", ...}` naming the port and the
 surviving pid, because reporting success there would send the next `start` into a
 bind that cannot succeed. Check the status before rebinding the same port.
+
+The six posture flags - `remove_volumes`, `force`, `deterministic`,
+`use_tensorrt`, `http_server` and `use_sim_policy_wrapper` - are checked rather
+than read by truthiness, and only by the actions that consume them: a spelling
+such as `remove_volumes="false"` is refused up front instead of selecting the
+volume removal it reads as declining, and `status` or `stop`, which read none of
+the six, refuse none of them.
 
 ## See also
 

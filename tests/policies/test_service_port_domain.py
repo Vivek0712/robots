@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from strands_robots.policies import create_policy
+from strands_robots.policies.factory import create_policy
 from strands_robots.utils import tcp_port_error
 
 # Ports no TCP transport can address. ``0`` asks the kernel for an ephemeral
@@ -170,8 +170,14 @@ class TestOnlyTheDialedPortIsValidated:
 
     def test_groot_local_mode_ignores_the_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``model_path`` selects local inference, which dials nothing."""
+        import strands_robots.policies.groot.policy as groot_policy
         from strands_robots.policies.groot.policy import Gr00tPolicy
 
+        # Local mode refuses before the loader when no Isaac-GR00T release is
+        # importable, so stubbing the loader alone no longer reaches the branch
+        # under test. Detection is stubbed too, which is what the port scoping
+        # is being measured against - not the availability of gr00t.
+        monkeypatch.setattr(groot_policy, "_detect_groot_version", lambda **kw: "n1.7")
         monkeypatch.setattr(Gr00tPolicy, "_load_local_policy", lambda self, *a, **k: None)
         monkeypatch.setattr(Gr00tPolicy, "_init_mappings", lambda self: None)
         policy = Gr00tPolicy(model_path="/tmp/checkpoint", port=99999)
@@ -244,6 +250,12 @@ def _policy_module_paths() -> list[Path]:
     resolved elsewhere would make the scan below silently empty, which is what
     the "these four classes were seen" assertion in
     :class:`TestNoProviderShipsAnUnguardedPort` exists to catch.
+
+    ``create_policy`` is imported from ``strands_robots.policies.factory``, the
+    module that defines it, rather than from the package that re-exports it.
+    ``inspect.getfile`` answers the same object either way, so the walk below is
+    unchanged; the import spelling is what lets a static reader see which file
+    the root comes from.
     """
     root = Path(inspect.getfile(create_policy)).parent
     return sorted(root.glob("*/policy.py"))

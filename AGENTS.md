@@ -33,7 +33,6 @@ strands_robots/
 ├── registry/              # JSON registry for policy discovery
 ├── tools/                 # Strands @tool functions
 │   ├── gr00t_inference.py # GR00T inference tool
-│   ├── lerobot_calibrate.py
 │   ├── lerobot_camera.py
 │   ├── lerobot_teleoperate.py
 │   ├── pose_tool.py
@@ -110,9 +109,9 @@ hatch run format            # ruff check --fix, ruff format
     and a HIGH advisory. State the floor in `[tool.uv] constraint-dependencies`,
     at the first version clearing the advisory rather than the version currently
     resolved, and name the GHSA id in a comment beside it. Use a constraint and
-    not an override: measured on this manifest, `gymnasium>=1.1.1` as a constraint
-    fails `uv lock` and names the `[vera-sim]` extra's contradicting
-    `gymnasium==0.29.1`, while the same floor as an override resolves silently and
+    not an override: measured against an extra pinning `gymnasium==0.29.1`,
+    `gymnasium>=1.1.1` as a constraint fails `uv lock` and names the contradicting
+    pin, while the same floor as an override resolves silently and
     discards that requirement - so an override hides exactly the signal a security
     floor exists to raise. `[project]` is the wrong home while the package stays
     transitive; move the bound there if it ever becomes direct. Pinned by
@@ -285,11 +284,26 @@ hatch run format            # ruff check --fix, ruff format
    as a separate `headRepositoryId`. Step 5 already says "from your fork"; step 1
    is where that stops being a preference.
 
-   Before you start, check that no open pull request already claims the issue:
+   Before you start, check that no open pull request already claims the issue,
+   and that none already edits the file the defect lives in:
 
    ```
-   python3 scripts/check_duplicate_claim.py --repo strands-labs/robots --issue <N>
+   python3 .github/scripts/check_duplicate_claim.py --repo strands-labs/robots --issue <N>
+   python3 scripts/check_merge_base_overlap.py --github-repo strands-labs/robots --paths <the paths you are about to edit>
    ```
+
+   The second read is the one with recall on this repository's duplicate pairs.
+   Five of them are recorded on #3169, and on every one the claim key was silent
+   (`Closes` against `Refs`), the fragment key was silent (two slugs, or the issue
+   number against the PR number) and the shared-edited-test key was silent (two
+   new test files). The one thing two fixes of one defect cannot avoid sharing is
+   the file the defect lives in, and that path is known before any commit exists.
+   #3368 was open and approved for 31 minutes before #3370's first commit against
+   the same three files; this read would have named it, and instead the pair spent
+   a second external approval - the scarcest resource here - on a diff `main`
+   already had. A hit is a pull request to read before writing a line, not a
+   refusal to work: if it is a different change to the same file it is a
+   merge-order question, which `--all-open` answers once yours is open.
 
    Name the repository rather than leaving it to be inferred. `$GITHUB_REPOSITORY`
    is where the command is *running*, which for a scheduled agent need not be a
@@ -324,7 +338,7 @@ hatch run format            # ruff check --fix, ruff format
    question:
 
    ```
-   python3 scripts/check_duplicate_claim.py --repo strands-labs/robots --all-open
+   python3 .github/scripts/check_duplicate_claim.py --repo strands-labs/robots --all-open
    ```
 
    It reports only pairs that **create the same thing**, which over the 2002 pairs
@@ -358,12 +372,15 @@ hatch run format            # ruff check --fix, ruff format
    complementary rather than nested: no issue-keyed pair shares an added path, and
    no claim-free pair claims an issue.
 
-   This one cannot be asked before you start, and not for want of trying: a path
-   set is a property of a pushed branch, so there is nothing to read at intake. It
-   caps the review cost of a collision rather than preventing the work, which is
-   why it belongs here and `--issue` belongs above. It still arrives early enough
-   to matter - both claim-free pairs opened inside the same ~35-minute window every
-   other observed collision shares, 14m 41s and 29m 26s apart.
+   The pairwise form cannot be asked before you start: a path set is a property of
+   a pushed branch, so with no branch there is no pair. But one side of the pair is
+   known at intake - the file you are about to edit - and `--paths` (step 1 above)
+   reads the open set against it, which is the same relation with a path list
+   standing in for the branch that does not exist yet. So the sweep here caps the
+   review cost of a collision the intake read missed, rather than being the first
+   chance to see one. It still arrives early enough to matter - both claim-free
+   pairs opened inside the same ~35-minute window every other observed collision
+   shares, 14m 41s and 29m 26s apart.
 2. Make changes, run `hatch run format && hatch run lint && hatch run test`.
    If you narrow the test run to the area you changed (`pytest tests/drivers/ -k g1`),
    run `hatch run whole-tree-check` alongside it. Ninety-odd graders take
@@ -383,7 +400,9 @@ hatch run format            # ruff check --fix, ruff format
    all of those resolve. The one shape that does not is a symbol imported from
    a module that only *re-exports* it: the import does not say which file the
    symbol came from, so it resolves to nothing rather than to a guess. Import
-   from the defining module.
+   from the defining module. A pin screens the whole tree for that shape and
+   names the module to import from, so a site that breaks the rule fails the
+   required check instead of dropping out of the roster unnoticed (#3273).
 3. Record the change as a news fragment: `changelog.d/<pr-number>-<slug>.md`
    (see [`changelog.d/README.md`](changelog.d/README.md)). **Never append to
    `## [Unreleased]` in `CHANGELOG.md` directly** - every branch inserts at the
@@ -499,8 +518,8 @@ hatch run format            # ruff check --fix, ruff format
    you is the part that does not survive a context rebuild, so ask a command:
 
    ```
-   python3 scripts/check_thread_is_answered.py --repo strands-labs/robots --pr <N>
-   python3 scripts/check_thread_is_answered.py --repo strands-labs/robots --all-open
+   python3 .github/scripts/check_thread_is_answered.py --repo strands-labs/robots --pr <N>
+   python3 .github/scripts/check_thread_is_answered.py --repo strands-labs/robots --all-open
    ```
 
    `settled` is not work. `awaiting-the-author` is a reply, `answered` is the
@@ -986,6 +1005,34 @@ hatch run format            # ruff check --fix, ruff format
      `require_last_push_approval` then disqualifies the pushing account from
      re-supplying it, turning a one-approval merge into one that needs a second
      reviewer.
+
+     **`CHANGES_REQUESTED` is a fourth reading, and it is the one no approval
+     answers.** A standing request for changes holds the merge until *its own
+     author* approves or dismisses it, so an approval from anybody else
+     satisfies `required_approving_review_count` and leaves the pull request
+     `BLOCKED`. That makes it the opposite of every other value here: the party
+     it needs is not "a reviewer" but one named account, and asking a different
+     reviewer for the approval spends a round that cannot merge anything.
+
+     It is also the reading a resolved thread hides. #3205 sat at
+     `CHANGES_REQUESTED` for 15h44m with its one review thread **resolved**,
+     `call-test-lint` `SUCCESS`, and `check_thread_is_answered.py` reading
+     `nothing-owed` -- 12h51m of that after the fix had landed. Thread
+     resolution and review decision are separate objects and resolving the
+     thread does not retract the review, so the sweep that answers "does this
+     owe me anything" correctly said no while the decision went on blocking.
+     Nor does the requester's own follow-up reply clear it: a reply is a
+     `COMMENTED` review, which expresses no position, so it supersedes nothing.
+
+     `check_merge_blockers.py` reports this as `changes-requested`, owed by
+     `the reviewer who requested changes` and named account by account, ahead of
+     the approval rules it is not answerable by. It did not always: it modelled
+     the approval side alone, so it reported #3205 as `missing-approval` owed by
+     "a reviewer other than the pusher" -- a party whose approval could not have
+     merged it, which is the #1905 presentation reached from the review-decision
+     side rather than the last-push side. If you are the requester and the work
+     has landed, the remedy is to supersede your own review; that is a review,
+     not a push, and it costs the branch nothing.
    - *And that the head it names is the branch's tip.* A pull request has three
      answers to "what is the head commit" and they can disagree for hours. Two
      of them are the API's, and are the pair this bullet compares: `headRefOid`
@@ -1070,11 +1117,11 @@ hatch run format            # ruff check --fix, ruff format
      checks above:
 
      ```
-     python3 scripts/check_pr_head_is_current.py --repo <owner/name> --all-open
+     python3 .github/scripts/check_pr_head_is_current.py --repo <owner/name> --all-open
      ```
 
      It agreed with `git ls-remote` on all 10 open pull requests, so it needs no
-     clone. Pinned by tests/test_pr_head_is_current.py. See #2538.
+     clone. See #2538.
    - *And that the tree you are deriving from is that tip.* The third answer is
      `refs/pull/N/head`, and it is the one every checkout reaches for and the
      only one with no signal at all. It is a mirror ref GitHub refreshes on its
@@ -1119,7 +1166,7 @@ hatch run format            # ruff check --fix, ruff format
      itself and exits 1 on a stale tree, so it can sit in front of the work:
 
      ```
-     python3 scripts/check_checkout_is_pr_head.py --repo <owner/name> --pr <N>
+     python3 .github/scripts/check_checkout_is_pr_head.py --repo <owner/name> --pr <N>
      ```
 
      It compares by **ancestry, not equality**: a clone sitting at its own
@@ -1127,7 +1174,7 @@ hatch run format            # ruff check --fix, ruff format
      state between a commit and its push and is not a finding. A tip missing
      from the local object database is `stale-checkout` rather than
      indeterminate - a clone that never fetched a commit cannot contain it.
-     Pinned by tests/test_checkout_is_pr_head.py. See #2520, which records four
+     See #2520, which records four
      instances: #2511 (one thread, four author replies), #2566 and #2577 (two
      runs deriving one fix, the duplicate discarded only because a plain push
      was refused) and #2678 above. That refusal is load-bearing by accident -
@@ -1273,21 +1320,24 @@ hatch run format            # ruff check --fix, ruff format
    Rather than infer which of these is operating, read it:
 
    ```
-   python3 scripts/check_merge_blockers.py --repo strands-labs/robots --pr <N>
-   python3 scripts/check_merge_blockers.py --repo strands-labs/robots --all-open
+   python3 .github/scripts/check_merge_blockers.py --repo strands-labs/robots --pr <N>
+   python3 .github/scripts/check_merge_blockers.py --repo strands-labs/robots --all-open
    ```
 
    It reads the branch ruleset - so a rule that is changed in settings cannot
    drift from this file - and names every rule the pull request leaves
    unsatisfied together with the party who can clear it: a conflict or an
-   unresolved thread or a failing check (the author), a missing approval (any
+   unresolved thread or a failing check (the author), a standing request for
+   changes (only the account that made it, by approving or dismissing its own
+   review -- no other reviewer's approval clears it), a missing approval (any
    reviewer), an approval only its own pusher supplied (a different reviewer,
    per #1905), a required check absent because a fork run is held at
    `action_required` (a maintainer, by approving each run), a required check
    absent because the head carries no check suite at all (also a maintainer,
    but by closing and reopening: there is no held run to approve and no
    suite to re-run), a check still running (nobody), a
-   mergeability GitHub has not finished computing (nobody, until a re-read), or
+   mergeability GitHub has not finished computing (nobody, until a re-read), a
+   pull request that has already merged (nobody, terminally), or
    no unsatisfied rule at all, which is the #2574 case and the one worth saying
    out loud. A conflict, a draft, or an uncomputed mergeability is reported as
    *gating*: the rules behind it cannot be assessed, so an approval there is
@@ -1302,9 +1352,20 @@ hatch run format            # ruff check --fix, ruff format
    request in the same state read `no-unsatisfied-rule`, whose printed remedy is
    to attempt the merge. Both are now `merge-state-unknown`. See #2585.
 
+   Read the null against `merged`, though, because "every open pull request" is
+   the whole of that claim. The pull request whose *own* merge invalidated the
+   value is not open, and for it the null never resolves: #2586 still read
+   `mergeable: null` / `mergeable_state: unknown` fourteen days after it
+   squashed. So a merged pull request reports `already-merged`, terminal and
+   ahead of every rule, rather than the re-read -- which on a closed pull request
+   describes a wait with no terminating condition, and reads in the reassuring
+   direction while a merge-and-verify cycle polls for an answer it already has.
+   A pull request closed *without* merging is a different reading again and does
+   not share the null: measured on #3194, it retains its last computed
+   `mergeable` (`true`/`blocked`). See #3231.
+
    It composes `check_last_push_approval.py` rather than restating it, so what
    counts as a current approval has one owner. Neither script gates a merge.
-   Pinned by tests/test_merge_blockers.py.
 
    This is worth the words because the failure mode is silent and expensive in the
    opposite direction from the usual one. Treating an advisory red as a merge
@@ -1380,7 +1441,7 @@ hatch run format            # ruff check --fix, ruff format
    | #1763, which broke `main` | `diverged  ahead_by=2  behind_by=1` | owed |
    | #2012, which raised the same alarm | `ahead  ahead_by=3  behind_by=0` | none exists |
 
-   #2012 edited `strands_robots/policies/vera/provider.py`, which #1992 had
+   #2012 edited a policy provider module, which #1992 had
    touched earlier the same day, so it met the trigger condition verbatim - but
    #1992 sat 13 commits back in the branch's own ancestry
    (`compare/<#1992 squash>...<head>` -> `ahead  behind_by=0`) rather than
@@ -1590,8 +1651,17 @@ hatch run format            # ruff check --fix, ruff format
    place it is legible:
 
    ```
-   GET /repos/{owner}/{repo}/actions/runs?head_sha=<head>  ->  triggering_actor
+   GET /repos/{owner}/{repo}/actions/runs?head_sha=<head>  ->  actor
    ```
+
+   Read `actor`, not `triggering_actor`. A run carries both; `triggering_actor`
+   names the account behind its *latest attempt*, so approving a held run or
+   re-running one rewrites it. On #3448 -- a first-time contributor's fork, every
+   run held at `action_required` -- releasing the CI moved `triggering_actor` to
+   the maintainer on all nine `pull_request` runs while `actor` stayed
+   `shipitfast`, so the check named its approver as the pusher. The two agree
+   wherever no run had a second attempt (measured on #1894, #1920, #1722, #1035
+   and #2907).
 
    #1035 is the control - same author, same fork, same `strands_robots/mesh/`
    files, one approval from the same account post-dating its head commit,
@@ -1600,7 +1670,7 @@ hatch run format            # ruff check --fix, ruff format
    `APPROVED` - until a later push moved that one input and took it into the
    blocked row as well:
 
-   | PR | commit author | `triggering_actor` | approver | `reviewDecision` |
+   | PR | commit author | `actor` | approver | `reviewDecision` |
    |---|---|---|---|---|
    | #1035 at `2be59dad` | the contributor | the contributor | the maintainer | `APPROVED` |
    | #1035 at `8d6a4c42` | the maintainer | the maintainer | the maintainer | `REVIEW_REQUIRED` |
@@ -1657,8 +1727,8 @@ hatch run format            # ruff check --fix, ruff format
    `8d6a4c42`.
 
    Do not try to settle this from the commit metadata, which misleads in three
-   different directions. All three heads below read `REVIEW_REQUIRED`; only
-   `triggering_actor` is load-bearing.
+   different directions. All three heads below read `REVIEW_REQUIRED`; only the
+   workflow run's `actor` is load-bearing.
 
    | head | git author / committer | metadata reads as |
    |---|---|---|
@@ -1670,8 +1740,9 @@ hatch run format            # ruff check --fix, ruff format
    prompt a check: a commit whose committer is a GitHub service account reads as
    GitHub having performed the merge rather than a person. It is what the
    **"Update branch" button** leaves behind, and the clicker survives only in the
-   git *author* field and in `triggering_actor` -- both `cagataycali` on that
-   head, across all 12 of its workflow runs, on a branch authored by `logesh4v`.
+   git *author* field and in the run attribution -- `cagataycali` in `actor` and
+   in `triggering_actor` alike, across all 12 of that head's workflow runs, on a
+   branch authored by `logesh4v`.
    A table that stopped two of the three shapes is why this one was read twice as
    harmless.
 
@@ -1923,6 +1994,28 @@ which side the enum is on.
   below the 100 ms threshold. Pinned on behaviour by
   `tests/tools/test_camera_durations_survive_a_clock_step.py`, which asserts what the tool
   reports across a step rather than which clock the source names.
+- **A process identity compared across processes is a duration too.** A pid does not name
+  a process - the kernel reuses the number - so a session record that outlives its run has
+  to carry the identity of the process it was written for, and `psutil.Process(pid)`
+  constructed to *ask* that question captures the identity it is being asked to check, so
+  `Process(pid).is_running()` cannot contradict a reused pid (measured: over 647 live pids
+  it never disagreed with `pid_exists`). What is recorded is the process's start offset
+  since boot, not its creation date: `create_time()` is the process's start ticks plus
+  `/proc/stat`'s btime, so a correction between the write and the read would make a live
+  session read as a stranger - and refusing to stop a training run that holds a GPU is
+  worse than the defect. Read the ticks from the kernel (`/proc/<pid>/stat` field 22 over
+  `SC_CLK_TCK`), **not** as `create_time() - boot_time()`: that subtraction puts the wall
+  clock on both sides and the two terms are not guaranteed to be one read of it. On psutil
+  at or before 7.0 the process side adds a btime cached at import while top-level
+  `boot_time()` deliberately re-reads `/proc/stat` ("we are not caching this because it is
+  subject to system clock updates"), so a step after the cache was populated moves the
+  result by the step size; on 7.2 the cache is gone and both re-read, narrowing the window
+  to a step landing between the two reads without closing it. Measured on this tree with
+  the two terms skewed by 10 s, the subtraction moved by exactly 10 s and a live session
+  mismatched its own record; the field-22 read moved by 0. Keep the subtraction only as the
+  non-procfs fallback, and say so where it is written. Pinned by
+  `tests/tools/test_session_running_verdict_names_its_own_process.py`, whose clock-step
+  cell asserts equality with the kernel value rather than a tolerance any spelling meets.
 - Pinned by `tests/test_expiry_gates_survive_a_clock_step.py` (a scan over the whole
   package, no exemption list), by `tests/tools/test_tool_wait_budgets_survive_a_clock_step.py`
   for the real `spin_for` behaviour, by
@@ -1990,6 +2083,16 @@ which side the enum is on.
   after the deletion it was refusing. Pinned by
   `tests/test_dataset_recorder_posture_flag_domain.py`, which also records why
   the neighbouring surfaces are out of scope.
+  The asset cache is the third one, and the only one whose deletion takes a file the
+  package never authored: `download_robots(force=)` and the `download_assets` facade both
+  read it, and a re-fetch removes the cached directory for a robot whose assets are
+  already present - the directory `_copy_external_tree` filters on read rather than
+  cleaning afterwards, precisely so a README or notes kept beside the assets survive a
+  download. `force="false"` was indistinguishable from `force=True`: measured with one
+  present robot, the directory was replaced, a file kept beside its assets was gone, and
+  the call reported `downloaded: 1`. `_needs_download` had returned the flag verbatim as
+  its own `bool` verdict, so an unchecked value became a partition decision rather than an
+  argument error. Pinned by `tests/test_asset_download_force_flag_domain.py`.
 - **A flag whose misread only shows up in a rendered frame is checked at construction.**
   Where the branch a flag selects is applied later - a fitted transform, a compositing
   decision - the misread has no error to surface at, so it reads as a scene that looks
@@ -2003,11 +2106,55 @@ which side the enum is on.
   supplied it, not where the branch is taken. Pinned by
   `tests/rendering/test_gsplat_background_posture_flag_domain.py`, which measures the
   branch each of the four selects.
+- **A flag that gates whether a numeric row is READ is checked ahead of the numeric
+  guard.** `lerobot_camera` refuses `timeout_ms` only under `async_mode`, because the
+  synchronous read consumes no budget and an option no handler reads must not be
+  refused - so the numeric table's own row is switched on and off by a posture flag
+  from outside the table. Read by truthiness, that gate admitted `timeout_ms=-5` under
+  `async_mode=0` (`status="success"` on an unusable budget) and, under
+  `async_mode="false"`, refused the *budget* by name for a caller whose only mistake was
+  the flag. The order is the point: a posture guard placed after the numeric guard still
+  refuses, but names the value the gate selected rather than the gate, sending the
+  caller to correct the wrong parameter. Scope the roster per action, as
+  `_ACTION_POSTURE_FLAGS` mirrors `_ACTION_NUMERIC_OPTIONS`, so `discover` and `list` -
+  which consume none of the three flags - refuse none of them. Pinned by
+  `tests/tools/test_lerobot_camera_posture_flag_domain.py`, which derives the roster
+  from the tool's own signature so a fourth flag cannot be added without the domain,
+  and whose ordering cell fails when the two guards are swapped.
+  A gate whose flag defaults to `True` inverts in the sharper direction, because a falsy
+  non-boolean then *removes* a behaviour the caller never asked to leave. `pose_tool`'s
+  `smooth` chooses between interpolating towards the joint targets over
+  `steps * step_delay` seconds and writing each goal position once, and it decides whether
+  those two options are read - so `smooth="false", steps=0` was refused for `steps`, and
+  `smooth=0` wrote 2 goal positions where `True` writes 42 over 21 increments, sending the
+  arm to the far end of its travel in one write: the full-travel jump the same module
+  already refuses `steps=True` for. Pinned by
+  `tests/tools/test_pose_tool_smooth_posture_flag_domain.py`.
+- **A facade that binds its numeric knobs to the tool-error envelope binds its flags the
+  same way, and a surface that submits to a worker checks them before the submit.**
+  `SimEngine.run_policy` validates `control_frequency`, `seed`, `action_horizon` and the
+  rest through `_validate_*` bindings of the shared numeric domains, while the four
+  posture flags in the same signature - `fast_mode`, `reset_between`,
+  `wbc_install_torque_control` and `async_rtc` - were read by truthiness one layer down:
+  `reset_between=0` on a two-episode call started episode two from wherever episode one
+  left the arm, and `async_rtc="false"` reported `rtc_async_enabled=True` beside the
+  background inference thread the caller had declined. `_validate_posture_flags` is the
+  binding, called ahead of robot resolution so a refused call builds no policy. A flag
+  whose `None` is a documented sentinel (`async_rtc` on `run_policy`, "resolve from the
+  policy") is checked only when supplied; the same name declared as a plain `bool` on
+  `eval_policy` refuses `None` with everything else. MuJoCo's `start_policy` repeats the
+  check before `executor.submit`, for the reason its sibling knobs already do: a refusal
+  produced on the worker is discarded with the future and the caller reads "started". The
+  `run_policy` tool checks its own `fast_mode` before `start_recording(overwrite=True)`,
+  so the facade's refusal cannot arrive after the dataset it was asked to record into has
+  been emptied. Pinned by `tests/simulation/test_run_policy_posture_flag_domain.py`,
+  whose roster is read from the facade's signature so a fifth flag cannot skip the domain.
 - Pinned by `tests/simulation/mujoco/test_actuate_robot_posture_flag_domain.py`,
   `tests/simulation/test_recording_posture_flag_domain.py`,
   `tests/tools/test_lerobot_teleoperate_flag_domain.py`,
   `tests/mesh/test_iot_provisioning_flag_domain.py`,
-  `tests/rendering/test_key_light_posture_flag_domain.py` and
+  `tests/rendering/test_key_light_posture_flag_domain.py`,
+  `tests/tools/test_pose_tool_smooth_posture_flag_domain.py` and
   `tests/test_ros2_command_surface_flag_domain.py`, each of which parametrizes over
   `boolean_flag_error` itself rather than a copied spelling list, so a spelling added to
   the shared domain is covered without an edit.
@@ -2039,8 +2186,8 @@ which side the enum is on.
   Where the selector is resolved into a dict rather than bound by position, a repeat
   resolves to its first occurrence and a mapping and a one-shot iterator are each read
   exactly once, so routing the shape through `name_list_error` would refuse calls that
-  are honored as written today - the same carve-out that keeps the WBC and MotionBricks
-  providers out of that domain. `download_robots(names=...)` is that case, and the
+  are honored as written today - the same carve-out that keeps the WBC provider out of
+  that domain. `download_robots(names=...)` is that case, and the
   membership read is still owed: read by truthiness, `names=[]` downloaded 56 robots on
   the shipped registry, and 13 - a whole category - when a `category` was also passed,
   reporting either count as the caller's own request. Nothing had to write `[]` to get
@@ -2060,9 +2207,10 @@ which side the enum is on.
 ### A model source is read by absence when absence selects another resolution path
 - **The selector rule above allows a scalar path to be read by truthiness "because empty
   and absent genuinely coincide there - the value is derived either way". That holds where
-  absence derives the SAME kind of value.** `examples/wbc/motionbricks_g1_mujoco.py`
-  declares `--scene-xml` with a `""` default and derives the scene from `--result-dir`, so
-  `""` IS its sentinel there and truthiness is correct. It does not hold where absence
+  absence derives the SAME kind of value.** A `--scene-xml` declared with a `""` default
+  whose empty value derives the scene path from an already-supplied `--result-dir` is that
+  case: `""` IS the sentinel there, both spellings land on a scene XML, and truthiness is
+  correct. It does not hold where absence
   selects a DIFFERENT RESOLUTION PATH: then the two spellings do not pick the same value
   by another route, they pick a different thing to blame when the call fails.
 - **`add_robot`'s model source is that case.** Absent means "resolve from `data_config`, or
@@ -2138,7 +2286,8 @@ which side the enum is on.
 - **If you must run code at import time, comment WHY it can't be lazy.** `MUJOCO_GL` is the canonical example: MuJoCo locks the GL backend at first `import mujoco`, so the env var must be set before any downstream import chain triggers it.
 - **An import-time env default must name a value that works where the code runs.** The same `MUJOCO_GL` example has a second half: because the backend is locked at first `import mujoco`, a *module-scope* default is what a headless host is left with when the operator exported nothing, while one inside a test function runs too late to select anything. MuJoCo's windowed backends (`cgl`, `glfw`) cannot render without a window server, and `glfw` fails worse than `cgl`: `cgl` is refused at import with a message naming the variable; `glfw` is accepted, and the render probe then warns that rendering is unavailable and names the missing `DISPLAY` but not the `MUJOCO_GL` value that asked for a window, after which camera observations are skipped and the caller's *failure* is whatever it was doing with those frames - a camera recording reports it as a dataset feature mismatch several frames away. Write `os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")` - a bare `"egl"` is not in MuJoCo's valid set on Darwin, so it trades one platform for the other.
 - Pinned by `tests/test_examples_mujoco_gl.py::test_no_module_scope_windowed_gl_default`, which is AST-scoped to module level so a backend name that is the value *under test* (a `monkeypatch.setenv`, or an assertion about what the resolver did) is out of scope by construction rather than by exemption.
-- **Cheap-guard optional imports** - `if importlib.util.find_spec("mujoco") is not None:` before doing `from strands_robots.simulation.mujoco.backend import _configure_gl_backend`. Users without the `[sim-mujoco]` extra shouldn't pay an import-attempt cost on every `import strands_robots`.
+- **Cheap-guard optional imports** - `if importlib.util.find_spec("mujoco") is not None:` before doing `from strands_robots._mujoco_gl import _configure_gl_backend`. Users without the `[sim-mujoco]` extra shouldn't pay an import-attempt cost on every `import strands_robots`.
+- **An import-time shim lives in a stdlib-only leaf, never under a package whose `__init__` is heavy.** `import strands_robots` is documented as leaving numpy, torch and mujoco out of `sys.modules`, and that is load-bearing rather than cosmetic: coverage resolves a dotted `--cov=strands_robots.<sub>` source with `find_spec` inside `sys_modules_saved()`, so any numpy the parent package initialises is dropped from `sys.modules` and the next `import numpy` re-executes its Python layer over an already-initialised C extension - `ndarray.max()` then returns a foreign `_NoValue` and 149 of 2268 Isaac tests failed on `float()` of it (#3587). The GL selector used to live in `simulation.mujoco.backend`, and importing it ran `simulation/__init__` -> `SimEngine` -> the policy runner -> the rendering package, twelve numpy-importing modules for a function that touches `os.environ`. It now lives in `strands_robots._mujoco_gl` beside `_dyld`, the other import-time shim, and a monkeypatch aimed at one of its helpers is set on that module - a patch on the backend's re-imported name is not read by the selector. Pinned by `tests/test_package_lazy_imports.py::TestBareImportLeavesNumpyUnloaded`, which grades the bare import in a subprocess, the coverage probe itself, and that the leaf imports only the stdlib.
 
 ### Public API Hygiene
 - **Never recommend a `_method` in user-facing docstrings or error messages.** If `Robot()`'s docstring says "use `sim._dispatch_action(...)` to add a camera", you've just locked in a private dependency. Promote it (rename `_dispatch_action` → `dispatch_action`) or add public shorthands (`Simulation.add_camera()` / `.create_world()` / `.add_robot()`) before merging.
@@ -2174,9 +2323,13 @@ which side the enum is on.
   ```
   or a Python check: `unicodedata.category(ch).startswith("So") or ord(ch) == 0xFE0F`.
 
+- **State the encoding on every on-disk text read and write** - `open()`, `Path.read_text`/`write_text`, `os.fdopen` and `tempfile.NamedTemporaryFile` all fall back to `locale.getencoding()`, so a file whose bytes are fixed answers differently in two processes that differ only in `LC_ALL`. Nothing this package reads is a locale-encoded document: a benchmark spec or policy config is authored in an editor, and lerobot writes `meta/info.json` with `encoding="utf-8"` and `ensure_ascii=False`. Under a non-UTF-8 locale that made a valid UTF-8 spec unreadable (`UnicodeDecodeError` out of `register_benchmark_from_file`) and a three-task dataset's `total_tasks` read as absent, which `validation_split_error` honours as single-task. Pass `encoding="utf-8"`; binary modes take no encoding and a child process's stdout is a separate decision (it encoded with the locale). Pinned by `tests/test_on_disk_text_io_states_utf8.py`. The *error handler* on a child's stream is decided by the bullet below.
+
+- **Decode a child process's stream with `errors="replace"`** - `subprocess` in text mode decodes with `errors="strict"`, so one byte the codec cannot decode replaces the whole captured stream with `UnicodeDecodeError`. A child's stdout is not this process's text: it is whatever bytes an arbitrary program wrote to a pipe - ffmpeg copying a latin-1 metadata tag, a container printing a log line byte for byte, a USB descriptor string a vendor chose - so a byte that is not valid UTF-8 is expected there. The same bytes read from the detached child's *log file* were already read with `errors="replace"`, and the MuJoCo GL probe decodes both of its child's streams the same way; the pipe readers did not, and `sync_dataset_to_bucket` - which documents "Never raises on `hf` failure" and which `stop_recording` calls unguarded on that promise - raised past a completed upload, Pass `errors="replace"` on every read of a child's stream (`capture_output=True` or a `PIPE`); a pipe this process *writes* stays strict, because substituting on the way out mangles a command instead of refusing to send it. Pinned by `tests/test_child_stream_decode_substitutes.py`.
+
 ### Testing Patterns
 - **Use `monkeypatch.setenv`, never `os.environ[...] = ...`** - direct mutation leaks if the test raises before `finally`, and `del os.environ[...]` can `KeyError` under parallel runs. The pytest fixture handles teardown atomically.
-- **Restore a `sys.modules` entry you remove** - a removal does not undo an import, it *orphans* every reference already bound to that module: the next `import X` re-executes the package and returns a *different* object, so a sibling test module's `monkeypatch.setattr(X, "attr", double)` installs the double where nothing will look and the real package is used instead. `monkeypatch.setitem(sys.modules, name, None)` makes `import name` raise `ImportError` *and* restores. A bare `sys.modules.pop("boto3", None)` in one camera-offload test left the IoT fan-out tests building a real client and attempting signed AWS requests, dormant only because they happened to sort ahead of the pop. Purging a module nothing patches, to force a re-import, stays legal - `tests/test_sys_modules_removal_leaves_no_orphan.py` grades the difference from the tree.
+- **Restore a `sys.modules` entry you remove** - a removal does not undo an import, it *orphans* every reference already bound to that module: the next `import X` re-executes the package and returns a *different* object, so a sibling test module's `monkeypatch.setattr(X, "attr", double)` installs the double where nothing will look and the real package is used instead. `monkeypatch.setitem(sys.modules, name, None)` makes `import name` raise `ImportError` *and* restores. A bare `sys.modules.pop("boto3", None)` in one camera-offload test left the IoT fan-out tests building a real client and attempting signed AWS requests, dormant only because they happened to sort ahead of the pop. Purging a module nothing patches, to force a re-import, stays legal - `tests/test_sys_modules_removal_leaves_no_orphan.py` grades the difference from the tree. **Blocking an optional dependency borrows the entry, so put back what you displaced**: `sys.modules[name] = None` makes the import fail, and the way out is re-assigning the module that was there, never `del sys.modules[name]` - deleting the key is the same orphaning by another spelling, and `require_optional`'s memo is no fallback because it is populated on the first *success*. `tests/_blocked_module.py`'s `blocked(name)` restores both entries and is the one owner of that pair.
 - **Import a tool from its own submodule, never off the tools package** - `strands_robots.tools` maps each tool name to the `@tool` object inside the submodule of the *same* name, so `from strands_robots.tools import pose_tool` resolves to whichever of the two this process bound first: CPython's `_handle_fromlist` imports the submodule only when the attribute is *absent*, and here the lookup triggers the package `__getattr__`, which succeeds, so the name binds to the tool object and the submodule is never imported. A source that binds a name that way and then reads it as a module - `ur.__file__`, `pose_mod.pose_tool`, any of the module's private names - therefore passes or fails on the import order of the whole process rather than on the behaviour it is about, and surfaces as an `AttributeError` naming the read rather than the import that decided it. Write `import strands_robots.tools.pose_tool as pose_mod` or `from strands_robots.tools.pose_tool import pose_tool`, which cannot resolve to anything else. `tests/tools/test_lazy_tool_name_is_not_read_as_a_module.py` derives both halves of the rule - which names are ambiguous, and which attributes only a module can answer - so a tool added to the mapping and a call site added to any scanned tree are graded on arrival.
 - **Happy-path tests, not just error-paths** - if you have `test_factory_raises_on_bad_xml`, you also need `test_factory_returns_working_sim` gated behind `pytest.importorskip("mujoco")`. Steps physics, asserts state, destroys cleanly.
 - **Never read a tool name off `strands_robots.tools`** - the package maps each exported name to the `@tool` object inside the submodule of the *same* name and caches it in the package `__dict__`, so `from strands_robots.tools import pose_tool` binds either the tool or the module depending on what the process imported first: cold it is the tool, and after any import of the submodule it is the module. That read is also the only spelling that writes the *tool* into the slot, which is what makes the module-alias form used widely here as a monkeypatch target (`import strands_robots.tools.use_rosbridge as rb_mod`) resolve to the tool instead - `rb_mod.roslibpy` then raises `AttributeError` naming the tool class rather than an import order. Both directions shipped, each passing in the selection it was written against: two tests read the name and used the result as a module (`'DecoratedFunctionTool' object has no attribute '__file__'`), two examples read it and used the result as a tool (`module ... has no attribute '__wrapped__'`). Write `import strands_robots.tools.<name> as <name>_mod` when the module object is wanted and `from strands_robots.tools.<name> import <name>` when the tool is wanted; both read the submodule, so no import order changes them. Pinned by `tests/tools/test_lazy_tool_name_imports_are_unambiguous.py`.
@@ -2269,10 +2422,46 @@ Corrections from code review that apply to all future contributions:
   Rewriting the flagged code to satisfy the query is the tempting fourth option
   and the one that costs: #1879 spent a round removing a `__float__` from a test
   fixture for a finding that gated nothing. It can also destroy the measurement
-  the code exists for. On #1890 the query asked for a `LookupError`; the one it
-  names first, `IndexError`, is what CPython's `seqiter` *clears* to terminate
-  legacy-protocol iteration, so taking the suggestion would have left the fixture
-  raising nothing and the test asserting nothing, still green.
+  the code exists for - but *which* rewrite does that is a fact about the probe
+  rather than about the rule, and the short version of this reason has now been
+  read onto a shape it is false of.
+
+  For `__getitem__` the query asks for "`KeyError` or `IndexError`" by name, and
+  those two are not interchangeable. Each row below is constructed and executed by
+  `TestTheGetItemRewriteIsNotOneBehaviour` in
+  `tests/test_codeql_query_filters.py`, which reads this table rather than
+  restating it, so a row that stops being true fails there:
+
+  | probe, `__getitem__` raising | `list(probe)` | the raise is swallowed |
+  |---|---|---|
+  | `_LegacySequence` (`__len__` and `__getitem__`, no `__iter__`), `IndexError` | `[]` | **yes** - `seqiter` clears it to end the protocol |
+  | `_LegacySequence`, `KeyError` | `KeyError` | no - it propagates, as a `RuntimeError` does |
+  | `_HostileStr` (a `str` subclass), `IndexError` | `['[', ':', ':', '1', ']']` | no - `str` supplies `__iter__`, so `seqiter` is never built |
+
+  Row 1 is the #1890 reason: `IndexError` is what CPython's `seqiter` *clears* to
+  terminate the legacy iteration protocol, so the probe is consulted, raises, and
+  the read completes empty - a cell asserting a refusal is no longer measuring the
+  read that failed. Rows 2 and 3 are the two ways that reason does not travel.
+  `KeyError` satisfies the same query and is not cleared, so one spelling of the
+  suggestion keeps the measurement intact. And a `str` subclass supplies its own
+  `__iter__`, so `seqiter` is never constructed and `__getitem__` is not consulted
+  at all - the mechanism is absent rather than adverse. That third row is alert
+  1168 on #3272, where this reason was reached for and measured false (#3276).
+
+  `list(probe)` is the whole discriminator, so run it before citing a mechanism.
+  The 280-character dismissal comment cites this file instead of restating an
+  argument, which is what makes a wrong reason here expensive: it becomes a wrong
+  claim in a dismissal that outlives the branch.
+
+  Refuse the rewrite on the **property** instead, because that holds for every
+  probe shape. The query's own help text gives the harm as a user of the class
+  meeting an exception the protocol did not lead them to expect, and a probe
+  written to be an unconventional class *is* that harm, under test on purpose. A
+  conforming `LookupError` models a value refusing *within* the protocol, which is
+  strictly weaker than what a guarded read documents itself as surviving. Then
+  check the population before calling it convention rather than defect: on #3272
+  the same file raised `RuntimeError` from `__str__`, `__iter__` and `__repr__`
+  and none of the three was flagged.
 - **One alert class clears under none of the three, and the question that settles
   it is which thread you marshal onto.** `py/catch-base-exception` never fires on
   cleanup-and-reraise: the query accepts a handler that re-raises *lexically*, and
@@ -2287,6 +2476,7 @@ Corrections from code review that apply to all future contributions:
   | handler | ends in | flagged |
   |---|---|---|
   | `strands_robots/dashboard/auth.py::_save_locked` | `os.unlink(tmp)`, bare `raise` | no |
+  | `strands_robots/dashboard/auth.py::_write_enroll_token` | `os.unlink(tmp)`, bare `raise` | no |
   | `strands_robots/dashboard/settings.py::_write_file` | `os.unlink(tmp)`, bare `raise` | no |
   | `strands_robots/episode_labels.py::_write_document` | `os.unlink(tmp_name)`, bare `raise` | no |
   | `strands_robots/hardware_robot.py::start_task` | `self._release_task()`, bare `raise` | no |
@@ -2368,6 +2558,108 @@ Corrections from code review that apply to all future contributions:
   that a record cannot split rather than the record's field layout, and keep the
   escape to `\r` and `\n`: these messages are read by a human diagnosing a
   binding, and a broader filter corrupts the diagnosis they exist for.
+- **`py/unused-import` does not read a string forward reference, so a
+  `TYPE_CHECKING` import consumed only by a `cast("X", ...)` is reported as
+  dead.** `cast`'s first argument is an ordinary runtime expression, so
+  `from __future__ import annotations` is not what makes it a string - the idiom
+  writes it as one, and a type checker resolves it against the module namespace,
+  which is where the `TYPE_CHECKING` block puts the name. The extractor reads
+  bare `Name` loads and a string carries none.
+
+  Do not answer the alert by reading it. Run the counterfactual - delete the
+  import and lint the file - because that is what separates the two cases, and
+  they need opposite actions:
+
+  | `ruff check` after deleting the import | meaning | action |
+  |---|---|---|
+  | `F821 Undefined name 'X'` at the cast | the import is the name's only binding, and load-bearing | dismiss as `false positive`, keep the import |
+  | clean | the name is bound at runtime too, so the import carries nothing | the alert is right: delete the import |
+
+  Measured on `strands_robots/training/rl/fast_td3.py` (alert 1160), where
+  `SimEnv` reaches nothing but `cast("SimEnv", self.env)`: `ruff` reports
+  `F821` at that line and `mypy` reports `Name "SimEnv" is not defined`
+  `[name-defined]`, both inside `call-test-lint / Test and Lint`. So the two
+  gates the repository actually runs refuse the edit the alert asks for, and the
+  remaining ways to take it anyway are a suppression or a runtime import - which
+  on that file also invites the `isinstance` narrow the comment above the cast
+  exists to refuse. Do not reach for the query filter either: the rule carries
+  live signal here, seven of its twelve alerts on `main` being open and
+  unadjudicated, and `tests/test_codeql_query_filters.py` pins that file at two
+  ids.
+
+  This is written down because the decision was already made once and did not
+  survive. Alert 599 was dismissed with this reasoning **32 minutes** after it
+  opened on 2026-07-02, and the reasoning went into the dismissal comment - 280
+  characters, in the Security tab, invisible from the tree. Two recurrences then
+  had nothing to point at:
+
+  | alert | site | cost before it was adjudicated |
+  |---|---|---|
+  | 599 | `tests/training/test_rl_truncation_bootstrap.py:27` | 32 minutes |
+  | 1138 | `tests/drivers/robotiq/test_robotiq_gripper_moves_over_modbus_tcp.py:24` | open on `main` for five days |
+  | 1160 | `strands_robots/training/rl/fast_td3.py:54` | a review thread held #3206 for twelve hours under `required_review_thread_resolution` |
+
+  A dismissal comment is a less durable home than the PR comment this file
+  already warns about, which is why the entry is here and not a fourth
+  dismissal. `tests/test_cast_string_imports_are_the_names_only_binding.py`
+  grades the boundary in the table above - it derives the sites from the tree
+  and refuses a `TYPE_CHECKING` import of a name the module also binds at
+  runtime, the one shape where this exemption would suppress a true finding and
+  the one direction `ruff` and `mypy` cannot report, since the cast string
+  resolves either way.
+- **`py/mixed-returns` does not read a `NoReturn` it did not model, so a
+  test helper that returns a value on one path and ends in `pytest.fail(...)`
+  on the other is reported as falling through.** `pytest.fail`, `pytest.skip`,
+  `pytest.exit` and `pytest.xfail` are each declared `-> NoReturn` in
+  `_pytest/outcomes.py` - as the `__call__` of an outcome class, which is why
+  the analysis does not follow it - so the only way past that line is an
+  exception and the implicit `None` the alert describes cannot be produced.
+  The shape is the idiomatic one for a helper that searches and refuses:
+
+  ```python
+  def _self_calls(module: str, method: str) -> set[str]:
+      for node in ast.walk(tree):
+          if isinstance(node, ast.FunctionDef) and node.name == method:
+              return {...}
+      pytest.fail(f"{method} not found in {module}")
+  ```
+
+  Do not answer the alert by rewriting the helper. Run the counterfactual,
+  because the two cases need opposite actions and only one of them is a false
+  positive:
+
+  | `mypy` after replacing the outcome with a call that can return | meaning | action |
+  |---|---|---|
+  | `Missing return statement [return]` at the `def` | the fall-through exists only if the terminal call returns, and it cannot | dismiss as `false positive` |
+  | clean | the helper is `-> Any` or unannotated, so `mypy` is not reading its body at all | read the terminal call yourself |
+
+  Measured with the three helpers' own annotations: `-> dict[str, str]` and
+  `-> set[str]` report `[return]` on the counterfactual and are clean as
+  written, and `-> Any` reports nothing either way - `mypy` does not grade a
+  missing return against `Any`, and `[tool.mypy]` relaxes
+  `disallow_untyped_defs` for `tests.*` and `tests_integ.*`, so an unannotated
+  helper's body is not read there. `hatch run lint` runs `mypy` over both test
+  trees, so the first row is already inside `call-test-lint / Test and Lint`;
+  the second row is the hole. Do not reach for the query filter: the rule
+  carries live signal, since a helper ending in `print(...)` or a cleanup
+  call is exactly the defect it names, and `tests/test_codeql_query_filters.py`
+  pins the filter at two ids.
+
+  Three instances, one class, none adjudicated until the third held a merge:
+
+  | alert | site | terminal call | cost before it was adjudicated |
+  |---|---|---|---|
+  | 823 | `tests/simulation/test_recording_rate_matches_control_frequency.py` | `pytest.fail` | open on `main` for 45 days |
+  | 1140 | `tests/drivers/ur/test_ur_sim_joint_order_matches_the_wire.py` | `pytest.skip`, closing a `try` handler | open on `main` for 12 days, and `-> Any`, so in the second row |
+  | 1206 | `tests/mesh/test_mesh_guide_opening_block_starts_the_mesh.py` | `pytest.fail` | a review thread gated #3551 under `required_review_thread_resolution`; merged 8 seconds after the resolve |
+
+  `tests/test_mixed_return_helpers_end_in_a_pytest_outcome.py` grades the
+  boundary at every site whatever the annotation: it derives from the test
+  trees every function that returns a value and can fall off its end through a
+  bare call - the terminal statement, or the last statement of an `if`, `try`
+  or `with` branch it ends in - and refuses one whose call is not a declared
+  `NoReturn`. That is the one shape where this exemption would suppress a true
+  finding and the one `mypy` cannot report in a test.
 - **Dependency Review hard-fails on high/critical CVEs in new deps.** If a PR
   needs a dep with a known critical CVE, the conversation is "do we need this
   dep" not "let's bypass the check."
@@ -2390,7 +2682,7 @@ Corrections from code review that apply to all future contributions:
   command.** A docstring one-liner that recomputes a pin is necessary but not
   sufficient; on-call at 3 AM needs a documented grace-period strategy. For the
   Amazon Root CA1 pin (`provision._AMAZON_ROOT_CA1_PINS`) the runbook lives in
-  README.md > "CA Pin Rotation Runbook": dual-pin tuple during the overlap, ship
+  docs/reference/configuration.md > "CA Pin Rotation Runbook": dual-pin tuple during the overlap, ship
   the new pin first, drop the old pin in a follow-up release after fleet uptake,
   and use `STRANDS_MESH_CA_PINS` only as an emergency out-of-band override.
 - **Make the accepted-pin set a collection, never a scalar.** `_resolve_ca_pins()`

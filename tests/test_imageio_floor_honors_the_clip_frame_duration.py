@@ -9,9 +9,9 @@
     imageio.mimsave(str(out), frame_list, duration=1000.0 / int(fps))
 
 That millisecond reading is imageio's from 2.28.0 on; earlier releases read the
-same number as seconds. ``[sim-mujoco]`` and ``[sim-isaac]`` declared
-``imageio>=2.28.0,<3.0.0`` for it. ``[vera-sim]`` - which ships ``mujoco``, and
-whose documented example records its rollout as a GIF - declared a bare
+same number as seconds. ``[sim-mujoco]`` and ``[sim-isaac]`` declare
+``imageio>=2.28.0,<3.0.0`` for it. A third extra - which shipped ``mujoco``, and
+whose documented example recorded its rollout as a GIF - declared a bare
 ``imageio`` with no bound at all, so the manifest described an install in which
 that encoder writes the wrong clip. Measured against the released wheels on
 Python 3.12 (the project's minimum), driving the shipped ``encode_clip`` over 12
@@ -41,9 +41,9 @@ either can be refused.
 The encoder itself is already covered: the suite pins that an ``encode_clip``
 GIF decodes to a per-frame duration matching the requested fps, which holds only
 from 2.28.0. What was missing is a floor that admits only the releases where
-that can hold. Nothing compared the two because ``[vera-sim]`` is declared in
-conflict with ``[all]`` (``[tool.uv] conflicts``) and CI installs ``.[all,dev]``,
-so the resolve this extra describes is never built.
+that can hold. Nothing compared the two because that extra was declared in
+conflict with ``[all]`` and CI installs ``.[all,dev]``, so the resolve it
+described was never built.
 
 :data:`_IMAGEIO_SYMBOL_FLOORS` and :data:`_GIF_DURATION_IN_MILLISECONDS_FROM`
 are the single owners of the measurement; the tests below derive the required
@@ -74,6 +74,11 @@ _DISTRIBUTION = "imageio"
 #: Sentinel symbol for "the module itself", used by ``import imageio.v2 as ...``
 #: and by the ``require_optional("imageio", ...)`` probe.
 _MODULE = "<module>"
+
+#: The media layer's owner of which encoder modules an output container needs.
+#: It returns the top-level ``imageio`` module, so a name it binds reaches for
+#: imageio exactly as ``require_optional("imageio", ...)`` does.
+_CLIP_ENCODER_OWNER = "require_clip_encoder"
 
 #: The releases probed to produce the table in the module docstring, oldest first.
 _PROBED_RELEASES = (
@@ -147,7 +152,11 @@ def _imported_imageio_names(source: str) -> set[tuple[str, str]]:
     * ``from imageio import ...``;
     * ``imageio = require_optional("imageio", ...)`` followed by
       ``imageio.get_writer`` - the package's own lazy-optional-import idiom,
-      which binds the module through a call rather than an ``import`` statement.
+      which binds the module through a call rather than an ``import`` statement;
+    * ``imageio = require_clip_encoder(path, ...)``, the media layer's owner of
+      which encoder modules an output container needs, which by contract returns
+      that same top-level module. It names no module string to read, so the bound
+      name is taken from its documented return value.
 
     Only maximal attribute chains are reported, so ``a.b.c`` yields
     ``("<pkg>.b", "c")`` rather than also ``("<pkg>", "b")``.
@@ -179,17 +188,23 @@ def _imported_imageio_names(source: str) -> set[tuple[str, str]]:
                 continue
             func = call.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if name != "require_optional" or not call.args:
+            if name == _CLIP_ENCODER_OWNER:
+                # Documented to return the top-level module, so there is no
+                # module string in the call to read.
+                requested_module = _DEP
+            elif name == "require_optional" and call.args:
+                requested = call.args[0]
+                if not isinstance(requested, ast.Constant) or not isinstance(requested.value, str):
+                    continue
+                if not _is_dep(requested.value):
+                    continue
+                requested_module = requested.value
+            else:
                 continue
-            requested = call.args[0]
-            if not isinstance(requested, ast.Constant) or not isinstance(requested.value, str):
-                continue
-            if not _is_dep(requested.value):
-                continue
-            found.add((requested.value, _MODULE))
+            found.add((requested_module, _MODULE))
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    bound[target.id] = requested.value
+                    bound[target.id] = requested_module
 
     # `a.b.c` is not maximal if it is the receiver of another attribute access.
     receivers = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}

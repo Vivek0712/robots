@@ -6,7 +6,8 @@ aliases, shorthands, and URL patterns on every reload.
 
 The ``robots`` registry is not a single file: its effective contents are the
 package ``robots.json`` merged with the user-local overlay
-(``$STRANDS_BASE_DIR/user_robots.json`` - see :func:`_merge_user_robots`).  The
+(``$STRANDS_BASE_DIR/user_robots.json``, read through :mod:`._overlay` - see
+:func:`_merge_user_robots`).  The
 hot-reload signature therefore covers *both* files, so an edit to the user
 overlay made outside this process (a second process, a manual edit, or any
 writer that does not call :func:`invalidate_cache`) is picked up on the next
@@ -26,6 +27,8 @@ import json
 import logging
 from pathlib import Path
 
+from ._overlay import parse_user_robots, user_registry_source
+
 logger = logging.getLogger(__name__)
 
 _REGISTRY_DIR = Path(__file__).parent
@@ -36,18 +39,28 @@ _cache: dict[str, dict] = {}
 _sources: dict[str, tuple] = {}
 
 
-def _user_registry_source() -> bytes | None:
-    """Contents of the user-local robot overlay, or None if absent.
+def normalize_robot_name(name: str) -> str:
+    """Fold a robot name or alias to the key every registry lookup uses.
 
-    Kept in :mod:`user_registry` so the overlay path has a single source of
-    truth; imported lazily to avoid an import cycle (``user_registry`` imports
-    :func:`invalidate_cache` from this module).
+    One rule, spelled once: lowercase, trim surrounding whitespace, and read a
+    dash as an underscore. It is the rule
+    :func:`~strands_robots.registry.robots.resolve_name` applies to a caller's
+    query, so it is also the rule the things a query is matched against have to
+    be keyed by - a canonical robot name (normalized by
+    :func:`~strands_robots.registry.user_registry.register_robot`), an alias
+    (keyed by :func:`~strands_robots.registry.robots._build_alias_map`), and the
+    uniqueness constraints :func:`_validate_robots` enforces over both. A
+    consumer that folds while a producer or a validator does not is how
+    ``"Franka-Panda"`` becomes a lookup nobody can satisfy, or worse, one that
+    lands on a different robot.
+
+    Args:
+        name: A robot name or alias, in any spelling.
+
+    Returns:
+        The lookup key for ``name``.
     """
-    try:
-        from .user_registry import user_registry_source
-    except ImportError:
-        return None
-    return user_registry_source()
+    return name.lower().strip().replace("-", "_")
 
 
 def _registry_signature(name: str, package_source: bytes) -> tuple:
@@ -59,7 +72,7 @@ def _registry_signature(name: str, package_source: bytes) -> tuple:
     """
     if name != "robots":
         return (package_source,)
-    return (package_source, _user_registry_source())
+    return (package_source, user_registry_source())
 
 
 def _load(name: str) -> dict:
@@ -108,11 +121,6 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
             overlay is absent.  Taken from the caller rather than re-read so
             the merged value and the cache signature describe the same bytes.
     """
-    try:
-        from .user_registry import parse_user_robots
-    except ImportError:
-        return data
-
     user_robots = parse_user_robots(overlay_source)
     if not user_robots:
         return data
@@ -146,15 +154,19 @@ def _validate_robots(data: dict) -> None:
             robot name, or a ``hardware.driver`` outside
             :data:`~strands_robots.drivers.base.DRIVER_CHOICES`.
     """
-    # Imported lazily for the same reason as :func:`_user_registry_source` above:
-    # the driver seam reads the registry, so importing it at module scope would
-    # close an import cycle. A driver name is validated here rather than where it
+    # Imported lazily because the driver seam reads the registry, so importing
+    # it at module scope would close an import cycle across the two packages. A
+    # driver name is validated here rather than where it
     # is read, because every reader - the factory, a tool, a driver package -
     # would otherwise have to re-check it, and the one that forgets accepts a
     # typo as "no preference" and quietly builds the default driver.
     from strands_robots.drivers.base import DRIVER_CHOICES
 
-    seen_aliases: dict[str, str] = {}
+    # Keyed by the lookup key, not the declared spelling: two aliases that
+    # differ only in case or separator are ONE key to every reader, so raw
+    # comparison passes a pair that the alias map then silently collapses to
+    # whichever entry is merged last (the user overlay).
+    seen_aliases: dict[str, tuple[str, str]] = {}
     for robot_name, info in data.get("robots", {}).items():
         declared_driver = info.get("hardware", {}).get("driver")
         if declared_driver is not None and declared_driver not in DRIVER_CHOICES:
@@ -163,13 +175,25 @@ def _validate_robots(data: dict) -> None:
                 f"which is not a driver. Valid drivers: {', '.join(DRIVER_CHOICES)}."
             )
         for alias in info.get("aliases", []):
-            if alias in seen_aliases:
+            key = normalize_robot_name(alias)
+            if key in seen_aliases:
+                prior_alias, prior_robot = seen_aliases[key]
+                shared = "" if prior_alias == alias else f" ({prior_alias!r} and {alias!r} are one lookup key, '{key}')"
                 raise ValueError(
-                    f"Duplicate robot alias '{alias}': claimed by both '{seen_aliases[alias]}' and '{robot_name}'"
+                    f"Duplicate robot alias '{alias}': claimed by both '{prior_robot}' and '{robot_name}'{shared}"
                 )
-            if alias in data.get("robots", {}):
-                raise ValueError(f"Robot alias '{alias}' in '{robot_name}' collides with a canonical robot name")
-            seen_aliases[alias] = robot_name
+            # An alias that folds to its OWNER's canonical name is a second
+            # spelling of that name, which the fold already accepts - the same
+            # carve-out :func:`_validate_policies` makes with ``alias !=
+            # provider_name``. Only a fold onto a DIFFERENT robot is a collision,
+            # and it is refused because the canonical name wins the lookup, so
+            # the alias would resolve to the other robot.
+            if key != robot_name and key in data.get("robots", {}):
+                spelled = "" if key == alias else f" (as '{key}')"
+                raise ValueError(
+                    f"Robot alias '{alias}' in '{robot_name}' collides with a canonical robot name{spelled}"
+                )
+            seen_aliases[key] = (alias, robot_name)
 
 
 def _validate_policies(data: dict) -> None:

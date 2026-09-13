@@ -58,8 +58,29 @@ def _mlp(in_dim: int, hidden: tuple[int, ...], out_dim: int) -> Any:
     return nn.Sequential(*layers)
 
 
-def _build_actor_critic(num_actor_obs: int, num_critic_obs: int, num_actions: int, spec: RLTrainSpec) -> Any:
-    """Construct the SAC ``ActorCritic`` module: tanh-Gaussian actor + twin Q critics."""
+def build_actor_critic(
+    num_actor_obs: int,
+    num_critic_obs: int,
+    num_actions: int,
+    *,
+    hidden_dims: tuple[int, ...] = (128, 128),
+) -> Any:
+    """Construct the SAC ``ActorCritic`` module: tanh-Gaussian actor + twin Q critics.
+
+    Public for the same reason as its PPO peer: ``load_deployable_actor``
+    rebuilds this graph to load a ``policy.pt`` saved from it, so the trainer
+    and the deployer cannot drift into two different networks.
+
+    Args:
+        num_actor_obs: Width of the actor observation vector.
+        num_critic_obs: Width of the critic observation vector.
+        num_actions: Number of action outputs.
+        hidden_dims: Hidden layer widths, expanded for every network built.
+
+    Returns:
+        An ``nn.Module`` whose ``act_inference`` is the deterministic action
+        a deployed checkpoint commands.
+    """
     import torch
     import torch.nn as nn
 
@@ -69,12 +90,12 @@ def _build_actor_critic(num_actor_obs: int, num_critic_obs: int, num_actions: in
         def __init__(self) -> None:
             super().__init__()
             # Actor outputs (mean, log_std) for the pre-squash Gaussian.
-            self.actor = _mlp(num_actor_obs, spec.hidden_dims, 2 * num_actions)
+            self.actor = _mlp(num_actor_obs, hidden_dims, 2 * num_actions)
             # Twin critics Q(critic_obs, action) -> scalar (clipped double-Q).
-            self.q1 = _mlp(num_critic_obs + num_actions, spec.hidden_dims, 1)
-            self.q2 = _mlp(num_critic_obs + num_actions, spec.hidden_dims, 1)
-            self.q1_target = _mlp(num_critic_obs + num_actions, spec.hidden_dims, 1)
-            self.q2_target = _mlp(num_critic_obs + num_actions, spec.hidden_dims, 1)
+            self.q1 = _mlp(num_critic_obs + num_actions, hidden_dims, 1)
+            self.q2 = _mlp(num_critic_obs + num_actions, hidden_dims, 1)
+            self.q1_target = _mlp(num_critic_obs + num_actions, hidden_dims, 1)
+            self.q2_target = _mlp(num_critic_obs + num_actions, hidden_dims, 1)
             self.q1_target.load_state_dict(self.q1.state_dict())
             self.q2_target.load_state_dict(self.q2.state_dict())
             for p in self.q1_target.parameters():
@@ -139,9 +160,18 @@ class FastSacTrainer(BaseRLAlgo):
             problems.append("env_factory is required (a zero-arg callable returning a SimEnv)")
         if not spec.output_dir:
             problems.append("output_dir is required")
+        # normalize_obs selects whether setup() wraps both observation streams in
+        # EmpiricalNormalization, and reads the flag by truthiness - so it takes
+        # the shared boolean domain ahead of the numeric knobs below.
+        problems.extend(self._observation_normalization_problems(spec))
         # gamma discounts the return this backend optimizes; the arithmetic that
         # consumes it never judges it, so the shared interval domain does.
         problems.extend(self._discount_factor_problems(spec))
+        # autotune_alpha selects whether a temperature optimizer is built at all,
+        # and so whether alpha_lr is read. It goes ahead of the rate it gates: a
+        # non-boolean here is refused as the flag, not as the rate the misread
+        # posture would have selected.
+        problems.extend(self._temperature_autotune_problems(spec))
         # alpha_lr is a second learning rate on a second optimizer: the actor
         # and critics take spec.learning_rate, the entropy temperature takes
         # this one, and only the first is covered above.
@@ -150,6 +180,12 @@ class FastSacTrainer(BaseRLAlgo):
         # torch.log on both branches, so only a positive finite value has a
         # usable logarithm - the same domain, on the value rather than the rate.
         problems.extend(self._initial_temperature_problems(spec))
+        # target_entropy is the constant the temperature is moved toward -
+        # the third and last caller-supplied field of the same block. Signed
+        # by construction (it defaults to -num_actions), so it takes the
+        # finite-real domain rather than the positive-finite one above, and
+        # the None sentinel is a request for that default rather than a value.
+        problems.extend(self._target_entropy_problems(spec))
         # total_timesteps and rollout_steps are the two caller-supplied factors of
         # this loop's own bound, max(1, total_timesteps // (rollout_steps *
         # num_envs)). The max() clamp means a local <= 0 test cannot bound them:
@@ -181,35 +217,63 @@ class FastSacTrainer(BaseRLAlgo):
         # the update loop after the env, networks, optimizers and buffer are
         # built, and raises TypeError itself on a string or None.
         problems.extend(self._rl_replay_problems(spec))
-        if not 0.0 < spec.tau <= 1.0:
-            problems.append(f"tau must be in (0, 1], got {spec.tau}")
-        # learning_starts >= batch_size is a relation between two counts, so BOTH
-        # operands are asked of the shared count domain and the relation only of
-        # two values that are counts. Asking it of batch_size alone was not
-        # enough: a non-finite learning_starts makes ``<`` answer False (every
-        # comparison against nan is False, and inf is below no int), so the
-        # relation passed and both consumers then read a value that is not a
-        # count. ``collect_rollout`` tests ``buffer.size < learning_starts`` to
-        # decide the random warmup and ``train`` tests ``buffer.size >=
-        # learning_starts`` to decide whether ``update()`` runs at all, so nan
-        # skips the warmup and takes zero gradient steps while inf warms up
-        # forever and takes zero gradient steps - a run that reports success
-        # having learned nothing, which is the outcome _rl_replay_problems exists
-        # to refuse for buffer_size. The domain is the strict count one its
-        # sibling operand already uses, so the relation compares two values drawn
-        # from one domain rather than one count against whatever the other side
-        # happened to be.
-        learning_starts_error = positive_count_error(spec.learning_starts, "learning_starts", self.provider_name)
-        if learning_starts_error is not None:
-            problems.append(learning_starts_error)
-        elif (
-            positive_count_error(spec.batch_size, "batch_size", self.provider_name) is None
-            and spec.learning_starts < spec.batch_size
-        ):
-            problems.append(
-                f"learning_starts ({spec.learning_starts}) must be >= batch_size ({spec.batch_size}) "
-                "so the first gradient step can sample a full batch"
-            )
+        # hidden_dims is the shape of every network this backend builds - the
+        # actor and the critics alike. The expansion loop judges nothing and
+        # nn.Linear accepts a width of zero, which makes the activation after it
+        # empty and the next layer's output its bias alone: the policy stops
+        # being a function of the observation, and the run reports success while
+        # exporting a deployable checkpoint whose actor is one fixed action.
+        problems.extend(self._network_width_problems(spec))
+        # device is spent by torch.device itself, which judges nothing: every
+        # network, buffer and rollout tensor is placed on the result. "gpu" and
+        # "cuda:abc" raise out of setup after the preflight passed, and a
+        # non-str ordinal constructs on any host and then dies at the first
+        # .to() with "invalid device ordinal" - the same spec training fine on a
+        # box with more GPUs.
+        problems.extend(self._spec_device_problems(spec))
+        # tau is the rate at which the target critics track the online ones,
+        # spent as tp.mul_(1.0 - spec.tau).add_(spec.tau * p) per mirrored pair,
+        # so it decides whether a separate target network exists at all. A bare
+        # interval comparison could not carry that: bool is an int subclass, so
+        # True read as the interval's maximum - the hard update tp = p, a target
+        # network that is a copy of the online one, measured as an exactly zero
+        # online-to-target gap in the checkpoint of a run that reported success -
+        # and a numeric string, None or a list raised TypeError out of the
+        # comparison itself, from a validate documented to return its problems.
+        # The interval is unchanged, and is the one the on-policy gamma and lam
+        # gates cite as the precedent they generalize; it is now shared with them
+        # rather than duplicated between this backend and its sibling.
+        problems.extend(self._polyak_coefficient_problems(spec))
+        # learning_starts is this backend's warmup threshold, and it must be at
+        # least batch_size or the first gradient step cannot sample a full batch.
+        # Both operands are counts, so the relation and each operand's domain are
+        # one rule - shared with the sibling off-policy backend that states it
+        # identically rather than inlined in both. The reasoning the relation
+        # rests on lives with it, in warmup_batch_relation_problems.
+        problems.extend(self._rl_warmup_batch_problems(spec))
+        # That relation sizes the FIRST batch; it does not make the threshold
+        # reachable. Two more caller-supplied counts bound the fill a run ever
+        # reaches - the step budget it collects, max(1, total_timesteps // steps)
+        # * steps, and buffer_size, the ring buffer's capacity - and either one
+        # below learning_starts takes zero gradient steps for the whole run while
+        # still reporting success with a checkpoint and an exported policy, the
+        # outcome the relation above and _rl_replay_problems each cite as the one
+        # they exist to refuse. Both were reachable with plain positive counts
+        # that pass every per-field domain: buffer_size=1 builds the same one-slot
+        # buffer as buffer_size=True, which the count rule refuses for exactly
+        # this outcome, and a total_timesteps below learning_starts warms up for
+        # the whole budget. Graded as a relation between counts, so a non-count is
+        # left to the domain gate that names it.
+        problems.extend(self._rl_warmup_reachability_problems(spec))
+        # log_interval is this loop's checkpoint cadence - the modulus of the one
+        # test that decides whether an intermediate checkpoint is written - so it
+        # answers the same question save_freq does for a supervised run and takes
+        # the same shared domain. The modulus judges it not at all: nan never
+        # satisfies it and silently keeps only the final checkpoint of a
+        # successful run, True writes one every iteration, a fraction is a
+        # silently different cadence, and a str raises out of the loop after
+        # setup has built the env, the networks and the optimizers.
+        problems.extend(self._rl_checkpoint_interval_problems(spec))
         return problems
 
     def setup(self, spec: RLTrainSpec) -> None:
@@ -234,8 +298,11 @@ class FastSacTrainer(BaseRLAlgo):
             self.env.device = self.device
         self.steps_per_iter = spec.rollout_steps * spec.num_envs
 
-        self.actor_critic = _build_actor_critic(
-            self.env.num_actor_obs, self.env.num_critic_obs, self.env.num_actions, spec
+        self.actor_critic = build_actor_critic(
+            self.env.num_actor_obs,
+            self.env.num_critic_obs,
+            self.env.num_actions,
+            hidden_dims=tuple(spec.hidden_dims),
         ).to(self.device)
 
         actor_params = list(self.actor_critic.actor.parameters())
@@ -265,7 +332,6 @@ class FastSacTrainer(BaseRLAlgo):
         self._obs = self.env.reset()
         self._collected_steps = 0
         self._ep_return = 0.0
-        self._recent_returns: list[float] = []
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -324,8 +390,6 @@ class FastSacTrainer(BaseRLAlgo):
             else:
                 self._obs = next_obs
 
-        if ep_returns:
-            self._recent_returns = ep_returns
         mean_return = float(sum(ep_returns) / len(ep_returns)) if ep_returns else float(sum(step_rewards))
         return {
             "mean_reward": float(sum(step_rewards) / max(1, len(step_rewards))),
@@ -412,7 +476,10 @@ class FastSacTrainer(BaseRLAlgo):
 
         Overrides the on-policy ``BaseRLAlgo.train``. ``spec`` MUST be an
         :class:`RLTrainSpec`; :meth:`validate` is called first and fails closed.
-        Updates run only after the buffer passes ``learning_starts``.
+        Updates run only after the buffer passes ``learning_starts``. The env
+        built by :meth:`setup` is closed in ``finally`` when the run leaves
+        this method - see :meth:`BaseRLAlgo._close_env` for the ownership rule
+        and why a later ``evaluate`` on the same instance still works.
         """
         if not isinstance(spec, RLTrainSpec):
             return TrainResult(
@@ -424,31 +491,34 @@ class FastSacTrainer(BaseRLAlgo):
         if problems:
             return TrainResult(status="error", job_id="", message="validation failed: " + "; ".join(problems))
 
-        self.setup(spec)
-        steps_per_iter = max(1, self.steps_per_iter)
-        num_iters = max(1, spec.total_timesteps // steps_per_iter)
+        try:
+            self.setup(spec)
+            steps_per_iter = max(1, self.steps_per_iter)
+            num_iters = max(1, spec.total_timesteps // steps_per_iter)
 
-        job_id = f"{self.provider_name}-{id(self):x}"
-        last_metrics: dict[str, Any] = {}
-        ckpt_dir: str | None = None
-        for it in range(num_iters):
-            rollout_metrics = self.collect_rollout()
-            loss_metrics = self.update() if self.buffer.size >= spec.learning_starts else {}
-            last_metrics = {**rollout_metrics, **loss_metrics, "iteration": it + 1}
-            if spec.log_interval and (it % spec.log_interval == 0 or it == num_iters - 1):
-                ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=it + 1)
-        if ckpt_dir is None:
-            ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=num_iters)
+            job_id = f"{self.provider_name}-{id(self):x}"
+            last_metrics: dict[str, Any] = {}
+            ckpt_dir: str | None = None
+            for it in range(num_iters):
+                rollout_metrics = self.collect_rollout()
+                loss_metrics = self.update() if self.buffer.size >= spec.learning_starts else {}
+                last_metrics = {**rollout_metrics, **loss_metrics, "iteration": it + 1}
+                if spec.log_interval and (it % spec.log_interval == 0 or it == num_iters - 1):
+                    ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=it + 1)
+            if ckpt_dir is None:
+                ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=num_iters)
 
-        last_metrics.setdefault("latest_step", self._collected_steps)
-        return TrainResult(
-            status="success",
-            job_id=job_id,
-            checkpoint_dir=ckpt_dir,
-            exported_model=self.export(spec, ckpt_dir),
-            metrics=last_metrics,
-            message=f"{self.provider_name}: {num_iters} iterations x {steps_per_iter} steps complete",
-        )
+            last_metrics.setdefault("latest_step", self._collected_steps)
+            return TrainResult(
+                status="success",
+                job_id=job_id,
+                checkpoint_dir=ckpt_dir,
+                exported_model=self.export(spec, ckpt_dir),
+                metrics=last_metrics,
+                message=f"{self.provider_name}: {num_iters} iterations x {steps_per_iter} steps complete",
+            )
+        finally:
+            self._close_env()
 
     def _checkpoint_dir(self, output_dir: str) -> str:
         return os.path.join(output_dir, "checkpoints", "last")

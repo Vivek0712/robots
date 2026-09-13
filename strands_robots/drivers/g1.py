@@ -49,6 +49,15 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any, cast
 
+from strands_robots.drivers.base import (
+    decode_motor_state,
+    policy_step,
+    telemetry_float,
+    telemetry_float_list,
+    telemetry_int,
+    telemetry_int_list,
+    undeclared_verb_error,
+)
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.tools.g1 import HANDSHAKE_FSMS, WALK_FSMS, decode_code
 from strands_robots.tools.g1._dds_engine import DDSPublisher, DDSSubscriberSet
@@ -233,6 +242,135 @@ _SDK_KD: tuple[float, ...] = _LEG_KD + _LEG_KD + _WAIST_KD + _ARM_KD + _ARM_KD
 # drift apart.
 _WIRE_FIELDS: tuple[str, ...] = ("q", "kp", "kd", "dq", "tau")
 
+# Per-joint command envelope (F-004, CWE-1284).  Finiteness says a value CAN go
+# on the wire; these tables say whether the joint can honor it.  Every number
+# below is the vendor's own: the ``<limit lower= upper= effort= velocity=>``
+# element of each revolute joint in ``robots/g1_description/g1_29dof.urdf`` in
+# unitreerobotics/unitree_ros.  Travel is radians; effort is the actuator's peak
+# torque in N m; velocity is rad/s.  The 29 travel rows are also the joint
+# ``range`` values of the compiled ``unitree_g1`` asset (mujoco_menagerie
+# ``unitree_g1/g1.xml``), so this transcription has an oracle on any machine
+# that has the asset: a slipped decimal disagrees with the vendor's own model
+# instead of reading as a plausible bound.  Roll joints are mirrored
+# left/right, which is why the two hips and the two shoulders do not share one
+# row.
+#
+# A value outside its row is REFUSED, never clamped: a clamped target still
+# moves the joint to a place the caller did not ask for, and on a standing
+# humanoid an unrequested motion is the failure these rows exist to prevent.
+_G1_JOINT_TRAVEL_RAD: dict[str, tuple[float, float]] = {
+    "left_hip_pitch": (-2.5307, 2.8798),
+    "left_hip_roll": (-0.5236, 2.9671),
+    "left_hip_yaw": (-2.7576, 2.7576),
+    "left_knee": (-0.087267, 2.8798),
+    "left_ankle_pitch": (-0.87267, 0.5236),
+    "left_ankle_roll": (-0.2618, 0.2618),
+    "right_hip_pitch": (-2.5307, 2.8798),
+    "right_hip_roll": (-2.9671, 0.5236),
+    "right_hip_yaw": (-2.7576, 2.7576),
+    "right_knee": (-0.087267, 2.8798),
+    "right_ankle_pitch": (-0.87267, 0.5236),
+    "right_ankle_roll": (-0.2618, 0.2618),
+    "waist_yaw": (-2.618, 2.618),
+    "waist_roll": (-0.52, 0.52),
+    "waist_pitch": (-0.52, 0.52),
+    "left_shoulder_pitch": (-3.0892, 2.6704),
+    "left_shoulder_roll": (-1.5882, 2.2515),
+    "left_shoulder_yaw": (-2.618, 2.618),
+    "left_elbow": (-1.0472, 2.0944),
+    "left_wrist_roll": (-1.972222054, 1.972222054),
+    "left_wrist_pitch": (-1.614429558, 1.614429558),
+    "left_wrist_yaw": (-1.614429558, 1.614429558),
+    "right_shoulder_pitch": (-3.0892, 2.6704),
+    "right_shoulder_roll": (-2.2515, 1.5882),
+    "right_shoulder_yaw": (-2.618, 2.618),
+    "right_elbow": (-1.0472, 2.0944),
+    "right_wrist_roll": (-1.972222054, 1.972222054),
+    "right_wrist_pitch": (-1.614429558, 1.614429558),
+    "right_wrist_yaw": (-1.614429558, 1.614429558),
+}
+
+# Peak torque (``effort``) and peak speed (``velocity``) per joint, same URDF.
+# ``tau`` is the feed-forward torque the frame carries verbatim; ``dq`` the
+# velocity reference.  Either past the actuator's peak asks for what the motor
+# cannot deliver, so the request is refused rather than left to saturate.
+_G1_TAU_MAX_NM: dict[str, float] = {
+    **{name: 88.0 for name in ("left_hip_pitch", "left_hip_roll", "left_hip_yaw")},
+    **{name: 88.0 for name in ("right_hip_pitch", "right_hip_roll", "right_hip_yaw")},
+    "left_knee": 139.0,
+    "right_knee": 139.0,
+    **{name: 35.0 for name in ("left_ankle_pitch", "left_ankle_roll", "right_ankle_pitch", "right_ankle_roll")},
+    "waist_yaw": 88.0,
+    "waist_roll": 35.0,
+    "waist_pitch": 35.0,
+    **{
+        f"{side}_{joint}": 25.0
+        for side in ("left", "right")
+        for joint in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll")
+    },
+    **{f"{side}_{joint}": 5.0 for side in ("left", "right") for joint in ("wrist_pitch", "wrist_yaw")},
+}
+_G1_DQ_MAX_RAD_S: dict[str, float] = {
+    **{name: 32.0 for name in ("left_hip_pitch", "left_hip_roll", "left_hip_yaw")},
+    **{name: 32.0 for name in ("right_hip_pitch", "right_hip_roll", "right_hip_yaw")},
+    "left_knee": 20.0,
+    "right_knee": 20.0,
+    **{name: 30.0 for name in ("left_ankle_pitch", "left_ankle_roll", "right_ankle_pitch", "right_ankle_roll")},
+    "waist_yaw": 32.0,
+    "waist_roll": 30.0,
+    "waist_pitch": 30.0,
+    **{
+        f"{side}_{joint}": 37.0
+        for side in ("left", "right")
+        for joint in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll")
+    },
+    **{f"{side}_{joint}": 22.0 for side in ("left", "right") for joint in ("wrist_pitch", "wrist_yaw")},
+}
+
+# Gain ceilings.  ``kp``/``kd`` are not physical limits the URDF states; they
+# are what the firmware's PD loop multiplies error by, and the wire carries them
+# verbatim.  The stiffest reference gain in :data:`_SDK_KP` is the knee at 100
+# and in :data:`_SDK_KD` the knee at 2; the vendor's RL locomotion configs
+# (unitree_rl_gym ``g1_config.py``) reach ``kp=150`` on the hips and knees and
+# ``kd`` in the low single digits.  Twice the stiffest reference position gain
+# and five times the stiffest reference damping gain admits every published
+# controller with headroom and still refuses the ``kp=500`` that turns a 1 rad
+# error into 500 N m of demand on a knee whose actuator peaks at 139.  A
+# negative gain is refused outright: negative stiffness or damping is an
+# unstable loop, not a softer one.
+_G1_KP_MAX: float = 200.0
+_G1_KD_MAX: float = 10.0
+
+
+def _bounded_error(value: float, *, joint: str, field: str, lo: float, hi: float, unit: str) -> str | None:
+    """Refusal text when a finite ``value`` lies outside ``[lo, hi]``, else ``None``.
+
+    Names the joint, the field, the value and both bounds, so the caller can see
+    what to change without reading a table.  Runs AFTER
+    :func:`~strands_robots.utils.finite_number_error`: a ``nan`` compares false
+    against every bound and would slip through a bare comparison.
+    """
+    if lo <= value <= hi:
+        return None
+    return f"send_action: {joint}.{field}={value!r} is outside the joint's envelope [{lo}, {hi}] {unit}; refusing"
+
+
+def _envelope_error(joint: str, q: float, kp: float, kd: float, dq: float, tau: float) -> str | None:
+    """Hold one joint's five wire fields to :data:`_G1_JOINT_TRAVEL_RAD` and friends."""
+    lo, hi = _G1_JOINT_TRAVEL_RAD[joint]
+    checks = (
+        ("q", q, lo, hi, "rad"),
+        ("kp", kp, 0.0, _G1_KP_MAX, "(position gain)"),
+        ("kd", kd, 0.0, _G1_KD_MAX, "(damping gain)"),
+        ("dq", dq, -_G1_DQ_MAX_RAD_S[joint], _G1_DQ_MAX_RAD_S[joint], "rad/s"),
+        ("tau", tau, -_G1_TAU_MAX_NM[joint], _G1_TAU_MAX_NM[joint], "N m"),
+    )
+    for field, value, f_lo, f_hi, unit in checks:
+        reason = _bounded_error(value, joint=joint, field=field, lo=f_lo, hi=f_hi, unit=unit)
+        if reason is not None:
+            return reason
+    return None
+
 
 class G1Driver:
     """Native driver for the Unitree G1.
@@ -321,6 +459,7 @@ class G1Driver:
         # tiny critical section around dict swap; readers snapshot.
         self._cache_lock = threading.Lock()
         self._imu: dict[str, Any] | None = None
+        self._joints: dict[str, Any] | None = None
         self._battery: dict[str, Any] | None = None
         self._lidar_state: dict[str, Any] | None = None
         self._lidar_summary: dict[str, Any] | None = None
@@ -462,7 +601,7 @@ class G1Driver:
                             "action": {
                                 "type": "string",
                                 "description": (
-                                    "sensors: return the latest cached IMU/battery/lidar; "
+                                    "sensors: return the latest cached IMU/joints/battery/lidar; "
                                     "status: report connection and FSM; "
                                     "stop: halt any running control loop - it publishes a zero-torque "
                                     "frame on exit - and report whether it joined"
@@ -507,6 +646,7 @@ class G1Driver:
                     {
                         "json": {
                             "imu": self._snapshot("_imu"),
+                            "joints": self._snapshot("_joints"),
                             "battery": self._snapshot("_battery"),
                             "lidar_state": self._snapshot("_lidar_state"),
                             "lidar_summary": self._snapshot("_lidar_summary"),
@@ -519,7 +659,7 @@ class G1Driver:
                 "status": "success",
                 "content": [{"json": await self.get_status()}],
             }
-        else:  # "stop"
+        elif action == "stop":
             # Report the halt outcome rather than assert one.  ``stop()`` is
             # the protocol's shutdown hook and returns ``None``, so an
             # envelope built beside it can only restate the intent: a policy
@@ -530,6 +670,8 @@ class G1Driver:
             # timeout reason), so the verb returns that envelope rather than
             # re-deriving it from the loop handle.
             envelope = self.stop_task()
+        else:
+            envelope = undeclared_verb_error(self, action)
         yield {"toolUseId": tool_use_id, **envelope}
 
     # ------------------------------------------------------------------ #
@@ -1033,12 +1175,14 @@ class G1Driver:
         1. A control loop.  A caller who wants 500 Hz calls this on their own
            timer; the driver's job here is one wire frame, not a schedule.
            :meth:`run_policy` owns that loop today; this method is one frame.
-        2. A safety filter.  The FSM and battery gates are the safety
-           envelope; command-magnitude limits are the arm-SDK client's job.
-           Every commanded field is still required to be a finite number, which
-           is a different question from how large it may be: a ``nan`` target is
-           not a bold move the SDK can clamp, it is a value the motor controller
-           cannot honor at all.
+        2. A controller.  The FSM and battery gates decide WHEN a frame may be
+           admitted; the per-joint envelope (:data:`_G1_JOINT_TRAVEL_RAD`,
+           :data:`_G1_TAU_MAX_NM`, :data:`_G1_DQ_MAX_RAD_S`, :data:`_G1_KP_MAX`,
+           :data:`_G1_KD_MAX`) decides WHICH values a frame may carry.  Both are
+           refusals, never clamps: a value the joint cannot honor is answered,
+           not quietly moved to a place the caller did not ask for.  Nothing
+           here plans a trajectory or checks self-collision between joints; a
+           caller who needs that owns it.
 
         Scope is ``"arm"`` because ``send_action`` writes to ``rt/lowcmd`` for
         arm-SDK-shaped targets; base velocity is not a ``send_action`` verb.
@@ -1142,16 +1286,30 @@ class G1Driver:
         allowed set.
 
         ``policy_object`` is either a built :class:`~strands_robots.policies.Policy`
-        or a bare callable - the admission check below accepts a ``.step()``
-        attribute *or* a callable object, so the annotation admits the same
-        set the refusal enforces.  It is called on each step with a snapshot
-        of the cached observations (``mode_machine``, ``fsm_id``, ``imu``, etc.)
-        and is expected to return a joint-name-keyed action dict of the
-        same shape :meth:`send_action` accepts.  A policy that returns
-        ``None`` or an unusable action is refused inside the loop; the
-        refusal name and count surface through :meth:`get_task_status`.
+        or a bare callable, resolved by
+        :func:`~strands_robots.drivers.base.policy_step` - so the admission
+        below accepts exactly the set :meth:`~strands_robots.drivers.base.HardwareDriver.run_policy` types
+        plus the two untyped shapes (``step``, bare callable) this loop has
+        always run.  It is called on each step with a snapshot of the cached
+        observations (``mode_machine``, ``fsm_id``, ``imu``, etc.) and is
+        expected to return a joint-name-keyed action dict of the same shape
+        :meth:`send_action` accepts, or a chunk of them whose first action is
+        commanded.  A policy that returns ``None`` or an unusable action is
+        refused inside the loop; the refusal name and count surface through
+        :meth:`get_task_status`.
+
+        Args:
+            policy_object: The policy to roll out.
+            instruction: Handed to the policy each step, as the second argument
+                of ``get_actions_sync``. The untyped shapes take no
+                instruction, so it does not reach those.
+            duration: Wall-clock budget for the rollout, in seconds.
+            n_steps: Step budget; when given it wins over ``duration``.
+
+        Returns:
+            A success envelope naming the running task's budgets, or an error
+            envelope naming the gate or the argument that refused it.
         """
-        del instruction  # policies own their own conditioning
         # Validate the continuous knobs on the shared domains before the
         # gate.  ``duration`` reaches ``deadline = started_at + duration``
         # inside the loop; ``nan`` poisons every comparison there so the
@@ -1173,9 +1331,8 @@ class G1Driver:
             return refusal
         if policy_object is None:
             return _refuse("run_policy: policy_object is required")
-        step_fn = getattr(policy_object, "step", None)
-        if not callable(step_fn) and not callable(policy_object):
-            return _refuse("run_policy: policy_object must be callable or expose a .step() method")
+        if policy_step(policy_object, instruction) is None:
+            return _refuse("run_policy: policy_object must be callable or expose get_actions_sync() or step()")
         # Admission held across the ``is_running`` check, the reference
         # assignment and ``start()`` so a second thread cannot pass the check
         # before either assigns ``self._loop`` (two rollouts on one wire),
@@ -1186,6 +1343,7 @@ class G1Driver:
             policy=policy_object,
             duration=float(duration),
             n_steps=n_steps,
+            instruction=instruction,
         )
         with self._task_admission:
             if self._loop is not None and self._loop.is_running:
@@ -1340,7 +1498,7 @@ class G1Driver:
         ]
 
     def _on_lowstate(self, msg: Any) -> None:
-        """Decode ``rt/lowstate`` into :attr:`_imu` and :attr:`_mode_machine`.
+        """Decode ``rt/lowstate`` into :attr:`_imu`, :attr:`_joints` and :attr:`_mode_machine`.
 
         ``LowState_.mode_machine`` is the uint8 hardware-layout id the firmware
         wants echoed on every ``LowCmd_``.  It is **not** the high-level FSM
@@ -1348,20 +1506,76 @@ class G1Driver:
         motion-switcher API and arrives on a different topic.  Writing this
         field to :attr:`_mode_machine` (rather than :attr:`_fsm_id`) keeps the
         two ranges separate: ``[0, 255]`` for the echo, arbitrary for the gate.
+
+        Each ``IMUState_`` vector is read through ``getattr(imu, name, None)``
+        and coerced by
+        :func:`~strands_robots.drivers.base.telemetry_float_list`, so a field
+        the message does not carry lands ``None`` rather than a typed default.
+        The twin driver
+        :meth:`~strands_robots.drivers.go2.Go2Driver._on_lowstate`
+        reads the same four names the same way, and it is the stricter half of
+        the rule here: a default-carrying read cannot fail, and every default
+        this IMU could take is a well-formed
+        reading of a robot that is fine -- ``[0.0, 0.0, 0.0]`` rpy is perfectly
+        level, ``[1.0, 0.0, 0.0, 0.0]`` is upright, and a zero accelerometer is
+        free fall, which a standing robot never reports because gravity is
+        always on one axis.  Those constants are published to
+        ``strands/{peer_id}/imu`` by
+        :class:`~strands_robots.mesh.sensors.SensorLoopsMixin` for as long as
+        the robot runs, so a fleet reading attitude off the wire would be told
+        a falling humanoid is level.  ``None`` says the field was not read,
+        which is what the ``g1_imu`` verb documents for every one of them.
+
+        Because each field is coerced on its own, one unreadable vector reports
+        itself as ``None`` and leaves the other three intact, rather than
+        raising past the dict and abandoning a frame that carried three good
+        readings.
+
+        ``motor_state`` is the array this robot's 29 PD-controlled joints
+        report through, and it is read by the same shared decoder the twin
+        driver uses -
+        :func:`~strands_robots.drivers.base.decode_motor_state` over
+        :data:`_G1_JOINT_INDEX` - so both Unitree peers publish one ``joints``
+        shape. It is the only proprioception the G1 publishes: without it
+        :meth:`send_action` writes ``motor_cmd[i].q`` under gains up to
+        :data:`_SDK_KP` against joints the driver cannot observe, and
+        :meth:`_ControlLoop._call_policy` hands a policy an observation with no
+        measured pose in it.
+
+        ``mode_machine`` is read the same way, through
+        :func:`~strands_robots.drivers.base.telemetry_int`.  It is a reading
+        like any other and it is the one this method sends back out: the
+        firmware drops a ``LowCmd_`` whose layout id does not match, so an id
+        built from something that was not a number is a write the robot
+        silently ignores.  ``int()`` read a ``bool`` as ``1``/``0``, both valid
+        uint8 layout ids, so a flag on the field was indistinguishable from a
+        reading; it also raised on a buffer or a word, which the shared
+        ``except`` then logged as a failure of the whole lowstate rather than of
+        one field.  A float is still truncated, because that is the owner's own
+        answer and the Go2 accepts it too.
+
+        A refused reading leaves :attr:`_mode_machine` at its previous value,
+        matching :meth:`_refresh_fsm_id` two ranges over: the layout id does
+        not change while the robot is powered, so the last reading that parsed
+        is a better answer than ``None`` - which the gate reads as "lowstate
+        has not delivered yet".
         """
         try:
             imu = getattr(msg, "imu_state", None)
             if imu is not None:
                 self._imu = {
-                    "rpy": [float(x) for x in getattr(imu, "rpy", [0.0, 0.0, 0.0])[:3]],
-                    "gyroscope": [float(x) for x in getattr(imu, "gyroscope", [0.0, 0.0, 0.0])[:3]],
-                    "accelerometer": [float(x) for x in getattr(imu, "accelerometer", [0.0, 0.0, 0.0])[:3]],
-                    "quaternion": [float(x) for x in getattr(imu, "quaternion", [1.0, 0.0, 0.0, 0.0])[:4]],
+                    "rpy": telemetry_float_list(getattr(imu, "rpy", None)),
+                    "gyroscope": telemetry_float_list(getattr(imu, "gyroscope", None)),
+                    "accelerometer": telemetry_float_list(getattr(imu, "accelerometer", None)),
+                    "quaternion": telemetry_float_list(getattr(imu, "quaternion", None)),
                     "t": time.time(),
                 }
-            mode_machine = getattr(msg, "mode_machine", None)
+            joints = decode_motor_state(getattr(msg, "motor_state", None), _G1_JOINT_INDEX)
+            if joints is not None:
+                self._joints = joints
+            mode_machine = telemetry_int(getattr(msg, "mode_machine", None))
             if mode_machine is not None:
-                self._mode_machine = int(mode_machine)
+                self._mode_machine = mode_machine
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
             logger.debug("%s: lowstate decode failed: %s", self._tool_name, exc)
 
@@ -1369,7 +1583,7 @@ class G1Driver:
         """Decode ``rt/lf/bmsstate`` into :attr:`_battery`.
 
         Every field is read through ``getattr(msg, name, None)`` and coerced
-        by :func:`_to_float` / :func:`_to_int`, so a name the message does
+        by :func:`telemetry_float` / :func:`telemetry_int`, so a name the message does
         not carry lands ``None`` in the record rather than a typed default.
         That distinction is the whole contract here: ``getattr`` with a
         ``0`` default cannot fail and ``0`` is a well-formed reading, so a
@@ -1388,9 +1602,9 @@ class G1Driver:
         """
         try:
             self._battery = {
-                "pct": _to_float(getattr(msg, "soc", None)),
-                "current": _to_float(getattr(msg, "current", None)),
-                "cycle": _to_int(getattr(msg, "cycle", None)),
+                "pct": telemetry_float(getattr(msg, "soc", None)),
+                "current": telemetry_float(getattr(msg, "current", None)),
+                "cycle": telemetry_int(getattr(msg, "cycle", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001
@@ -1401,22 +1615,31 @@ class G1Driver:
 
         The names read here are the ones ``LidarState_`` declares: the MID-360
         reports its fault code as ``error_state`` and its scan rate as
-        ``cloud_frequency``. Reading a name the IDL does not define is
-        indistinguishable from a healthy reading in this record, because
-        ``getattr``'s default is what lands in it - so a unit whose lidar had
-        faulted would publish ``code=-1`` and ``freq=0.0`` for as long as it
-        ran, and the fleet card would read that as "no reading yet".
+        ``cloud_frequency``. Each is read as ``getattr(msg, name, None)`` and
+        coerced by :func:`~strands_robots.drivers.base.telemetry_int` /
+        :func:`~strands_robots.drivers.base.telemetry_float`, the rule every
+        other decoder in this class follows, so a name the message does not
+        carry lands ``None`` for that key rather than a constant shaped like a
+        reading. The typed defaults this read used to carry were all such
+        constants: ``-1`` renders as a fault code, ``0.0`` on ``cloud_frequency``
+        is a unit that has stopped scanning, and ``int(False)`` on
+        ``error_state`` is ``0``, which :func:`decode_code` renders as ``OK`` - a
+        healthy lidar fabricated from a flag. ``g1_lidar_state`` documents every
+        field as "or ``None``", and this is what makes that reachable once a
+        message has arrived.
 
-        ``error_state`` is read once and used for both the numeric code and its
-        rendered text so the two cannot come to describe different fields.
+        ``code_text`` renders the coerced ``code``, not the raw field, so the
+        two describe one reading: a numeric string on the field used to publish
+        ``code=3`` beside ``code_text="'3'"``. A code that is no reading has no
+        text.
         """
         try:
-            error_state = getattr(msg, "error_state", -1)
+            code = telemetry_int(getattr(msg, "error_state", None))
             self._lidar_state = {
-                "code": int(error_state),
-                "code_text": decode_code(error_state),
-                "freq": float(getattr(msg, "cloud_frequency", 0.0)),
-                "sys_rotation_speed": float(getattr(msg, "sys_rotation_speed", 0.0)),
+                "code": code,
+                "code_text": None if code is None else decode_code(code),
+                "freq": telemetry_float(getattr(msg, "cloud_frequency", None)),
+                "sys_rotation_speed": telemetry_float(getattr(msg, "sys_rotation_speed", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001
@@ -1437,17 +1660,25 @@ class G1Driver:
         for a cap to apply to. ``count`` is therefore the cloud's true size: a
         MID-360 that drops from 24000 points to 3000 is reporting a fault, and
         clamping the number would hide exactly that.
+
+        For the same reason a header field the message does not carry is
+        ``None``, not ``0``. Each is read as ``getattr(msg, name, None)`` and
+        coerced by :func:`~strands_robots.drivers.base.telemetry_int`, so a
+        renamed ``width`` reports no reading rather than a zero-point cloud -
+        which is precisely the shape of the fault ``count`` exists to show.
+        ``count`` needs both dimensions, so it is ``None`` when either is; a
+        field that is unreadable costs that field, not the frame, so the header
+        fields that did parse still reach the record.
         """
         try:
-            width = int(getattr(msg, "width", 0))
-            height = int(getattr(msg, "height", 0))
-            count = width * height
+            width = telemetry_int(getattr(msg, "width", None))
+            height = telemetry_int(getattr(msg, "height", None))
             self._lidar_summary = {
-                "count": count,
+                "count": None if width is None or height is None else width * height,
                 "width": width,
                 "height": height,
-                "point_step": int(getattr(msg, "point_step", 0)),
-                "row_step": int(getattr(msg, "row_step", 0)),
+                "point_step": telemetry_int(getattr(msg, "point_step", None)),
+                "row_step": telemetry_int(getattr(msg, "row_step", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001
@@ -1477,10 +1708,10 @@ class G1Driver:
         """
         try:
             self._mainboard = {
-                "fan_state": _to_int_list(getattr(msg, "fan_state", None)),
-                "temperature": _to_float_list(getattr(msg, "temperature", None)),
-                "value": _to_float_list(getattr(msg, "value", None)),
-                "state": _to_int_list(getattr(msg, "state", None)),
+                "fan_state": telemetry_int_list(getattr(msg, "fan_state", None)),
+                "temperature": telemetry_float_list(getattr(msg, "temperature", None)),
+                "value": telemetry_float_list(getattr(msg, "value", None)),
+                "state": telemetry_int_list(getattr(msg, "state", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
@@ -1506,10 +1737,10 @@ class G1Driver:
         """
         try:
             self._pressure = {
-                "pressure": _to_float_list(getattr(msg, "pressure", None)),
-                "temperature": _to_float_list(getattr(msg, "temperature", None)),
-                "lost": _to_int(getattr(msg, "lost", None)),
-                "reserve": _to_int(getattr(msg, "reserve", None)),
+                "pressure": telemetry_float_list(getattr(msg, "pressure", None)),
+                "temperature": telemetry_float_list(getattr(msg, "temperature", None)),
+                "lost": telemetry_int(getattr(msg, "lost", None)),
+                "reserve": telemetry_int(getattr(msg, "reserve", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
@@ -1530,82 +1761,6 @@ class G1Driver:
             if value is None:
                 return None
             return dict(value)
-
-
-def _to_int(value: Any) -> int | None:
-    """Coerce ``value`` to ``int``, or return ``None`` if it will not.
-
-    ``BmsState_.cycle`` is declared integer, but the value landing here comes
-    from ``getattr(msg, name, None)`` at :meth:`G1Driver._on_bms`, so a
-    firmware that renames the field yields ``None`` at this call.  Returning
-    ``None`` decidably rather than raising keeps the DDS thread's decoder
-    swallowing nothing silently, and the ``g1_battery`` verb reports the
-    missing field as ``None`` in the envelope instead of dropping the whole
-    reading.  The same rule is why no caller passes a typed default: ``0``
-    would be indistinguishable from a real zero-cycle pack.
-    """
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float(value: Any) -> float | None:
-    """Coerce ``value`` to ``float``, or return ``None`` if it will not.
-
-    The float counterpart of :func:`_to_int`, for ``BmsState_``'s ``soc`` and
-    ``current``.  Same rule: the caller passes ``getattr(msg, name, None)``
-    rather than a typed default, so a renamed or undeclared field reaches the
-    ``g1_battery`` envelope as ``None`` instead of a plausible ``0.0``.
-    """
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_int_list(value: Any) -> list[int] | None:
-    """Coerce ``value`` (a vector IDL field) to ``list[int]``, or ``None``.
-
-    Vector fields on the ``MainBoardState_`` IDL - ``fan_state`` -- arrive as
-    an iterable whose element type is declared integer on the current
-    firmware.  Copying into a plain ``list`` here (rather than storing the
-    IDL sequence) means the ``_snapshot`` accessor's ``dict(value)`` copy
-    already carries a list a caller can mutate without racing the DDS
-    thread's next write, and it turns a bytes-like or string value (which
-    would otherwise iterate as characters) into ``None``.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (str, bytes, bytearray)):
-        return None
-    try:
-        return [int(item) for item in value]
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float_list(value: Any) -> list[float] | None:
-    """Coerce ``value`` (a vector IDL field) to ``list[float]``, or ``None``.
-
-    Vector fields on the ``MainBoardState_`` IDL - ``temperature`` -- are a
-    float sequence on the current firmware.  Same copy-into-list rule as
-    :func:`_to_int_list`: the returned list is fresh, so a caller mutating
-    the ``g1_mainboard`` verb's envelope does not race the DDS thread that
-    writes the cache.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (str, bytes, bytearray)):
-        return None
-    try:
-        return [float(item) for item in value]
-    except (TypeError, ValueError):
-        return None
 
 
 def _refuse(reason: str) -> dict[str, Any]:
@@ -1669,9 +1824,15 @@ def _build_lowcmd_from_action(
       A ``nan`` or ``inf`` survives a bare ``float()`` and serializes onto the
       wire as a valid IEEE-754 float, so the motor controller integrates it
       instead of rejecting it; ``True`` would land as a silent ``1.0`` rad. This
-      is not a magnitude limit - it is the gate that keeps an unrepresentable
-      target off the wire, and refusing the whole action is the same posture an
-      unknown joint name gets, for the same reason.
+      is the gate that keeps an unrepresentable target off the wire, and
+      refusing the whole action is the same posture an unknown joint name gets,
+      for the same reason.
+    * Every field is then held to the joint's envelope: ``q`` inside
+      :data:`_G1_JOINT_TRAVEL_RAD`, ``|tau|`` under :data:`_G1_TAU_MAX_NM`,
+      ``|dq|`` under :data:`_G1_DQ_MAX_RAD_S`, ``kp``/``kd`` in
+      ``[0, _G1_KP_MAX]`` / ``[0, _G1_KD_MAX]``.  Out of envelope is refused,
+      never clamped, with a reason naming joint, field, value and bounds
+      (F-004).
 
     Wire-frame contract:
 
@@ -1739,6 +1900,12 @@ def _build_lowcmd_from_action(
                 return None, reason
         q_f, kp_f, kd_f = float(q), float(kp), float(kd)
         dq_f, tau_f = float(dq), float(tau)
+        # Finite says the value can go on the wire; the envelope says the joint
+        # can honor it.  Checked on every field, supplied or defaulted, so a
+        # table edit that put a default out of range would be caught here too.
+        reason = _envelope_error(name, q_f, kp_f, kd_f, dq_f, tau_f)
+        if reason is not None:
+            return None, reason
         motor = cmd.motor_cmd[slot]
         motor.mode = 1  # Enable - a Disable slot commands nothing regardless of CRC.
         motor.q = q_f
@@ -1872,9 +2039,16 @@ class _ControlLoop:
         policy: Any,
         duration: float,
         n_steps: int | None,
+        instruction: str = "",
     ) -> None:
         self._driver = driver
         self._policy = policy
+        # Resolved once, here, rather than per step: the resolution reads
+        # attributes off the policy, and this loop calls it at 500 Hz.  It is
+        # the same resolver ``run_policy``'s admission consulted, so a policy
+        # admitted at the door cannot fail to resolve on the thread.
+        self._step_fn = policy_step(policy, instruction)
+        self._instruction = instruction
         self._duration = float(duration)
         self._n_steps = n_steps
         self._stop_event = threading.Event()
@@ -1932,6 +2106,16 @@ class _ControlLoop:
         ``_stop_event.is_set()`` at the top of every step, and once more
         after the policy returns and before the frame publishes.
 
+        ``reason`` is recorded *before* the signal.  The loop's ``finally``
+        stashes its terminal snapshot on the driver while this call is still
+        inside ``join()``, so a reason written after the join reaches
+        ``_exit_reason`` but never the stashed copy
+        :meth:`G1Driver.get_task_status` reads once the loop has cleared
+        itself - which reported a finished rollout with no exit reason at
+        all.  Recording first costs nothing: :meth:`_ControlLoop._set_exit` is
+        first-writer-wins, so a loop that already ended on its own budget
+        keeps that more specific reason.
+
         Returns:
             ``True`` when the thread joined within ``timeout``.  ``False``
             when the loop is still running - a caller-supplied policy that
@@ -1940,17 +2124,13 @@ class _ControlLoop:
             :meth:`stop_task` envelope rather than a ``success`` claim the
             payload's ``running=True`` contradicts.
         """
+        self._set_exit(reason, None)
         self._stop_event.set()
         thread = self._thread
         joined = True
         if thread is not None:
             thread.join(timeout=timeout)
             joined = not thread.is_alive()
-        with self._lock:
-            # The loop itself may have set an exit_reason (budget expiry
-            # racing the caller's stop); if not, the caller wins.
-            if self._exit_reason is None:
-                self._exit_reason = reason
         return joined
 
     def snapshot(self) -> dict[str, Any]:
@@ -2187,17 +2367,21 @@ class _ControlLoop:
                     self._driver._loop = None
 
     def _call_policy(self) -> Any:
-        """Invoke the policy with a snapshot of cached observations."""
+        """Invoke the policy with a snapshot of cached observations.
+
+        Returns:
+            The action dict the policy commanded for this step, or ``None`` when
+            it yielded none - which the caller refuses as ``policy``.
+        """
         obs = {
             "mode_machine": self._driver._mode_machine,
             "fsm_id": self._driver._fsm_id,
             "battery": self._driver._battery,
             "imu": self._driver._imu,
+            "joints": self._driver._joints,
         }
-        step = getattr(self._policy, "step", None)
-        if callable(step):
-            return step(obs)
-        return self._policy(obs)  # pragma: no cover - covered by direct-callable tests
+        assert self._step_fn is not None, "run_policy admits only a resolvable policy"
+        return self._step_fn(obs)
 
     def _emit_zero_torque(self) -> None:
         """Publish one zero-torque frame.  Errors are logged, not raised."""

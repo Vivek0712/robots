@@ -16,25 +16,9 @@ sim = Robot("crazyflie")        # Bitcraze Crazyflie 2 quadcopter
 
 ## Catalog
 
-| Name | Description | Joints | Aliases |
-|------|-------------|-------:|---------|
-| `aliengo` | Unitree Aliengo Quadruped (12-DOF) | 13 | `unitree_aliengo` |
-| `anymal_b` | ANYbotics ANYmal B Quadruped (12-DOF) | 13 | `anybotics_anymal_b` |
-| `anymal_c` | ANYbotics ANYmal C Quadruped (12-DOF) | 13 | `anybotics_anymal_c` |
-| `crazyflie` | Bitcraze Crazyflie 2 Nano-Quadcopter | 1 | `cf2`, `bitcraze_crazyflie` |
-| `earthrover` | EarthRover Mini Plus (mobile outdoor navigation) _(hardware-only, no sim asset)_ | ? | `earth_rover`, `earthrover_mini_plus`, `frodobots` |
-| `go1` | Unitree Go1 Quadruped (12-DOF) | 13 | `unitree_go1` |
-| `google_robot` | Google Robot (mobile base + arm, RT-X) | 10 | `oxe_google` |
-| `lekiwi` | LeKiwi mobile manipulator (6-DOF arm on 3-omniwheel base, 9 actuators) | 9 | - |
-| `lekiwi_client` | LeKiwi networked client (drives a remote LeKiwi host over ZMQ) _(hardware-only, no sim asset)_ | ? | `lekiwi_remote`, `lekiwi_net` |
-| `robot_soccer_kit` | Robot Soccer Kit (multi-robot soccer, 65-DOF total) | 65 | `rsk` |
-| `skydio_x2` | Skydio X2 Autonomous Drone | 1 | - |
-| `spot` | Boston Dynamics Spot (with arm) | 20 | `boston_dynamics_spot` |
-| `stretch` | Hello Robot Stretch (original, mobile manipulator) | 18 | `hello_robot_stretch_original` |
-| `stretch3` | Hello Robot Stretch 3 (mobile manipulator) | 41 | `hello_robot_stretch`, `hello_robot_stretch_3` |
-| `tiago_dual` | PAL Robotics TIAGo++ Dual-Arm Mobile (26-DOF) | 26 | `tiago++`, `pal_tiago_dual` |
-| `unitree_a1` | Unitree A1 Quadruped | 13 | `a1` |
-| `unitree_go2` | Unitree Go2 Quadruped | 40 | `go2` |
+Every robot in this family, generated from `robots.json` at build time. Renders are MuJoCo sim renders, never hardware photos.
+
+{{robot_cards:mobile, mobile_manip, aerial}}
 
 ## Flying a real Crazyflie
 
@@ -53,10 +37,20 @@ cf = Robot("crazyflie", mode="real", port="radio://0/80/2M/E7E7E7E7E7")
 if (reason := cf.connect_eagerly()) is not None:
     raise SystemExit(reason)
 
-cf.takeoff(height=0.5, duration=2.0)
-cf.set_twist(vx=0.2, wz=1.0, z=0.5)   # 0.2 m/s forward, 1.0 rad/s yaw, holding 0.5 m
-cf.land()                              # descends under control
-cf.cleanup()
+# Every flight verb answers with an envelope, including for a link that went quiet
+# after connecting - so read `status` rather than assuming the write landed. Each
+# step is checked before the next is issued: after a refused takeoff there is no
+# altitude for the twist to hold.
+try:
+    env = cf.takeoff(height=0.5, duration=2.0)
+    if env["status"] == "success":
+        env = cf.set_twist(vx=0.2, wz=1.0, z=0.5)  # 0.2 m/s fwd, 1.0 rad/s yaw, 0.5 m
+    if env["status"] == "success":
+        env = cf.land()                            # descends under control
+    if env["status"] != "success":
+        print(env["content"][0]["text"])
+finally:
+    cf.cleanup()  # lands if it is still flying, then releases the radio
 ```
 
 Install the client library with the `crazyflie` extra:
@@ -65,7 +59,7 @@ GPLv3 and this project is Apache-2.0, so the copyleft dependency is only install
 caller who names it. Without it the driver still imports and registers; it reports a
 reason naming this extra instead of connecting.
 
-Four things behave differently from a ground robot, and each one is a way to break the
+Five things behave differently from a ground robot, and each one is a way to break the
 aircraft if you assume otherwise:
 
 | | What to know |
@@ -74,6 +68,7 @@ aircraft if you assume otherwise:
 | **Units** | `wz` is **rad/s**, as everywhere else in this package. `cflib` wants deg/s, and the driver is the only place that conversion happens. |
 | **Setpoints are a stream** | The firmware supervisor cuts thrust when the setpoint stream goes quiet, so one `send_action` latches a setpoint and a background repeater keeps it alive at `setpoint_hz` (default 20 Hz). It returns when the setpoint is latched, not when the motion is done. |
 | **`stop` lands** | `stop()` / `stop_task()` / `cleanup()` all perform a controlled descent. Cutting the motors - an airborne aircraft *falls* - is the separately named `emergency_stop()`, and the agent tool schema cannot reach it. |
+| **A link can go quiet in flight** | `is_connected` reads True for a link that opened and then stopped answering - the handle is live and only the write finds out. So every flight verb returns an error envelope for a write the radio would not carry, rather than raising: check `status` on `send_action` / `set_twist` / `takeoff` / `land` / `emergency_stop`, not just on `connect_eagerly()`. Two of those refusals carry a consequence worth acting on - a refused priority handover means the climb or descent was *not* commanded, and a refused `emergency_stop` means the motors are **still turning** with the setpoint stream already stopped, so only a hardware cutoff will stop the aircraft. |
 
 The flight envelope is the driver's, not the SDK's: `cflib` imposes no ceiling and the
 firmware attempts whatever arrives. A setpoint outside it is **refused by name**, never
@@ -85,26 +80,6 @@ Commands go through `send_action` / `set_twist` / `takeoff` / `land`; `start_tas
 quadcopter has no joints for a manipulation policy's action to land on. Telemetry
 (`stateEstimate` position, `stabilizer` attitude, `pm.vbat`) is cached for the mesh; a bare
 Crazyflie has no ranger deck, so no lidar topic is published.
-
-## Featured renders
-
-### `spot`
-
-![spot](../assets/sim_render_spot.png){ width=400 }
-
-_Boston Dynamics Spot (with arm)_
-
-### `stretch3`
-
-![stretch3](../assets/sim_render_stretch3.png){ width=400 }
-
-_Hello Robot Stretch 3 (mobile manipulator)_
-
-### `unitree_go2`
-
-![unitree_go2](../assets/sim_render_unitree_go2.png){ width=400 }
-
-_Unitree Go2 Quadruped_
 
 ## Real hardware: the Go2 native driver
 
@@ -128,7 +103,10 @@ service driving the legs. Until it is released, a `rt/lowcmd` frame puts that
 controller and your commands on the same twelve motors, so every write path
 (`send_action`, `run_policy`, `start_task`) refuses until `release_sport_mode()`
 confirms the robot reports no active mode. Releasing is deliberately *not* a side
-effect of `connect_eagerly()`, which only subscribes to read.
+effect of `connect_eagerly()`, which only subscribes to read. The release is
+asynchronous, so `release_sport_mode(attempts=N)` polls: N release-then-verify
+rounds, each release followed by the `CheckMode()` read that confirms it, and a
+refusal names the mode that last read reported.
 
 **Actions are keyed by joint name, never by index.** `rt/lowcmd`'s `motor_cmd`
 array follows Unitree's `LegID` order - front-right, front-left, rear-right,
@@ -161,6 +139,97 @@ re-checks both gates every step, and publishes a zero-gain (but still enabled)
 soft-stop frame on the way out rather than cutting the motors dead. Poll
 `get_task_status()`; `stop_task()` reports honestly whether the loop actually
 joined.
+
+`get_task_status()` keeps answering after the rollout's thread is gone, and its
+`exit_reason` names whichever of these ended it — so a caller who polls late
+still learns why the robot stopped moving:
+
+| `exit_reason` | What happened |
+|---------------|---------------|
+| `n_steps` / `duration` | the rollout ran its budget out |
+| `gate` | sport mode was taken back, or the battery fell under the floor (`exit_detail` says which) |
+| `policy` | the policy raised, returned `None`, or named a joint this robot does not have |
+| `publish` | the frame did not reach `rt/lowcmd` |
+| `stop_task` / `stop` / `cleanup` | a caller halted it — `stop_task()`, the mesh's `stop` verb, or teardown |
+
+## Real hardware: the EarthRover native driver
+
+`earthrover` declares `hardware.lerobot_type`, so `mode="real"` builds the lerobot robot
+by default; `driver="strands"` selects the native driver instead. That driver talks to the
+vendor's [earth-rovers-sdk](https://github.com/frodobots-org/earth-rovers-sdk) over HTTP,
+which proxies to the rover, and `port=` is that SDK's base URL.
+
+That transport is `requests`, supplied by `pip install 'strands-robots[earthrover]'`
+(a member of `[all]`). Without it the driver still imports and registers, and
+`connect_eagerly()` returns a reason naming the extra rather than raising.
+
+```python
+from strands_robots import Robot
+
+rover = Robot("earthrover", mode="real", driver="strands", port="http://10.0.0.9:8001")
+if (reason := rover.connect_eagerly()) is not None:   # proves GET /data answers
+    raise SystemExit(reason)
+
+rover.send_action({"linear": 0.4, "angular": -0.2})    # each axis normalised to [-1, 1]
+rover.cleanup()                                        # sends a parting zero twist
+```
+
+The driver *is* the agent's tool, so an agent gets the rover's whole surface by holding it:
+
+```python
+from strands import Agent
+
+Agent(tools=[rover])("drive forward for two seconds, then show me the front camera")
+```
+
+| `action` | Parameters | Does |
+|---|---|---|
+| `sensors` | - | Telemetry snapshot: a one-line summary block plus the whole `/data` JSON. Refuses when the SDK has never answered, rather than reporting an empty rover. |
+| `status` | - | Connection state, the SDK URL and the last commanded twist. |
+| `camera` | `camera` (`front`/`rear`) | One frame, as an image block the model can see. |
+| `move` | `linear`, `angular`, `duration_s` | One twist. With `duration_s` (at most 30 s) the twist is held and a zero twist follows; the answer reports both halves, so a lost trailing stop is an error and not a completed move. |
+| `lamp` | `on` | Switches the headlamp - and stops, because the SDK carries `lamp` inside the one `/control` twist frame. |
+| `speak` | `text` | Says `text` through the rover's speaker. |
+| `stop` | - | A zero twist, and the envelope says whether it reached the SDK. |
+
+An `action` outside that enum is refused naming the declared verbs, never dispatched onto
+the halt. Writes are judged on the driver's own write path, so `move` and `send_action` are
+refused by the same sentence.
+
+Both axes are a fraction of full speed, so `1.0` is already the fastest value there is and
+a magnitude above it is **refused by name**, never clamped - the same disposition as the
+Crazyflie envelope above, for the reason the rover makes sharper: it is velocity-commanded,
+so a twist it was not asked for keeps running until the next command. Clamping sent every
+out-of-range magnitude at full speed, which is exactly what a caller writing the value on a
+percent scale needs to be told about: `linear=1` and `linear=100` are the same command once
+both saturate. `lamp` is read as a boolean rather than for truthiness, so `lamp="off"`
+is refused instead of switching the headlamp on.
+
+The `sensors` summary reads the lamp the same way. The SDK carries the field as the `1`/`0`
+that `lamp` write puts on the wire, so those integers and the two booleans are the readings;
+anything else - a firmware that no longer carries `lamp`, or one that spells it `"off"` -
+reads `?`, like every other field the snapshot does not carry. Read for truthiness the
+summary answered for the rover: a dropped field reported the headlamp *off* and the string
+`"off"` reported it *on*. The whole `/data` block beside the summary is unchanged, so a
+caller that wants the raw field still reads it.
+
+Every endpoint - including `POST /control`, which *drives* - is built from that one
+string, so it has to address the host you wrote. A value whose authority names one host
+and resolves to another is refused at construction, because the transport does not refuse
+it: it reports only the host it ended up with, and `connect_eagerly()` reports success
+whenever something answers there.
+
+| `port=` | Result |
+|---|---|
+| omitted, `http://10.0.0.9:8001`, `10.0.0.9:8001`, `https://rover.local:8001` | Accepted. A bare `host:port` is prefixed with `http://`. |
+| `HTTP://10.0.0.9:8001`, `http://[::1]:8001`, `10.0.0.9:8001/rover-7` | Accepted - the scheme is case-insensitive, an IPv6 literal keeps its brackets, and a path prefix survives for an SDK behind a reverse proxy. |
+| `bot.local@10.0.0.9:8001` | **Refused.** Everything before the `@` is userinfo, so `10.0.0.9` is dialled while the address still reads as `bot.local`. |
+| `ws://10.0.0.9:8001` | **Refused.** The SDK is plain HTTP; left alone, `ws` becomes the host and the port you wrote is discarded. |
+| `/tmp/rover.sock` | **Refused** - that shape belongs to the serial arms. |
+
+A URL that cannot be used at all - `http://`, an out-of-range port, an embedded space -
+is left to `requests`, which already names it; `connect_eagerly()` returns that reason
+rather than raising.
 
 ## See also
 

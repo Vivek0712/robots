@@ -23,7 +23,6 @@ Usage:
 
 import difflib
 import importlib.util
-import json
 import logging
 import re
 import sys
@@ -256,6 +255,7 @@ def sync_dataset_to_bucket(
             [hf, "buckets", "create", bucket] + (["--private"] if private else []),
             capture_output=True,
             text=True,
+            errors="replace",
         )
         blob = (cp.stderr + cp.stdout).lower()
         # An already-created bucket is the normal case for a daily re-sync, so it
@@ -273,7 +273,7 @@ def sync_dataset_to_bucket(
     if delete:
         cmd.append("--delete")
     logger.info("Syncing %s -> %s", local_root, dest)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         return {
             "status": "error",
@@ -519,6 +519,12 @@ def _get_lerobot_dataset_class():
 
     Supports test mocking: if ``strands_robots.dataset_recorder.LeRobotDataset``
     has been set (by a test mock), returns that class directly.
+
+    Raises:
+        ImportError: The dataset stack did not import, carrying the diagnosis
+            :func:`_describe_lerobot_import_failure` composes for that exact
+            failure - which of its four causes applied, and the install that
+            fixes it (or that no install does).
     """
     # Support test mocking: check module-level overrides
     this_module = sys.modules[__name__]
@@ -534,9 +540,14 @@ def _get_lerobot_dataset_class():
 
         return LeRobotDataset
     except (ImportError, ValueError, RuntimeError) as exc:
-        raise ImportError(
-            f"lerobot not available ({exc}). Install with: pip install lerobot\nRequired for LeRobotDataset recording."
-        ) from exc
+        # The same import, the same three exception classes and the same four
+        # causes :func:`lerobot_dataset_import_error` reports, so the diagnosis
+        # has one owner. This raise used to compose its own - "lerobot not
+        # available. Install with: pip install lerobot" - which
+        # :func:`_describe_lerobot_import_failure` records as not a usable
+        # instruction for three of the four: lerobot is installed, so the
+        # command names a package that is already there and changes nothing.
+        raise ImportError(f"{_describe_lerobot_import_failure(exc)}\nRequired for LeRobotDataset recording.") from exc
 
 
 def _lerobot_home() -> Path:
@@ -555,16 +566,56 @@ def _lerobot_home() -> Path:
         return Path.home() / ".cache" / "huggingface" / "lerobot"
 
 
-def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
-    """Resolve the on-disk directory a dataset will live in.
+def local_dataset_dir(repo_id: str) -> Path | None:
+    """The local directory a ``repo_id`` that is itself a path names.
 
-    Mirrors ``LeRobotDataset`` root resolution so callers can inspect the
-    target before ``create``/``resume``:
+    A ``repo_id`` that is absolute, ``./``-prefixed, or carries no
+    ``owner/name`` slash is read as a local directory. That reading is this
+    repo's, not LeRobot's - ``LeRobotDataset`` resolves any absent root to
+    ``$HF_LEROBOT_HOME/{repo_id}`` whatever the id looks like - so these are
+    exactly the ids whose directory this repo has to state on every surface that
+    opens a dataset by id. Stating it on some of them and not others puts the
+    directory written to and the directory read back in two different places.
+
+    Args:
+        repo_id: HuggingFace dataset id (``owner/name``) or a local path.
+
+    Returns:
+        The directory the id names, or None for an ``owner/name`` Hub id.
+
+        ``None`` is a resolution, not a gap: that id's directory is LeRobot's to
+        derive, and a *reader* must leave it there. An absent root is how
+        LeRobot selects the revision-safe Hub snapshot cache for a download
+        (``snapshot_download(cache_dir=HF_LEROBOT_HUB_CACHE)``); naming the
+        directory instead switches it to a plain ``local_dir=`` materialization
+        and skips the re-download a legacy on-disk layout triggers. A *writer*
+        must never open that shared cache, which is why
+        :func:`resolve_dataset_dir` names ``$HF_LEROBOT_HOME/{repo_id}`` for the
+        same id - the two are the same directory whenever it already exists
+        locally, and they differ only in who owns a download.
+    """
+    if "/" not in repo_id or repo_id.startswith("/") or repo_id.startswith("./"):
+        return Path(repo_id)
+    return None
+
+
+def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
+    """Resolve the on-disk directory a dataset will be WRITTEN to.
 
     * explicit ``root`` -> used verbatim;
-    * a ``repo_id`` that is itself a path (absolute, ``./`` prefixed, or with no
-      ``owner/name`` slash) -> treated as a local directory;
+    * a ``repo_id`` that is itself a path -> the directory it names
+      (:func:`local_dataset_dir`);
     * otherwise ``$HF_LEROBOT_HOME/{repo_id}``.
+
+    Every writing entry point hands the result down as an explicit ``root``
+    rather than letting LeRobot resolve a second time - otherwise the directory
+    inspected before the write and the directory written to are two different
+    places for exactly the ids the middle rule covers.
+
+    This is the writer's resolution: the third rule names a concrete directory
+    for a Hub id because a writer must not be handed LeRobot's shared snapshot
+    cache. A reader resolves the middle rule only and leaves the third to
+    LeRobot; see :func:`local_dataset_dir` on why the two differ.
 
     Args:
         repo_id: HuggingFace dataset id (``owner/name``) or a local path.
@@ -575,8 +626,8 @@ def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
     """
     if root:
         return Path(root)
-    if "/" not in repo_id or repo_id.startswith("/") or repo_id.startswith("./"):
-        return Path(repo_id)
+    if (local := local_dataset_dir(repo_id)) is not None:
+        return local
     return _lerobot_home() / repo_id
 
 
@@ -672,20 +723,31 @@ def unrecordable_action_columns_error(
     outside it (in a shared scene, the robots this rollout does not drive) are
     not this frame's to supply and are left alone.
 
+    A required column is unrecordable whether the action dict omits the key or
+    carries it as ``None``: neither is a command that was issued, and the two
+    arrive from the same places - a policy that produced no value for a joint,
+    a wire payload whose reading was ``null``, a dict built by zipping names
+    against a shorter sequence of values. This is the same reading
+    :func:`unrecordable_state_columns_error` applies to a state column.
+
     Args:
         action: The frame's action dict, keyed as the dataset schema spells it.
+            A key mapped to ``None`` counts as absent.
         declared: Action column names declared by the dataset schema.
         required: Column names this frame must supply, or ``None`` to skip the
-            check entirely (the historical behaviour).
+            check. :meth:`DatasetRecorder.add_frame` no longer passes ``None``
+            for a frame that carries an action - unscoped, every declared
+            column is required - so ``None`` reaches here only from a caller
+            that deliberately makes no claim about who owes what.
 
     Returns:
         An actionable message naming the missing columns, or ``None`` when every
-        required column is present.
+        required column carries a value.
     """
     if required is None:
         return None
     declared_set = set(declared)
-    missing = [key for key in required if key in declared_set and key not in action]
+    missing = [key for key in required if key in declared_set and action.get(key) is None]
     if not missing:
         return None
     return (
@@ -697,6 +759,39 @@ def unrecordable_action_columns_error(
         "injective). Record with a policy that produces a value for every declared action column "
         "- an action vector narrower than the actuator list is reported by diagnose_action_dim - "
         "or record a schema covering only the actuators it drives."
+    )
+
+
+def unrecordable_state_columns_error(
+    observation: Mapping[str, Any],
+    declared: Sequence[str],
+) -> str | None:
+    """Reject a frame whose observation omits a declared state column.
+
+    The state sibling of :func:`unrecordable_action_columns_error`. A joint the
+    observation does not carry has no measured position at this step, and
+    ``0.0`` is a real position - the recorded column would say the joint sat at
+    zero for the whole episode, ``verify-dataset`` would pass it (a constant
+    column is a valid column), and a policy would train on it. LeRobot's own
+    ``build_dataset_frame`` raises ``KeyError`` here; so does this recorder.
+
+    Args:
+        observation: The frame's observation dict, keyed as the schema spells it.
+        declared: State column names (or vector source keys) the schema declares.
+
+    Returns:
+        An actionable message naming the missing columns, or ``None`` when every
+        declared column has a value.
+    """
+    missing = [key for key in declared if observation.get(key) is None]
+    if not missing:
+        return None
+    return (
+        f"Recorded state column(s) {missing} have no value in this frame's observation, so the "
+        "recording would persist a joint position that was never measured (0.0 is a position, "
+        "not 'unknown'). Declare joint_names that match the observation keys - for a sim "
+        "Robot that is list(sim.get_observation()[<robot>].keys()) - or record with the "
+        "backend's start_recording(), which derives the schema from the robot."
     )
 
 
@@ -729,7 +824,7 @@ def _frame_shape_error(
       quiet one: nothing is logged, the dataset is created, and the mismatch
       surfaces later against ``add_frame``.
     * A component that is not a positive integer is written into the feature
-      as given - ``(3, 480, nan)``, ``(3, 480, '640')`` - so the schema
+      as given - ``(480, nan, 3)``, ``(480, '640', 3)`` - so the schema
       declares a shape no frame can match.
     * A value that is not a two-element sequence unpacks as a bare
       ``TypeError`` / ``ValueError``, and a non-mapping ``camera_dims`` as a
@@ -838,6 +933,35 @@ class DatasetRecorder:
         strict: bool = True,
         camera_key_map: dict[str, str] | None = None,
     ):
+        """Wrap an open LeRobotDataset writer.
+
+        Args:
+            dataset: An open ``LeRobotDataset`` accepting ``add_frame``. Built by
+                :meth:`create` or reopened by :meth:`resume`; a plain
+                ``LeRobotDataset(...)`` is read-only and its ``add_frame``
+                raises.
+            task: Default task description for frames that name none of their
+                own. The bottom of the three-level chain :meth:`add_frame`
+                documents.
+            strict: Whether a failed dataset write raises
+                :class:`RecordingFrameError` (the default) or is counted in
+                ``dropped_frame_count`` and logged. A posture rather than a
+                quantity, so it is held to the domain the rest of this module
+                applies to its flags
+                (:func:`~strands_robots.utils.boolean_flag_error`).
+            camera_key_map: Optional remap of observed camera stream names to
+                the declared schema names, in either bare or fully-qualified
+                spelling (see :meth:`create`).
+
+        Raises:
+            ValueError: ``strict`` is not a boolean. Refused rather than read by
+                truthiness: a falsy non-boolean selected best-effort recording,
+                which drops frames and completes, and a truthy one selected
+                fail-fast and then named ``strict=True`` in the refusal text
+                whatever the caller wrote.
+        """
+        if text := boolean_flag_error(strict, "strict", "DatasetRecorder"):
+            raise ValueError(text)
         self.dataset = dataset
         self.default_task = task
         self.frame_count = 0
@@ -973,7 +1097,12 @@ class DatasetRecorder:
                 ``base_quat.*`` columns). Scalar joint/action fallbacks ignore
                 these; add_frame reads the source keys, not the expanded names.
             task: Default task description
-            root: Local directory for dataset storage
+            root: Local directory for dataset storage. When omitted, the
+                directory is resolved by
+                :func:`~strands_robots.dataset_recorder.resolve_dataset_dir`
+                and forwarded to ``LeRobotDataset.create`` explicitly, so the
+                target ``overwrite`` inspects is the target the dataset is
+                written to.
             use_videos: Encode camera frames as video (True) or keep as images.
                 Selects a posture rather than scaling a quantity, so it must be a
                 boolean (:func:`~strands_robots.utils.boolean_flag_error`) - the
@@ -1151,11 +1280,22 @@ class DatasetRecorder:
 
         logger.info(f"Creating LeRobotDataset: {repo_id} @ {fps}fps, {len(features)} features, robot_type={robot_type}")
 
+        # The directory this dataset will live in, resolved once. It is passed to
+        # ``LeRobotDataset.create`` as an explicit ``root`` rather than letting
+        # the writer re-derive it from ``repo_id``, because the two derivations
+        # are not the same one: ``resolve_dataset_dir`` reads a ``repo_id`` that
+        # is itself a path (no ``owner/name`` slash, or ``./``-prefixed) as a
+        # local directory, while LeRobot resolves any absent root to
+        # ``$HF_LEROBOT_HOME/{repo_id}``. Resolving twice put the directory
+        # ``_prepare_create_target`` inspects and wipes somewhere other than the
+        # directory the dataset is written to - see the call below.
+        dataset_dir = resolve_dataset_dir(repo_id, root)
+
         # Build kwargs, skip unsupported params for this LeRobot version.
         create_kwargs = dict(
             repo_id=repo_id,
             fps=fps,
-            root=root,
+            root=str(dataset_dir),
             robot_type=robot_type,
             features=features,
             use_videos=use_videos,
@@ -1184,7 +1324,11 @@ class DatasetRecorder:
         # otherwise dead-end on a bare FileExistsError. This also keeps the
         # resume() docstring and its no-resume RuntimeError message honest: both
         # point callers at an ``overwrite=`` parameter that now exists here.
-        _prepare_create_target(resolve_dataset_dir(repo_id, root), overwrite=overwrite)
+        # ``dataset_dir`` is the same path ``create_kwargs["root"]`` carries, so
+        # what is inspected here is what gets written; a second, independent
+        # resolution here would leave this guard reading a directory the writer
+        # never touches, and ``overwrite=True`` deleting it.
+        _prepare_create_target(dataset_dir, overwrite=overwrite)
 
         dataset = LeRobotDatasetCls.create(**create_kwargs)
 
@@ -1229,7 +1373,14 @@ class DatasetRecorder:
 
         Args:
             repo_id: HuggingFace dataset ID (same as the original recording).
-            root: Local dataset directory (same as the original recording).
+            root: Local dataset directory. When omitted, the directory this
+                ``repo_id`` resolves to
+                (:func:`~strands_robots.dataset_recorder.resolve_dataset_dir`) -
+                the same one :meth:`create` writes to, so the id that created a
+                dataset reopens it. It is forwarded to LeRobot as an explicit
+                root either way; LeRobot refuses an absent one, because the
+                directory it derives for a writer would be the revision-safe Hub
+                snapshot cache.
             task: Default task description for appended frames.
             vcodec: Video codec for the per-camera MP4 streams (default
                 "h264"; routed into the version-appropriate encoder
@@ -1276,8 +1427,19 @@ class DatasetRecorder:
                 "Use overwrite=True for a fresh single-session dataset."
             )
 
+        # The directory to append into, resolved once by the same rule
+        # :meth:`create` writes through and forwarded as an explicit ``root`` for
+        # the same reason: an absent root is not LeRobot's to derive here.
+        # ``LeRobotDataset.resume`` refuses one outright - the directory it would
+        # derive is the revision-safe Hub snapshot cache, which a DatasetWriter
+        # must not open - so forwarding the caller's ``None`` unresolved made the
+        # append entry point unreachable on exactly the arguments ``create``
+        # accepts: the ``repo_id`` that created a dataset could not reopen it, and
+        # the refusal asked for the directory this resolver already names.
+        dataset_dir = resolve_dataset_dir(repo_id, root)
+
         resume_sig = inspect.signature(LeRobotDatasetCls.resume).parameters
-        resume_kwargs: dict[str, Any] = dict(repo_id=repo_id, root=root)
+        resume_kwargs: dict[str, Any] = dict(repo_id=repo_id, root=str(dataset_dir))
         # Mirror create()'s version-tolerant codec routing.
         resume_kwargs.update(_codec_create_kwargs(resume_sig, vcodec, context="resume"))
         if "streaming_encoding" in resume_sig:
@@ -1320,30 +1482,36 @@ class DatasetRecorder:
 
         LeRobot v3 features format:
         {
-            "observation.images.camera_name": {"dtype": "video", "shape": (C, H, W), "names": [...]},
+            "observation.images.camera_name": {"dtype": "video", "shape": (H, W, C), "names": [...]},
             "observation.state": {"dtype": "float32", "shape": (N,), "names": [...]},
             "action": {"dtype": "float32", "shape": (N,), "names": [...]},
         }
 
         Note: "names" must be a flat list of strings, NOT a dict like {"motors": [...]}.
+
+        The camera block delegates to lerobot's ``hw_to_dataset_features``, so a
+        call that declares any camera needs lerobot importable. Every production
+        caller reaches this through :meth:`create`, which resolves
+        ``LeRobotDataset`` first and so answers an absent extra with
+        :func:`_describe_lerobot_import_failure`'s diagnosis rather than a raw
+        import error.
         """
         features = {}
 
-        # Observation: cameras → video/image features
+        # Observation: cameras -> video/image features. The declaration is
+        # lerobot's own (``hw_to_dataset_features``): HWC shape ``(H, W, 3)``
+        # with names ``[height, width, channels]``, the layout of lerobot's
+        # record path and of every published v3 dataset. Training transposes
+        # by names, so datasets this recorder wrote as CHW keep loading.
         if camera_keys:
+            from lerobot.utils.feature_utils import hw_to_dataset_features
+
             camera_dims = camera_dims or {}
-            for cam_name in camera_keys:
-                key = f"observation.images.{cam_name}"
-                dtype = "video" if use_videos else "image"
-                # Per-camera (height, width). Falls back to the global
-                # video_height/width when a camera has no explicit dims, so
-                # callers that don't pass camera_dims keep the old behaviour.
-                cam_h, cam_w = camera_dims.get(cam_name, (video_height, video_width))
-                features[key] = {
-                    "dtype": dtype,
-                    "shape": (3, cam_h, cam_w),
-                    "names": ["channels", "height", "width"],
-                }
+            # Per-camera (height, width). Falls back to the global
+            # video_height/width when a camera has no explicit dims, so
+            # callers that don't pass camera_dims keep the old behaviour.
+            hw = {cam: (*camera_dims.get(cam, (video_height, video_width)), 3) for cam in camera_keys}
+            features.update(hw_to_dataset_features(hw, "observation", use_video=use_videos))
 
         # Observation: state (joint positions)
         state_dim = 0
@@ -1449,12 +1617,17 @@ class DatasetRecorder:
                 being driven. A declared column in this set that ``action``
                 omits raises ``ValueError`` rather than being written as a
                 fabricated command; see
-                :func:`unrecordable_action_columns_error`. ``None`` skips
-                the check.
+                :func:`unrecordable_action_columns_error`. ``None`` (the
+                default) requires every declared column - a recorder fed
+                directly has no other robot to leave columns for.
 
         Raises:
-            ValueError: A column in ``required_action_keys`` is declared by
-                the dataset schema but absent from ``action``.
+            ValueError: With ``required_action_keys=None`` (the direct-API
+                default), a declared state column is absent from
+                ``observation`` or a declared action column is absent from
+                ``action`` - nothing is written as 0.0 in place of a value
+                the frame did not carry. With an explicit scope, a scoped
+                action column absent from ``action``.
             RecordingFrameError: The dataset write failed and this recorder is
                 ``strict`` (the default). With ``strict=False`` the frame is
                 counted in ``dropped_frame_count`` and a warning is logged
@@ -1494,6 +1667,16 @@ class DatasetRecorder:
                     state_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
                     self._cached_state_keys = state_names if state_names else sorted(state_keys)
 
+            if required_action_keys is None:
+                # Direct API: no scope was given, so every declared column is
+                # this frame's to supply and a missing one is refused. The
+                # backends' hooks always pass a scope; for them a bystander
+                # robot whose state read failed degrades to the fill below
+                # (see ``strands_robots.simulation.recording.undriven_robot_state``) rather
+                # than ending the driven robot's episode.
+                gap = unrecordable_state_columns_error(observation, self._cached_state_keys)
+                if gap is not None:
+                    raise ValueError(gap)
             for k in self._cached_state_keys:
                 v = observation.get(k)
                 if v is None:
@@ -1524,7 +1707,13 @@ class DatasetRecorder:
             elif action:
                 self._cached_action_keys = sorted(action.keys())
 
-        gap = unrecordable_action_columns_error(action, self._cached_action_keys or [], required_action_keys)
+        # ``None`` (the direct-API default) means every declared column is this
+        # frame's to supply: a single recorder fed by hand has no other robot to
+        # leave columns for. The backends' recording hooks pass the scoped set.
+        declared_action_keys = self._cached_action_keys or []
+        if required_action_keys is None and action:
+            required_action_keys = declared_action_keys
+        gap = unrecordable_action_columns_error(action, declared_action_keys, required_action_keys)
         if gap is not None:
             raise ValueError(gap)
 
@@ -1533,6 +1722,12 @@ class DatasetRecorder:
             for k in self._cached_action_keys or []:
                 v = action.get(k)
                 if v is None:
+                    # Only reachable for a column OUTSIDE an explicitly scoped
+                    # ``required_action_keys`` (a shared scene: the robots this
+                    # rollout does not drive). Every column this frame must
+                    # supply was checked above - by value, so a required column
+                    # present as ``None`` was refused there rather than filled
+                    # here.
                     action_vals.append(0.0)
                 elif isinstance(v, (int, float)):
                     action_vals.append(float(v))
@@ -1881,7 +2076,12 @@ def load_lerobot_episode(repo_id: str, episode: int = 0, root: str | None = None
             once the shared guard has round-tripped it, so an accepted index
             reaches the O(1) episode-row lookup rather than the last-resort
             frame scan a float index falls through to.
-        root: Optional local dataset root override.
+        root: Local dataset directory. When omitted, a ``repo_id`` that is
+            itself a path is read as the directory it names - the same one the
+            recording entry points write to, so the id that recorded a dataset
+            reads it back. An ``owner/name`` id keeps an absent root so LeRobot
+            resolves its own revision-safe cache
+            (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
 
     Returns:
         Tuple of (dataset, episode_start, episode_length) on success.
@@ -1917,7 +2117,23 @@ def load_lerobot_episode(repo_id: str, episode: int = 0, root: str | None = None
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    ds = LeRobotDataset(repo_id=repo_id, root=root)
+    # The directory to read, resolved by the same rule the recording was written
+    # through. A ``repo_id`` that is itself a path is a local directory here as
+    # it is there (:func:`local_dataset_dir`); forwarding the caller's ``None``
+    # unresolved sent the read somewhere the recording never was, because
+    # LeRobot reads an absent root as ``$HF_LEROBOT_HOME/{repo_id}`` whatever
+    # the id looks like. So the id that recorded a dataset could not read it
+    # back: the miss falls through to a Hub lookup for a dataset name that only
+    # ever named a directory.
+    #
+    # Only that rule is resolved here. An ``owner/name`` id keeps its absent
+    # root, which is how LeRobot selects the revision-safe snapshot cache for a
+    # download - and it already reads back what a local write put at
+    # ``$HF_LEROBOT_HOME/{repo_id}``, since that is the same directory LeRobot
+    # derives. Resolving it here would move Hub downloads out of that cache for
+    # no gain.
+    read_root = Path(root) if root else local_dataset_dir(repo_id)
+    ds = LeRobotDataset(repo_id=repo_id, root=str(read_root) if read_root is not None else None)
 
     num_episodes = ds.meta.total_episodes if hasattr(ds.meta, "total_episodes") else len(ds.meta.episodes)
     if episode >= num_episodes:
@@ -1964,129 +2180,3 @@ def load_lerobot_episode(repo_id: str, episode: int = 0, root: str | None = None
         raise ValueError(f"Episode {episode} has no frames")
 
     return ds, episode_start, episode_length
-
-
-def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
-    """Read episode-level ground truth from a LeRobot v3 dataset on disk.
-
-    Parses every ``meta/episodes/**/*.parquet`` file under ``root`` and returns
-    the recorded episode index set plus per-episode frame counts. This is the
-    parquet source of truth used by :meth:`SimEngine.verify_dataset_episodes`
-    to confirm a recording session produced the number of distinct episodes the
-    caller intended (rather than one merged ``episode_index=0`` mega-episode).
-
-    Pure ``pyarrow`` read - it does NOT import ``lerobot`` or instantiate a
-    ``LeRobotDataset`` (which would re-validate/scan the whole dataset). Reads
-    only the lightweight episode metadata parquet.
-
-    Args:
-        root: Dataset root directory (the dir that contains ``meta/``).
-
-    Returns:
-        Dict with:
-          - ``episode_indices``: sorted list of distinct ``episode_index`` values.
-          - ``total_episodes``: number of distinct episodes (``len`` of above).
-          - ``total_frames``: sum of per-episode ``length`` (0 if unavailable).
-          - ``frames_per_episode``: per-episode frame counts aligned to
-            ``episode_indices`` (empty list if the ``length`` column is absent).
-          - ``info_total_episodes``: the ``total_episodes`` recorded in
-            ``meta/info.json`` (``None`` if that file is absent or unreadable).
-            Returned alongside the parquet truth so callers can cross-check the
-            two metadata sources for agreement - a healthy dataset has
-            ``info_total_episodes == total_episodes``.
-          - ``unreadable_files``: ``"<path relative to root>: <error>"`` for
-            every ``meta/episodes`` parquet that could not be read (empty list
-            for a healthy dataset). A partially-corrupt dataset - one truncated
-            file out of twenty, the usual outcome of an interrupted sync or hub
-            download - still yields the episode truth of the readable files, so
-            callers can localise the damage instead of seeing zero episodes.
-            The episode counts above cover ONLY the readable files, so any
-            non-empty ``unreadable_files`` means the totals are a lower bound
-            and the dataset must not be certified as complete.
-
-    Raises:
-        ImportError: If ``pyarrow`` is not installed.
-        FileNotFoundError: If no ``meta/episodes`` parquet exists under ``root``
-            (no episode was ever flushed - the dataset is empty/unfinalized).
-        ValueError: If every ``meta/episodes`` parquet is unreadable, so there
-            is no episode ground truth at all. The message lists each file and
-            its read error.
-    """
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as e:  # pragma: no cover - pyarrow ships with lerobot
-        raise ImportError("read_dataset_episode_indices requires pyarrow (installed with the lerobot extra).") from e
-
-    root_path = Path(root)
-    parquet_files = sorted((root_path / "meta" / "episodes").glob("**/*.parquet"))
-    if not parquet_files:
-        raise FileNotFoundError(
-            f"No meta/episodes parquet under {root_path}. The dataset is empty or was "
-            "never finalized (episodes are flushed to parquet at stop_recording/finalize)."
-        )
-
-    pairs: list[tuple[int, int]] = []
-    seen: set[int] = set()
-    unreadable_files: list[str] = []
-    readable_files = 0
-    for pf in parquet_files:
-        # A corrupt / truncated / foreign parquet raises ArrowInvalid (a
-        # ValueError subclass); an unreadable one raises OSError. Damage is
-        # usually confined to a few files (interrupted rsync, partial hub
-        # download), so record which file failed and keep reading the rest -
-        # aborting the whole read here would report zero episodes for a dataset
-        # that is mostly intact and hide which file is actually broken.
-        try:
-            table = pq.read_table(pf)
-        except (ValueError, OSError) as e:
-            unreadable_files.append(f"{pf.relative_to(root_path)}: {e}")
-            continue
-        readable_files += 1
-        cols = table.column_names
-        if "episode_index" not in cols:
-            continue
-        data = table.to_pydict()
-        ep_indices = data["episode_index"]
-        lengths = data.get("length")
-        for i, ep in enumerate(ep_indices):
-            ep_int = int(ep)
-            if ep_int in seen:
-                continue
-            seen.add(ep_int)
-            length = int(lengths[i]) if lengths is not None and lengths[i] is not None else 0
-            pairs.append((ep_int, length))
-
-    if unreadable_files and readable_files == 0:
-        # Nothing readable at all: there is no ground truth to return, so this
-        # is a hard read failure rather than a partial one.
-        detail = "; ".join(unreadable_files)
-        raise ValueError(f"No readable meta/episodes parquet under {root_path}: {detail}")
-
-    pairs.sort(key=lambda p: p[0])
-    episode_indices = [p[0] for p in pairs]
-    frames_per_episode = [p[1] for p in pairs]
-    has_lengths = any(f > 0 for f in frames_per_episode)
-
-    # Read meta/info.json total_episodes as a second, independent metadata
-    # source. A healthy LeRobot dataset has info.json.total_episodes equal to
-    # the distinct episode count in the parquet; a mismatch means the dataset
-    # is internally inconsistent (e.g. an interrupted finalize), which
-    # verify_dataset_episodes surfaces. Absent/corrupt info.json -> None (the
-    # parquet remains the ground truth and is still reported).
-    info_total_episodes: int | None = None
-    info_path = root_path / "meta" / "info.json"
-    if info_path.is_file():
-        try:
-            with info_path.open() as f:
-                info_total_episodes = int(json.load(f)["total_episodes"])
-        except (OSError, ValueError, KeyError, TypeError):
-            info_total_episodes = None
-
-    return {
-        "episode_indices": episode_indices,
-        "total_episodes": len(episode_indices),
-        "total_frames": sum(frames_per_episode) if has_lengths else 0,
-        "frames_per_episode": frames_per_episode if has_lengths else [],
-        "info_total_episodes": info_total_episodes,
-        "unreadable_files": unreadable_files,
-    }

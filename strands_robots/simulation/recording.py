@@ -30,7 +30,7 @@ import logging
 import math
 import numbers
 import shutil
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -128,6 +128,27 @@ def dataset_recording_posture_error(method: str, param: str, value: Any) -> dict
     return None
 
 
+def _schema_key_collisions(camera_names: Iterable[str]) -> dict[str, list[str]]:
+    """Group the camera names that collapse to one :func:`~strands_robots.utils.camera_schema_key`.
+
+    Blank names are ignored: a backend skips an unnamed camera, so it names
+    neither a dataset column nor a file.
+
+    Args:
+        camera_names: Scene camera names, in the backend's own order.
+
+    Returns:
+        ``{the shared key: the names that collapse to it}``, sorted by key and
+        holding only the keys more than one name claims.
+    """
+    groups: dict[str, list[str]] = {}
+    for name in camera_names:
+        if not name:
+            continue
+        groups.setdefault(camera_schema_key(name), []).append(name)
+    return {key: members for key, members in sorted(groups.items()) if len(members) > 1}
+
+
 def camera_schema_key_collision_error(method: str, camera_names: Iterable[str]) -> dict[str, Any] | None:
     """Error envelope when two scene cameras share one dataset feature name.
 
@@ -172,12 +193,7 @@ def camera_schema_key_collision_error(method: str, camera_names: Iterable[str]) 
         A tool-style error envelope, or ``None`` when every name has a distinct
         key.
     """
-    groups: dict[str, list[str]] = {}
-    for name in camera_names:
-        if not name:
-            continue
-        groups.setdefault(camera_schema_key(name), []).append(name)
-    collisions = {key: members for key, members in sorted(groups.items()) if len(members) > 1}
+    collisions = _schema_key_collisions(camera_names)
     if not collisions:
         return None
     described = "; ".join(f"{key!r} <- {sorted(members)}" for key, members in collisions.items())
@@ -195,6 +211,111 @@ def camera_schema_key_collision_error(method: str, camera_names: Iterable[str]) 
                     "the names still differ once '/' becomes '__', then record again."
                 )
             }
+        ],
+    }
+
+
+def camera_clip_name_collision_error(method: str, camera_names: Iterable[str]) -> dict[str, Any] | None:
+    """Error envelope when two cameras would write to one MP4 clip.
+
+    A raw camera recording writes one clip per camera into ``output_dir``, and a
+    camera's ``/`` namespace separator cannot survive into a file name - there
+    it names a directory, so ``arm0/wrist`` would put the clip one level below
+    the directory the caller asked for, under a name the recording tag is
+    missing from. The separator is therefore written as ``__``
+    (:func:`~strands_robots.utils.camera_schema_key`, the same collapse that
+    names the dataset column for that camera, so a clip and its
+    ``observation.images.*`` feature are spelled alike).
+
+    That mapping is not injective: ``arm0/wrist`` and ``arm0__wrist`` are two
+    cameras in the scene and one file on disk, so one camera's clip would
+    overwrite the other's while the result reported both as written. It is
+    refused as the recording starts, before a frame is captured - where
+    :func:`camera_schema_key_collision_error` refuses the same pair of names for
+    the dataset sink.
+
+    Args:
+        method: The public method name, used to prefix the message.
+        camera_names: The cameras this recording will capture.
+
+    Returns:
+        A tool-style error envelope, or ``None`` when every camera names its own
+        clip.
+    """
+    collisions = _schema_key_collisions(camera_names)
+    if not collisions:
+        return None
+    described = "; ".join(f"{key!r} <- {sorted(members)}" for key, members in collisions.items())
+    return {
+        "status": "error",
+        "content": [
+            {
+                "text": (
+                    f"{method}: these cameras do not name distinct MP4 clips: {described}. A "
+                    "camera's '/' namespace separator cannot be part of a file name (it names a "
+                    "directory), so it is written as '__' - which makes these names one file, and "
+                    "the clip flushed first would be overwritten by the other. Rename one of them "
+                    "(add_camera(name=...)) or pass cameras=[...] naming only one of them, then "
+                    "record again."
+                )
+            }
+        ],
+    }
+
+
+def encoder_absent_flush_refusal(reason: object, name: str, buffered: Mapping[str, int]) -> dict[str, Any]:
+    """The refusal a raw-camera flush owes buffers whose encoder is not installed.
+
+    A ``stop_cameras_recording`` flush is best-effort and never-raises, so every
+    other way an encode can fail is folded into its success envelope and the
+    recording is deregistered. The absent encoder is the one exception, and it is
+    the reason this refusal exists rather than being one more artifact line:
+    :func:`~strands_robots.rendering.require_clip_encoder` raises before any
+    writer is opened, so NO camera was written and NO buffer was touched. The
+    frames are all still in memory, and the remedy - install the encoder, call
+    the verb again - is only followable while the recording is still registered.
+
+    Deregistering there discarded exactly the frames the message promised were
+    recoverable. So the envelope and the retention are one decision, and this is
+    the one place that words it: both raw-camera recorders (MuJoCo's daemon-
+    thread capture and Isaac's ``on_frame`` capture) return it, which is what
+    keeps the two from drifting into different answers about the same absence.
+
+    Args:
+        reason: The encoder's own refusal - an ``ImportError`` raised through
+            :func:`~strands_robots.utils.require_optional`. It is quoted rather
+            than re-diagnosed: ``imageio`` and the MP4 plugin it leaves optional
+            are two different absences, so a fixed line names the wrong module
+            half the time and prescribes an install that changes nothing.
+        name: The registered recording's tag, echoed so a caller holding several
+            knows which one is still resident.
+        buffered: Frames held per camera, which is what the caller loses by not
+            following the remedy.
+
+    Returns:
+        A tool-style error envelope whose ``json`` carries ``stopped=False``,
+        ``recording`` and ``buffered_frames`` - the state a caller needs to
+        decide, without parsing the message.
+    """
+    held = dict(buffered)
+    return {
+        "status": "error",
+        "content": [
+            {
+                "text": (
+                    f"{reason}\n"
+                    f"Nothing was encoded and nothing was dropped: camera recording "
+                    f"{name!r} is left registered holding {held}. Install "
+                    f"the encoder and call stop_cameras_recording() again to flush it."
+                )
+            },
+            {
+                "json": {
+                    "stopped": False,
+                    "recording": name,
+                    "buffered_frames": held,
+                }
+            },
         ],
     }
 
@@ -592,6 +713,22 @@ def requested_rate_mismatch_reason(method: str, fps: Any, control_frequency: Any
         f"capturing at control_frequency={rate:g} Hz. {rate_mismatch_explanation(fps_int, rate)} "
         f"Align the two rates: {remedy}."
     )
+
+
+def _camera_height_width(shape: Sequence[Any], names: Sequence[str] | None) -> tuple[Any, Any]:
+    """Read ``(height, width)`` from a camera feature declared in either layout.
+
+    The recorder declares cameras the way lerobot does, HWC ``(H, W, 3)`` with
+    names ``[height, width, channels]``; datasets it recorded before that are
+    CHW ``(3, H, W)`` with names ``[channels, height, width]``. Names decide
+    when present (lerobot's own transposition rule); without names the
+    3-channel axis is located by value.
+    """
+    if names and set(names) >= {"height", "width"}:
+        return shape[list(names).index("height")], shape[list(names).index("width")]
+    if shape[0] == 3 and shape[-1] != 3:
+        return shape[1], shape[2]
+    return shape[0], shape[1]
 
 
 def _resume_schema_error(diffs: list[str]) -> str:
@@ -1393,15 +1530,23 @@ class DatasetRecordingMixin:
 
         Args:
             repo_id: HF dataset id (e.g. ``"lerobot/svla_so100_pickplace"``) or
-                a local repo_id paired with ``root=``.
+                a ``repo_id`` that is itself a path, which streams the directory
+                it recorded to with no ``root`` restated
+                (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
             **kwargs: Forwarded to
                 :meth:`StreamingDatasetReader.open` - e.g. ``root``,
-                ``delta_timestamps``, ``episodes``, ``shuffle``, ``buffer_size``,
-                ``max_num_shards``, ``drop_videos`` (proprio-only,
+                ``delta_timestamps``, ``episodes``, ``shuffle`` (which decides
+                cross-epoch reproducibility, NOT read order - see that method's
+                "Ordering" note), ``buffer_size`` and ``max_num_shards`` (both
+                ``1`` to read in capture order),
+                ``drop_videos`` (proprio-only,
                 torchcodec-free; requires ``delta_timestamps`` with at least one
-                non-video key, else ValueError), ``repo_type`` (``"dataset"`` or
-                ``"bucket"``; ``"bucket"`` requires lerobot>=0.6.1, else
-                RuntimeError).
+                non-video key, else ValueError), ``repo_type`` (``"dataset"``
+                or ``"bucket"``, forwarded unconditionally: every
+                lerobot-bearing extra floors lerobot at
+                ``BUCKET_STREAMING_MIN_LEROBOT``, whose constructor accepts the
+                keyword, so a below-floor install surfaces lerobot's own
+                ``TypeError`` naming it rather than a refusal from here).
 
         Returns:
             A :class:`~strands_robots.streaming_dataset.StreamingDatasetReader`.
@@ -1411,7 +1556,7 @@ class DatasetRecordingMixin:
                 "local/agent_demo", root="/tmp/strands_agent_dataset",
                 delta_timestamps={"observation.state": [-0.0667, 0.0],
                                   "action": [0.0, 0.0667]},
-                shuffle=False,
+                buffer_size=1, max_num_shards=1,  # capture order for replay
             )
             for frame in reader:
                 ...
@@ -1534,7 +1679,7 @@ class DatasetRecordingMixin:
             shape = disk_cam.get("shape")
             scene_dim = camera_dims.get(cam)
             if shape and len(shape) == 3 and scene_dim is not None:
-                _, disk_h, disk_w = shape
+                disk_h, disk_w = _camera_height_width(shape, disk_cam.get("names"))
                 scene_h, scene_w = scene_dim
                 if (int(disk_h), int(disk_w)) != (int(scene_h), int(scene_w)):
                     diffs.append(

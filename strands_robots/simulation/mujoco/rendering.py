@@ -24,6 +24,7 @@ from strands_robots.simulation.mujoco.scene_ops import (
     robot_owned_actuator_ids,
     tendon_joint_ids,
 )
+from strands_robots.simulation.recording import camera_clip_name_collision_error
 from strands_robots.simulation.safe_output import (
     atomic_write_bytes,
     env_flag,
@@ -32,7 +33,7 @@ from strands_robots.simulation.safe_output import (
     validate_output_path,
     video_sandbox_args,
 )
-from strands_robots.utils import FREE_CAMERA_TOKENS, name_list_error
+from strands_robots.utils import FREE_CAMERA_TOKENS, camera_schema_key, name_list_error
 
 logger = logging.getLogger(__name__)
 
@@ -233,8 +234,8 @@ class RenderingMixin:
     the low-level ``_apply_sim_action`` (MuJoCo ``ctrl[]`` write + mj_step).
 
     **Coupling** (see the :mod:`simulation` top-level docstring): mixin reaches
-    into ``self._world``, ``self._renderer_tls``, ``self._renderer_model``,
-    ``self.default_width`` / ``self.default_height``, ``self._lock`` and
+    into ``self._world``, ``self._renderer_tls``, ``self.default_width`` /
+    ``self.default_height``, ``self._lock`` and
     ``self._viewer_handle``. ``TYPE_CHECKING`` stubs below exist so mypy
     accepts those lookups; they are a documentary contract, not an
     enforceable protocol.
@@ -249,7 +250,6 @@ class RenderingMixin:
 
         _world: "SimWorld | None"
 
-        _renderer_model: Any
         _renderer_tls: Any  # threading.local() - per-thread renderer dict
         default_width: int
         default_height: int
@@ -361,9 +361,6 @@ class RenderingMixin:
         if self._renderer_tls.model is not self._world._model:
             renderers.clear()
             self._renderer_tls.model = self._world._model
-            # Keep the per-instance marker for compatibility with any remaining
-            # read paths that checked self._renderer_model.
-            self._renderer_model = self._world._model
 
         key = (width, height)
         if key not in renderers:
@@ -516,19 +513,40 @@ class RenderingMixin:
         ``<freejoint>`` -- seeded from a declared joint (a mobile base like
         LeKiwi) or, for a robot that declares none, from the bodies its own
         actuators act on (an aerial robot's rotor sites). A fixed-base arm has
-        neither and returns ``-1``. Mirrors the free-joint detection inlined in
-        :meth:`_get_sim_observation`.
+        neither and returns ``-1``.
+
+        Applies the same precedence as the detection inlined in
+        :meth:`_get_sim_observation` and ``get_robot_state``: the
+        ownership-checked resolver decides, and the named scan only supplies a
+        candidate for the case where ownership resolves nothing. The named scan
+        is not allowed to decide on its own, because a robot whose MJCF ships a
+        free-jointed task object under its own namespace names that joint in
+        ``joint_names`` as well - so choosing the first one there reported the
+        prop as the robot's base, which is what terrain seating then moved.
         """
         mj = _ensure_mujoco()
         pfx = robot.namespace or ""
+        # The named scan RECORDS a candidate; it does not CHOOSE. Returning the
+        # first free joint named in ``joint_names`` chose a sibling task object's
+        # joint whenever the robot's MJCF ships one - a free-jointed payload, a
+        # kick ball, a Menagerie grasping cube - because such a joint is a named
+        # entry in ``joint_names`` too, while the robot's own base may be an
+        # UNNAMED ``<freejoint>`` that is not in that list at all. Last write
+        # wins here for the same reason it does in the two loops this mirrors.
+        named = -1
         for jnt_name in robot.joint_names:
             lookup = pfx + jnt_name if pfx else jnt_name
             jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, lookup)
             if jnt_id < 0 and pfx:
                 jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
             if jnt_id >= 0 and model.jnt_type[jnt_id] == mj.mjtJoint.mjJNT_FREE:
-                return int(jnt_id)
-        return self._robot_base_free_joint(model, robot, pfx)
+                named = int(jnt_id)
+        # :meth:`_robot_base_free_joint` checks ownership, so its answer wins;
+        # its ``-1`` is not allowed to erase a base the scan did find. Same
+        # precedence, in the same order, as ``_get_sim_observation`` and
+        # ``get_robot_state``.
+        owned = self._robot_base_free_joint(model, robot, pfx)
+        return owned if owned >= 0 else named
 
     def _get_sim_observation(self, robot_name: str, *, skip_images: bool = False) -> dict[str, Any]:
         """Get observation from sim: joint state + cameras (unless skipped).
@@ -2219,6 +2237,14 @@ class RenderingMixin:
         if not names:
             return {"status": "error", "content": [{"text": "No cameras to record."}]}
 
+        # A namespaced camera ("arm0/wrist") is ONE camera, and the clip names
+        # below write its separator as "__" so the clip stays a file inside
+        # output_dir. That collapse is not injective, so two cameras naming one
+        # clip are refused before a frame is captured rather than one silently
+        # overwriting the other.
+        if collision := camera_clip_name_collision_error("start_cameras_recording", names):
+            return collision
+
         # output_dir and name are LLM-supplied: reject traversal / symlink /
         # metacharacters (and a name carrying path separators) before we
         # makedirs and interpolate name into the per-camera filename.
@@ -2245,7 +2271,7 @@ class RenderingMixin:
         tag = name or f"rec_{_uuid.uuid4().hex[:8]}"
 
         buffers = {cam: [] for cam in names}
-        paths = {cam: _os.path.join(out_dir, f"{tag}__{cam}.mp4") for cam in names}
+        paths = {cam: _os.path.join(out_dir, f"{tag}__{camera_schema_key(cam)}.mp4") for cam in names}
 
         # ``ready`` is set by the recorder thread once its GL context is warm
         # and it has entered the capture loop. ``start`` blocks on it below so
@@ -2420,9 +2446,43 @@ class RenderingMixin:
                 if lag < interval:
                     _time.sleep(interval - lag)
 
-        state["thread"] = _threading.Thread(target=_loop, daemon=True)
-        state["thread"].start()
+        # Register BEFORE the thread exists. The registration is the only route
+        # every other recorder verb has to this recording -
+        # ``get_cameras_recording_status``, ``stop_cameras_recording`` and the
+        # guard both start verbs ask (:meth:`_refuse_replacing_cams_recording`)
+        # all read ``_cams_rec_state`` - so a thread that is capturing before it
+        # is published is a recorder nothing can see: a concurrent status read
+        # answered ``[idle]`` about a live capture, a stop reported "Was not
+        # recording cameras" as a success and left that thread rendering to its
+        # ``max_frames`` cap, and a second start was admitted onto the same
+        # cameras and then had its own registration overwritten by the store
+        # below, orphaning its thread and its frames. Publishing first closes
+        # all three, and costs nothing: ``running`` is already set, so the phase
+        # a status read sees is ``[recording]`` with no frames yet, and the
+        # ``thread`` slot stays ``None`` for the same window that the
+        # synchronous recorder - which registers before it builds its closures -
+        # leaves it ``None`` for good, so every reader already tolerates it.
         self._cams_rec_state = state
+        state["thread"] = _threading.Thread(target=_loop, daemon=True)
+        try:
+            state["thread"].start()
+        except RuntimeError as e:
+            # No capture loop will ever run, so the registration this method
+            # just published would refuse every later start for the lifetime of
+            # the world (only a flush deregisters) and hand ``stop`` an
+            # unstarted thread to join. Deregister and report instead.
+            self._cams_rec_state = None
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"start_cameras_recording: could not start the recorder thread for "
+                            f"'{tag}': {e}. Nothing was recorded and no recording is registered."
+                        )
+                    }
+                ],
+            }
 
         # Wait for the recorder thread to warm its GL context and enter the
         # capture loop before reporting success. Worst case is the 30-attempt
@@ -2575,6 +2635,7 @@ class RenderingMixin:
         import time as _time
 
         from strands_robots.rendering.video import encode_clip
+        from strands_robots.simulation.recording import encoder_absent_flush_refusal
 
         elapsed = _time.monotonic() - state["started_mono"]
         lines = [
@@ -2612,36 +2673,15 @@ class RenderingMixin:
                 try:
                     encode_clip(to_encode, path, fps=state["fps"])
                     frames_written = len(to_encode)
-                except ImportError:
-                    # Fires on the first camera holding frames, before any
-                    # writer is opened, so nothing is encoded and no buffer is
-                    # touched. Report it the way the expired-join refusal
-                    # reports its own recoverable state - counts included, and
-                    # naming the verb that encodes them - because the caller
-                    # here can follow that advice for the same reason: the
-                    # recording is left registered. See
-                    # :meth:`_flush_and_deregister_cameras_recording`.
+                except ImportError as exc:
+                    # Fires on the first camera holding frames, before any writer
+                    # is opened, so nothing is encoded and no buffer is touched.
+                    # The retention that makes its remedy followable is
+                    # :meth:`_flush_and_deregister_cameras_recording`'s, and the
+                    # wording is the shared owner's - see
+                    # :func:`~strands_robots.simulation.recording.encoder_absent_flush_refusal`.
                     buffered = {_c: len(state["buffers"][_c]) for _c in state["cameras"]}
-                    return {
-                        "status": "error",
-                        "content": [
-                            {
-                                "text": (
-                                    "imageio not installed. pip install imageio imageio-ffmpeg\n"
-                                    f"Nothing was encoded and nothing was dropped: camera recording "
-                                    f"{state['name']!r} is left registered holding {buffered}. Install "
-                                    f"the encoder and call stop_cameras_recording() again to flush it."
-                                )
-                            },
-                            {
-                                "json": {
-                                    "stopped": False,
-                                    "recording": state["name"],
-                                    "buffered_frames": buffered,
-                                }
-                            },
-                        ],
-                    }
+                    return encoder_absent_flush_refusal(exc, state["name"], buffered)
                 except Exception as e:  # noqa: BLE001 - best-effort flush must never raise
                     flush_error = f"{type(e).__name__}: {e}"
                     logger.warning("camera recorder flush failed for %r -> %s: %s", cam, path, flush_error)
@@ -2831,6 +2871,14 @@ class RenderingMixin:
         if not names:
             return {"status": "error", "content": [{"text": "No cameras to record."}]}
 
+        # A namespaced camera ("arm0/wrist") is ONE camera, and the clip names
+        # below write its separator as "__" so the clip stays a file inside
+        # output_dir. That collapse is not injective, so two cameras naming one
+        # clip are refused before a frame is captured rather than one silently
+        # overwriting the other.
+        if collision := camera_clip_name_collision_error("start_cameras_recording_synchronous", names):
+            return collision
+
         # output_dir and name are LLM-supplied: reject traversal / symlink /
         # metacharacters (and a name carrying path separators) before we
         # makedirs and interpolate name into the per-camera filename.
@@ -2857,7 +2905,7 @@ class RenderingMixin:
         tag = name or f"rec_{_uuid.uuid4().hex[:8]}"
 
         buffers: dict[str, list] = {cam: [] for cam in names}
-        paths = {cam: _os.path.join(out_dir, f"{tag}__{cam}.mp4") for cam in names}
+        paths = {cam: _os.path.join(out_dir, f"{tag}__{camera_schema_key(cam)}.mp4") for cam in names}
 
         state: dict[str, Any] = {
             "running": True,

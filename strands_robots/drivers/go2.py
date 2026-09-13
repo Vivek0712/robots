@@ -73,6 +73,15 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any, cast
 
+from strands_robots.drivers.base import (
+    decode_motor_state,
+    policy_step,
+    telemetry_float,
+    telemetry_float_list,
+    telemetry_int,
+    telemetry_int_list,
+    undeclared_verb_error,
+)
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.tools.g1._dds_engine import DDSPublisher, DDSSubscriberSet
 from strands_robots.tools.g1._g1_common import _DDS_INIT_LOCK
@@ -607,12 +616,14 @@ class Go2Driver:
             envelope: dict[str, Any] = {"status": "success", "content": [{"json": self.state}]}
         elif action == "status":
             envelope = {"status": "success", "content": [{"json": await self.get_status()}]}
-        else:  # "stop"
+        elif action == "stop":
             # ``stop_task`` already decides the verdict, including the join
             # timeout, so the verb returns that envelope rather than
             # re-deriving one that could read "success" over a loop still
             # holding the wire.
             envelope = self.stop_task()
+        else:
+            envelope = undeclared_verb_error(self, action)
         yield {"toolUseId": tool_use_id, **envelope}
 
     # ------------------------------------------------------------------ #
@@ -879,11 +890,15 @@ class Go2Driver:
 
         Args:
             attempts: How many release-then-verify rounds to try before giving
-                up. Must be a positive count.
+                up. Must be a positive count. Every round's release is followed
+                by the read that confirms it, so ``attempts=1`` really does
+                release once and then look again.
 
         Returns:
             A success envelope naming the released mode when the robot reports no
-            active mode, or an error envelope naming why the gate stays shut.
+            active mode, or an error envelope naming why the gate stays shut. A
+            refusal for a mode that would not clear names what the last read
+            after the last release reported, not what was seen before it.
         """
         if err := positive_count_error(attempts, "attempts", "release_sport_mode"):
             return _refuse(err)
@@ -891,7 +906,15 @@ class Go2Driver:
         if client is None:
             return _refuse(self._sport_mode_client_error or "MotionSwitcherClient is unavailable")
         previous: str | None = None
-        for _ in range(int(attempts)):
+        # A round is a release followed by the read that verifies it, so N rounds
+        # take N + 1 reads: one to see what holds the robot, then one after every
+        # release. Reading only once per round would leave the last release
+        # unverified, and the refusal below would then name a mode as still
+        # active without having asked the robot again since letting go of it -
+        # on a robot that released on its final attempt, a refusal whose reading
+        # was never taken.
+        last_round = int(attempts)
+        for round_index in range(last_round + 1):
             mode_name, refusal = self._read_mode_name(client)
             if refusal is not None:
                 return _refuse(refusal)
@@ -911,6 +934,8 @@ class Go2Driver:
                     ],
                 }
             previous = mode_name
+            if round_index == last_round:
+                break
             try:
                 client.ReleaseMode()
             except Exception as exc:  # noqa: BLE001 - any transport failure is one reason
@@ -1103,17 +1128,21 @@ class Go2Driver:
         last commanded posture.
 
         ``policy_object`` is either a built
-        :class:`~strands_robots.policies.Policy` or a bare callable - the
-        admission check accepts a ``.step()`` attribute *or* a callable object,
-        so the annotation admits the same set the refusal enforces. It is called
-        each step with :attr:`state` and must return a joint-name-keyed action
-        dict of the shape :meth:`send_action` accepts. A policy returning
-        ``None`` or an unusable action is refused inside the loop, and the
-        refusal count surfaces through :meth:`get_task_status`.
+        :class:`~strands_robots.policies.Policy` or a bare callable, resolved by
+        :func:`~strands_robots.drivers.base.policy_step` - so the admission
+        accepts exactly the set :meth:`~strands_robots.drivers.base.HardwareDriver.run_policy` types plus the
+        two untyped shapes (``step``, bare callable) this loop has always run. It
+        is called each step with :attr:`state` and must return a joint-name-keyed
+        action dict of the shape :meth:`send_action` accepts, or a chunk of them
+        whose first action is commanded. A policy returning ``None`` or an
+        unusable action is refused inside the loop, and the refusal count
+        surfaces through :meth:`get_task_status`.
 
         Args:
             policy_object: The policy to roll out.
-            instruction: Ignored; policies own their own conditioning.
+            instruction: Handed to the policy each step, as the second argument
+                of ``get_actions_sync``. The untyped shapes take no instruction,
+                so it does not reach those.
             duration: Wall-clock budget in seconds. Must be positive and finite -
                 ``nan`` poisons the deadline comparison so the loop would
                 actuate with no budget, and ``inf`` never expires.
@@ -1126,22 +1155,26 @@ class Go2Driver:
             A success envelope naming the running task's budgets, or an error
             envelope naming the gate or the argument that refused it.
         """
-        del instruction  # policies own their own conditioning
         if err := positive_finite_number_error(duration, "duration", "run_policy"):
             return _refuse(err)
         if n_steps is not None and (err := positive_count_error(n_steps, "n_steps", "run_policy")):
             return _refuse(err)
         if policy_object is None:
             return _refuse("run_policy: policy_object is required")
-        step_fn = getattr(policy_object, "step", None)
-        if not callable(step_fn) and not callable(policy_object):
-            return _refuse("run_policy: policy_object must be callable or expose a .step() method")
+        if policy_step(policy_object, instruction) is None:
+            return _refuse("run_policy: policy_object must be callable or expose get_actions_sync() or step()")
         refusal = self._check_motion_gates("run_policy")
         if refusal is not None:
             return refusal
         if self._pubs is None:
             return _refuse("publisher not initialised - call connect_eagerly() first")
-        loop = _ControlLoop(driver=self, policy=policy_object, duration=float(duration), n_steps=n_steps)
+        loop = _ControlLoop(
+            driver=self,
+            policy=policy_object,
+            duration=float(duration),
+            n_steps=n_steps,
+            instruction=instruction,
+        )
         # Admission held across the ``is_running`` check, the reference
         # assignment and ``start()`` so a second caller cannot pass the check
         # before either assigns ``self._loop`` - two rollouts on one wire.
@@ -1245,39 +1278,37 @@ class Go2Driver:
         drops one must cost that field, not the whole callback and with it the
         IMU the mesh publishes.
 
+        Never raises, like the twin :meth:`~strands_robots.drivers.g1.G1Driver._on_lowstate`:
+        the SDK owns this thread, so an escaping decode error kills the
+        subscription instead of reaching a caller, and this is the topic behind
+        both write gates - the battery floor :meth:`send_action` checks and the
+        measured pose it holds uncommanded joints at would then be frozen at the
+        last frame that happened to decode.
+
         Args:
             msg: The decoded ``unitree_go`` ``LowState_``.
         """
-        imu = getattr(msg, "imu_state", None)
-        if imu is not None:
-            self._imu = {
-                "quaternion": _to_float_list(getattr(imu, "quaternion", None)),
-                "gyroscope": _to_float_list(getattr(imu, "gyroscope", None)),
-                "accelerometer": _to_float_list(getattr(imu, "accelerometer", None)),
-                "rpy": _to_float_list(getattr(imu, "rpy", None)),
-            }
-        bms = getattr(msg, "bms_state", None)
-        if bms is not None:
-            self._battery = {
-                "pct": _to_float(getattr(bms, "soc", None)),
-                "current": _to_float(getattr(bms, "current", None)),
-                "cycle": _to_int(getattr(bms, "cycle", None)),
-            }
-        motors = getattr(msg, "motor_state", None)
-        if motors is not None:
-            joints: dict[str, Any] = {}
-            for name, slot in GO2_JOINT_INDEX.items():
-                try:
-                    motor = motors[slot]
-                except (IndexError, KeyError, TypeError):
-                    continue
-                joints[name] = {
-                    "q": _to_float(getattr(motor, "q", None)),
-                    "dq": _to_float(getattr(motor, "dq", None)),
-                    "tau_est": _to_float(getattr(motor, "tau_est", None)),
-                    "temperature": _to_int(getattr(motor, "temperature", None)),
+        try:
+            imu = getattr(msg, "imu_state", None)
+            if imu is not None:
+                self._imu = {
+                    "quaternion": telemetry_float_list(getattr(imu, "quaternion", None)),
+                    "gyroscope": telemetry_float_list(getattr(imu, "gyroscope", None)),
+                    "accelerometer": telemetry_float_list(getattr(imu, "accelerometer", None)),
+                    "rpy": telemetry_float_list(getattr(imu, "rpy", None)),
                 }
-            self._joints = joints
+            bms = getattr(msg, "bms_state", None)
+            if bms is not None:
+                self._battery = {
+                    "pct": telemetry_float(getattr(bms, "soc", None)),
+                    "current": telemetry_float(getattr(bms, "current", None)),
+                    "cycle": telemetry_int(getattr(bms, "cycle", None)),
+                }
+            joints = decode_motor_state(getattr(msg, "motor_state", None), GO2_JOINT_INDEX)
+            if joints is not None:
+                self._joints = joints
+        except Exception as exc:  # noqa: BLE001 - IDL message can be anything
+            logger.debug("%s: lowstate decode failed: %s", self._tool_name, exc)
 
     def _on_sportmode(self, msg: Any) -> None:
         """Cache body pose, velocity and gait from ``rt/sportmodestate``.
@@ -1287,77 +1318,24 @@ class Go2Driver:
         rollout: body height and velocity say what the robot actually did with
         the frames this driver sent.
 
+        Never raises, for the reason :meth:`_on_lowstate` states: a decode error
+        on the SDK's own thread must cost this frame, not the subscription.
+
         Args:
             msg: The decoded ``unitree_go`` ``SportModeState_``.
         """
-        self._sport = {
-            "mode": _to_int(getattr(msg, "mode", None)),
-            "gait_type": _to_int(getattr(msg, "gait_type", None)),
-            "body_height": _to_float(getattr(msg, "body_height", None)),
-            "position": _to_float_list(getattr(msg, "position", None)),
-            "velocity": _to_float_list(getattr(msg, "velocity", None)),
-            "yaw_speed": _to_float(getattr(msg, "yaw_speed", None)),
-            "foot_force": _to_int_list(getattr(msg, "foot_force", None)),
-        }
-
-
-def _to_float(value: Any) -> float | None:
-    """Coerce an SDK scalar to ``float``, or ``None`` when it is not numeric."""
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_int(value: Any) -> int | None:
-    """Coerce an SDK scalar to ``int``, or ``None`` when it is not numeric."""
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float_list(value: Any) -> list[float] | None:
-    """Coerce an SDK sequence to ``list[float]``, or ``None`` when unusable.
-
-    Returns ``None`` rather than a partial list when any element fails to
-    convert: half a quaternion is worse than no quaternion, because a consumer
-    cannot tell it is half.
-    """
-    if value is None or isinstance(value, (str, bytes)):
-        return None
-    try:
-        items = list(value)
-    except TypeError:
-        return None
-    out: list[float] = []
-    for item in items:
-        coerced = _to_float(item)
-        if coerced is None:
-            return None
-        out.append(coerced)
-    return out
-
-
-def _to_int_list(value: Any) -> list[int] | None:
-    """Coerce an SDK sequence to ``list[int]``, or ``None`` when unusable."""
-    if value is None or isinstance(value, (str, bytes)):
-        return None
-    try:
-        items = list(value)
-    except TypeError:
-        return None
-    out: list[int] = []
-    for item in items:
-        coerced = _to_int(item)
-        if coerced is None:
-            return None
-        out.append(coerced)
-    return out
+        try:
+            self._sport = {
+                "mode": telemetry_int(getattr(msg, "mode", None)),
+                "gait_type": telemetry_int(getattr(msg, "gait_type", None)),
+                "body_height": telemetry_float(getattr(msg, "body_height", None)),
+                "position": telemetry_float_list(getattr(msg, "position", None)),
+                "velocity": telemetry_float_list(getattr(msg, "velocity", None)),
+                "yaw_speed": telemetry_float(getattr(msg, "yaw_speed", None)),
+                "foot_force": telemetry_int_list(getattr(msg, "foot_force", None)),
+            }
+        except Exception as exc:  # noqa: BLE001 - IDL message can be anything
+            logger.debug("%s: sportmodestate decode failed: %s", self._tool_name, exc)
 
 
 class _ControlLoop:
@@ -1378,17 +1356,26 @@ class _ControlLoop:
         policy: Any,
         duration: float,
         n_steps: int | None,
+        instruction: str = "",
     ) -> None:
         """Record the rollout's budgets. :meth:`start` spawns the thread.
 
         Args:
             driver: The driver whose gates, publisher and caches the loop uses.
-            policy: A callable, or an object exposing ``.step()``.
+            policy: A built :class:`~strands_robots.policies.Policy`, an object
+                exposing ``.step()``, or a bare callable.
             duration: Wall-clock budget in seconds.
             n_steps: Optional step cap.
+            instruction: Handed to the policy each step when it takes one.
         """
         self._driver = driver
         self._policy = policy
+        # Resolved once, here, rather than per step: the resolution reads
+        # attributes off the policy, and this loop calls it at 500 Hz. It is the
+        # same resolver ``run_policy``'s admission consulted, so a policy
+        # admitted at the door cannot fail to resolve on the thread.
+        self._step_fn = policy_step(policy, instruction)
+        self._instruction = instruction
         self._duration = float(duration)
         self._n_steps = n_steps
         self._stop_event = threading.Event()
@@ -1431,10 +1418,20 @@ class _ControlLoop:
         The signal wins over policy work: the loop re-reads the event at the top
         of every step and again after the policy returns, before publishing.
 
+        ``reason`` is recorded *before* the signal. The loop's ``finally`` stashes
+        its terminal snapshot on the driver while this call is still inside
+        ``join()``, so a reason written after the join reaches ``_exit_reason``
+        but never the stashed copy :meth:`Go2Driver.get_task_status` reads once
+        the loop has cleared itself - which reported a finished rollout with no
+        exit reason at all, and collapsed this driver's three caller words
+        (``stop_task``, the agent ``stop`` verb, ``cleanup``) into one absence.
+        Recording first costs nothing: :meth:`_ControlLoop._set_exit` is first-writer-wins, so
+        a loop that already ended on its own budget keeps that reason.
+
         Args:
             reason: Recorded as the exit reason unless the loop already set one -
-                a budget expiring concurrently with a caller's stop keeps its own,
-                more specific reason.
+                a budget that expired before this call keeps its own, more
+                specific reason.
             timeout: Seconds to wait for the join.
 
         Returns:
@@ -1442,15 +1439,13 @@ class _ControlLoop:
             is still running, which a caller must report honestly rather than
             claiming a stop that has not happened.
         """
+        self._set_exit(reason)
         self._stop_event.set()
         thread = self._thread
         joined = True
         if thread is not None:
             thread.join(timeout=timeout)
             joined = not thread.is_alive()
-        with self._lock:
-            if self._exit_reason is None:
-                self._exit_reason = reason
         return joined
 
     def snapshot(self) -> dict[str, Any]:
@@ -1483,11 +1478,14 @@ class _ControlLoop:
                 self._exit_detail = detail
 
     def _call_policy(self) -> Any:
-        """Invoke the policy for one step with the driver's cached state."""
-        step_fn = getattr(self._policy, "step", None)
-        if callable(step_fn):
-            return step_fn(self._driver.state)
-        return self._policy(self._driver.state)
+        """Invoke the policy for one step with the driver's cached state.
+
+        Returns:
+            The action dict the policy commanded for this step, or ``None`` when
+            it yielded none - which the caller refuses as ``policy``.
+        """
+        assert self._step_fn is not None, "run_policy admits only a resolvable policy"
+        return self._step_fn(self._driver.state)
 
     def _emit_zero_torque(self) -> None:
         """Publish the soft-stop frame. Best effort, and never raises.

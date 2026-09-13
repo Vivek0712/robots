@@ -6,7 +6,7 @@ description: Strands @tool helpers for hardware bring-up - calibrate, camera, te
 
 ```python
 from strands_robots.tools import (
-    lerobot_calibrate, lerobot_camera, lerobot_teleoperate, lerobot_train,
+    lerobot_camera, lerobot_teleoperate, lerobot_train,
     pose_tool, serial_tool, download_assets,
     gr00t_inference,   # see GR00T page
     robot_mesh,        # see multi-robot page
@@ -20,7 +20,6 @@ from strands_robots.tools import (
 
 | Tool | Key actions | What |
 |------|-------------|------|
-| `lerobot_calibrate` | `"list"`, `"view"`, `"search"`, `"backup"`, `"restore"` | Manage existing calibration JSONs under `~/.cache/huggingface/lerobot/calibration/` (this tool inspects/organizes - actual calibration is run via the LeRobot CLI) |
 | `lerobot_camera` | `"list"`, `"test"`, `"capture"`, `"record"` | Enumerate, test, capture from, and record connected cameras |
 | `lerobot_teleoperate` | `"start"`, `"stop"`, `"status"`, `"replay"`, `"dagger"` | Leader-follower teleop session, episode replay, and DAgger correction collection |
 | `lerobot_train` | `"start"`, `"status"`, `"stop"`, `"list"` | Fine-tune a policy on a local dataset via `lerobot-train` |
@@ -58,11 +57,57 @@ Passing a value an action ignores is never an error: `action="start"` without a
 
 ### A session is only forgotten once its process is gone
 
+Both verbs answer through `psutil`, which `[lerobot]` supplies alongside
+`lerobot` itself. `lerobot_train` and `lerobot_teleoperate` import it at module
+scope, so it is a requirement of importing either tool rather than of some branch
+inside it - an install that omits it ships both tools and can load neither.
+
 Because the session runs detached, the on-disk session store is the only place
-its pid is recorded - `stop` and `status` both look the session up there. Both
-stores load, modify and write back, so a record a load leaves out is erased from
-disk by the next session started or stopped. What a load counts as "finished"
-therefore decides whether a session stays stoppable.
+its pid is recorded - `stop` and `status` both look the session up there. Every
+read loads, modifies and writes back, so a record a load leaves out is erased
+from disk by the next session started or stopped. A read therefore deletes
+nothing: `remove_session` is the only thing that drops a record, and being listed
+is not a claim of running - `list` and `status` each derive that from the pid at
+the moment they are asked, so a retained record reads as running only while its
+pid still holds the process the record was written for. A finished run keeps its
+record so `status` can still report the final log tail.
+
+Both tools read and write one file, which is why they share one reader:
+`SessionManager`, in `strands_robots.tools._process_stop`. Two readers of one
+document could not hold two retention policies - whichever one deleted a record
+would delete it for the other - so the file has one class over it and one
+`SESSION_DIR` naming it.
+
+Loading and writing back is also why the *write* has to land whole. A store that
+lands partially does not lose the session being changed - it loses every session
+the file held, in both tools at once, and the load path reports an unparseable
+store as *no sessions*. So the map is
+serialized in full before the destination is opened and committed through a temp
+file plus an atomic rename: a full disk during a training run leaves the previous
+store intact rather than truncated, and a record holding a value JSON cannot
+represent is refused naming the store, with everything already recorded still
+listed and still stoppable.
+
+A pid alone cannot answer that, because the kernel hands the number back out once
+the process holding it exits. Each record therefore also carries the identity of
+the process it was written for - how long after boot that process started - and
+"is it running" means *that* process, not whatever now holds its number. A start
+offset rather than a creation date, because the record is written by one run and
+read back by a later one: `/proc/stat`'s boot time is recomputed from the wall
+clock on every read, so a date would move under an NTP correction while the
+kernel's own start ticks do not.
+
+Before either question can be asked, the number has to *be* a process id, and it
+arrives from a file rather than from a caller. So it is graded, not converted:
+`int()` of a value the store should not hold answers about a different process -
+`int(4321.5)` is `4321`, and `true` is pid 1 - or raises on a value `json.load`
+produces from a well-formed file (`1e400`, `NaN`, or the U+FFFD the store's own
+decode policy substitutes for a damaged byte). A `pid` field holding anything but
+a positive integer within the platform's `pid_t` range therefore means "this
+record names no process": `list` and `status` report it as stopped, the teleop
+store prunes it like any other record with no live process, the training store
+keeps it and `stop` refuses it naming the type it found, and nothing is
+signalled either way.
 
 `lerobot_teleoperate` prunes a finished session:
 
@@ -70,13 +115,13 @@ therefore decides whether a session stays stoppable.
 |------------------------|---------|
 | the pid no longer exists | finished - pruned |
 | `psutil.NoSuchProcess` (reaped between the existence check and the probe) | finished - pruned |
-| `is_running()` returns `False` (a zombie, or the pid was reused) | not this session - pruned |
-| `psutil.AccessDenied` (the pid exists, this user may not inspect it) | kept, and reported at `WARNING` |
+| the process holding the pid started at some other time | the pid was reused - pruned |
+| `psutil.AccessDenied` (the pid exists, this user may not inspect it) | kept on existence alone, and reported at `WARNING` |
 
 The last row is why a session started under `sudo` - a common way to reach a
 serial port - is still listed and still stoppable when the tool is later invoked
 as the unprivileged user. Being kept is not a claim that it is running: `list`
-and `status` each derive that from the pid's existence at the moment you ask.
+and `status` each re-derive that at the moment you ask.
 
 `lerobot_train` keeps a store of the same shape, held to the same rule, with one
 deliberate difference: a finished run is *retained* so `status` can still show
@@ -85,7 +130,7 @@ through `remove_session` - is what ends a record:
 
 | What the probe reports | Verdict |
 |------------------------|---------|
-| the pid no longer exists, or `is_running()` returns `False` | finished - kept for its log tail |
+| the pid no longer exists, or another process now holds it | finished - kept for its log tail |
 | `psutil.NoSuchProcess` (reaped between the existence check and the probe) | the same finished run - kept |
 | `psutil.AccessDenied` (the pid exists, this user may not inspect it) | kept, and reported at `WARNING` |
 
@@ -95,7 +140,8 @@ The last row is the one where dropping the record would lose a pid that still
 names a *live* process - a training run holding a GPU, with nothing left
 recording where it is.
 
-`stop` is held to the same standard from the other side. It captures the process
+`stop` is held to the same standard from the other side. It checks that the pid is
+still its session's process before it signals anything, and captures the process
 identity *before* it signals - so the SIGKILL escalation is aimed at the process
 it found, not at whatever holds the pid once the grace period is over - and then
 reports only what it can establish:
@@ -104,6 +150,7 @@ reports only what it can establish:
 |-----------------------------|-----------|--------|
 | the process left the process table | `true` | success, record dropped |
 | it was already gone when `stop` looked | `true` | success ("already stopped"), record dropped |
+| the pid is held by another process now | `true` | success, nothing signalled, record dropped |
 | it is still there | `false` | error, record kept |
 | whether it exited could not be determined (`AccessDenied`) | `null` | error, record kept |
 
@@ -143,12 +190,21 @@ the same rule to the frames it builds
 (`build_packet(..., allow_broadcast=False)`), so the tool and the driver cannot
 disagree about which address is a servo and which is the whole bus.
 
+A *unicast* write is not reply-less. The addressed servo answers it with a
+six-byte status packet - the frame a read is answered with, minus the parameters
+- and that reply is the only evidence the motor took the command. The native
+driver's bus reads it: `FeetechBus.set_torque` names a servo that did not
+acknowledge, which is what lets the `stop` verb report a joint that may still be
+driven instead of an arm that is safe to approach, and reading it is also what
+keeps six unread acks from sitting in front of the next state read's reply
+stream.
+
 | Option | Accepted | Why the bound is where it is |
 |--------|----------|------------------------------|
 | `motor_id` | integer in `[1, 254]`, or `[1, 253]` for an action that reads a reply | the frame carries the ID in one byte, of which `0xfd` is the highest a servo may hold and `0xfe` is the broadcast, while `0xff` is the header value |
 | `position` | integer in `[0, 4095]` | `Goal_Position` is 12-bit on the STS/SMS series - the same full scale the reported angle divides by |
 | `velocity` | integer in `[0, 32767]` | `Goal_Velocity` is sign-magnitude with bit 15 the direction bit, so a larger magnitude commands the opposite direction |
-| `baudrate` | positive integer | pyserial coerces rather than checks, so `2.7` opens the port at 2 baud |
+| `baudrate` | positive integer | pyserial coerces rather than checks, so `2.7` opens the port at 2 baud and `0` opens it at a speed no servo answers - the same domain every native serial driver holds its `baud_rate` to |
 | `read_bytes` | positive integer | pyserial's read loop is `while len(read) < size`, so a non-positive size returns no bytes and looks like a timeout |
 | `timeout` | finite number >= 0 | `0` is pyserial's non-blocking mode (return what is buffered); `nan` waits no time at all and `inf` overflows the deadline |
 
@@ -176,6 +232,46 @@ tool, `pose_tool`, and the native `FeetechDriver` bus - reads both from there.
 Addressing an SCS-series servo needs a second word order and a second full scale
 rather than a scale option, so no surface here offers one.
 
+### A stored pose is stored whole, or the tool reports that it was not
+
+`store_pose` and `delete_pose` rewrite the *whole* pose library for a robot -
+`<robot_id>_poses.json` under `.strands_robots/poses/` in the working directory -
+so a write that lands partially loses every posture the arm had, not just the one
+being changed. The document is therefore serialized before the destination is
+touched and committed through a temp sibling plus `os.replace`. A full disk, or a
+joint angle JSON cannot represent (a NumPy scalar), leaves the stored library
+exactly as it was, with no temp file beside it, and the tool answers
+`status="error"` naming the pose it did not store and the postures that are
+unchanged - rather than reporting a named posture that no later `load_pose` can
+find.
+
+### `smooth` is checked, so a word for "no" cannot change the trajectory
+
+`pose_tool`'s `smooth` selects one of two ways to reach the same joint targets,
+not a magnitude: interpolate over `steps * step_delay` seconds, or write each
+`Goal_Position` once and let the servo travel at its own speed. It was read by
+truthiness, and the two undeclared halves invert in opposite directions:
+
+| `smooth=` | Trajectory written | Trajectory asked for |
+|-----------|--------------------|----------------------|
+| `True` (default) | 21 increments, paced | same |
+| `False` | one write per motor | same |
+| `0`, `""`, `None`, `[]` | one write per motor | the default, interpolated |
+| `"false"`, `"no"`, `"off"`, `"0"` | 21 increments, paced | one write per motor |
+
+The falsy half is the sharper one, because this flag defaults to `True`: it
+*removes* an interpolation the caller never asked to leave, and what reaches the
+bus is a single write to the far end of the travel - the full-travel jump this
+tool already refuses `steps=True` for. The flag also decides whether `steps` and
+`step_delay` are read at all, so `smooth="false", steps=0` was refused for
+`steps` - an option the caller's own posture said nobody would read.
+
+Both halves are now refused against the shared boolean domain, ahead of the
+`steps` / `step_delay` check so a bad flag is named as the flag. Only
+`"load_pose"` and `"move_multiple"` consult it: `"reset_to_home"` interpolates
+unconditionally and supplies its own, and every other action moves in one shot,
+so none of them is refused for it. The two declared postures are unchanged.
+
 ### A mesh wait budget is bounded where the command body cannot carry it
 
 `robot_mesh` takes four numeric options. `duration` and `policy_port` travel
@@ -198,13 +294,32 @@ The same scoping rule applies: `timeout` is read by `tell` / `send` / `rpc` /
 for either. `emergency_stop` fans out on a fixed internal budget, so the
 caller's `timeout` is not effective there.
 
+## Calibration
+
+No tool here calibrates. Recording a calibration means disabling torque and
+moving one physical arm by hand, and LeRobot ships that procedure as its own
+console scripts:
+
+```bash
+lerobot-find-port                                       # which bus is the arm on
+lerobot-setup-motors --robot.type=so101_follower --robot.port=/dev/ttyACM0
+lerobot-calibrate    --robot.type=so101_follower --robot.port=/dev/ttyACM0 \
+                     --robot.id=my_arm
+```
+
+The result is JSON under `HF_LEROBOT_CALIBRATION` (by default
+`~/.cache/huggingface/lerobot/calibration/`). `lerobot_teleoperate` and
+`lerobot_train` read it through LeRobot, so nothing here needs to parse it; code
+that does should import `lerobot.motors.MotorCalibration` rather than restate
+the schema. `lerobot-find-joint-limits` reports the travel a recorded
+calibration allows.
+
 ## Examples
 
 ```python
 result = serial_tool(action="list_ports")
 print(result["content"][0]["text"])
 
-result = lerobot_calibrate(action="list", device_type="robots")
 result = lerobot_camera(action="list", camera_type="opencv")
 result = pose_tool(action="read_all", robot_id="so101_follower", port="/dev/ttyACM0")
 
@@ -227,11 +342,11 @@ result = lerobot_teleoperate(
 ```python
 from strands import Agent
 from strands_robots import Robot
-from strands_robots.tools import lerobot_calibrate, lerobot_camera, pose_tool, serial_tool
+from strands_robots.tools import lerobot_camera, pose_tool, serial_tool
 
 agent = Agent(tools=[
     Robot("so100"),
-    lerobot_calibrate, lerobot_camera, pose_tool, serial_tool,
+    lerobot_camera, pose_tool, serial_tool,
 ])
 agent("Find a connected so100, calibrate it, then stream the wrist camera for 10 seconds")
 ```

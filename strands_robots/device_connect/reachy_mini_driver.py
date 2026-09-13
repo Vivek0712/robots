@@ -16,7 +16,7 @@ from typing import Any
 from device_connect_edge.drivers import DeviceDriver, emit, get_rpc_source_device, on, rpc
 from device_connect_edge.types import DeviceIdentity, DeviceStatus
 
-from strands_robots.device_connect._authz import authz_error, is_authorized_caller
+from strands_robots.device_connect._authz import attached_runtime, authz_error, is_authorized_caller
 from strands_robots.device_connect.reachy_transport import (
     WebSocketLink,
     ZenohLink,
@@ -26,14 +26,52 @@ from strands_robots.device_connect.reachy_transport import (
 )
 from strands_robots.mesh.security import ValidationError, validate_mesh_identifier
 from strands_robots.tools.reachy import envelope_error
-from strands_robots.utils import finite_number_error, tcp_port_error
+from strands_robots.utils import dial_host_error, finite_number_error, tcp_port_error
 
 logger = logging.getLogger(__name__)
 
 # Security hardening: recorded-move names are interpolated into a REST URL
-# path, so restrict them to a safe charset to prevent path traversal and
-# query/parameter injection into the daemon API.
-_MOVE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}\Z")
+# path, so restrict them to one bare path segment - the safe charset plus an
+# alphanumeric first character - to prevent path traversal and query/parameter
+# injection into the daemon API. The leading-character rule is what excludes
+# `.` and `..`, which a charset drawn from the same alphabet admits: a `..`
+# name builds a URL that resolves to the daemon's parent path, naming an
+# endpoint the caller did not ask for. Kept identical to
+# `strands_robots.drivers.reachy._MOVE_NAME_RE`, which gates the same daemon
+# path from the native driver.
+_MOVE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+# The two recorded-move libraries the daemon serves, mapped to their HuggingFace
+# dataset ids. A dict rather than string surgery for the same reason
+# `_MOVE_NAME_RE` is a pattern rather than a substring check: the dataset id is
+# interpolated into the REST path, so the admitted set has to be enumerable both
+# to keep the interpolation structurally safe and so a refusal can name what was
+# expected. Kept identical to `strands_robots.drivers.reachy._MOVE_LIBRARIES`,
+# which resolves the same two libraries for the same daemon endpoints from the
+# native driver.
+_MOVE_LIBRARIES: dict[str, str] = {
+    "emotions": "pollen-robotics/reachy-mini-emotions-library",
+    "dances": "pollen-robotics/reachy-mini-dances-library",
+}
+
+
+def _library_error(library: str, verb: str) -> dict[str, str] | None:
+    """Structured rejection when ``library`` names no recorded-move library.
+
+    Args:
+        library: The caller's library name.
+        verb: The RPC doing the lookup, so the reason names it.
+
+    Returns:
+        An error envelope naming the value and the admitted set, or ``None``
+        when the library is one the daemon serves.
+    """
+    if library in _MOVE_LIBRARIES:
+        return None
+    return {
+        "status": "error",
+        "reason": f"{verb}: unknown library {library!r}; expected one of {sorted(_MOVE_LIBRARIES)}",
+    }
 
 
 def _key_prefix_error(value: Any, param: str, cls_name: str) -> str | None:
@@ -185,6 +223,28 @@ def _motion_domain_error(rpc_name: str, values: dict[str, Any]) -> dict[str, str
     return None
 
 
+def _motor_selection(motor_ids: str) -> list[str] | None:
+    """Resolve the comma-separated ``motor_ids`` selector into the ids to command.
+
+    ``""``, the declared default, selects every motor and resolves to ``None``,
+    which is the spelling the firmware reads as "all". A non-empty selector that
+    names no motor - ``","``, ``" "``, ``",,"`` - is refused rather than widened:
+    read by truthiness it parsed to ``[]``, was coalesced to ``None`` and torqued
+    every motor, while the reply echoed the caller's own selector as the set
+    acted on. One resolver serves both torque verbs so the two cannot disagree
+    about which spellings select every motor.
+
+    Raises:
+        ValueError: ``motor_ids`` is non-empty and names no motor.
+    """
+    if motor_ids == "":
+        return None
+    ids = [s.strip() for s in motor_ids.split(",") if s.strip()]
+    if not ids:
+        raise ValueError(f"motor_ids names no motor: {motor_ids!r}; pass '' to select every motor")
+    return ids
+
+
 class ReachyMiniDriver(DeviceDriver):
     """Device Connect driver for Pollen Reachy Mini.
 
@@ -203,7 +263,12 @@ class ReachyMiniDriver(DeviceDriver):
         """Configure the driver for a Reachy Mini reachable at ``host``.
 
         Args:
-            host: Hostname or IP of the Reachy Mini daemon.
+            host: Hostname or IP of the Reachy Mini daemon. Must name a host: a
+                bare hostname or IP literal, since it is interpolated into the
+                daemon URL (``http://<host>:<api_port>``) beside ``api_port``.
+                A URI delimiter there re-cuts that URL and the validated port
+                becomes part of the path. ``reachy-mini.local`` and
+                ``192.168.1.42`` are accepted; ``127.0.0.1/foo`` is not.
             prefix: Zenoh key prefix used by the Wireless variant. Must be a
                 ``/``-joined sequence of mesh identifiers -- a Zenoh wildcard
                 (``*`` / ``**``) would widen the command key to every Mini
@@ -213,17 +278,40 @@ class ReachyMiniDriver(DeviceDriver):
                 Must name a port: an ``int`` in ``[1, 65535]``.
 
         Raises:
-            ValueError: If ``api_port`` cannot address a TCP port, or if
-                ``prefix`` cannot address a single robot's key expressions
-                (see :func:`_key_prefix_error`).
+            ValueError: If ``api_port`` cannot address a TCP port, if ``host``
+                cannot address the host half of the daemon URL (see
+                :func:`~strands_robots.utils.dial_host_error`), or if ``prefix``
+                cannot address a single robot's key expressions (see
+                :func:`_key_prefix_error`).
         """
         # Refused here rather than at first use, and before any base-class state
-        # is allocated. This port is interpolated verbatim into both the daemon
-        # REST URL (``reachy_transport.api``) and the Lite WebSocket target, and
-        # neither refuses it: ``api`` reports every failure as an ``{"error":
-        # ...}`` result rather than raising, so an unusable port is reported as
-        # an unreachable daemon - identically to a reachable port with the
-        # daemon down. Naming the port is the only point a caller can act on.
+        # is allocated. This host and the port below are the two halves of one
+        # address, interpolated into the daemon REST URL
+        # (``reachy_transport.api`` builds ``http://<host>:<api_port><path>``)
+        # and into the Lite WebSocket target (``ws://<host>:<api_port>/ws/sdk``).
+        # Neither is refused downstream: ``api`` reports every failure as an
+        # ``{"error": ...}`` result rather than raising, so an unusable value is
+        # reported as an unreachable daemon - identically to a usable one with
+        # the daemon down - and ``connect()`` reads that result as the Wireless
+        # variant and logs a connection. Naming the value is the only point a
+        # caller can act on.
+        #
+        # The host is graded first, before the port it would have taken: a URI
+        # delimiter inside it re-cuts the URL, and the validated port is the
+        # component that gets discarded. ``host="127.0.0.1/foo"`` builds
+        # ``http://127.0.0.1/foo:8000/...``, which resolves as host
+        # ``127.0.0.1`` with the port in the *path*, so the driver dials :80 - a
+        # port nobody configured, and one the port domain cannot see, because it
+        # is the host half that takes it away. Reporting the port to a caller
+        # who got both wrong would name the component that was discarded rather
+        # than the one that discarded it. Userinfo redirects the dial outright
+        # (``"bot.local@evil.example"`` resolves to ``evil.example``), and a
+        # non-string is carried verbatim, so ``None`` reaches the resolver as
+        # the DNS name "none".
+        if (host_error := dial_host_error(host, "host", type(self).__name__)) is not None:
+            raise ValueError(host_error)
+        # The port half of that address, held to the shared domain for the same
+        # reason, and reported after the host that could have discarded it.
         if (port_error := tcp_port_error(api_port, "api_port", type(self).__name__)) is not None:
             raise ValueError(port_error)
         # Refused alongside the port, and for the same reason: this value is
@@ -343,7 +431,7 @@ class ReachyMiniDriver(DeviceDriver):
             carried to the robot.
         """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "look")
         if (
             rejection := _motion_domain_error(
@@ -368,7 +456,7 @@ class ReachyMiniDriver(DeviceDriver):
             "reason": ...}`` dict naming the argument that was refused.
         """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "antennas")
         if (rejection := _motion_domain_error("antennas", {"left": left, "right": right})) is not None:
             return rejection
@@ -388,7 +476,7 @@ class ReachyMiniDriver(DeviceDriver):
             "reason": ...}`` dict naming the argument that was refused.
         """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "body")
         if (rejection := _motion_domain_error("body", {"yaw": yaw})) is not None:
             return rejection
@@ -432,12 +520,16 @@ class ReachyMiniDriver(DeviceDriver):
         """Enable motors (torque on).
 
         Args:
-            motor_ids: Comma-separated motor IDs (empty = all)
+            motor_ids: Comma-separated motor IDs (empty = all). A non-empty
+                selector that names no motor is refused.
         """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "enableMotors")
-        ids = [s.strip() for s in motor_ids.split(",") if s.strip()] or None
+        try:
+            ids = _motor_selection(motor_ids)
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc)}
         await self._send_cmd({"torque": True, "ids": ids})
         return {"status": "success", "enabled": motor_ids or "all"}
 
@@ -452,9 +544,13 @@ class ReachyMiniDriver(DeviceDriver):
         to the caller rather than reporting a false ack.
 
         Args:
-            motor_ids: Comma-separated motor IDs (empty = all).
+            motor_ids: Comma-separated motor IDs (empty = all). A non-empty
+                selector that names no motor is refused.
         """
-        ids = [s.strip() for s in motor_ids.split(",") if s.strip()] or None
+        try:
+            ids = _motor_selection(motor_ids)
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc)}
         await self._send_cmd({"torque": False, "ids": ids})
         return {"status": "success", "disabled": motor_ids or "all"}
 
@@ -463,14 +559,56 @@ class ReachyMiniDriver(DeviceDriver):
         """Disable motors (torque off).
 
         Args:
-            motor_ids: Comma-separated motor IDs (empty = all)
+            motor_ids: Comma-separated motor IDs (empty = all). A non-empty
+                selector that names no motor is refused.
         """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "disableMotors")
         return await self._disable_motors_impl(motor_ids)
 
     # ── Move RPCs (REST) ──────────────────────────────────────
+
+    def _transport_failure(self, result: Any, verb: str) -> dict[str, Any] | None:
+        """Return a refusal for a daemon reply that never landed, else ``None``.
+
+        :func:`~strands_robots.device_connect.reachy_transport.api` reports every
+        HTTP and connection failure as ``{"error": ...}`` rather than raising, so
+        a reply carrying that key is a call that did not reach the daemon. Nesting
+        it under a key of the envelope's own (``{"status": "success", "result":
+        result}``) keeps it away from the verdict but does not decide one: the
+        caller still reads ``success`` for a command the robot never received.
+
+        The refusal is an envelope rather than the ``RuntimeError``
+        :meth:`_stop_motion_impl` raises, on the criterion
+        :meth:`getDaemonStatus` records: that one guards a *stop*, where a caller
+        acting on a false success stops nothing, so it must not be catchable as a
+        result. These verbs' every other refusal - ``authz_error``, an invalid
+        ``move_name`` - is already an envelope, and a remote caller branches on
+        ``status``.
+
+        Presence rather than truthiness decides, because an HTTP error with an
+        empty body puts ``""`` under ``error``. A reply that is not a mapping is
+        not a transport failure: the catalogue endpoint answers with a JSON
+        array, so only the callers that require an object judge that shape.
+
+        Args:
+            result: The reply :func:`api` handed back.
+            verb: RPC name, so a reason names the call that did not land.
+
+        Returns:
+            ``{"status": "error", "reason": ...}`` naming the verb, the daemon's
+            address and the transport's cause, or ``None`` when the daemon
+            answered.
+        """
+        if not isinstance(result, dict):
+            return None
+        if (error := result.get("error")) is None:
+            return None
+        return {
+            "status": "error",
+            "reason": f"{verb}: daemon unreachable ({self._host}:{self._api_port}): {error}",
+        }
 
     @rpc()
     async def playMove(self, move_name: str, library: str = "emotions") -> dict[str, Any]:
@@ -478,14 +616,21 @@ class ReachyMiniDriver(DeviceDriver):
 
         Args:
             move_name: Name of the move to play
-            library: Move library (emotions or dance)
+            library: Which library, one of ``'emotions'`` or ``'dances'``.
+
+        Returns:
+            A success envelope naming the move, or an error envelope naming the
+            gate that refused - the caller, the ``library``, the ``move_name``,
+            or a daemon that was not reached, in which case no move was played.
         """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "playMove")
+        if (refusal := _library_error(library, "playMove")) is not None:
+            return refusal
         if not _MOVE_NAME_RE.fullmatch(move_name or ""):
             return {"status": "error", "reason": f"invalid move_name: {move_name!r}"}
-        ds = f"pollen-robotics/reachy-mini-{'emotions' if library == 'emotions' else 'dances'}-library"
+        ds = _MOVE_LIBRARIES[library]
         result = await asyncio.to_thread(
             api,
             self._host,
@@ -493,6 +638,8 @@ class ReachyMiniDriver(DeviceDriver):
             f"/api/move/play/recorded-move-dataset/{ds}/{move_name}",
             "POST",
         )
+        if (failure := self._transport_failure(result, "playMove")) is not None:
+            return failure
         return {"status": "success", "move": move_name, "result": result}
 
     @rpc()
@@ -500,15 +647,25 @@ class ReachyMiniDriver(DeviceDriver):
         """List available recorded moves.
 
         Args:
-            library: Move library (emotions or dance)
+            library: Which library, one of ``'emotions'`` or ``'dances'``.
+
+        Returns:
+            A success envelope whose ``moves`` is the daemon's array of names,
+            or an error envelope naming what refused - the ``library``, or a
+            daemon that was not reached, in which case the catalogue is unknown
+            rather than empty.
         """
-        ds = f"pollen-robotics/reachy-mini-{'emotions' if library == 'emotions' else 'dances'}-library"
+        if (refusal := _library_error(library, "listMoves")) is not None:
+            return refusal
+        ds = _MOVE_LIBRARIES[library]
         result = await asyncio.to_thread(
             api,
             self._host,
             self._api_port,
             f"/api/move/recorded-move-datasets/list/{ds}",
         )
+        if (failure := self._transport_failure(result, "listMoves")) is not None:
+            return failure
         return {"status": "success", "moves": result}
 
     # ── Expression RPCs (Zenoh animations via transport) ───────
@@ -517,7 +674,7 @@ class ReachyMiniDriver(DeviceDriver):
     async def nod(self) -> dict[str, Any]:
         """Nod the head (yes gesture)."""
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "nod")
         for _ in range(3):
             await self._send_cmd({"head_pose": rpy_to_pose(15, 0, 0)})
@@ -531,7 +688,7 @@ class ReachyMiniDriver(DeviceDriver):
     async def shake(self) -> dict[str, Any]:
         """Shake the head (no gesture)."""
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "shake")
         for _ in range(3):
             await self._send_cmd({"head_pose": rpy_to_pose(0, 0, 25)})
@@ -545,7 +702,7 @@ class ReachyMiniDriver(DeviceDriver):
     async def happy(self) -> dict[str, Any]:
         """Happy antenna wiggle expression."""
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "happy")
         for _ in range(4):
             await self._send_cmd({"antennas_joint_positions": [math.radians(60), math.radians(-60)]})
@@ -559,9 +716,15 @@ class ReachyMiniDriver(DeviceDriver):
 
     @rpc()
     async def wakeUp(self) -> dict[str, Any]:
-        """Wake up the robot (enable motors + play wake animation)."""
+        """Wake up the robot (enable motors + play wake animation).
+
+        Returns:
+            A success envelope, or an error envelope naming the caller that was
+            not authorized or the daemon that was not reached - in which case
+            the motors were not enabled.
+        """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "wakeUp")
         result = await asyncio.to_thread(
             api,
@@ -570,13 +733,21 @@ class ReachyMiniDriver(DeviceDriver):
             "/api/move/play/wake_up",
             "POST",
         )
+        if (failure := self._transport_failure(result, "wakeUp")) is not None:
+            return failure
         return {"status": "success", "result": result}
 
     @rpc()
     async def sleep(self) -> dict[str, Any]:
-        """Put robot to sleep (play sleep animation + disable motors)."""
+        """Put robot to sleep (play sleep animation + disable motors).
+
+        Returns:
+            A success envelope, or an error envelope naming the caller that was
+            not authorized or the daemon that was not reached - in which case
+            the robot is still awake.
+        """
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "sleep")
         result = await asyncio.to_thread(
             api,
@@ -585,6 +756,8 @@ class ReachyMiniDriver(DeviceDriver):
             "/api/move/play/goto_sleep",
             "POST",
         )
+        if (failure := self._transport_failure(result, "sleep")) is not None:
+            return failure
         return {"status": "success", "result": result}
 
     async def _stop_motion_impl(self) -> dict[str, Any]:
@@ -614,7 +787,7 @@ class ReachyMiniDriver(DeviceDriver):
     async def stopMotion(self) -> dict[str, Any]:
         """Stop all current motion."""
         caller = get_rpc_source_device()
-        if not is_authorized_caller(caller, scope="rpc"):
+        if not is_authorized_caller(caller, scope="rpc", device=attached_runtime(self)):
             return authz_error(caller, "stopMotion")
         return await self._stop_motion_impl()
 
@@ -665,11 +838,8 @@ class ReachyMiniDriver(DeviceDriver):
                 "status": "error",
                 "reason": f"daemon status is not a JSON object: {type(result).__name__}",
             }
-        if (error := result.get("error")) is not None:
-            return {
-                "status": "error",
-                "reason": f"daemon unreachable ({self._host}:{self._api_port}): {error}",
-            }
+        if (failure := self._transport_failure(result, "getDaemonStatus")) is not None:
+            return failure
         return {**result, "status": "success"}
 
     # ── Events ────────────────────────────────────────────────
@@ -691,7 +861,7 @@ class ReachyMiniDriver(DeviceDriver):
         in the emergency-stop allowlist, so a spoofed event from an arbitrary
         device cannot interrupt operations.
         """
-        if not is_authorized_caller(device_id, scope="estop"):
+        if not is_authorized_caller(device_id, scope="estop", device=attached_runtime(self)):
             logger.warning("Ignoring emergencyStop from unauthorized source %s", device_id)
             return
         logger.warning("Emergency stop received from %s - disabling motors", device_id)

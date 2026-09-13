@@ -16,86 +16,9 @@ sim = Robot("so100")            # SO-ARM100 (low-cost Feetech)
 
 ## Catalog
 
-| Name | Description | Joints | Aliases |
-|------|-------------|-------:|---------|
-| `arx_l5` | ARX L5 (6-DOF lightweight arm) | 11 | - |
-| `dynamixel_2r` | Dynamixel 2R Educational Arm (2-DOF) | 2 | - |
-| `fr3` | Franka Research 3 (7-DOF + gripper) | 8 | `franka_fr3` |
-| `fr3_v2` | Franka Research 3 v2 (7-DOF + gripper, updated) | 7 | `franka_fr3_v2` |
-| `hope_jr` | Hope Junior arm _(hardware-only, no sim asset)_ | ? | - |
-| `kinova_gen3` | Kinova Gen3 (7-DOF lightweight) | 7 | - |
-| `koch` | Koch v1.1 Low Cost Robot Arm (6-DOF, Dynamixel) | 7 | `koch_follower`, `koch_v1.1`, `low_cost_robot_arm` |
-| `kuka_iiwa` | KUKA LBR iiwa 14 (7-DOF collaborative) | 11 | `kuka_iiwa_14` |
-| `omx` | OMX Robot Arm (ROBOTIS, CAN bus motors) _(hardware-only, no sim asset)_ | ? | `omx_follower`, `omx_robot`, `robotis_omx` |
-| `openarm` | Enactic OpenArm (7-DOF, DAMIAO motors, CAN bus) | 9 | `enactic_openarm`, `open_arm`, `openarm_v10` |
-| `panda` | Franka Emika Panda (7-DOF + gripper) | 7 | `bimanual_panda_gripper`, `bimanual_panda_hand`, `franka`, `franka_emika_panda`, `franka_panda`, `libero_panda`, `oxe_droid`, `oxe_droid_rel`, `oxe_droid_relative_eef_relative_joint`, `single_panda_gripper` |
-| `piper` | AgileX Piper (6-DOF + gripper) | 11 | `agilex_piper` |
-| `rebot_b601` | Seeed Studio reBot B601-DM (6-DOF + gripper, Damiao CAN motors) _(hardware-only, no sim asset)_ | 7 | `rebot_b601_follower`, `seeed_rebot_b601`, `b601_dm` |
-| `sawyer` | Rethink Robotics Sawyer (7-DOF) | 7 | `rethink_sawyer` |
-| `so100` | TrossenRobotics SO-ARM100 (6-DOF, Feetech servos) | 6 | `so100_4cam`, `so100_dualcam`, `so100_follower`, `so_arm100`, `trs_so_arm100` |
-| `so101` | RobotStudio SO-101 (6-DOF, upgraded SO-100) | 6 | `robotstudio_so101`, `so101_dualcam`, `so101_follower`, `so101_tricam` |
-| `ur10e` | Universal Robots UR10e (6-DOF industrial) | 6 | - |
-| `ur5e` | Universal Robots UR5e (6-DOF industrial) | 6 | - |
-| `vx300s` | Trossen ViperX 300s (6-DOF + gripper) | 19 | `oxe_widowx`, `trossen_vx300s`, `viper_x300s` |
-| `wx250s` | Trossen WidowX 250s (6-DOF + gripper) | 16 | `widowx_250s`, `trossen_wx250s` |
-| `xarm7` | UFactory xArm 7 (7-DOF + gripper) | 13 | `ufactory_xarm7` |
-| `yam` | i2rt YAM Arm (8-DOF) | 8 | `i2rt_yam` |
-| `z1` | Unitree Z1 (6-DOF + gripper) | 8 | `unitree_z1` |
+Every robot in this family, generated from `robots.json` at build time. Renders are MuJoCo sim renders, never hardware photos.
 
-
-## Featured renders
-
-A handful of the arms with their default sim render:
-
-### `arx_l5`
-
-![arx_l5](../assets/sim_render_arx_l5.png){ width=400 }
-
-_ARX L5 (6-DOF lightweight arm)_
-
-### `fr3`
-
-![fr3](../assets/sim_render_fr3.png){ width=400 }
-
-_Franka Research 3 (7-DOF + gripper)_
-
-### `kinova_gen3`
-
-![kinova_gen3](../assets/sim_render_kinova_gen3.png){ width=400 }
-
-_Kinova Gen3 (7-DOF lightweight)_
-
-### `koch`
-
-![koch](../assets/sim_render_koch.png){ width=400 }
-
-_Koch v1.1 Low Cost Robot Arm (6-DOF, Dynamixel)_
-
-### `kuka_iiwa`
-
-![kuka_iiwa](../assets/sim_render_kuka_iiwa.png){ width=400 }
-
-_KUKA LBR iiwa 14 (7-DOF collaborative)_
-
-### `openarm`
-
-![openarm](../assets/sim_render_openarm.png){ width=400 }
-
-_Enactic OpenArm (7-DOF, DAMIAO motors, CAN bus)_
-
-### `panda`
-
-![panda](../assets/sim_render_panda.png){ width=400 }
-
-_Franka Emika Panda (7-DOF + gripper)_
-
-### `piper`
-
-![piper](../assets/sim_render_piper.png){ width=400 }
-
-_AgileX Piper (6-DOF + gripper)_
-
-
+{{robot_cards:arm}}
 
 ## Universal Robots over RTDE
 
@@ -113,7 +36,8 @@ arm.send_action({"elbow_joint": 1.40})     # one servoJ setpoint, radians
 arm.run_policy(policy, n_steps=500)        # streamed rollout at control_frequency
 ```
 
-Needs the SDK: `pip install ur_rtde`. `port=` is the controller's address; the RTDE
+Needs the SDK: `pip install 'strands-robots[ur]'`, which declares the `ur_rtde`
+build the driver's two interfaces come from. `port=` is the controller's address; the RTDE
 port is fixed at 30004 by the protocol, so a different suffix is refused rather than
 dialled.
 
@@ -130,14 +54,32 @@ command the way a servo bus does - it accepts the register and performs nothing:
   proximal joints are held to 120 deg/s - so the same policy cadence can be admitted on
   one arm and refused on the other.
 
+Reads are held to one further rule, and it applies to every surface rather than only to a
+write: each RTDE vector is named by its position against the arm's six joints, so a
+controller answering a different width is refused by name - `state()` and the mesh joint
+read included - instead of being reported as far as it goes. A seven-axis answer is the
+case that makes it load-bearing: naming its first six elements produces a pose that reads
+exactly like a genuine six-axis one. This driver serves six-axis e-Series arms only.
+
 Stopping a rollout is reported rather than asserted. `stop_task()` signals the loop,
 waits up to two seconds for its thread and decelerates the arm with `servoStop`; a
 policy blocking on a remote inference call outlasts that budget, and the envelope then
 carries `status="error"` with `stopped=False` and a reason naming the timeout, matching
 what `get_task_status()` says about the same loop. The arm is decelerated either way,
-and no further setpoint reaches the controller - the loop re-reads the stop signal after
-the policy returns and before it writes. `stop()` carries no verdict (the driver protocol
-annotates it `-> None`); read `stop_task()` when the outcome matters.
+and no further setpoint reaches the controller. That takes two re-reads rather than one:
+the loop re-reads the stop signal after the policy returns, and `send_action` re-reads the
+driver's halt counter immediately before `servoJ`. Between those two it reads both mode
+registers and the measured pose - three RTDE round trips to the same controller, during
+which a halt was otherwise answered by one more setpoint. `stop()` carries no verdict (the
+driver protocol annotates it `-> None`); read `stop_task()` when the outcome matters.
+
+`start_task()` is the one verb in the fleet that builds the policy for you, from the
+provider registry, and a provider it cannot build is refused rather than raised: the verb
+is reached as an agent tool, where an exception is not something the caller can handle.
+The refusal names the provider and carries the build's own reason, so a remote-code
+provider reports the `STRANDS_TRUST_REMOTE_CODE` opt-in it wants and a mistyped
+`checkpoint_dir` reports the path. Hold a built policy and `run_policy()` skips the build
+entirely.
 
 Joint keys are the arm's own names, in RTDE wire order, and the MuJoCo assets declare
 them identically - so an action dict recorded in simulation streams to the controller
@@ -201,6 +143,35 @@ Bottom: every commanded step against the model ceiling._
     motion.
 - Joint counts include any free joints / gripper actuators - the *control* DOF is
   usually `joints - 1` for arms with grippers.
+
+## Calibrating a Feetech SO arm
+
+`so100`, `so101` and `lekiwi` read and command **degrees**, and those degrees are
+measured against the travel `lerobot-calibrate` recorded for *that particular
+arm*. Pass the file that run wrote:
+
+```python
+from strands_robots.drivers.feetech import FeetechDriver, lerobot_calibration_path
+
+arm = FeetechDriver(
+    tool_name="so101",
+    port="/dev/ttyACM0",
+    calibration=lerobot_calibration_path("so101_follower", "my_arm"),
+)
+arm.connect_eagerly()                       # returns None, or a reason
+arm.send_action({"shoulder_pan": 30.0, "gripper": 100.0})
+```
+
+`lerobot_calibration_path(robot_type, robot_id)` is where
+`lerobot-calibrate --robot.type=so101_follower --robot.id=my_arm` put its output,
+read from LeRobot's own constants so `HF_LEROBOT_CALIBRATION` is honoured.
+Records can also be passed directly (`calibration=load_calibration(path)`), and
+`get_status()` reports which travel is in force as `calibration_source`.
+
+Omitting it spans the *servo's* full rotation instead of the arm's measured
+travel. No two SO-101s stop in the same place, so `0 degrees` and
+`0 percent closed` then land somewhere different on each one - the degrees are an
+encoder angle rather than a joint angle. Calibrate the arm and pass the file.
 
 ## See also
 

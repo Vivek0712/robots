@@ -8,7 +8,7 @@ description: Compose non-trivial scenes - multiple robots, tables, obstacles, cu
 from strands_robots import Robot
 
 sim = Robot("so100")                              # one arm on flat ground plane
-sim.add_robot(name="so100", position=[0.0, 0.5, 0.0])   # second arm
+sim.add_robot(name="arm2", data_config="so100", position=[0.0, 0.5, 0.0])   # second arm
 
 sim.add_object(name="table", shape="box", size=[0.5, 0.5, 0.02],
                position=[0.0, 0.0, 0.0], color=[0.5, 0.3, 0.1, 1.0], mass=20.0)
@@ -128,8 +128,11 @@ those `position=[0, 0, 0]` spawns the robot standing rather than sunk into the
 floor, which is the reason the compose is the useful default. `add_robot`
 reports the *measured* world position of the robot's root body and names the
 request and the model's offset beside it whenever they differ, so a spawn that
-did not land where it was asked is visible in the result. This differs from
-`add_object`, whose `position` places its body at exactly that world point.
+did not land where it was asked is visible in the result. `list_robots` reports
+the same measured base pose, re-read from the physics on every call, so a robot
+that has since walked, driven or fallen is listed where it now is rather than
+where it spawned. This differs from `add_object`, whose `position` places its
+body at exactly that world point.
 
 ### Adding a robot does not disturb the scene it joins
 
@@ -216,10 +219,24 @@ below the nominal floor), and it is regenerated identically on every
 `reset()` (deterministic given the terrain kind), so a benchmark that
 evaluates a policy on rough ground is reproducible. `terrain` only applies
 when `ground_plane=True` (the default, which is the master floor switch);
-an unknown kind is rejected with an error listing the supported kinds. It
+an unknown kind is rejected with an error listing the supported kinds.
+`ground_plane` itself must be a boolean: it selects a posture (lay a floor or
+leave the world open), so a non-boolean is refused under the shared
+`boolean_flag_error` domain rather than read by truthiness - `"false"` does
+not lay a floor and `0` does not omit one (MuJoCo and Newton backends). It
 is the ground-generation primitive a terrain *curriculum* (progressive
 difficulty across resets) builds on. (MuJoCo backend; the Newton backend
 rejects `terrain=` as not-yet-supported.)
+
+Those guarantees - the field flush with `z=0` at its lowest cell, reaching the
+full elevation at its highest, with the declared plateau count for a stepped
+kind - are properties of the *grid* as much as of the kind, so each kind needs a
+minimum number of cells to draw its shape at all. `create_world()` always uses a
+40-cell grid and is comfortably above every minimum. A caller reaching for the
+generator directly (`generate_heightfield(kind, resolution=...)`) is refused
+below it, naming the kind and the count that works, rather than handed a field
+that is flat or short of its top plateau; the minimums are exported as
+`TERRAIN_MIN_RESOLUTION`.
 
 That curriculum knob is `difficulty`, which scales the terrain's peak
 elevation (the metre height its normalized `[0, 1]` field maps to) without
@@ -250,6 +267,19 @@ height beneath its `(x, y)` so its feet rest on the ground, rather than at
 the flat-ground keyframe height (which would leave them buried below a raised
 heightfield). A flat ground plane and a fixed-base arm (no free joint) are
 unaffected.
+
+"Its base" is the robot's OWN floating base, resolved by ownership rather than
+by name. That distinction matters when a robot's MJCF ships a free-jointed task
+object of its own -- a payload, a kick ball, the grasping cube a Menagerie
+manipulation scene declares under the robot's namespace. Such an object's joint
+is a named entry in `robot_joint_names(...)` too, and on a mobile base whose own
+`<freejoint>` is unnamed it is the only free joint that appears there at all, so
+picking a base by name can land on the object. Seating never moves it: it is not
+the robot's base, its `(x, y)` is not where the robot stands, and it is left
+exactly where the scene put it. The same resolved base is what `get_observation`
+reports as `base_pos` / `base_quat` / `base_lin_vel` / `base_ang_vel` and what
+`start_recording` declares those columns from, so the seated pose, the observed
+pose and the recorded pose are the same body's.
 
 ## Procedural objects
 
@@ -286,12 +316,31 @@ differently-sized object while `add_object` reports success:
 | Shape | Components consumed |
 |-------|---------------------|
 | `box` / `ellipsoid` | `[x, y, z]` - all three full edge lengths / diameters |
-| `cylinder` / `capsule` | `[diameter, unused, full height]` - three (index 1 is ignored) |
+| `cylinder` | `[diameter, unused, full height]` - three (index 1 is ignored) |
+| `capsule` | `[diameter, unused, cylinder-section length]` - three (index 1 is ignored). The two caps add `size[0] / 2` at each end, so the object stands `size[2] + size[0]` tall |
 | `sphere` | `[diameter]` - one is enough |
 | `plane` | `[x]` or `[x, y]` visual half-widths (`y` mirrors `x` when omitted) |
 | `mesh` | none - the asset's own units define the extent |
 
 At most 3 components are accepted; omit `size` entirely for the 5 cm default.
+
+`add_object`'s success text reports the extent the geom **compiled to**, read
+back off the model, never the request. The two agree only for `box` and
+`ellipsoid`, the shapes that consume all three components; for every other row
+in the table the request holds a value the geom does not carry, and echoing it
+stated an extent the object does not have:
+
+```python
+sim.add_object("ball", shape="sphere", size=[0.05, 0.09, 0.2])
+# 'ball' added: sphere at [0.0, 0.0, 0.0], size=[0.05, 0.05, 0.05], 0.1kg
+#   the ball is 5 cm across in every axis; 0.09 and 0.2 described nothing
+sim.add_object("rod", shape="capsule", size=[0.05, 0.0, 0.9])
+# 'rod' added: capsule at [0.0, 0.0, 0.0], size=[0.05, 0.05, 0.95], 0.1kg
+#   0.95 m tall, not the 0.9 m asked for - the caps add the diameter
+sim.add_object("floor", shape="plane", size=[1.0, 2.0], is_static=True)
+# 'floor' added: plane at [0.0, 0.0, 0.0], size=[1.0, 2.0] visual half-widths
+#   (infinite for collision), static
+```
 
 `set_geom_properties(size=...)` resizes an existing geom and takes a *different*
 convention for the same word: the compiled geom's own MuJoCo `geom_size`
@@ -392,9 +441,10 @@ sim.add_object(name="bracket", shape="mesh", mesh_path="/abs/path/bracket.stl",
 # asset (collision uses its convex hull), 0.1kg
 ```
 
-Because no `size` component is consumed, the success text reports the extent
-read back off the compiled geom rather than echoing the request - the request
-carries no extent for a mesh, and the asset can be any size.
+As for every shape, the success text reports the extent read back off the
+compiled geom rather than echoing the request - and for a mesh the request
+carries no extent at all, so there is nothing else it could report. The asset
+can be any size.
 
 ### A mesh geom collides as its convex hull
 
