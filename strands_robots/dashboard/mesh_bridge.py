@@ -18,7 +18,7 @@ from typing import Any, cast
 
 from strands_robots.dashboard import safety_state
 from strands_robots.mesh._zenoh_config import cmd_bytes_cap as _cmd_bytes_cap
-from strands_robots.utils import finite_number_error
+from strands_robots.utils import finite_number_error, refusal_repr
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +343,7 @@ def _raw_to_jpeg(raw: bytes, shape: Any) -> tuple[bytes | None, str | None]:
     ``encoding`` is not JPEG.
     """
     if not (isinstance(shape, (list, tuple)) and len(shape) in (2, 3)):
-        return None, f"encoding is not jpeg and shape {shape!r} is unusable"
+        return None, f"encoding is not jpeg and shape {refusal_repr(shape)} is unusable"
     try:
         import numpy as np
         from PIL import Image
