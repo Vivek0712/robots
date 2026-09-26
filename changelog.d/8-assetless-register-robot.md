@@ -1,10 +1,5 @@
 ### Added: `register_robot` registers a robot with no simulation asset
 
-`register_robot` required `model_xml` and refused a robot whose asset directory
-or model file was missing, so a robot with no mesh - a spacecraft, a remote
-service robot - could not be added through the public writer even though the
-package registry already ships hardware-only entries.
-
 `model_xml` is now optional. Without it the entry is stored with no `asset`
 block, and it must declare `hardware` with a non-empty `lerobot_type` or
 `driver` `"strands"`, so the entry declares how it is driven for real (a
