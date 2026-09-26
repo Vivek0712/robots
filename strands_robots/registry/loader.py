@@ -27,7 +27,7 @@ import json
 import logging
 from pathlib import Path
 
-from ._overlay import parse_user_robots, user_registry_source
+from ._overlay import parse_user_robots, user_registry_path, user_registry_source
 
 #: The driver a robot gets when nothing says otherwise. Every robot in the
 #: package registry is a lerobot robot today, so the default keeps them working
@@ -131,15 +131,22 @@ def _load(name: str) -> dict:
 def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     """Merge user-local robot registry on top of package robots.json.
 
-    User entries override package entries on name collision. Keys are merged
-    as written; :func:`_validate_robots` then refuses any key that is not
-    already folded, since no lookup could reach it.
+    User entries override package entries on name collision. A user key that
+    is not its own :func:`normalize_robot_name` fold is refused rather than
+    merged: every lookup folds its query, so no lookup could reach it.
 
     Args:
         data: Parsed package ``robots.json``.
         overlay_source: Contents of ``user_robots.json``, or None when the
             overlay is absent.  Taken from the caller rather than re-read so
             the merged value and the cache signature describe the same bytes.
+
+    Returns:
+        *data* with the user robots merged into its ``robots`` table.
+
+    Raises:
+        ValueError: On a user key that is not already folded. The message names
+            the overlay file and the spelling to rename the key to.
     """
     user_robots = parse_user_robots(overlay_source)
     if not user_robots:
@@ -150,6 +157,26 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     merged_robots.update(user_robots)
     merged["robots"] = merged_robots
 
+    # ``register_robot`` folds before it writes, but a hand-written overlay is
+    # read verbatim, and a key like ``sat-001`` then answers no query - not even
+    # its own spelling, which is folded before it is looked up. The key is
+    # refused here, where it is known to come from the overlay, rather than
+    # folded: folding could collapse two keys (or an overlay key and a package
+    # key) onto one entry and keep whichever merged last. Package keys are held
+    # to the same fold by tests/registry/test_integrity.py.
+    for robot_name in user_robots:
+        folded = normalize_robot_name(robot_name)
+        if folded != robot_name:
+            taken = (
+                f" (a robot named '{folded}' already exists; renaming replaces it, so choose another name to keep both)"
+                if folded in merged_robots
+                else ""
+            )
+            raise ValueError(
+                f"Robot key '{robot_name}' in {user_registry_path()} is not a lookup key: every lookup folds it "
+                f"to '{folded}', so the entry can never be found; rename it to '{folded}'{taken}"
+            )
+
     logger.debug("Merged %d user-registered robot(s) into registry", len(user_robots))
     return merged
 
@@ -158,9 +185,7 @@ def _validate(name: str, data: dict) -> None:
     """Validate uniqueness constraints after loading a registry file.
 
     Raises:
-        ValueError: On an unfolded robot key, or duplicate aliases, shorthands,
-            or URL patterns (see :func:`_validate_robots` and
-            :func:`_validate_policies`).
+        ValueError: On duplicate aliases, shorthands, or URL patterns.
     """
     if name == "robots":
         _validate_robots(data)
@@ -172,10 +197,8 @@ def _validate_robots(data: dict) -> None:
     """Ensure no two robots share the same alias, and that declared drivers exist.
 
     Raises:
-        ValueError: On a robot key that is not its own
-            :func:`normalize_robot_name` fold, a duplicate alias, an alias
-            colliding with a canonical robot name, or a ``hardware.driver``
-            outside :data:`DRIVER_CHOICES`.
+        ValueError: On a duplicate alias, an alias colliding with a canonical
+            robot name, or a ``hardware.driver`` outside :data:`DRIVER_CHOICES`.
     """
     # A driver name is validated here rather than where it is read, because
     # every reader - the factory, a tool, a driver package - would otherwise
@@ -186,23 +209,8 @@ def _validate_robots(data: dict) -> None:
     # differ only in case or separator are ONE key to every reader, so raw
     # comparison passes a pair that the alias map then silently collapses to
     # whichever entry is merged last (the user overlay).
-    #
-    # A robot key is held to the same fold. ``register_robot`` folds before it
-    # writes, but a hand-written ``user_robots.json`` is merged verbatim, and a
-    # key like ``sat-001`` then answers no query - not even its own spelling,
-    # which is folded before it is looked up. It is refused rather than folded
-    # here, because folding could collapse two keys (or an overlay key and a
-    # package key) onto one entry and keep whichever merged last.
-    robots = data.get("robots", {})
     seen_aliases: dict[str, tuple[str, str]] = {}
-    for robot_name, info in robots.items():
-        folded = normalize_robot_name(robot_name)
-        if folded != robot_name:
-            taken = f" (a robot named '{folded}' already exists)" if folded in robots else ""
-            raise ValueError(
-                f"Robot key '{robot_name}' is not a lookup key: every lookup folds it to '{folded}', "
-                f"so the entry can never be found; rename '{robot_name}' to '{folded}'{taken}"
-            )
+    for robot_name, info in data.get("robots", {}).items():
         declared_driver = info.get("hardware", {}).get("driver")
         if declared_driver is not None and declared_driver not in DRIVER_CHOICES:
             raise ValueError(
@@ -223,7 +231,7 @@ def _validate_robots(data: dict) -> None:
             # provider_name``. Only a fold onto a DIFFERENT robot is a collision,
             # and it is refused because the canonical name wins the lookup, so
             # the alias would resolve to the other robot.
-            if key != robot_name and key in robots:
+            if key != robot_name and key in data.get("robots", {}):
                 spelled = "" if key == alias else f" (as '{key}')"
                 raise ValueError(
                     f"Robot alias '{alias}' in '{robot_name}' collides with a canonical robot name{spelled}"

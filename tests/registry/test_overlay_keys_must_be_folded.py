@@ -19,19 +19,18 @@ spelling to rename to.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from strands_robots.registry import get_robot, list_robots, normalize_robot_name
-from strands_robots.registry.loader import _REGISTRY_DIR
-from strands_robots.utils import get_base_dir
+from strands_robots.registry import get_robot, list_robots, unregister_robot
 
 
-def _write_overlay(robots: dict) -> None:
-    """Write user_robots.json directly, bypassing register_robot()."""
-    path = get_base_dir() / "user_robots.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_overlay(base: Path, robots: dict) -> Path:
+    """Write user_robots.json directly under *base*, bypassing register_robot()."""
+    path = base / "user_robots.json"
     path.write_text(json.dumps({"robots": robots}))
+    return path
 
 
 def _entry(description: str = "hand-written") -> dict:
@@ -48,34 +47,47 @@ def _entry(description: str = "hand-written") -> dict:
     [("sat-001", "sat_001"), ("My_Arm", "my_arm"), (" padded ", "padded")],
     ids=["dashed", "mixed-case", "padded"],
 )
-def test_an_overlay_key_that_is_not_folded_is_refused_with_its_folded_spelling(declared: str, folded: str) -> None:
-    """The load fails and says which spelling the key has to be renamed to."""
-    _write_overlay({declared: _entry()})
+def test_an_overlay_key_that_is_not_folded_is_refused_with_its_file_and_folded_spelling(
+    tmp_path: Path, declared: str, folded: str
+) -> None:
+    """The load fails, names the overlay file the key is in and the spelling to rename it to."""
+    overlay = _write_overlay(tmp_path, {declared: _entry()})
 
-    with pytest.raises(ValueError, match=f"rename '{declared}' to '{folded}'"):
+    with pytest.raises(ValueError) as refused:
         get_robot(declared)
 
+    message = str(refused.value)
+    assert f"Robot key '{declared}' in {overlay} is not a lookup key" in message
+    assert f"rename it to '{folded}'" in message
 
-def test_an_overlay_key_that_folds_onto_a_shipped_robot_names_the_robot_it_would_replace() -> None:
+
+def test_an_overlay_key_that_folds_onto_a_shipped_robot_warns_that_renaming_replaces_it(tmp_path: Path) -> None:
     """Renaming ``Panda`` to ``panda`` would override the shipped entry, so the error says so."""
-    _write_overlay({"Panda": _entry()})
+    _write_overlay(tmp_path, {"Panda": _entry()})
 
-    with pytest.raises(ValueError, match="a robot named 'panda' already exists"):
+    with pytest.raises(ValueError) as refused:
         list_robots()
 
+    assert "(a robot named 'panda' already exists; renaming replaces it, so choose another name to keep both)" in str(
+        refused.value
+    )
 
-def test_a_folded_overlay_key_still_loads_and_answers_every_spelling() -> None:
+
+def test_unregister_robot_removes_an_unfolded_key_by_its_raw_spelling(tmp_path: Path) -> None:
+    """The recovery path: the refused key can be removed without hand-editing the file."""
+    overlay = _write_overlay(tmp_path, {"sat-001": _entry()})
+
+    assert unregister_robot("sat-001") is True
+
+    assert "sat-001" not in json.loads(overlay.read_text())["robots"]
+    assert get_robot("so100") is not None
+
+
+def test_a_folded_overlay_key_still_loads_and_answers_every_spelling(tmp_path: Path) -> None:
     """Control: the refusal is about the key's spelling, not about hand-written overlays."""
-    _write_overlay({"sat_001": _entry("folded")})
+    _write_overlay(tmp_path, {"sat_001": _entry("folded")})
 
     for query in ("sat_001", "sat-001", "SAT-001"):
         entry = get_robot(query)
         assert entry is not None, f"{query!r} reached no robot"
         assert entry["description"] == "folded"
-
-
-def test_every_shipped_robot_key_is_already_folded() -> None:
-    """The check covers package keys too, so the package must already comply."""
-    shipped = json.loads((_REGISTRY_DIR / "robots.json").read_text(encoding="utf-8"))["robots"]
-    assert len(shipped) >= 50, f"premise: the shipped registry declares few robots ({len(shipped)})"
-    assert [key for key in shipped if key != normalize_robot_name(key)] == []
