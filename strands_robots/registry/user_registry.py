@@ -49,7 +49,7 @@ from typing import Any
 from strands_robots.utils import resolve_asset_path, safe_join
 
 from ._overlay import parse_user_robots, user_registry_path, user_registry_source
-from .loader import _REGISTRY_DIR, _validate_robots, invalidate_cache, normalize_robot_name
+from .loader import _REGISTRY_DIR, DRIVER_CHOICES, _validate_robots, invalidate_cache, normalize_robot_name
 from .robots import get_robot
 
 logger = logging.getLogger(__name__)
@@ -176,7 +176,7 @@ def _asset_relative(resolved_dir: Path, param: str, value: str) -> Path:
 def register_robot(
     name: str,
     *,
-    model_xml: str,
+    model_xml: str | None = None,
     description: str = "",
     category: str = "arm",
     joints: int = 0,
@@ -204,6 +204,10 @@ def register_robot(
     Args:
         name: Canonical robot name (lowercase, underscores).
         model_xml: Path to MJCF/URDF model file, relative to ``asset_dir``.
+            None (default) registers a robot with no simulation asset - a
+            spacecraft, a remote service robot - stored with no ``asset``
+            block, like the package's hardware-only entries. Such a robot must
+            declare *hardware* and is reachable in real mode only.
         description: Human-readable description.
         category: Robot category (arm, humanoid, mobile, hand, aerial, bimanual, ...).
         joints: Number of actuated joints.
@@ -220,7 +224,10 @@ def register_robot(
             onto another robot's canonical name or alias is refused rather than
             resolving to that robot.
         robot_descriptions_module: Optional ``robot_descriptions`` module name.
-        hardware: Optional hardware config dict (``lerobot_type``, etc.).
+        hardware: Hardware config dict (``lerobot_type``, ``driver``, ...).
+            Optional with ``model_xml``; required without it, where it must
+            declare a non-empty ``lerobot_type`` or a ``driver`` other than
+            ``"auto"`` (see :func:`_require_hardware_declaration`).
         overwrite: If False (default), raises ValueError if robot already exists.
 
     Returns:
@@ -239,6 +246,9 @@ def register_robot(
             JSON-serializable, since the overlay is a JSON document - see
             :func:`_save_user_registry`, which refuses such an entry before the
             stored overlay is touched.
+            Also raised when ``model_xml`` is omitted and *hardware* declares
+            no backend, or ``scene_xml``, ``asset_dir`` or
+            ``robot_descriptions_module`` is given without ``model_xml``.
         FileNotFoundError: If ``model_xml`` doesn't exist at the resolved path.
 
     Example::
@@ -269,6 +279,22 @@ def register_robot(
                 "Robot '%s' exists in package registry - user registration will override it.",
                 name,
             )
+
+    if model_xml is None:
+        return _register_without_asset(
+            name,
+            data,
+            description=description,
+            category=category,
+            joints=joints,
+            aliases=aliases,
+            hardware=hardware,
+            asset_only={
+                "scene_xml": scene_xml,
+                "asset_dir": asset_dir,
+                "robot_descriptions_module": robot_descriptions_module,
+            },
+        )
 
     # Resolve asset_dir via shared utility (respects STRANDS_ASSETS_DIR)
     resolved_dir = resolve_asset_path(asset_dir, default_name=name)
@@ -345,6 +371,83 @@ def register_robot(
     _invalidate_cache()
 
     logger.info("Registered robot '%s' -> %s/%s", name, dir_name, model_xml)
+    return entry
+
+
+def _require_hardware_declaration(hardware: dict[str, Any] | None) -> None:
+    """Refuse an asset-less entry that declares no hardware backend.
+
+    Mirrors what the package registry holds for its own hardware-only entries
+    and what :func:`~strands_robots.registry.has_hardware` reads: a non-empty
+    ``lerobot_type`` or a ``driver``. ``"auto"`` alone does not count - it
+    expresses no preference and falls back to the lerobot driver, which then
+    needs a ``lerobot_type`` to build anything.
+
+    Args:
+        hardware: The caller's ``hardware`` argument.
+
+    Raises:
+        ValueError: *hardware* declares neither field.
+    """
+    hw = hardware or {}
+    lerobot_type = hw.get("lerobot_type")
+    if isinstance(lerobot_type, str) and lerobot_type.strip():
+        return
+    if hw.get("driver") in DRIVER_CHOICES and hw.get("driver") != "auto":
+        return
+    raise ValueError(
+        f"a robot registered without model_xml has no simulation asset, so hardware must declare "
+        f"a non-empty 'lerobot_type' or a 'driver' ({', '.join(c for c in DRIVER_CHOICES if c != 'auto')}); "
+        f"got hardware={hardware!r}"
+    )
+
+
+def _register_without_asset(
+    name: str,
+    data: dict[str, Any],
+    *,
+    description: str,
+    category: str,
+    joints: int,
+    aliases: list[str] | None,
+    hardware: dict[str, Any] | None,
+    asset_only: dict[str, str | None],
+) -> dict[str, Any]:
+    """Store an entry with no ``asset`` block - the asset-less half of :func:`register_robot`.
+
+    Args:
+        name: Normalized robot name.
+        data: The loaded user registry document.
+        description: Human-readable description.
+        category: Robot category.
+        joints: Number of actuated joints.
+        aliases: Alternative names, or None.
+        hardware: Hardware config; must declare a backend.
+        asset_only: The asset parameters the caller passed, keyed by name.
+
+    Returns:
+        The registered robot definition dict.
+
+    Raises:
+        ValueError: An asset parameter was given, *hardware* declares no
+            backend, an alias collides, or a value is not JSON-serializable.
+    """
+    given = sorted(k for k, v in asset_only.items() if v is not None)
+    if given:
+        raise ValueError(
+            f"{', '.join(given)} describe a simulation asset and require model_xml; "
+            "omit them to register a robot with no asset."
+        )
+    _require_hardware_declaration(hardware)
+    entry: dict[str, Any] = {"description": description, "category": category, "joints": joints}
+    if aliases:
+        entry["aliases"] = aliases
+    entry["hardware"] = hardware
+    data.setdefault("robots", {})[name] = entry
+    _assert_registry_still_loads(data)
+    _save_user_registry(data)
+    _invalidate_cache()
+    logger.info("Registered robot '%s' with no simulation asset", name)
     return entry
 
 
