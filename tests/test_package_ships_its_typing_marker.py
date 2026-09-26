@@ -3,11 +3,11 @@
 PEP 561 says a type checker only reads the inline annotations of an installed
 package that carries a ``py.typed`` marker; without it every import from the
 package is ``Any``. The package annotates its public surface (``SimEngine``,
-``Policy``, ``HardwareDriver``) and checks itself under ``mypy`` with
-``disallow_untyped_defs``, yet shipped no marker, so a downstream project running
-``mypy --strict`` saw a subclass of ``SimEngine`` as a subclass of ``Any``: a
-misspelt override or a wrong return type went unreported, and
-``disallow_subclassing_any`` refused the subclass outright.
+``Policy``, ``HardwareDriver``) and checks most of its modules under ``mypy``
+with ``disallow_untyped_defs``, yet shipped no marker, so a downstream project
+running ``mypy --strict`` saw a subclass of ``SimEngine`` as a subclass of
+``Any``: an override with a wrong return type or an incompatible signature went
+unreported, and ``disallow_subclassing_any`` refused the subclass outright.
 
 Two things have to hold for the marker to reach an install: it exists as a
 resource of the package, and the wheel target does not leave it out.
@@ -52,6 +52,11 @@ class TestWheelTargetKeepsTheMarker:
         assert "strands_robots" in wheel["packages"]
 
     def test_no_exclude_pattern_matches_the_marker(self) -> None:
+        """No build or wheel exclude pattern drops the marker.
+
+        No exclude exists today, so this guards a future config change. It is a
+        config-level proxy for building a wheel and listing its contents.
+        """
         build = self._hatch_build()
         wheel = build["targets"]["wheel"]
         patterns = [*build.get("exclude", []), *wheel.get("exclude", [])]
