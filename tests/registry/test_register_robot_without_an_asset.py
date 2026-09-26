@@ -17,12 +17,9 @@ from strands_robots.registry.user_registry import get_user_robots, register_robo
 
 
 def test_asset_less_robot_is_stored_with_no_asset_block():
-    entry = register_robot(
-        "orbiter",
-        description="Spacecraft with no mesh",
-        category="aerial",
-        hardware={"driver": "strands"},
-    )
+    hardware = {"driver": "strands"}
+    entry = register_robot("orbiter", description="Spacecraft with no mesh", category="aerial", hardware=hardware)
+    assert entry["hardware"] is not hardware
     assert "asset" not in entry
     assert "_user_asset_path" not in entry
     assert entry["hardware"] == {"driver": "strands"}
@@ -44,10 +41,10 @@ def test_asset_less_robot_may_declare_only_a_lerobot_type():
 
 @pytest.mark.parametrize(
     "hardware",
-    [None, {}, {"lerobot_type": ""}, {"driver": "auto"}, {"port": "/dev/null"}],
+    [None, {}, {"lerobot_type": ""}, {"lerobot_type": 5}, {"driver": "auto"}, {"driver": "lerobot"}, {"port": "x"}],
 )
 def test_asset_less_robot_without_a_hardware_declaration_is_refused(hardware):
-    with pytest.raises(ValueError, match="hardware"):
+    with pytest.raises(ValueError, match="Robot 'orbiter' is registered without model_xml"):
         register_robot("orbiter", hardware=hardware)
     assert "orbiter" not in get_user_robots()
 
@@ -57,8 +54,23 @@ def test_asset_less_robot_without_a_hardware_declaration_is_refused(hardware):
     [{"scene_xml": "scene.xml"}, {"asset_dir": "orbiter"}, {"robot_descriptions_module": "panda_mj_description"}],
 )
 def test_asset_arguments_without_model_xml_are_refused(asset_only):
-    with pytest.raises(ValueError, match="model_xml"):
+    with pytest.raises(ValueError, match="only apply to a simulation asset and require model_xml; pass model_xml"):
         register_robot("orbiter", hardware={"driver": "strands"}, **asset_only)
+    assert "orbiter" not in get_user_robots()
+
+
+@pytest.mark.parametrize("model_xml", ["", "  "])
+def test_an_empty_model_xml_is_refused(model_xml):
+    with pytest.raises(ValueError, match="model_xml"):
+        register_robot("orbiter", model_xml=model_xml, hardware={"driver": "strands"})
+    assert "orbiter" not in get_user_robots()
+
+
+@pytest.mark.parametrize("model_xml", [None, "orbiter.xml"])
+@pytest.mark.parametrize("hardware", ["strands", ["driver"]])
+def test_a_hardware_value_that_is_not_a_dict_is_refused(model_xml, hardware):
+    with pytest.raises(TypeError, match="hardware must be a dict"):
+        register_robot("orbiter", model_xml=model_xml, hardware=hardware)
     assert "orbiter" not in get_user_robots()
 
 

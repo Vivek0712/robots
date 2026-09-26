@@ -49,7 +49,7 @@ from typing import Any
 from strands_robots.utils import resolve_asset_path, safe_join
 
 from ._overlay import parse_user_robots, user_registry_path, user_registry_source
-from .loader import _REGISTRY_DIR, DRIVER_CHOICES, _validate_robots, invalidate_cache, normalize_robot_name
+from .loader import _REGISTRY_DIR, _validate_robots, invalidate_cache, normalize_robot_name
 from .robots import get_robot
 
 logger = logging.getLogger(__name__)
@@ -200,6 +200,8 @@ def register_robot(
 
     The robot becomes immediately available in ``get_robot()``,
     ``list_robots()``, ``resolve_model_path()``, ``sim.add_robot()``, etc.
+    A robot registered without ``model_xml`` is available to the registry
+    readers only, not to ``resolve_model_path()`` or ``sim.add_robot()``.
 
     Args:
         name: Canonical robot name (lowercase, underscores).
@@ -226,8 +228,7 @@ def register_robot(
         robot_descriptions_module: Optional ``robot_descriptions`` module name.
         hardware: Hardware config dict (``lerobot_type``, ``driver``, ...).
             Optional with ``model_xml``; required without it, where it must
-            declare a non-empty ``lerobot_type`` or a ``driver`` other than
-            ``"auto"`` (see :func:`_require_hardware_declaration`).
+            declare a non-empty ``lerobot_type`` or ``driver="strands"``.
         overwrite: If False (default), raises ValueError if robot already exists.
 
     Returns:
@@ -245,10 +246,11 @@ def register_robot(
             when a value in *hardware* (or any other field) is not
             JSON-serializable, since the overlay is a JSON document - see
             :func:`_save_user_registry`, which refuses such an entry before the
-            stored overlay is touched.
-            Also raised when ``model_xml`` is omitted and *hardware* declares
-            no backend, or ``scene_xml``, ``asset_dir`` or
-            ``robot_descriptions_module`` is given without ``model_xml``.
+            stored overlay is touched; when ``model_xml`` is empty; and when
+            ``model_xml`` is omitted and *hardware* declares no backend, or
+            ``scene_xml``, ``asset_dir`` or ``robot_descriptions_module`` is
+            given without it.
+        TypeError: If *hardware* is given and is not a dict.
         FileNotFoundError: If ``model_xml`` doesn't exist at the resolved path.
 
     Example::
@@ -262,7 +264,13 @@ def register_robot(
             joints=7,
             aliases=["myarm", "custom_arm"],
         )
+        register_robot("orbiter", category="aerial", hardware={"driver": "strands"})
     """
+    if hardware is not None and not isinstance(hardware, dict):
+        raise TypeError(f"hardware must be a dict, got {type(hardware).__name__}: {hardware!r}")
+    if model_xml is not None and not model_xml.strip():
+        raise ValueError(f"model_xml must name a model file, got {model_xml!r}; omit it to register with no asset")
+
     # Normalize name
     name = normalize_robot_name(name)
 
@@ -281,79 +289,82 @@ def register_robot(
             )
 
     if model_xml is None:
-        return _register_without_asset(
-            name,
-            data,
-            description=description,
-            category=category,
-            joints=joints,
-            aliases=aliases,
-            hardware=hardware,
-            asset_only={
-                "scene_xml": scene_xml,
-                "asset_dir": asset_dir,
-                "robot_descriptions_module": robot_descriptions_module,
+        asset_only = {
+            "scene_xml": scene_xml,
+            "asset_dir": asset_dir,
+            "robot_descriptions_module": robot_descriptions_module,
+        }
+        given = sorted(k for k, v in asset_only.items() if v is not None)
+        if given:
+            raise ValueError(
+                f"{', '.join(given)} only apply to a simulation asset and require model_xml; pass model_xml, "
+                f"or omit {'it' if len(given) == 1 else 'them'} to register a robot with no asset"
+            )
+        _require_hardware_declaration(name, hardware)
+        entry: dict[str, Any] = {"description": description, "category": category, "joints": joints}
+        where = "with no simulation asset"
+    else:
+        # Resolve asset_dir via shared utility (respects STRANDS_ASSETS_DIR)
+        resolved_dir = resolve_asset_path(asset_dir, default_name=name)
+
+        # Use the directory name as the asset "dir" key (relative to search paths)
+        # This matches how resolve_model_path works: search_dir / asset["dir"] / xml
+        dir_name = resolved_dir.name
+
+        # Validate model_xml exists.  Previously we only checked when
+        # ``resolved_dir`` existed - which silently accepted registrations for
+        # dirs that didn't exist yet and surfaced a confusing error only at
+        # ``add_robot()`` time.  Now we fail-closed on both conditions so the
+        # user gets an immediate, actionable error at registration time.
+        #
+        # The join is the reader's join (:func:`_asset_relative`), so a value that
+        # leaves the asset directory is refused here rather than validated against
+        # a file outside it. Joined raw, an absolute ``model_xml`` discards
+        # ``resolved_dir`` entirely and any existing host file satisfies the check,
+        # and the deferred ``add_robot()`` failure above comes back - now with the
+        # entry already persisted, and with ``_user_asset_path`` naming a directory
+        # the stored path does not live in.
+        model_path = _asset_relative(resolved_dir, "model_xml", model_xml)
+        if scene_xml is not None:
+            # Not existence-checked (a scene is optional and may be authored later),
+            # but contained: it is stored and read back the same way ``model_xml``
+            # is, by ``resolve_model_path(prefer_scene=True)``.
+            _asset_relative(resolved_dir, "scene_xml", scene_xml)
+        if not resolved_dir.exists():
+            raise FileNotFoundError(
+                f"Asset directory does not exist: {resolved_dir}\n"
+                f"Create the directory and place '{model_xml}' inside it before registering."
+            )
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Model XML not found: {model_path}\nEnsure '{model_xml}' exists in '{resolved_dir}'"
+            )
+
+        # Build entry
+        entry = {
+            "description": description,
+            "category": category,
+            "joints": joints,
+            "asset": {
+                "dir": dir_name,
+                "model_xml": model_xml,
+                "scene_xml": scene_xml or model_xml,
             },
-        )
+        }
 
-    # Resolve asset_dir via shared utility (respects STRANDS_ASSETS_DIR)
-    resolved_dir = resolve_asset_path(asset_dir, default_name=name)
+        if robot_descriptions_module:
+            entry["asset"]["robot_descriptions_module"] = robot_descriptions_module
 
-    # Use the directory name as the asset "dir" key (relative to search paths)
-    # This matches how resolve_model_path works: search_dir / asset["dir"] / xml
-    dir_name = resolved_dir.name
-
-    # Validate model_xml exists.  Previously we only checked when
-    # ``resolved_dir`` existed - which silently accepted registrations for
-    # dirs that didn't exist yet and surfaced a confusing error only at
-    # ``add_robot()`` time.  Now we fail-closed on both conditions so the
-    # user gets an immediate, actionable error at registration time.
-    #
-    # The join is the reader's join (:func:`_asset_relative`), so a value that
-    # leaves the asset directory is refused here rather than validated against
-    # a file outside it. Joined raw, an absolute ``model_xml`` discards
-    # ``resolved_dir`` entirely and any existing host file satisfies the check,
-    # and the deferred ``add_robot()`` failure above comes back - now with the
-    # entry already persisted, and with ``_user_asset_path`` naming a directory
-    # the stored path does not live in.
-    model_path = _asset_relative(resolved_dir, "model_xml", model_xml)
-    if scene_xml is not None:
-        # Not existence-checked (a scene is optional and may be authored later),
-        # but contained: it is stored and read back the same way ``model_xml``
-        # is, by ``resolve_model_path(prefer_scene=True)``.
-        _asset_relative(resolved_dir, "scene_xml", scene_xml)
-    if not resolved_dir.exists():
-        raise FileNotFoundError(
-            f"Asset directory does not exist: {resolved_dir}\n"
-            f"Create the directory and place '{model_xml}' inside it before registering."
-        )
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model XML not found: {model_path}\nEnsure '{model_xml}' exists in '{resolved_dir}'")
-
-    # Build entry
-    entry: dict[str, Any] = {
-        "description": description,
-        "category": category,
-        "joints": joints,
-        "asset": {
-            "dir": dir_name,
-            "model_xml": model_xml,
-            "scene_xml": scene_xml or model_xml,
-        },
-    }
-
-    if robot_descriptions_module:
-        entry["asset"]["robot_descriptions_module"] = robot_descriptions_module
+        # Store the full resolved path so the asset manager can find it
+        # even if the dir isn't in the standard search paths
+        entry["_user_asset_path"] = str(resolved_dir)
+        where = f"-> {dir_name}/{model_xml}"
 
     if aliases:
         entry["aliases"] = aliases
 
     if hardware:
-        entry["hardware"] = hardware
-
-    # Store the full resolved path so the asset manager can find it
-    # even if the dir isn't in the standard search paths
-    entry["_user_asset_path"] = str(resolved_dir)
+        entry["hardware"] = dict(hardware)
 
     # Save
     data.setdefault("robots", {})[name] = entry
@@ -370,85 +381,34 @@ def register_robot(
     # Invalidate loader cache so next get_robot() picks up the merge
     _invalidate_cache()
 
-    logger.info("Registered robot '%s' -> %s/%s", name, dir_name, model_xml)
+    logger.info("Registered robot '%s' %s", name, where)
     return entry
 
 
-def _require_hardware_declaration(hardware: dict[str, Any] | None) -> None:
-    """Refuse an asset-less entry that declares no hardware backend.
+def _require_hardware_declaration(name: str, hardware: dict[str, Any] | None) -> None:
+    """Refuse an asset-less entry whose hardware cannot be built.
 
-    Mirrors what the package registry holds for its own hardware-only entries
-    and what :func:`~strands_robots.registry.has_hardware` reads: a non-empty
-    ``lerobot_type`` or a ``driver``. ``"auto"`` alone does not count - it
-    expresses no preference and falls back to the lerobot driver, which then
-    needs a ``lerobot_type`` to build anything.
+    Not a mirror of :func:`~strands_robots.registry.has_hardware`, which
+    accepts any ``hardware`` block. This matches the package's hardware-only
+    entries, which must declare a ``lerobot_type``, plus the case of a native
+    driver: ``driver="strands"``. ``"auto"`` and ``"lerobot"`` alone do not
+    count - both build through lerobot, which needs a ``lerobot_type``.
 
     Args:
+        name: Normalized robot name, quoted in the refusal.
         hardware: The caller's ``hardware`` argument.
 
     Raises:
-        ValueError: *hardware* declares neither field.
+        ValueError: *hardware* declares neither.
     """
     hw = hardware or {}
     lerobot_type = hw.get("lerobot_type")
-    if isinstance(lerobot_type, str) and lerobot_type.strip():
-        return
-    if hw.get("driver") in DRIVER_CHOICES and hw.get("driver") != "auto":
+    if (isinstance(lerobot_type, str) and lerobot_type.strip()) or hw.get("driver") == "strands":
         return
     raise ValueError(
-        f"a robot registered without model_xml has no simulation asset, so hardware must declare "
-        f"a non-empty 'lerobot_type' or a 'driver' ({', '.join(c for c in DRIVER_CHOICES if c != 'auto')}); "
-        f"got hardware={hardware!r}"
+        f"Robot '{name}' is registered without model_xml, so it has no simulation asset and hardware must "
+        f"declare a non-empty 'lerobot_type' or driver 'strands'; got hardware={hardware!r}"
     )
-
-
-def _register_without_asset(
-    name: str,
-    data: dict[str, Any],
-    *,
-    description: str,
-    category: str,
-    joints: int,
-    aliases: list[str] | None,
-    hardware: dict[str, Any] | None,
-    asset_only: dict[str, str | None],
-) -> dict[str, Any]:
-    """Store an entry with no ``asset`` block - the asset-less half of :func:`register_robot`.
-
-    Args:
-        name: Normalized robot name.
-        data: The loaded user registry document.
-        description: Human-readable description.
-        category: Robot category.
-        joints: Number of actuated joints.
-        aliases: Alternative names, or None.
-        hardware: Hardware config; must declare a backend.
-        asset_only: The asset parameters the caller passed, keyed by name.
-
-    Returns:
-        The registered robot definition dict.
-
-    Raises:
-        ValueError: An asset parameter was given, *hardware* declares no
-            backend, an alias collides, or a value is not JSON-serializable.
-    """
-    given = sorted(k for k, v in asset_only.items() if v is not None)
-    if given:
-        raise ValueError(
-            f"{', '.join(given)} describe a simulation asset and require model_xml; "
-            "omit them to register a robot with no asset."
-        )
-    _require_hardware_declaration(hardware)
-    entry: dict[str, Any] = {"description": description, "category": category, "joints": joints}
-    if aliases:
-        entry["aliases"] = aliases
-    entry["hardware"] = hardware
-    data.setdefault("robots", {})[name] = entry
-    _assert_registry_still_loads(data)
-    _save_user_registry(data)
-    _invalidate_cache()
-    logger.info("Registered robot '%s' with no simulation asset", name)
-    return entry
 
 
 def unregister_robot(name: str) -> bool:
