@@ -33,6 +33,7 @@ __all__ = [
     "ROBOTS",
     "STEP",
     "UNSUPPORTED_BY_BACKEND",
+    "UNSUPPORTED_BY_POLICY",
     "WORLD",
     "CapabilityNotSupported",
     "CapabilityReporter",
@@ -73,6 +74,8 @@ OPTIONAL_CAPABILITY_METHODS: dict[str, str] = {
 }
 
 UNSUPPORTED_BY_BACKEND = "unsupported_by_backend"
+#: The rollout was refused because the policy, not the backend, cannot bind the action keys.
+UNSUPPORTED_BY_POLICY = "unsupported_by_policy"
 
 
 class CapabilityNotSupported(NotImplementedError):

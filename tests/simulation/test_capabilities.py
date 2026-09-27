@@ -314,9 +314,19 @@ def test_run_policy_on_backend_without_joints_refuses_before_any_step(caller: st
     assert_strands_tool_result(result)
     payload = tool_json(result)
     assert (result["status"], payload["code"], payload["member"]) == ("error", caps.UNSUPPORTED_BY_BACKEND, caller)
-    assert caps.JOINTS in payload["missing"]
+    # start_policy only delegates to run_policy (which checks joints itself), so it checks policy_rollout alone.
+    assert (caps.JOINTS in payload["missing"]) is (caller != "start_policy")
     assert (caps.POLICY_ROLLOUT in payload["missing"]) is (caller != "replay_episode")
     assert reached == []
+
+
+def test_a_joint_less_backend_with_its_own_run_policy_can_start_a_policy() -> None:
+    ran = {"status": "success", "content": [{"text": "ran"}]}
+    body = {"list_robots": lambda self: ["sat0"], "run_policy": lambda self, robot_name, **k: ran}
+    engine = _engine(CAPABILITIES=caps.DEFAULT_CAPABILITIES - {caps.JOINTS}, **body)()
+    assert engine.start_policy("sat0") is ran
+    for refused in (lambda e: e.eval_policy("sat0"), lambda e: e.replay_episode("org/data", "sat0")):
+        assert tool_json(refused(engine))["missing"] == [caps.JOINTS]
 
 
 def _raise(exc: BaseException) -> Any:
@@ -378,7 +388,8 @@ def test_run_policy_refuses_when_action_keys_raise_not_supported(
     result = _BINDERS[caller](engine, policy)
     assert_strands_tool_result(result)
     payload = tool_json(result)
-    assert (result["status"], payload["code"], payload["member"]) == ("error", caps.UNSUPPORTED_BY_BACKEND, member)
+    code = caps.UNSUPPORTED_BY_POLICY if member == "set_robot_state_keys" else caps.UNSUPPORTED_BY_BACKEND
+    assert (result["status"], payload["code"], payload["member"]) == ("error", code, member)
     assert reached == []
 
 
@@ -386,6 +397,7 @@ def test_a_policy_that_cannot_bind_is_named_in_the_refusal(monkeypatch: Any) -> 
     engine = _armed(monkeypatch, [], robot_action_keys=lambda self, robot_name: ["a"])
     result = engine.run_policy("arm", policy_object=_KeylessPolicy())
     assert (tool_json(result)["policy"], tool_json(result)["detail"]) == ("_KeylessPolicy", "no state keys")
+    assert tool_json(result)["code"] == caps.UNSUPPORTED_BY_POLICY
     assert "_KeylessPolicy" in result["content"][0]["text"]
 
 

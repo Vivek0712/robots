@@ -1638,7 +1638,7 @@ class SimEngine(ABC):
             if member == "set_robot_state_keys":
                 name = type(policy).__name__
                 result["content"][0]["text"] = f"The {name} policy cannot bind {robot_name!r}'s action keys: {exc}"
-                result["content"][1]["json"].update(policy=name, detail=str(exc))
+                result["content"][1]["json"].update(code=_caps.UNSUPPORTED_BY_POLICY, policy=name, detail=str(exc))
             return result
         return None
 
@@ -4899,7 +4899,9 @@ class SimEngine(ABC):
         ``policy_kwargs`` carries the per-call #300 goal payload through to
         ``policy.get_actions`` (see :meth:`run_policy`).
         """
-        if refusal := self._require_capabilities("start_policy"):
+        # Only policy_rollout: this delegates to run_policy, which checks joints
+        # itself - and a joint-less backend may override run_policy.
+        if refusal := self._require_capabilities("start_policy", frozenset({_caps.POLICY_ROLLOUT})):
             return refusal
         robot_name = self._resolve_single_robot(robot_name)
         return self.run_policy(
