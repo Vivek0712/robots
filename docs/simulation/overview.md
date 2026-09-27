@@ -159,6 +159,10 @@ def joint_names(sim):
     return check_capabilities(sim, [JOINTS], caller="joint_names") or sim.robot_joint_names("arm")
 ```
 
+The rollout entry points (`run_policy` and its siblings) return the same error
+before building a policy when `joints` or `policy_rollout` is missing;
+`replay_episode` needs only `joints`.
+
 ## See also
 
 - [Physics and actions](physics.md) - stepping, contacts, forces, state writes, `send_action`.

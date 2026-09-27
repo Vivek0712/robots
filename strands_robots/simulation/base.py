@@ -1110,7 +1110,7 @@ class SimEngine(ABC):
             return
         # A backend without JOINTS has no joint_states to publish; skip them up
         # front rather than catching its refusal on every robot every step.
-        has_joints = _caps.JOINTS in self.capabilities()
+        has_joints = _caps.JOINTS in self._effective_capabilities()
         for robot in self.list_robots():
             # Per-robot guard: a transient render/observation failure on one
             # robot (e.g. EGL/GL context loss, a camera that produced no frame)
@@ -1576,6 +1576,39 @@ class SimEngine(ABC):
             return None, f"{surface}: {outcome}"
         return outcome, None
 
+    def _effective_capabilities(self) -> frozenset[str]:
+        """``capabilities()``, or the derived set when a backend's own member of that name has another shape.
+
+        Returns:
+            The declared names when ``capabilities()`` returns a set of str, else
+            what :meth:`SimEngine.capabilities` derives for this class.
+        """
+        own: object
+        try:
+            own = self.capabilities()
+        except TypeError as exc:
+            own = exc
+        if isinstance(own, (set, frozenset)) and all(isinstance(name, str) for name in own):
+            return frozenset(own)
+        logger.debug("%s.capabilities gave %r; using the derived set", type(self).__name__, own)
+        return SimEngine.capabilities(self)
+
+    def _require_capabilities(
+        self, caller: str, required: Iterable[str] = _ROLLOUT_CAPABILITIES
+    ) -> dict[str, Any] | None:
+        """:func:`check_capabilities` against :meth:`_effective_capabilities`.
+
+        Args:
+            caller: The entry point, named in the refusal.
+            required: Capability names ``caller`` needs; a policy rollout's by default.
+
+        Returns:
+            ``None`` when all are present, otherwise the ``unsupported_by_backend`` result.
+        """
+        effective = self._effective_capabilities()
+        reporter = type(type(self).__name__, (), {"capabilities": lambda _self: effective})()
+        return _caps.check_capabilities(reporter, required, caller=caller)
+
     def _bind_state_keys(self, policy: Policy, robot_name: str) -> dict[str, Any] | None:
         """Bind ``robot_name``'s action keys as ``policy``'s state keys, or refuse.
 
@@ -1591,10 +1624,8 @@ class SimEngine(ABC):
         Returns:
             ``None`` once bound, otherwise the error result.
 
-        Raises:
-            Exception: Any other exception from ``robot_action_keys`` or
-                ``set_robot_state_keys``, unchanged, so each caller keeps its
-                own handling of it.
+        Any other exception propagates unchanged, so each caller keeps its own
+        handling of it.
         """
         member = "robot_action_keys"
         try:
@@ -1603,7 +1634,12 @@ class SimEngine(ABC):
             policy.set_robot_state_keys(keys)
         except NotImplementedError as exc:
             logger.debug("%s for %r is not implemented: %s", member, robot_name, exc)
-            return _caps.unsupported_result(_caps.JOINTS, member, type(self).__name__)
+            result = _caps.unsupported_result(_caps.JOINTS, member, type(self).__name__)
+            if member == "set_robot_state_keys":
+                name = type(policy).__name__
+                result["content"][0]["text"] = f"The {name} policy cannot bind {robot_name!r}'s action keys: {exc}"
+                result["content"][1]["json"].update(policy=name, detail=str(exc))
+            return result
         return None
 
     def _build_policy(
@@ -3583,7 +3619,7 @@ class SimEngine(ABC):
             robot's valid actuator names. A PARTIAL failure runs to completion,
             surfaced via ``partial_action_failure_rate``.
         """
-        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="run_policy"):
+        if refusal := self._require_capabilities("run_policy"):
             return refusal
         # Refuse a value outside the observer's domain before robot discovery,
         # policy construction, backend hook creation, clocks, or rollout work.
@@ -3929,7 +3965,7 @@ class SimEngine(ABC):
             multi-robot rollout. Implementing backends return the standard
             status dict with per-robot step counts.
         """
-        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="run_multi_policy"):
+        if refusal := self._require_capabilities("run_multi_policy"):
             return refusal
         return {
             "status": "error",
@@ -4863,7 +4899,7 @@ class SimEngine(ABC):
         ``policy_kwargs`` carries the per-call #300 goal payload through to
         ``policy.get_actions`` (see :meth:`run_policy`).
         """
-        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="start_policy"):
+        if refusal := self._require_capabilities("start_policy"):
             return refusal
         robot_name = self._resolve_single_robot(robot_name)
         return self.run_policy(
@@ -5288,7 +5324,7 @@ class SimEngine(ABC):
         """
         # Replay drives recorded actions through robot_action_keys and a numeric
         # send_action; it builds no policy, so it needs JOINTS alone.
-        if refusal := _caps.check_capabilities(self, {_caps.JOINTS}, caller="replay_episode"):
+        if refusal := self._require_capabilities("replay_episode", {_caps.JOINTS}):
             return refusal
 
         return PolicyRunner(self).replay(
@@ -5544,7 +5580,7 @@ class SimEngine(ABC):
             ``rtc_avg_inference_ms`` and ``rtc_max_inference_ms`` are kept for
             one release with the same values.
         """
-        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="eval_policy"):
+        if refusal := self._require_capabilities("eval_policy"):
             return refusal
         # Same posture-flag rule as run_policy, ahead of robot resolution: an
         # evaluation is the one place a misread here would be trusted as a
@@ -5975,7 +6011,7 @@ class SimEngine(ABC):
             Only this route reports it: :meth:`eval_policy` takes a ``success_fn``
             and has no failure criterion to sample.
         """
-        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="evaluate_benchmark"):
+        if refusal := self._require_capabilities("evaluate_benchmark"):
             return refusal
         from strands_robots.simulation.benchmark import get_benchmark, spec_instruction
 

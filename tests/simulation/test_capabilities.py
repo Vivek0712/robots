@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from strands_robots.policies import MockPolicy
 from strands_robots.simulation import capabilities as caps
 from strands_robots.simulation.base import SimEngine
 from tests.tool_result_contract import assert_strands_tool_result, tool_json
@@ -339,13 +340,31 @@ def _halt(reached: list[str]) -> Any:
     return install
 
 
-class _KeylessPolicy:
-    """Stands in for a policy whose state-key binding is not implemented."""
+class _KeylessPolicy(MockPolicy):
+    """A real policy whose state-key binding is not implemented."""
 
-    set_robot_state_keys = staticmethod(_raise(NotImplementedError("no state keys")))
+    def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
+        raise NotImplementedError("no state keys")
 
 
-@pytest.mark.parametrize("caller", ["run_policy", "eval_policy"])
+_BINDERS = {
+    "run_policy": lambda e, p: e.run_policy("arm", policy_object=p),
+    "eval_policy": lambda e, p: e.eval_policy("arm", policy_object=p),
+    "evaluate_benchmark": lambda e, p: e.evaluate_benchmark("any", "arm", policy_object=p),
+}
+
+
+def _armed(monkeypatch: Any, reached: list[str], **attrs: Any) -> Any:
+    """An undeclared engine holding ``arm``, whose rollout halts at the controller install."""
+    monkeypatch.setattr("strands_robots.simulation.benchmark.get_benchmark", lambda name: object())
+    engine = _engine(list_robots=lambda self: ["arm"], **attrs)()
+    monkeypatch.setattr(engine, "_benchmark_robot_mismatch_error", lambda *a: None)
+    monkeypatch.setattr(engine, "step", lambda *a, **k: reached.append("step"))
+    monkeypatch.setattr(engine, "_install_action_controller", _halt(reached))
+    return engine
+
+
+@pytest.mark.parametrize("caller", sorted(_BINDERS))
 @pytest.mark.parametrize(
     ("keys", "policy", "member"),
     [
@@ -357,29 +376,45 @@ class _KeylessPolicy:
 def test_run_policy_refuses_when_action_keys_raise_not_supported(
     caller: str, keys: Any, policy: Any, member: str, monkeypatch: Any
 ) -> None:
-    engine = _engine(list_robots=lambda self: ["arm"], robot_action_keys=keys)()
-    assert engine.capabilities() == caps.DEFAULT_CAPABILITIES
     reached: list[str] = []
-    monkeypatch.setattr(engine, "step", lambda *a, **k: reached.append("step"))
-    monkeypatch.setattr(engine, "_install_action_controller", _halt(reached))
-    monkeypatch.setattr(engine, "_validate_policy_object", lambda *a: None)
-    result = getattr(engine, caller)("arm", policy_object=policy)
+    engine = _armed(monkeypatch, reached, robot_action_keys=keys)
+    assert engine.capabilities() == caps.DEFAULT_CAPABILITIES
+    result = _BINDERS[caller](engine, policy)
     assert_strands_tool_result(result)
     payload = tool_json(result)
     assert (result["status"], payload["code"], payload["member"]) == ("error", caps.UNSUPPORTED_BY_BACKEND, member)
     assert reached == []
 
 
+def test_a_policy_that_cannot_bind_is_named_in_the_refusal(monkeypatch: Any) -> None:
+    engine = _armed(monkeypatch, [], robot_action_keys=lambda self, robot_name: ["a"])
+    result = engine.run_policy("arm", policy_object=_KeylessPolicy())
+    assert (tool_json(result)["policy"], tool_json(result)["detail"]) == ("_KeylessPolicy", "no state keys")
+    assert "_KeylessPolicy" in result["content"][0]["text"]
+
+
 def test_run_policy_continues_as_today_when_action_keys_raise_another_error(monkeypatch: Any) -> None:
-    engine = _engine(list_robots=lambda self: ["arm"], robot_action_keys=_raise(RuntimeError("torn down")))()
     reached: list[str] = []
-    monkeypatch.setattr(engine, "_install_action_controller", _halt(reached))
+    engine = _armed(monkeypatch, reached, robot_action_keys=_raise(RuntimeError("torn down")))
     result = engine.run_policy("arm")
     assert (result["status"], result["content"][0]["text"], reached) == ("error", "x", ["controller"])
+    with pytest.raises(RuntimeError, match="torn down"):
+        engine.eval_policy("arm")
+
+
+@pytest.mark.parametrize("clash", [["legacy"], lambda self: None, lambda self: {caps.JOINTS: False}])
+def test_a_clashing_capabilities_member_falls_back_to_the_derived_set(clash: Any, monkeypatch: Any) -> None:
+    reached: list[str] = []
+    engine = _armed(monkeypatch, reached, capabilities=clash)
+    assert engine.run_policy("arm")["content"][0]["text"] == "x"
+    engine._ros_bridge = type("Bridge", (), {"publish_joint_states": lambda *a: reached.append("joints")})()
+    engine._publish_ros_telemetry(skip_images=True)
+    assert reached == ["controller", "joints"]
 
 
 def test_stop_policy_destroy_reset_ignore_capabilities() -> None:
     engine = _Sat()
+    # destroy and reset are abstract, so this half pins only that no base wrapper gates them.
     assert (engine.destroy(), engine.reset()) == ({}, {})
     result = engine.stop_policy("sat0")
     assert_strands_tool_result(result)
