@@ -29,7 +29,7 @@ import os
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, SupportsFloat, cast
+from typing import TYPE_CHECKING, Any, ClassVar, SupportsFloat, cast
 
 if TYPE_CHECKING:
     import numpy as np
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 # AST). Instead, we reference ``OnFrame`` in the ``evaluate_benchmark``
 # signature as a *string* annotation; ``from __future__ import
 # annotations`` (already in effect) makes that a no-op at runtime.
+from strands_robots.simulation import capabilities as _caps
 from strands_robots.simulation.observers import RunPolicyObserver
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 from strands_robots.utils import (
@@ -978,6 +979,40 @@ class SimEngine(ABC):
     # subclasses and test doubles need not thread ``super().__init__()``
     # through (the same constraint :meth:`_init_ros_bridge` documents).
     _init_complete: bool = False
+
+    CAPABILITIES: ClassVar[frozenset[str] | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Reject a ``CAPABILITIES`` declaration the class cannot honour.
+
+        Args:
+            **kwargs: Forwarded to the next ``__init_subclass__`` in the MRO.
+
+        Raises:
+            TypeError: A declared name is unknown and not ``vendor:name``, or a
+                declared optional capability's method is still the base stub.
+        """
+        super().__init_subclass__(**kwargs)
+        for name in cls.CAPABILITIES or ():
+            vendor, sep, rest = name.partition(":")
+            if name not in _caps.KNOWN_CAPABILITIES and not (vendor and sep and rest):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
+            method = _caps.OPTIONAL_CAPABILITY_METHODS.get(name)
+            if method is not None and getattr(cls, method) is getattr(SimEngine, method):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but does not override {method}()")
+
+    def capabilities(self) -> frozenset[str]:
+        """Return ``CAPABILITIES``, or derive it: the default set plus each overridden optional method.
+
+        Returns:
+            Frozen set of names from :mod:`strands_robots.simulation.capabilities`.
+        """
+        declared = getattr(type(self), "CAPABILITIES", None)
+        if declared is not None:
+            return frozenset(declared)
+        stubs = {c: getattr(SimEngine, m) for c, m in _caps.OPTIONAL_CAPABILITY_METHODS.items()}
+        optional = {c for c, stub in stubs.items() if getattr(type(self), stub.__name__, stub) is not stub}
+        return _caps.DEFAULT_CAPABILITIES | optional
 
     def _init_ros_bridge(self, *, ros2_bridge: bool = False, ros2_domain: int = 0) -> None:
         """Initialize the optional ROS 2 telemetry bridge state.
@@ -6640,7 +6675,7 @@ class SimEngine(ABC):
         in a single call, instead of guessing method names.
 
         Returns:
-            Plain dict with keys: robots, cameras, methods, note.
+            Plain dict with keys: robots, capabilities, cameras, methods, note.
         """
         methods: dict[str, str] = {
             "get_robot_state": "(robot_name: str) -> dict",
@@ -6806,11 +6841,18 @@ class SimEngine(ABC):
         # than by a hand-kept list of which backend has what, so a backend that
         # gains one of these starts advertising it with no second edit, and a
         # fourth backend is held to the rule on arrival.
-        for optional in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
-            if getattr(type(self), optional, None) is getattr(SimEngine, optional):
-                methods.pop(optional, None)
+        # :meth:`capabilities` applies that test, and also covers a declared profile.
+        caps = self.capabilities()
+        gated: dict[str, tuple[str, ...]] = {cap: (m,) for cap, m in _caps.OPTIONAL_CAPABILITY_METHODS.items()}
+        gated[_caps.OBJECTS], gated[_caps.RENDER] = ("add_object", "remove_object"), ("render",)
+        rollout = ("run_policy", "start_policy", "eval_policy", "evaluate_benchmark", "replay_episode")
+        gated[_caps.POLICY_ROLLOUT] = rollout
+        for cap in gated.keys() - caps:
+            for name in gated[cap]:
+                methods.pop(name, None)
         return {
             "robots": self.list_robots(),
+            "capabilities": sorted(caps),
             "cameras": [],  # backends override to list camera names
             "methods": methods,
             "note": (

@@ -32,6 +32,7 @@ class _Engine:
 
     list_benchmarks = _Base.list_benchmarks
     describe = _Base.describe
+    capabilities = _Base.capabilities
 
     def list_robots(self):
         return []
