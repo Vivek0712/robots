@@ -33,6 +33,7 @@ __all__ = [
     "ROBOTS",
     "STEP",
     "UNSUPPORTED_BY_BACKEND",
+    "UNSUPPORTED_BY_POLICY",
     "WORLD",
     "CapabilityNotSupported",
     "CapabilityReporter",
@@ -48,7 +49,7 @@ OBSERVATION = "observation"
 JOINTS = "joints"  # robot_joint_names / robot_action_keys / numeric send_action
 OBJECTS = "objects"  # add_object / remove_object
 RENDER = "render"  # render and camera frames
-POLICY_ROLLOUT = "policy_rollout"  # run_policy and its rollout siblings
+POLICY_ROLLOUT = "policy_rollout"  # run_policy and its rollout siblings; replay needs only joints
 LOAD_SCENE = "load_scene"
 RANDOMIZE = "randomize"
 OBS_NOISE = "obs_noise"
@@ -73,6 +74,8 @@ OPTIONAL_CAPABILITY_METHODS: dict[str, str] = {
 }
 
 UNSUPPORTED_BY_BACKEND = "unsupported_by_backend"
+#: The rollout was refused because the policy, not the backend, cannot bind the action keys.
+UNSUPPORTED_BY_POLICY = "unsupported_by_policy"
 
 
 class CapabilityNotSupported(NotImplementedError):

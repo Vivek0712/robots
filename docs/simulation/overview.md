@@ -141,16 +141,15 @@ instead of guessing names.
 
 ## Capabilities
 
-`sim.capabilities()` names what a backend supports (`describe()["capabilities"]`):
-the core `world`, `robots`, `step`, `observation`, then `joints`, `objects`,
-`render`, `policy_rollout` and six optional names. `describe()["methods"]`
-omits the members of each absent one that the backend does not implement itself.
+`sim.capabilities()` names what a backend supports: `world`, `robots`, `step`,
+`observation`, `joints`, `objects`, `render`, `policy_rollout` and six optional
+names. `describe()` omits an absent one's members the backend lacks.
 
 A backend without joints, objects or rendering mixes in `ManipulationOptional`
-before `SimEngine`: `add_object` / `remove_object` / `render` return an
-`unsupported_by_backend` error and `robot_joint_names` raises
-`CapabilityNotSupported`. Declaring `objects`, `render` or `joints` while the
-refusal is inherited raises `TypeError` at class creation. Callers check first:
+before `SimEngine`: `add_object`, `remove_object` and `render` return an
+`unsupported_by_backend` error; `robot_joint_names` raises
+`CapabilityNotSupported`. Declaring one of these while its refusal is inherited
+is a `TypeError`. Callers check first:
 
 ```python
 from strands_robots.simulation.capabilities import JOINTS, check_capabilities
@@ -158,6 +157,9 @@ from strands_robots.simulation.capabilities import JOINTS, check_capabilities
 def joint_names(sim):
     return check_capabilities(sim, [JOINTS], caller="joint_names") or sim.robot_joint_names("arm")
 ```
+
+Rollouts (`run_policy` and siblings) return that error before building a policy
+when `joints` or `policy_rollout` is missing; `replay_episode` needs `joints`.
 
 ## See also
 

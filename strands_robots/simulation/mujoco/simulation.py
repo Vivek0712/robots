@@ -6763,6 +6763,8 @@ class MuJoCoSimEngine(
         accepts ``n_steps`` (primary) or legacy ``max_steps`` as an
         alternate horizon specification; run_policy converts to duration.
         """
+        if refusal := self._require_capabilities("start_policy"):
+            return refusal
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
         try:
@@ -7303,6 +7305,8 @@ class MuJoCoSimEngine(
         Returns:
             Standard status dict with per-robot step counts.
         """
+        if refusal := self._require_capabilities("run_multi_policy"):
+            return refusal
         import numpy as np
 
         from strands_robots._async_utils import _resolve_coroutine
@@ -7373,7 +7377,8 @@ class MuJoCoSimEngine(
         # actuators send_action resolves, not the joints; see robot_action_keys).
         for rname, pol in policies.items():
             try:
-                pol.set_robot_state_keys(self.robot_action_keys(rname))
+                if refusal := self._bind_state_keys(pol, rname):
+                    return refusal
                 self.bind_policy_sim_context(pol, rname)
             except Exception as exc:  # noqa: BLE001 - non-fatal, mirrors run_policy defensiveness
                 logger.debug("set_robot_state_keys(%s) failed: %s", rname, exc)

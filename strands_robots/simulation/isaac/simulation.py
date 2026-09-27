@@ -5842,6 +5842,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 starts at frame 0 rather than appending to a dangling
                 half-episode (mirrors the MuJoCo loop).
         """
+        if refusal := self._require_capabilities("run_multi_policy"):
+            return refusal
         from collections import deque
 
         from strands_robots._async_utils import _resolve_coroutine
@@ -5965,7 +5967,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         # Bind each policy's action keys (best-effort, mirrors run_policy).
         for rname, pol in policies.items():
             try:
-                pol.set_robot_state_keys(self.robot_action_keys(rname))
+                if refusal := self._bind_state_keys(pol, rname):
+                    return refusal
                 self.bind_policy_sim_context(pol, rname)
             except Exception as exc:  # noqa: BLE001 - non-fatal, mirrors run_policy defensiveness
                 logger.debug("set_robot_state_keys(%s) failed: %s", rname, exc)

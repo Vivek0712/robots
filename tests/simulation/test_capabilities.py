@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from strands_robots.policies import MockPolicy
 from strands_robots.simulation import capabilities as caps
 from strands_robots.simulation.base import SimEngine
 from tests.tool_result_contract import assert_strands_tool_result, tool_json
@@ -284,3 +285,154 @@ def test_a_joint_less_backend_keeps_its_own_action_keys_and_drops_its_refusals()
     assert "robot_action_keys" in methods and "send_action" in methods
     assert "robot_joint_names" not in methods
     assert burner.robot_action_keys("sat") == ["dv_mps", "burn_s"]
+
+
+class _Sat(_Orbit):
+    """A core-only engine holding one robot, so a rollout gets past robot resolution."""
+
+    def list_robots(self) -> list[str]:
+        return ["sat0"]
+
+
+_ROLLOUTS = {
+    "run_policy": lambda s: s.run_policy("sat0"),
+    "start_policy": lambda s: s.start_policy("sat0"),
+    "eval_policy": lambda s: s.eval_policy("sat0"),
+    "run_multi_policy": lambda s: s.run_multi_policy({"sat0": object()}),
+    "evaluate_benchmark": lambda s: s.evaluate_benchmark("any", "sat0"),
+    "replay_episode": lambda s: s.replay_episode("org/data", "sat0"),
+}
+
+
+@pytest.mark.parametrize("caller", sorted(_ROLLOUTS))
+def test_run_policy_on_backend_without_joints_refuses_before_any_step(caller: str, monkeypatch: Any) -> None:
+    reached: list[str] = []
+    monkeypatch.setattr("strands_robots.policies.create_policy", lambda *a, **k: reached.append("create_policy"))
+    engine = _Sat()
+    monkeypatch.setattr(engine, "step", lambda *a, **k: reached.append("step"))
+    result = _ROLLOUTS[caller](engine)
+    assert_strands_tool_result(result)
+    payload = tool_json(result)
+    assert (result["status"], payload["code"], payload["member"]) == ("error", caps.UNSUPPORTED_BY_BACKEND, caller)
+    # start_policy only delegates to run_policy (which checks joints itself), so it checks policy_rollout alone.
+    assert (caps.JOINTS in payload["missing"]) is (caller != "start_policy")
+    assert (caps.POLICY_ROLLOUT in payload["missing"]) is (caller != "replay_episode")
+    assert reached == []
+
+
+def test_a_joint_less_backend_with_its_own_run_policy_can_start_a_policy() -> None:
+    ran = {"status": "success", "content": [{"text": "ran"}]}
+    body = {"list_robots": lambda self: ["sat0"], "run_policy": lambda self, robot_name, **k: ran}
+    engine = _engine(CAPABILITIES=caps.DEFAULT_CAPABILITIES - {caps.JOINTS}, **body)()
+    assert engine.start_policy("sat0") is ran
+    for refused in (lambda e: e.eval_policy("sat0"), lambda e: e.replay_episode("org/data", "sat0")):
+        assert tool_json(refused(engine))["missing"] == [caps.JOINTS]
+
+
+def _raise(exc: BaseException) -> Any:
+    def raiser(*a: Any, **k: Any) -> Any:
+        raise exc
+
+    return raiser
+
+
+def _halt(reached: list[str]) -> Any:
+    """Stand in for the controller install, the first step after binding: record it and refuse with ``x``."""
+
+    def install(*a: Any) -> tuple[None, str]:
+        reached.append("controller")
+        return None, "x"
+
+    return install
+
+
+class _KeylessPolicy(MockPolicy):
+    """A real policy whose state-key binding is not implemented."""
+
+    def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
+        raise NotImplementedError("no state keys")
+
+
+_BINDERS = {
+    "run_policy": lambda e, p: e.run_policy("arm", policy_object=p),
+    "eval_policy": lambda e, p: e.eval_policy("arm", policy_object=p),
+    "evaluate_benchmark": lambda e, p: e.evaluate_benchmark("any", "arm", policy_object=p),
+}
+
+
+def _armed(monkeypatch: Any, reached: list[str], **attrs: Any) -> Any:
+    """An undeclared engine holding ``arm``, whose rollout halts at the controller install."""
+    monkeypatch.setattr("strands_robots.simulation.benchmark.get_benchmark", lambda name: object())
+    engine = _engine(list_robots=lambda self: ["arm"], **attrs)()
+    monkeypatch.setattr(engine, "_benchmark_robot_mismatch_error", lambda *a: None)
+    monkeypatch.setattr(engine, "step", lambda *a, **k: reached.append("step"))
+    monkeypatch.setattr(engine, "_install_action_controller", _halt(reached))
+    return engine
+
+
+@pytest.mark.parametrize("caller", sorted(_BINDERS))
+@pytest.mark.parametrize(
+    ("keys", "policy", "member"),
+    [
+        (_raise(caps.CapabilityNotSupported(caps.JOINTS, "robot_action_keys")), None, "robot_action_keys"),
+        (_raise(NotImplementedError("no keys")), None, "robot_action_keys"),
+        (lambda self, robot_name: ["a"], _KeylessPolicy(), "set_robot_state_keys"),
+    ],
+)
+def test_run_policy_refuses_when_action_keys_raise_not_supported(
+    caller: str, keys: Any, policy: Any, member: str, monkeypatch: Any
+) -> None:
+    reached: list[str] = []
+    engine = _armed(monkeypatch, reached, robot_action_keys=keys)
+    assert engine.capabilities() == caps.DEFAULT_CAPABILITIES
+    result = _BINDERS[caller](engine, policy)
+    assert_strands_tool_result(result)
+    payload = tool_json(result)
+    code = caps.UNSUPPORTED_BY_POLICY if member == "set_robot_state_keys" else caps.UNSUPPORTED_BY_BACKEND
+    assert (result["status"], payload["code"], payload["member"]) == ("error", code, member)
+    assert reached == []
+
+
+def test_a_policy_that_cannot_bind_is_named_in_the_refusal(monkeypatch: Any) -> None:
+    engine = _armed(monkeypatch, [], robot_action_keys=lambda self, robot_name: ["a"])
+    result = engine.run_policy("arm", policy_object=_KeylessPolicy())
+    assert (tool_json(result)["policy"], tool_json(result)["detail"]) == ("_KeylessPolicy", "no state keys")
+    assert tool_json(result)["code"] == caps.UNSUPPORTED_BY_POLICY
+    assert "_KeylessPolicy" in result["content"][0]["text"]
+
+
+def test_run_policy_continues_as_today_when_action_keys_raise_another_error(monkeypatch: Any) -> None:
+    reached: list[str] = []
+    engine = _armed(monkeypatch, reached, robot_action_keys=_raise(RuntimeError("torn down")))
+    result = engine.run_policy("arm")
+    assert (result["status"], result["content"][0]["text"], reached) == ("error", "x", ["controller"])
+    with pytest.raises(RuntimeError, match="torn down"):
+        engine.eval_policy("arm")
+
+
+@pytest.mark.parametrize("clash", [["legacy"], lambda self: None, lambda self: {caps.JOINTS: False}])
+def test_a_clashing_capabilities_member_falls_back_to_the_derived_set(clash: Any, monkeypatch: Any) -> None:
+    reached: list[str] = []
+    engine = _armed(monkeypatch, reached, capabilities=clash)
+    assert engine.run_policy("arm")["content"][0]["text"] == "x"
+    engine._ros_bridge = type("Bridge", (), {"publish_joint_states": lambda *a: reached.append("joints")})()
+    engine._publish_ros_telemetry(skip_images=True)
+    assert reached == ["controller", "joints"]
+
+
+def test_stop_policy_destroy_reset_ignore_capabilities() -> None:
+    engine = _Sat()
+    # destroy and reset are abstract, so this half pins only that no base wrapper gates them.
+    assert (engine.destroy(), engine.reset()) == ({}, {})
+    result = engine.stop_policy("sat0")
+    assert_strands_tool_result(result)
+    assert caps.UNSUPPORTED_BY_BACKEND not in repr(result)
+
+
+def test_ros_bridge_skips_joint_states_on_a_backend_without_joints(caplog: Any) -> None:
+    published: list[str] = []
+    engine = _Sat()
+    engine._ros_bridge = type("Bridge", (), {"publish_joint_states": lambda *a: published.append("joints")})()
+    with caplog.at_level("WARNING"):
+        engine._publish_ros_telemetry(skip_images=True)
+    assert (published, caplog.records) == ([], [])
