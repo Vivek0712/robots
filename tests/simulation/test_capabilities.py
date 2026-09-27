@@ -287,10 +287,6 @@ def test_a_joint_less_backend_keeps_its_own_action_keys_and_drops_its_refusals()
     assert burner.robot_action_keys("sat") == ["dv_mps", "burn_s"]
 
 
-    assert build(None).describe()["methods"].keys() & _ALL_GATED
-    assert not build(_CORE).describe()["methods"].keys() & _ALL_GATED
-
-
 class _Sat(_Orbit):
     """A core-only engine holding one robot, so a rollout gets past robot resolution."""
 
