@@ -105,3 +105,12 @@ def test_a_str_subclass_cannot_pass_a_blank_lerobot_type():
 
     with pytest.raises(ValueError, match="hardware must declare"):
         register_robot("orbiter", hardware={"lerobot_type": Padded("   ")})
+
+
+def test_a_str_subclass_cannot_pass_a_blank_model_xml():
+    class Padded(str):
+        def strip(self, chars=None):  # type: ignore[override]
+            return "not blank"
+
+    with pytest.raises(ValueError, match="model_xml must name a model file"):
+        register_robot("orbiter", model_xml=Padded("   "), hardware={"driver": "strands"})
