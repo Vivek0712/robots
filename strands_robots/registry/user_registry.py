@@ -354,14 +354,22 @@ def unregister_robot(name: str) -> bool:
     Does not affect the package ``robots.json``. If the robot exists
     only in the package registry, this is a no-op.
 
+    A key spelled exactly as *name* is removed first, so a hand-written key the
+    loader refuses as not folded (``sat-001``) can be removed by the spelling
+    the refusal quotes. Otherwise *name* is folded and that key is removed. The
+    overlay file is read directly, not through the merged registry, which fails
+    to load while such a key is present.
+
     Args:
-        name: Robot name to remove.
+        name: Robot name to remove, as the exact key in ``user_robots.json`` or
+            any spelling that folds to it.
 
     Returns:
         True if the robot was removed, False if it wasn't in the user registry.
     """
-    name = normalize_robot_name(name)
     data = _load_user_registry()
+    if name not in data.get("robots", {}):
+        name = normalize_robot_name(name)
 
     if name not in data.get("robots", {}):
         logger.info("Robot '%s' not in user registry - nothing to remove.", name)

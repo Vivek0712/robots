@@ -27,7 +27,7 @@ import json
 import logging
 from pathlib import Path
 
-from ._overlay import parse_user_robots, user_registry_source
+from ._overlay import parse_user_robots, user_registry_path, user_registry_source
 
 #: The driver a robot gets when nothing says otherwise. Every robot in the
 #: package registry is a lerobot robot today, so the default keeps them working
@@ -131,13 +131,22 @@ def _load(name: str) -> dict:
 def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     """Merge user-local robot registry on top of package robots.json.
 
-    User entries override package entries on name collision.
+    User entries override package entries on name collision. A user key that
+    is not its own :func:`normalize_robot_name` fold is refused rather than
+    merged: every lookup folds its query, so no lookup could reach it.
 
     Args:
         data: Parsed package ``robots.json``.
         overlay_source: Contents of ``user_robots.json``, or None when the
             overlay is absent.  Taken from the caller rather than re-read so
             the merged value and the cache signature describe the same bytes.
+
+    Returns:
+        *data* with the user robots merged into its ``robots`` table.
+
+    Raises:
+        ValueError: On a user key that is not already folded. The message names
+            the overlay file and the spelling to rename the key to.
     """
     user_robots = parse_user_robots(overlay_source)
     if not user_robots:
@@ -147,6 +156,26 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     merged_robots = dict(merged.get("robots", {}))
     merged_robots.update(user_robots)
     merged["robots"] = merged_robots
+
+    # ``register_robot`` folds before it writes, but a hand-written overlay is
+    # read verbatim, and a key like ``sat-001`` then answers no query - not even
+    # its own spelling, which is folded before it is looked up. The key is
+    # refused here, where it is known to come from the overlay, rather than
+    # folded: folding could collapse two keys (or an overlay key and a package
+    # key) onto one entry and keep whichever merged last. The package's own
+    # robots.json keys are already folded, so only the overlay is checked here.
+    for robot_name in user_robots:
+        folded = normalize_robot_name(robot_name)
+        if folded != robot_name:
+            taken = (
+                f" (a robot named '{folded}' already exists; renaming replaces it, so choose another name to keep both)"
+                if folded in merged_robots
+                else ""
+            )
+            raise ValueError(
+                f"Robot key '{robot_name}' in {user_registry_path()} is not a lookup key: every lookup folds it "
+                f"to '{folded}', so the entry can never be found; rename it to '{folded}'{taken}"
+            )
 
     logger.debug("Merged %d user-registered robot(s) into registry", len(user_robots))
     return merged
