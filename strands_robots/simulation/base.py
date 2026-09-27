@@ -26,6 +26,7 @@ import logging
 import math
 import numbers
 import os
+import re
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -70,6 +71,7 @@ from strands_robots.utils import (
     sequence_length,
 )
 
+_VENDOR_CAPABILITY = re.compile(r"[a-z][a-z0-9_]*:[a-z0-9_][a-z0-9_.-]*")
 logger = logging.getLogger(__name__)
 
 
@@ -980,6 +982,7 @@ class SimEngine(ABC):
     # through (the same constraint :meth:`_init_ros_bridge` documents).
     _init_complete: bool = False
 
+    # Declared capability names (frozen at class creation); None derives them.
     CAPABILITIES: ClassVar[frozenset[str] | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -989,16 +992,25 @@ class SimEngine(ABC):
             **kwargs: Forwarded to the next ``__init_subclass__`` in the MRO.
 
         Raises:
-            TypeError: A declared name is unknown and not ``vendor:name``, or a
-                declared optional capability's method is still the base stub.
+            TypeError: The declaration is not a collection of str names, lacks a
+                core name, holds an unknown name that is not ``vendor:name``, or
+                claims an optional capability whose method is still the base stub.
         """
         super().__init_subclass__(**kwargs)
-        for name in cls.CAPABILITIES or ():
-            vendor, sep, rest = name.partition(":")
-            if name not in _caps.KNOWN_CAPABILITIES and not (vendor and sep and rest):
+        declared = cls.__dict__.get("CAPABILITIES")
+        if declared is None:
+            return
+        if isinstance(declared, str) or not all(isinstance(name, str) for name in declared):
+            raise TypeError(f"{cls.__name__}.CAPABILITIES must be a collection of str names, got {declared!r}")
+        cls.CAPABILITIES = declared = frozenset(declared)
+        if missing_core := set(_caps.KNOWN_CAPABILITIES[:4]) - declared:
+            raise TypeError(f"{cls.__name__}.CAPABILITIES lacks the core capabilities {sorted(missing_core)}")
+        for name in declared:
+            if name not in _caps.KNOWN_CAPABILITIES and not _VENDOR_CAPABILITY.fullmatch(name):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
             method = _caps.OPTIONAL_CAPABILITY_METHODS.get(name)
-            if method is not None and getattr(cls, method) is getattr(SimEngine, method):
+            impl = getattr(cls, method, None) if method else None
+            if method and (impl is getattr(SimEngine, method) or not callable(impl)):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but does not override {method}()")
 
     def capabilities(self) -> frozenset[str]:
@@ -6841,18 +6853,12 @@ class SimEngine(ABC):
         # than by a hand-kept list of which backend has what, so a backend that
         # gains one of these starts advertising it with no second edit, and a
         # fourth backend is held to the rule on arrival.
-        # :meth:`capabilities` applies that test, and also covers a declared profile.
-        caps = self.capabilities()
-        gated: dict[str, tuple[str, ...]] = {cap: (m,) for cap, m in _caps.OPTIONAL_CAPABILITY_METHODS.items()}
-        gated[_caps.OBJECTS], gated[_caps.RENDER] = ("add_object", "remove_object"), ("render",)
-        rollout = ("run_policy", "start_policy", "eval_policy", "evaluate_benchmark", "replay_episode")
-        gated[_caps.POLICY_ROLLOUT] = rollout
-        for cap in gated.keys() - caps:
-            for name in gated[cap]:
-                methods.pop(name, None)
+        for optional in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
+            if getattr(type(self), optional, None) is getattr(SimEngine, optional):
+                methods.pop(optional, None)
         return {
             "robots": self.list_robots(),
-            "capabilities": sorted(caps),
+            "capabilities": sorted(self.capabilities()),
             "cameras": [],  # backends override to list camera names
             "methods": methods,
             "note": (

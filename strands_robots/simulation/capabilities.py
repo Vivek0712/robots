@@ -88,6 +88,9 @@ class CapabilityNotSupported(NotImplementedError):
         self.capability = capability
         self.member = member
 
+    def __reduce__(self) -> tuple[type[CapabilityNotSupported], tuple[str, str]]:
+        return (type(self), (self.capability, self.member))
+
 
 def unsupported_result(capability: str, member: str, backend: str) -> dict[str, Any]:
     """Build the standard error result for a member the backend does not support.
@@ -116,8 +119,13 @@ def check_capabilities(sim: SimEngine, required: Iterable[str], *, caller: str) 
     Returns:
         ``None`` when every capability is present, otherwise an error result
         whose ``json`` block lists the absent names under ``missing``.
+
+    Raises:
+        TypeError: ``required`` is a single ``str`` rather than a collection.
     """
-    missing = sorted(set(required) - sim.capabilities())
+    if isinstance(required, str):
+        raise TypeError(f"required must be a collection of capability names, not the str {required!r}")
+    missing = sorted(set(required) - frozenset(sim.capabilities()))
     if not missing:
         return None
     backend = type(sim).__name__
