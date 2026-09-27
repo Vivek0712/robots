@@ -180,6 +180,19 @@ def test_declared_capability_backed_by_refusal_is_a_type_error(claimed: str) -> 
         type("X", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": wrapped})
 
 
+def test_a_partial_or_an_inherited_claim_backed_by_refusal_is_a_type_error() -> None:
+    partial = functools.partialmethod(caps.ManipulationOptional.render, "cam")
+    with pytest.raises(TypeError, match="render"):
+        type("X", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": partial})
+
+    def render(self: Any, camera_name: str = "default", width: int | None = None, height: int | None = None) -> Any:
+        return {"status": "success", "content": [{"text": camera_name}]}
+
+    parent = type("Imager", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": render})
+    with pytest.raises(TypeError, match="render"):
+        type("Reverted", (parent,), {"render": caps.ManipulationOptional.render})
+
+
 def test_mixin_backend_that_overrides_render_may_declare_it() -> None:
     def render(self: Any, camera_name: str = "default", width: int | None = None, height: int | None = None) -> Any:
         return {"status": "success", "content": [{"text": camera_name}]}

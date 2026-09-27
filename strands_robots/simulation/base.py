@@ -941,6 +941,20 @@ _MIXIN_REFUSALS = {
 }
 
 
+def _underlying(member: Any) -> Any:
+    """The function behind ``member``, through ``functools.wraps`` and partials.
+
+    A lambda or method that merely calls a refusal is not seen through; the
+    check is structural and cannot follow a call.
+    """
+    for _ in range(8):
+        member = inspect.unwrap(member)
+        if not isinstance(member, (functools.partial, functools.partialmethod)):
+            break
+        member = member.func
+    return member
+
+
 class SimEngine(ABC):
     """Abstract base class for simulation engines.
 
@@ -1017,22 +1031,24 @@ class SimEngine(ABC):
         """
         super().__init_subclass__(**kwargs)
         declared = cls.__dict__.get("CAPABILITIES")
-        if declared is None:
-            return
-        if isinstance(declared, str) or not all(isinstance(name, str) for name in declared):
-            raise TypeError(f"{cls.__name__}.CAPABILITIES must be a collection of str names, got {declared!r}")
-        cls.CAPABILITIES = declared = frozenset(declared)
-        if missing_core := set(_caps.KNOWN_CAPABILITIES[:4]) - declared:
-            raise TypeError(f"{cls.__name__}.CAPABILITIES lacks the core capabilities {sorted(missing_core)}")
-        for name in declared:
-            if name not in _caps.KNOWN_CAPABILITIES and not _VENDOR_CAPABILITY.fullmatch(name):
-                raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
+        if declared is not None:
+            if isinstance(declared, str) or not all(isinstance(name, str) for name in declared):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES must be a collection of str names, got {declared!r}")
+            cls.CAPABILITIES = declared = frozenset(declared)
+            if missing_core := set(_caps.KNOWN_CAPABILITIES[:4]) - declared:
+                raise TypeError(f"{cls.__name__}.CAPABILITIES lacks the core capabilities {sorted(missing_core)}")
+            for name in declared:
+                if name not in _caps.KNOWN_CAPABILITIES and not _VENDOR_CAPABILITY.fullmatch(name):
+                    raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
+        # The member checks run against the effective (possibly inherited)
+        # declaration, so a subclass cannot revert a member its parent claims.
+        for name in getattr(cls, "CAPABILITIES", None) or ():
             method = _caps.OPTIONAL_CAPABILITY_METHODS.get(name)
             impl = getattr(cls, method, None) if method else None
             if method and (impl is getattr(SimEngine, method) or not callable(impl)):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but does not override {method}()")
             refusals = [vars(_caps.ManipulationOptional)[m] for m in _MIXIN_REFUSALS.get(name, ())]
-            if any(inspect.unwrap(getattr(cls, m.__name__)) is m for m in refusals):
+            if any(_underlying(inspect.getattr_static(cls, m.__name__, None)) is m for m in refusals):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but keeps a ManipulationOptional refusal")
 
     def capabilities(self) -> frozenset[str]:
