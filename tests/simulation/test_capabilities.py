@@ -238,18 +238,49 @@ def _skeleton(backend: str, declared: frozenset[str] | None) -> Any:
     return sub.__new__(sub)
 
 
-@pytest.mark.parametrize("absent", sorted(_GATED))
-def test_describe_omits_methods_of_absent_capabilities(absent: str) -> None:
-    full = _skeleton("mujoco", None).describe()["methods"].keys()
-    methods = _skeleton("mujoco", frozenset(caps.KNOWN_CAPABILITIES) - {absent}).describe()["methods"].keys()
-    assert not _GATED[absent] & methods
-    assert (full & _ALL_GATED) - _GATED[absent] <= methods
+def _inherited_default(cls: type, name: str) -> bool:
+    """True when ``cls.name`` is SimEngine's own implementation or the mixin's refusal."""
+    member = inspect.getattr_static(cls, name, None)
+    defaults = (inspect.getattr_static(SimEngine, name, None), vars(caps.ManipulationOptional).get(name))
+    return member is not None and any(member is d for d in defaults if d is not None)
+
+
+@pytest.mark.parametrize("absent", sorted(caps.DEFAULT_CAPABILITIES - _CORE))
+def test_describe_omits_only_inherited_defaults_of_an_absent_capability(absent: str) -> None:
+    full = _engine()().describe()["methods"].keys()
+    engine = _engine(CAPABILITIES=caps.DEFAULT_CAPABILITIES - {absent})()
+    hidden = full - engine.describe()["methods"].keys()
+    assert hidden == {n for n in _GATED[absent] & full if _inherited_default(type(engine), n)}
 
 
 @pytest.mark.parametrize("backend", ["base", *_SKELETONS])
-def test_core_only_backend_advertises_no_gated_method(backend: str) -> None:
+def test_a_narrowed_backend_hides_only_what_it_does_not_implement(backend: str) -> None:
     def build(declared: frozenset[str] | None) -> Any:
         return _engine(CAPABILITIES=declared)() if backend == "base" else _skeleton(backend, declared)
 
-    assert build(None).describe()["methods"].keys() & _ALL_GATED
-    assert not build(_CORE).describe()["methods"].keys() & _ALL_GATED
+    core = build(_CORE)
+    hidden = build(None).describe()["methods"].keys() - core.describe()["methods"].keys()
+    assert hidden <= _ALL_GATED
+    assert all(_inherited_default(type(core), name) for name in hidden)
+    if backend == "base":
+        assert hidden
+
+
+class _Advertising(_Orbit):
+    """A joint-less backend that, like MuJoCo, adds its own entries to describe() and then prunes."""
+
+    def describe(self) -> dict[str, Any]:
+        desc = super().describe()
+        desc["methods"].update({"robot_action_keys": "(robot_name) -> list[str]", "robot_joint_names": "(r)"})
+        self._prune_absent_capability_methods(desc["methods"])
+        return desc
+
+
+def test_a_joint_less_backend_keeps_its_own_action_keys_and_drops_its_refusals() -> None:
+    inherited = _Advertising().describe()["methods"]
+    assert {"robot_action_keys", "robot_joint_names", "add_object", "render", "run_policy"}.isdisjoint(inherited)
+    burner = type("Burner", (_Advertising,), {"robot_action_keys": lambda self, robot_name: ["dv_mps", "burn_s"]})()
+    methods = burner.describe()["methods"]
+    assert "robot_action_keys" in methods and "send_action" in methods
+    assert "robot_joint_names" not in methods
+    assert burner.robot_action_keys("sat") == ["dv_mps", "burn_s"]

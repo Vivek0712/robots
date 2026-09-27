@@ -6729,10 +6729,14 @@ class SimEngine(ABC):
             return None
 
     def _prune_absent_capability_methods(self, methods: dict[str, str]) -> dict[str, str]:
-        """Drop from a ``describe()`` methods map every entry whose capability is absent.
+        """Drop from a ``describe()`` methods map what an absent capability leaves unimplemented.
 
-        Backends call it last, after adding their own entries. When
-        ``capabilities()`` cannot answer, ``methods`` is returned unchanged.
+        Backends call it last, after adding their own entries. An entry is dropped
+        only when its capability is absent AND the member is still the base
+        ``SimEngine`` implementation or the ``ManipulationOptional`` refusal: a
+        member the backend implements itself (a joint-less backend's
+        ``robot_action_keys``, say) is always advertised. When ``capabilities()``
+        cannot answer, ``methods`` is returned unchanged.
 
         Args:
             methods: The ``describe()["methods"]`` map; pruned in place.
@@ -6743,9 +6747,13 @@ class SimEngine(ABC):
         present = self._described_capabilities()
         if present is None:
             return methods
+        refusals = vars(_caps.ManipulationOptional)
         for capability, names in _DESCRIBE_GATES.items():
-            if capability not in present:
-                for name in names:
+            if capability in present:
+                continue
+            for name in names:
+                member = _underlying(inspect.getattr_static(type(self), name, None))
+                if member is None or member in (inspect.getattr_static(SimEngine, name, None), refusals.get(name)):
                     methods.pop(name, None)
         return methods
 

@@ -144,8 +144,7 @@ instead of guessing names.
 `sim.capabilities()` names what a backend supports (`describe()["capabilities"]`):
 the core `world`, `robots`, `step`, `observation`, then `joints`, `objects`,
 `render`, `policy_rollout` and six optional names. `describe()["methods"]`
-omits the members of each absent one (for `render`: `render`, `render_depth`,
-`render_all`).
+omits the members of each absent one that the backend does not implement itself.
 
 A backend without joints, objects or rendering mixes in `ManipulationOptional`
 before `SimEngine`: `add_object` / `remove_object` / `render` return an
