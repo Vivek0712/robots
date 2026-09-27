@@ -271,7 +271,7 @@ def register_robot(
         raise TypeError(f"hardware must be a dict, got {type(hardware).__name__}: {hardware!r}")
     if model_xml is not None and not isinstance(model_xml, str):
         raise TypeError(f"model_xml must be a str, got {type(model_xml).__name__}: {model_xml!r}")
-    if model_xml is not None and not model_xml.strip():
+    if model_xml is not None and not str.strip(model_xml):
         raise ValueError(f"model_xml must name a model file, got {model_xml!r}; omit it to register with no asset")
 
     # Normalize name
