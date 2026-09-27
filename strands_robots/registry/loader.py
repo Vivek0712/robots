@@ -164,6 +164,26 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     # folded: folding could collapse two keys (or an overlay key and a package
     # key) onto one entry and keep whichever merged last. The package's own
     # robots.json keys are already folded, so only the overlay is checked here.
+    _refuse_unfolded_user_keys(user_robots, merged_robots)
+
+    logger.debug("Merged %d user-registered robot(s) into registry", len(user_robots))
+    return merged
+
+
+def _refuse_unfolded_user_keys(user_robots: dict, merged_robots: dict) -> None:
+    """Refuse a user-overlay key that is not its own lookup fold.
+
+    Shared by the loader's merge and the user registry's write-time check, so a
+    write cannot persist into an overlay the next read refuses.
+
+    Args:
+        user_robots: The user overlay's robot table.
+        merged_robots: The package table overlaid with *user_robots*.
+
+    Raises:
+        ValueError: On a key that is not already folded, naming the overlay
+            file and the spelling to rename it to.
+    """
     for robot_name in user_robots:
         folded = normalize_robot_name(robot_name)
         if folded != robot_name:
@@ -176,9 +196,6 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
                 f"Robot key '{robot_name}' in {user_registry_path()} is not a lookup key: every lookup folds it "
                 f"to '{folded}', so the entry can never be found; rename it to '{folded}'{taken}"
             )
-
-    logger.debug("Merged %d user-registered robot(s) into registry", len(user_robots))
-    return merged
 
 
 def _validate(name: str, data: dict) -> None:

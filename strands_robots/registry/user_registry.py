@@ -49,7 +49,7 @@ from typing import Any
 from strands_robots.utils import resolve_asset_path, safe_join
 
 from ._overlay import parse_user_robots, user_registry_path, user_registry_source
-from .loader import _REGISTRY_DIR, _validate_robots, invalidate_cache, normalize_robot_name
+from .loader import _REGISTRY_DIR, _refuse_unfolded_user_keys, _validate_robots, invalidate_cache, normalize_robot_name
 from .robots import get_robot
 
 logger = logging.getLogger(__name__)
@@ -250,7 +250,8 @@ def register_robot(
             ``model_xml`` is omitted and *hardware* declares no backend, or
             ``scene_xml``, ``asset_dir`` or ``robot_descriptions_module`` is
             given without it.
-        TypeError: If *hardware* is given and is not a dict.
+        TypeError: If *hardware* is given and is not a dict, or *model_xml* is
+            given and is not a ``str``.
         FileNotFoundError: If ``model_xml`` doesn't exist at the resolved path.
 
     Example::
@@ -268,6 +269,8 @@ def register_robot(
     """
     if hardware is not None and not isinstance(hardware, dict):
         raise TypeError(f"hardware must be a dict, got {type(hardware).__name__}: {hardware!r}")
+    if model_xml is not None and not isinstance(model_xml, str):
+        raise TypeError(f"model_xml must be a str, got {type(model_xml).__name__}: {model_xml!r}")
     if model_xml is not None and not model_xml.strip():
         raise ValueError(f"model_xml must name a model file, got {model_xml!r}; omit it to register with no asset")
 
@@ -403,7 +406,8 @@ def _require_hardware_declaration(name: str, hardware: dict[str, Any] | None) ->
     """
     hw = hardware or {}
     lerobot_type = hw.get("lerobot_type")
-    if (isinstance(lerobot_type, str) and lerobot_type.strip()) or hw.get("driver") == "strands":
+    # str.strip, not the value's own: a str subclass may override strip().
+    if (isinstance(lerobot_type, str) and str.strip(lerobot_type)) or hw.get("driver") == "strands":
         return
     raise ValueError(
         f"Robot '{name}' is registered without model_xml, so it has no simulation asset and hardware must "
@@ -485,7 +489,8 @@ def _assert_registry_still_loads(data: dict[str, Any]) -> None:
     Raises:
         ValueError: If the merged registry would violate a uniqueness
             constraint (e.g. an alias colliding with a canonical name or
-            another robot's alias).
+            another robot's alias), or the user entries hold a key that is not
+            already folded.
     """
     pkg_path = _REGISTRY_DIR / "robots.json"
     try:
@@ -493,8 +498,10 @@ def _assert_registry_still_loads(data: dict[str, Any]) -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         pkg = {}
 
+    user_robots = data.get("robots", {})
     merged = dict(pkg.get("robots", {}))
-    merged.update(data.get("robots", {}))
+    merged.update(user_robots)
+    _refuse_unfolded_user_keys(user_robots, merged)
     _validate_robots({"robots": merged})
 
 

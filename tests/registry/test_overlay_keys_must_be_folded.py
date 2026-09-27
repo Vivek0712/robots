@@ -91,3 +91,14 @@ def test_a_folded_overlay_key_still_loads_and_answers_every_spelling(tmp_path: P
         entry = get_robot(query)
         assert entry is not None, f"{query!r} reached no robot"
         assert entry["description"] == "folded"
+
+
+def test_register_robot_refuses_to_write_while_an_unfolded_key_is_present(tmp_path: Path) -> None:
+    """The write-time check mirrors the load: it does not persist into a registry that cannot load."""
+    from strands_robots.registry.user_registry import register_robot
+
+    path = _write_overlay(tmp_path, {"sat-001": _entry()})
+    before = path.read_text()
+    with pytest.raises(ValueError, match="rename it to 'sat_001'"):
+        register_robot("orbiter", hardware={"driver": "strands"}, overwrite=True)
+    assert path.read_text() == before
