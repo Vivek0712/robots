@@ -134,7 +134,8 @@ Destructive - writes into model arrays. Recompile the scene to undo.
 | `register_urdf(name, path)` | Register an additional asset - it is named by `list_urdfs` from then on |
 | `get_features(robot_name=None)` | Joint / actuator / camera / robot names of the scene (scoped with `robot_name`) - the source of truth for the action keys a policy must emit, and the feature schema used for recording |
 
-Every verb above is listed in `sim.describe()["methods"]`, so an agent builds a
+Every verb above is listed in `sim.describe()["methods"]` (on a backend that
+has the capability; see [Capabilities](#capabilities) below), so an agent builds a
 scene, renders it, snapshots it and reads its features from one `describe()` call
 instead of guessing names.
 
@@ -142,7 +143,9 @@ instead of guessing names.
 
 `sim.capabilities()` names what a backend supports (`describe()["capabilities"]`):
 the core `world`, `robots`, `step`, `observation`, then `joints`, `objects`,
-`render`, `policy_rollout` and six optional names.
+`render`, `policy_rollout` and six optional names. `describe()["methods"]`
+omits the members of each absent one (for `render`: `render`, `render_depth`,
+`render_all`).
 
 A backend without joints, objects or rendering mixes in `ManipulationOptional`
 before `SimEngine`: `add_object` / `remove_object` / `render` return an

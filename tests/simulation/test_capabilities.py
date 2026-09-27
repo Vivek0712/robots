@@ -9,6 +9,7 @@ import inspect
 import pickle
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -187,3 +188,55 @@ def test_mixin_backend_that_overrides_render_may_declare_it() -> None:
     engine = type("Imager", (_Orbit,), {"CAPABILITIES": declared, "render": render})()
     assert engine.capabilities() == _CORE | {caps.RENDER}
     assert engine.render()["status"] == "success"
+
+
+#: Hand-written, independent of the source table: what describe() must drop per absent capability.
+_GATED = {
+    "joints": {"robot_joint_names", "robot_action_keys", "set_joint_positions", "set_joint_velocities"},
+    "objects": {"add_object", "remove_object", "list_objects", "move_object"},
+    "render": {"render", "render_depth", "render_all"},
+    "policy_rollout": {"run_policy", "start_policy", "eval_policy", "evaluate_benchmark", "replay_episode"}
+    | {"run_multi_policy"},
+    "load_scene": {"load_scene"},
+    "randomize": {"randomize"},
+    "obs_noise": {"set_obs_noise"},
+    "contacts": {"get_contacts"},
+    "frames": {"get_frame"},
+    "camera_params": {"get_camera_params"},
+}
+_ALL_GATED = set().union(*_GATED.values())
+# The minimum each describe() reads on a ``__new__`` instance: no world, model, GPU or Kit app.
+_SKELETONS: dict[str, tuple[str, dict[str, Any]]] = {
+    "mujoco": ("MuJoCoSimEngine", {}),
+    "newton": (
+        "NewtonSimEngine",
+        {"list_cameras": lambda self: [], "device": None, "_model": None, "_solver_name": "x"},
+    ),
+    "isaac": ("IsaacSimulation", {"_cameras": {}, "_world_created": False}),
+}
+
+
+def _skeleton(backend: str, declared: frozenset[str] | None) -> Any:
+    name, attrs = _SKELETONS[backend]
+    engine_cls = getattr(importlib.import_module(f"strands_robots.simulation.{backend}.simulation"), name)
+    wp = types.SimpleNamespace(get_device=lambda *a: "cpu")
+    body: dict[str, Any] = {"CAPABILITIES": declared, "list_robots": lambda self: [], "_wp": wp}
+    sub: Any = type(f"Core{name}", (engine_cls,), {**body, "_world": None, "default_timestep": 0.01, **attrs})
+    return sub.__new__(sub)
+
+
+@pytest.mark.parametrize("absent", sorted(_GATED))
+def test_describe_omits_methods_of_absent_capabilities(absent: str) -> None:
+    full = _skeleton("mujoco", None).describe()["methods"].keys()
+    methods = _skeleton("mujoco", frozenset(caps.KNOWN_CAPABILITIES) - {absent}).describe()["methods"].keys()
+    assert not _GATED[absent] & methods
+    assert (full & _ALL_GATED) - _GATED[absent] <= methods
+
+
+@pytest.mark.parametrize("backend", ["base", *_SKELETONS])
+def test_core_only_backend_advertises_no_gated_method(backend: str) -> None:
+    def build(declared: frozenset[str] | None) -> Any:
+        return _engine(CAPABILITIES=declared)() if backend == "base" else _skeleton(backend, declared)
+
+    assert build(None).describe()["methods"].keys() & _ALL_GATED
+    assert not build(_CORE).describe()["methods"].keys() & _ALL_GATED

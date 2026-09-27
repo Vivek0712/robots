@@ -9708,6 +9708,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 ),
             }
         )
+        self._prune_absent_capability_methods(desc["methods"])
         return desc
 
     def cleanup(self) -> None:

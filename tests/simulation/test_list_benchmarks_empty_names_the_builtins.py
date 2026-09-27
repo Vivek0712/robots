@@ -34,6 +34,7 @@ class _Engine:
     describe = _Base.describe
     capabilities = _Base.capabilities
     _described_capabilities = _Base._described_capabilities
+    _prune_absent_capability_methods = _Base._prune_absent_capability_methods
 
     def list_robots(self):
         return []

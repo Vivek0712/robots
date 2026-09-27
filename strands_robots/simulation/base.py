@@ -922,6 +922,17 @@ def _bundled_benchmark_roster() -> str:
     return ", ".join(f"{name} ({specs[name]['default_robot']})" for name in sorted(specs))
 
 
+#: Capability -> the ``describe()`` entries advertised only when it is present; a name a backend
+#: does not advertise is simply absent.
+_DESCRIBE_GATES: dict[str, tuple[str, ...]] = {
+    _caps.JOINTS: ("robot_joint_names", "robot_action_keys", "set_joint_positions", "set_joint_velocities"),
+    _caps.OBJECTS: ("add_object", "remove_object", "list_objects", "move_object"),
+    _caps.RENDER: ("render", "render_depth", "render_all"),
+    _caps.POLICY_ROLLOUT: ("run_policy", "start_policy", "eval_policy", "evaluate_benchmark", "replay_episode")
+    + ("run_multi_policy",),
+    **{name: (method,) for name, method in _caps.OPTIONAL_CAPABILITY_METHODS.items()},
+}
+
 #: Capability -> the ``ManipulationOptional`` members that refuse it; claiming it needs overrides.
 _MIXIN_REFUSALS = {
     _caps.OBJECTS: ("add_object", "remove_object"),
@@ -6701,6 +6712,27 @@ class SimEngine(ABC):
         except TypeError:
             return None
 
+    def _prune_absent_capability_methods(self, methods: dict[str, str]) -> dict[str, str]:
+        """Drop from a ``describe()`` methods map every entry whose capability is absent.
+
+        Backends call it last, after adding their own entries. When
+        ``capabilities()`` cannot answer, ``methods`` is returned unchanged.
+
+        Args:
+            methods: The ``describe()["methods"]`` map; pruned in place.
+
+        Returns:
+            The same ``methods`` map.
+        """
+        present = self._described_capabilities()
+        if present is None:
+            return methods
+        for capability, names in _DESCRIBE_GATES.items():
+            if capability not in present:
+                for name in names:
+                    methods.pop(name, None)
+        return methods
+
     def describe(self) -> dict[str, Any]:
         """Return a machine-readable summary of this engine's live contract.
 
@@ -6875,6 +6907,7 @@ class SimEngine(ABC):
         # than by a hand-kept list of which backend has what, so a backend that
         # gains one of these starts advertising it with no second edit, and a
         # fourth backend is held to the rule on arrival.
+        # Kept beside _prune_absent_capability_methods: it still applies when capabilities() cannot answer.
         for optional in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
             if getattr(type(self), optional, None) is getattr(SimEngine, optional):
                 methods.pop(optional, None)
@@ -6882,7 +6915,7 @@ class SimEngine(ABC):
             "robots": self.list_robots(),
             "capabilities": self._described_capabilities(),
             "cameras": [],  # backends override to list camera names
-            "methods": methods,
+            "methods": self._prune_absent_capability_methods(methods),
             "note": (
                 "robot_name defaults to the sole robot when only one exists "
                 "for get_observation, send_action, get_robot_state, run_policy, "
