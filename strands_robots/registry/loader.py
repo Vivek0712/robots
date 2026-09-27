@@ -162,8 +162,8 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     # its own spelling, which is folded before it is looked up. The key is
     # refused here, where it is known to come from the overlay, rather than
     # folded: folding could collapse two keys (or an overlay key and a package
-    # key) onto one entry and keep whichever merged last. Package keys are held
-    # to the same fold by tests/registry/test_integrity.py.
+    # key) onto one entry and keep whichever merged last. The package's own
+    # robots.json keys are already folded, so only the overlay is checked here.
     for robot_name in user_robots:
         folded = normalize_robot_name(robot_name)
         if folded != robot_name:
