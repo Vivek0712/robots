@@ -26,10 +26,11 @@ import logging
 import math
 import numbers
 import os
+import re
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, SupportsFloat, cast
+from typing import TYPE_CHECKING, Any, ClassVar, SupportsFloat, cast
 
 if TYPE_CHECKING:
     import numpy as np
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 # AST). Instead, we reference ``OnFrame`` in the ``evaluate_benchmark``
 # signature as a *string* annotation; ``from __future__ import
 # annotations`` (already in effect) makes that a no-op at runtime.
+from strands_robots.simulation import capabilities as _caps
 from strands_robots.simulation.observers import RunPolicyObserver
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 from strands_robots.utils import (
@@ -69,6 +71,7 @@ from strands_robots.utils import (
     sequence_length,
 )
 
+_VENDOR_CAPABILITY = re.compile(r"[a-z][a-z0-9_]*:[a-z0-9_][a-z0-9_.-]*")
 logger = logging.getLogger(__name__)
 
 
@@ -978,6 +981,50 @@ class SimEngine(ABC):
     # subclasses and test doubles need not thread ``super().__init__()``
     # through (the same constraint :meth:`_init_ros_bridge` documents).
     _init_complete: bool = False
+
+    # Declared capability names (frozen at class creation); None derives them.
+    CAPABILITIES: ClassVar[frozenset[str] | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Reject a ``CAPABILITIES`` declaration the class cannot honour.
+
+        Args:
+            **kwargs: Forwarded to the next ``__init_subclass__`` in the MRO.
+
+        Raises:
+            TypeError: The declaration is not a collection of str names, lacks a
+                core name, holds an unknown name that is not ``vendor:name``, or
+                claims an optional capability whose method is still the base stub.
+        """
+        super().__init_subclass__(**kwargs)
+        declared = cls.__dict__.get("CAPABILITIES")
+        if declared is None:
+            return
+        if isinstance(declared, str) or not all(isinstance(name, str) for name in declared):
+            raise TypeError(f"{cls.__name__}.CAPABILITIES must be a collection of str names, got {declared!r}")
+        cls.CAPABILITIES = declared = frozenset(declared)
+        if missing_core := set(_caps.KNOWN_CAPABILITIES[:4]) - declared:
+            raise TypeError(f"{cls.__name__}.CAPABILITIES lacks the core capabilities {sorted(missing_core)}")
+        for name in declared:
+            if name not in _caps.KNOWN_CAPABILITIES and not _VENDOR_CAPABILITY.fullmatch(name):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
+            method = _caps.OPTIONAL_CAPABILITY_METHODS.get(name)
+            impl = getattr(cls, method, None) if method else None
+            if method and (impl is getattr(SimEngine, method) or not callable(impl)):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but does not override {method}()")
+
+    def capabilities(self) -> frozenset[str]:
+        """Return ``CAPABILITIES``, or derive it: the default set plus each overridden optional method.
+
+        Returns:
+            Frozen set of names from :mod:`strands_robots.simulation.capabilities`.
+        """
+        declared = getattr(type(self), "CAPABILITIES", None)
+        if declared is not None:
+            return frozenset(declared)
+        stubs = {c: getattr(SimEngine, m) for c, m in _caps.OPTIONAL_CAPABILITY_METHODS.items()}
+        optional = {c for c, stub in stubs.items() if getattr(type(self), stub.__name__, stub) is not stub}
+        return _caps.DEFAULT_CAPABILITIES | optional
 
     def _init_ros_bridge(self, *, ros2_bridge: bool = False, ros2_domain: int = 0) -> None:
         """Initialize the optional ROS 2 telemetry bridge state.
@@ -6632,6 +6679,17 @@ class SimEngine(ABC):
 
     # Discovery / introspection
 
+    def _described_capabilities(self) -> list[str] | None:
+        """``capabilities()`` for ``describe()``, or ``None`` when it cannot answer.
+
+        A third-party backend may already define its own ``capabilities`` with
+        another shape; ``describe()`` reports ``None`` for it rather than failing.
+        """
+        try:
+            return sorted(self.capabilities())
+        except TypeError:
+            return None
+
     def describe(self) -> dict[str, Any]:
         """Return a machine-readable summary of this engine's live contract.
 
@@ -6640,7 +6698,7 @@ class SimEngine(ABC):
         in a single call, instead of guessing method names.
 
         Returns:
-            Plain dict with keys: robots, cameras, methods, note.
+            Plain dict with keys: robots, capabilities, cameras, methods, note.
         """
         methods: dict[str, str] = {
             "get_robot_state": "(robot_name: str) -> dict",
@@ -6811,6 +6869,7 @@ class SimEngine(ABC):
                 methods.pop(optional, None)
         return {
             "robots": self.list_robots(),
+            "capabilities": self._described_capabilities(),
             "cameras": [],  # backends override to list camera names
             "methods": methods,
             "note": (
