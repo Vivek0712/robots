@@ -89,3 +89,19 @@ def test_sim_mode_on_an_asset_less_robot_fails_with_a_clear_error():
     register_robot("orbiter", hardware={"driver": "strands"})
     with pytest.raises(RuntimeError, match="'orbiter' is registered for real hardware only"):
         Robot("orbiter", mode="sim")
+
+
+@pytest.mark.parametrize("model_xml", [5, pytest.param(__import__("pathlib").Path("m.xml"), id="path")])
+def test_a_model_xml_that_is_not_a_str_is_a_type_error(model_xml):
+    with pytest.raises(TypeError, match="model_xml must be a str"):
+        register_robot("orbiter", model_xml=model_xml, hardware={"driver": "strands"})
+    assert not user_registry_path().exists()
+
+
+def test_a_str_subclass_cannot_pass_a_blank_lerobot_type():
+    class Padded(str):
+        def strip(self, chars=None):  # type: ignore[override]
+            return "not blank"
+
+    with pytest.raises(ValueError, match="hardware must declare"):
+        register_robot("orbiter", hardware={"lerobot_type": Padded("   ")})
