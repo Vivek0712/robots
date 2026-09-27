@@ -1577,7 +1577,7 @@ class SimEngine(ABC):
         return outcome, None
 
     def _effective_capabilities(self) -> frozenset[str]:
-        """``capabilities()``, or the derived set when a backend's own member of that name has another shape.
+        """``capabilities()``, or the derived set when a backend's own member of that name has another shape or raises.
 
         Returns:
             The declared names when ``capabilities()`` returns a set of str, else
@@ -1586,7 +1586,7 @@ class SimEngine(ABC):
         own: object
         try:
             own = self.capabilities()
-        except TypeError as exc:
+        except Exception as exc:  # noqa: BLE001 - a foreign member of this name may raise anything; fall back
             own = exc
         if isinstance(own, (set, frozenset)) and all(isinstance(name, str) for name in own):
             return frozenset(own)
@@ -6813,11 +6813,13 @@ class SimEngine(ABC):
         """``capabilities()`` for ``describe()``, or ``None`` when it cannot answer.
 
         A third-party backend may already define its own ``capabilities`` with
-        another shape; ``describe()`` reports ``None`` for it rather than failing.
+        another shape, or one that raises; ``describe()`` reports ``None`` for it
+        rather than failing, so the "call this first" entry point never crashes.
         """
         try:
             return sorted(self.capabilities())
-        except TypeError:
+        except Exception:  # noqa: BLE001 - a foreign member of this name may raise anything; describe() is advisory
+            logger.debug("%s.capabilities() could not be read for describe()", type(self).__name__, exc_info=True)
             return None
 
     def _prune_absent_capability_methods(self, methods: dict[str, str]) -> dict[str, str]:

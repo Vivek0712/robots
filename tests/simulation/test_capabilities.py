@@ -410,10 +410,14 @@ def test_run_policy_continues_as_today_when_action_keys_raise_another_error(monk
         engine.eval_policy("arm")
 
 
-@pytest.mark.parametrize("clash", [["legacy"], lambda self: None, lambda self: {caps.JOINTS: False}])
+_CLASHES = [["legacy"], lambda self: None, lambda self: {caps.JOINTS: False}, _raise(RuntimeError("not ready"))]
+
+
+@pytest.mark.parametrize("clash", _CLASHES)
 def test_a_clashing_capabilities_member_falls_back_to_the_derived_set(clash: Any, monkeypatch: Any) -> None:
     reached: list[str] = []
     engine = _armed(monkeypatch, reached, capabilities=clash)
+    assert engine.describe()["capabilities"] in (None, [caps.JOINTS])
     assert engine.run_policy("arm")["content"][0]["text"] == "x"
     engine._ros_bridge = type("Bridge", (), {"publish_joint_states": lambda *a: reached.append("joints")})()
     engine._publish_ros_telemetry(skip_images=True)
