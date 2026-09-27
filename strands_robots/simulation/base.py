@@ -922,6 +922,14 @@ def _bundled_benchmark_roster() -> str:
     return ", ".join(f"{name} ({specs[name]['default_robot']})" for name in sorted(specs))
 
 
+#: Capability -> the ``ManipulationOptional`` members that refuse it; claiming it needs overrides.
+_MIXIN_REFUSALS = {
+    _caps.OBJECTS: ("add_object", "remove_object"),
+    _caps.RENDER: ("render",),
+    _caps.JOINTS: ("robot_joint_names",),
+}
+
+
 class SimEngine(ABC):
     """Abstract base class for simulation engines.
 
@@ -994,7 +1002,7 @@ class SimEngine(ABC):
         Raises:
             TypeError: The declaration is not a collection of str names, lacks a
                 core name, holds an unknown name that is not ``vendor:name``, or
-                claims an optional capability whose method is still the base stub.
+                claims a capability whose method is a base stub or mixin refusal.
         """
         super().__init_subclass__(**kwargs)
         declared = cls.__dict__.get("CAPABILITIES")
@@ -1012,6 +1020,9 @@ class SimEngine(ABC):
             impl = getattr(cls, method, None) if method else None
             if method and (impl is getattr(SimEngine, method) or not callable(impl)):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but does not override {method}()")
+            refusals = [vars(_caps.ManipulationOptional)[m] for m in _MIXIN_REFUSALS.get(name, ())]
+            if any(inspect.unwrap(getattr(cls, m.__name__)) is m for m in refusals):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but keeps a ManipulationOptional refusal")
 
     def capabilities(self) -> frozenset[str]:
         """Return ``CAPABILITIES``, or derive it: the default set plus each overridden optional method.

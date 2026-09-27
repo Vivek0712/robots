@@ -138,6 +138,25 @@ Every verb above is listed in `sim.describe()["methods"]`, so an agent builds a
 scene, renders it, snapshots it and reads its features from one `describe()` call
 instead of guessing names.
 
+## Capabilities
+
+`sim.capabilities()` names what a backend supports (`describe()["capabilities"]`):
+the core `world`, `robots`, `step`, `observation`, then `joints`, `objects`,
+`render`, `policy_rollout` and six optional names.
+
+A backend without joints, objects or rendering mixes in `ManipulationOptional`
+before `SimEngine`: `add_object` / `remove_object` / `render` return an
+`unsupported_by_backend` error and `robot_joint_names` raises
+`CapabilityNotSupported`. Declaring `objects`, `render` or `joints` while the
+refusal is inherited raises `TypeError` at class creation. Callers check first:
+
+```python
+from strands_robots.simulation.capabilities import JOINTS, check_capabilities
+
+def joint_names(sim):
+    return check_capabilities(sim, [JOINTS], caller="joint_names") or sim.robot_joint_names("arm")
+```
+
 ## See also
 
 - [Physics and actions](physics.md) - stepping, contacts, forces, state writes, `send_action`.
