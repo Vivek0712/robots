@@ -6679,6 +6679,17 @@ class SimEngine(ABC):
 
     # Discovery / introspection
 
+    def _described_capabilities(self) -> list[str] | None:
+        """``capabilities()`` for ``describe()``, or ``None`` when it cannot answer.
+
+        A third-party backend may already define its own ``capabilities`` with
+        another shape; ``describe()`` reports ``None`` for it rather than failing.
+        """
+        try:
+            return sorted(self.capabilities())
+        except TypeError:
+            return None
+
     def describe(self) -> dict[str, Any]:
         """Return a machine-readable summary of this engine's live contract.
 
@@ -6858,7 +6869,7 @@ class SimEngine(ABC):
                 methods.pop(optional, None)
         return {
             "robots": self.list_robots(),
-            "capabilities": sorted(self.capabilities()),
+            "capabilities": self._described_capabilities(),
             "cameras": [],  # backends override to list camera names
             "methods": methods,
             "note": (

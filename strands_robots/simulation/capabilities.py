@@ -2,16 +2,18 @@
 
 The names form a closed set; a backend may add ``"<vendor>:<name>"`` extras. A
 missing capability is reported with :data:`UNSUPPORTED_BY_BACKEND`, which no
-operator grant can lift, so it is not a continuable refusal code. Pure stdlib.
+operator grant can lift, so it is not a continuable refusal code. A declaration
+must name the four core capabilities (world, robots, step, observation); an
+undeclared backend is credited with all eight names of
+:data:`DEFAULT_CAPABILITIES`. Pure stdlib, and it imports nothing from the
+package, so the engine is described by :class:`CapabilityReporter` rather than
+by the base class.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from strands_robots.simulation.base import SimEngine
+from typing import Any, Protocol
 
 __all__ = [
     "CAMERA_PARAMS",
@@ -32,9 +34,8 @@ __all__ = [
     "STEP",
     "UNSUPPORTED_BY_BACKEND",
     "WORLD",
-    "CapabilityNotSupported",
+    "CapabilityReporter",
     "check_capabilities",
-    "unsupported_result",
 ]
 
 WORLD = "world"
@@ -71,48 +72,19 @@ OPTIONAL_CAPABILITY_METHODS: dict[str, str] = {
 UNSUPPORTED_BY_BACKEND = "unsupported_by_backend"
 
 
-class CapabilityNotSupported(NotImplementedError):
-    """A member was called on a backend that lacks the capability it needs.
+class CapabilityReporter(Protocol):
+    """Anything that reports its capabilities, such as a ``SimEngine``."""
 
-    Raised only by list-returning members; others return :func:`unsupported_result`.
-
-    Args:
-        capability: The missing capability name.
-        member: The ``SimEngine`` member that was called.
-    """
-
-    code: str = UNSUPPORTED_BY_BACKEND
-
-    def __init__(self, capability: str, member: str) -> None:
-        super().__init__(f"{member} needs the {capability!r} capability, which this backend does not support")
-        self.capability = capability
-        self.member = member
-
-    def __reduce__(self) -> tuple[type[CapabilityNotSupported], tuple[str, str]]:
-        return (type(self), (self.capability, self.member))
+    def capabilities(self) -> frozenset[str]:
+        """Return the capability names this object supports."""
+        ...
 
 
-def unsupported_result(capability: str, member: str, backend: str) -> dict[str, Any]:
-    """Build the standard error result for a member the backend does not support.
-
-    Args:
-        capability: The missing capability name.
-        member: The ``SimEngine`` member that was called.
-        backend: The backend's name, usually its class name.
-
-    Returns:
-        A tool-result dict with ``status="error"`` and a ``json`` block carrying
-        ``code``, ``capability``, ``member`` and ``backend``.
-    """
-    text = f"{backend} does not support {member}: it lacks the {capability!r} capability."
-    return _error(text, capability=capability, member=member, backend=backend)
-
-
-def check_capabilities(sim: SimEngine, required: Iterable[str], *, caller: str) -> dict[str, Any] | None:
+def check_capabilities(sim: CapabilityReporter, required: Iterable[str], *, caller: str) -> dict[str, Any] | None:
     """Check that ``sim`` has every capability in ``required``.
 
     Args:
-        sim: The engine to check.
+        sim: The engine to check; any object with a ``capabilities()`` method.
         required: Capability names the caller needs.
         caller: The member or tool doing the check, named in the result.
 

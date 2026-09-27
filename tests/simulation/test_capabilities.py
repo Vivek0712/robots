@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
-import pickle
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -58,19 +59,6 @@ def test_invalid_declaration_is_a_type_error_and_a_valid_one_is_frozen(declared:
     assert engine_cls.CAPABILITIES == frozenset(_CORE | {"acme:eclipse"})
 
 
-def test_unsupported_result_and_exception_carry_the_stable_code() -> None:
-    result = caps.unsupported_result(caps.OBJECTS, "add_object", "OrbitSim")
-    assert_strands_tool_result(result)
-    assert result["status"] == "error"
-    expected = {"code": caps.UNSUPPORTED_BY_BACKEND, "capability": caps.OBJECTS}
-    assert tool_json(result) == {**expected, "member": "add_object", "backend": "OrbitSim"}
-    err = caps.CapabilityNotSupported(caps.JOINTS, "robot_joint_names")
-    assert isinstance(err, NotImplementedError)
-    assert (err.code, err.capability, err.member) == (caps.UNSUPPORTED_BY_BACKEND, caps.JOINTS, "robot_joint_names")
-    copy = pickle.loads(pickle.dumps(err))
-    assert (type(copy), copy.capability, copy.member, str(copy)) == (type(err), err.capability, err.member, str(err))
-
-
 def test_check_capabilities_names_the_missing_ones() -> None:
     needed = [caps.POLICY_ROLLOUT, caps.JOINTS]
     assert caps.check_capabilities(_engine()(), needed, caller="run_policy") is None
@@ -94,3 +82,16 @@ def test_vocabulary_module_imports_no_heavy_dependency() -> None:
     )
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
+
+
+def test_any_engine_like_object_is_checked_and_a_clashing_name_does_not_break_describe() -> None:
+    class Reporter:
+        def capabilities(self) -> frozenset[str]:
+            return _CORE
+
+    assert tool_json(caps.check_capabilities(Reporter(), [caps.JOINTS], caller="x"))["missing"] == [caps.JOINTS]
+    assert _engine(capabilities=["legacy"])().describe()["capabilities"] is None
+    tree = ast.parse(Path(caps.__file__).read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(n, ast.ImportFrom) and (n.module or "").startswith("strands_robots") for n in ast.walk(tree)
+    )
