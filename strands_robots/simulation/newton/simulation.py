@@ -2606,7 +2606,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         """
         device = str(self._wp.get_device(self.device)) if self.device else str(self._wp.get_device())
         bodies = list(self._model.body_label) if self._model is not None else []
-        return {
+        described: dict[str, Any] = {
             "backend": "newton",
             "solver": self._solver_name,
             "available_solvers": sorted(articulated_solvers()),
@@ -2755,6 +2755,8 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 "With multiple robots, pass robot_name explicitly (from 'robots')."
             ),
         }
+        self._prune_absent_capability_methods(described["methods"])
+        return described
 
     def _request_policy_stop(self, robot_name: str) -> bool | None:
         """Newton override: move this robot's rollout claim out of date.

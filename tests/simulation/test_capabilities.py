@@ -9,6 +9,7 @@ import inspect
 import pickle
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +180,19 @@ def test_declared_capability_backed_by_refusal_is_a_type_error(claimed: str) -> 
         type("X", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": wrapped})
 
 
+def test_a_partial_or_an_inherited_claim_backed_by_refusal_is_a_type_error() -> None:
+    partial = functools.partialmethod(caps.ManipulationOptional.render, "cam")
+    with pytest.raises(TypeError, match="render"):
+        type("X", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": partial})
+
+    def render(self: Any, camera_name: str = "default", width: int | None = None, height: int | None = None) -> Any:
+        return {"status": "success", "content": [{"text": camera_name}]}
+
+    parent = type("Imager", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": render})
+    with pytest.raises(TypeError, match="render"):
+        type("Reverted", (parent,), {"render": caps.ManipulationOptional.render})
+
+
 def test_mixin_backend_that_overrides_render_may_declare_it() -> None:
     def render(self: Any, camera_name: str = "default", width: int | None = None, height: int | None = None) -> Any:
         return {"status": "success", "content": [{"text": camera_name}]}
@@ -187,3 +201,86 @@ def test_mixin_backend_that_overrides_render_may_declare_it() -> None:
     engine = type("Imager", (_Orbit,), {"CAPABILITIES": declared, "render": render})()
     assert engine.capabilities() == _CORE | {caps.RENDER}
     assert engine.render()["status"] == "success"
+
+
+#: Hand-written, independent of the source table: what describe() must drop per absent capability.
+_GATED = {
+    "joints": {"robot_joint_names", "robot_action_keys", "set_joint_positions", "set_joint_velocities"},
+    "objects": {"add_object", "remove_object", "list_objects", "move_object"},
+    "render": {"render", "render_depth", "render_all"},
+    "policy_rollout": {"run_policy", "start_policy", "eval_policy", "evaluate_benchmark", "replay_episode"}
+    | {"run_multi_policy"},
+    "load_scene": {"load_scene"},
+    "randomize": {"randomize"},
+    "obs_noise": {"set_obs_noise"},
+    "contacts": {"get_contacts"},
+    "frames": {"get_frame"},
+    "camera_params": {"get_camera_params"},
+}
+_ALL_GATED = set().union(*_GATED.values())
+# The minimum each describe() reads on a ``__new__`` instance: no world, model, GPU or Kit app.
+_SKELETONS: dict[str, tuple[str, dict[str, Any]]] = {
+    "mujoco": ("MuJoCoSimEngine", {}),
+    "newton": (
+        "NewtonSimEngine",
+        {"list_cameras": lambda self: [], "device": None, "_model": None, "_solver_name": "x"},
+    ),
+    "isaac": ("IsaacSimulation", {"_cameras": {}, "_world_created": False}),
+}
+
+
+def _skeleton(backend: str, declared: frozenset[str] | None) -> Any:
+    name, attrs = _SKELETONS[backend]
+    engine_cls = getattr(importlib.import_module(f"strands_robots.simulation.{backend}.simulation"), name)
+    wp = types.SimpleNamespace(get_device=lambda *a: "cpu")
+    body: dict[str, Any] = {"CAPABILITIES": declared, "list_robots": lambda self: [], "_wp": wp}
+    sub: Any = type(f"Core{name}", (engine_cls,), {**body, "_world": None, "default_timestep": 0.01, **attrs})
+    return sub.__new__(sub)
+
+
+def _inherited_default(cls: type, name: str) -> bool:
+    """True when ``cls.name`` is SimEngine's own implementation or the mixin's refusal."""
+    member = inspect.getattr_static(cls, name, None)
+    defaults = (inspect.getattr_static(SimEngine, name, None), vars(caps.ManipulationOptional).get(name))
+    return member is not None and any(member is d for d in defaults if d is not None)
+
+
+@pytest.mark.parametrize("absent", sorted(caps.DEFAULT_CAPABILITIES - _CORE))
+def test_describe_omits_only_inherited_defaults_of_an_absent_capability(absent: str) -> None:
+    full = _engine()().describe()["methods"].keys()
+    engine = _engine(CAPABILITIES=caps.DEFAULT_CAPABILITIES - {absent})()
+    hidden = full - engine.describe()["methods"].keys()
+    assert hidden == {n for n in _GATED[absent] & full if _inherited_default(type(engine), n)}
+
+
+@pytest.mark.parametrize("backend", ["base", *_SKELETONS])
+def test_a_narrowed_backend_hides_only_what_it_does_not_implement(backend: str) -> None:
+    def build(declared: frozenset[str] | None) -> Any:
+        return _engine(CAPABILITIES=declared)() if backend == "base" else _skeleton(backend, declared)
+
+    core = build(_CORE)
+    hidden = build(None).describe()["methods"].keys() - core.describe()["methods"].keys()
+    assert hidden <= _ALL_GATED
+    assert all(_inherited_default(type(core), name) for name in hidden)
+    if backend == "base":
+        assert hidden
+
+
+class _Advertising(_Orbit):
+    """A joint-less backend that, like MuJoCo, adds its own entries to describe() and then prunes."""
+
+    def describe(self) -> dict[str, Any]:
+        desc = super().describe()
+        desc["methods"].update({"robot_action_keys": "(robot_name) -> list[str]", "robot_joint_names": "(r)"})
+        self._prune_absent_capability_methods(desc["methods"])
+        return desc
+
+
+def test_a_joint_less_backend_keeps_its_own_action_keys_and_drops_its_refusals() -> None:
+    inherited = _Advertising().describe()["methods"]
+    assert {"robot_action_keys", "robot_joint_names", "add_object", "render", "run_policy"}.isdisjoint(inherited)
+    burner = type("Burner", (_Advertising,), {"robot_action_keys": lambda self, robot_name: ["dv_mps", "burn_s"]})()
+    methods = burner.describe()["methods"]
+    assert "robot_action_keys" in methods and "send_action" in methods
+    assert "robot_joint_names" not in methods
+    assert burner.robot_action_keys("sat") == ["dv_mps", "burn_s"]

@@ -4142,6 +4142,7 @@ class MuJoCoSimEngine(
         else:
             base["world_created"] = False
 
+        self._prune_absent_capability_methods(base["methods"])
         return base
 
     def get_robot_state(self, robot_name: str | None = None) -> dict[str, Any]:

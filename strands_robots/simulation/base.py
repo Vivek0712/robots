@@ -922,12 +922,37 @@ def _bundled_benchmark_roster() -> str:
     return ", ".join(f"{name} ({specs[name]['default_robot']})" for name in sorted(specs))
 
 
+#: Capability -> the ``describe()`` entries advertised only when it is present; a name a backend
+#: does not advertise is simply absent.
+_DESCRIBE_GATES: dict[str, tuple[str, ...]] = {
+    _caps.JOINTS: ("robot_joint_names", "robot_action_keys", "set_joint_positions", "set_joint_velocities"),
+    _caps.OBJECTS: ("add_object", "remove_object", "list_objects", "move_object"),
+    _caps.RENDER: ("render", "render_depth", "render_all"),
+    _caps.POLICY_ROLLOUT: ("run_policy", "start_policy", "eval_policy", "evaluate_benchmark", "replay_episode")
+    + ("run_multi_policy",),
+    **{name: (method,) for name, method in _caps.OPTIONAL_CAPABILITY_METHODS.items()},
+}
+
 #: Capability -> the ``ManipulationOptional`` members that refuse it; claiming it needs overrides.
 _MIXIN_REFUSALS = {
     _caps.OBJECTS: ("add_object", "remove_object"),
     _caps.RENDER: ("render",),
     _caps.JOINTS: ("robot_joint_names",),
 }
+
+
+def _underlying(member: Any) -> Any:
+    """The function behind ``member``, through ``functools.wraps`` and partials.
+
+    A lambda or method that merely calls a refusal is not seen through; the
+    check is structural and cannot follow a call.
+    """
+    for _ in range(8):
+        member = inspect.unwrap(member)
+        if not isinstance(member, (functools.partial, functools.partialmethod)):
+            break
+        member = member.func
+    return member
 
 
 class SimEngine(ABC):
@@ -1006,22 +1031,24 @@ class SimEngine(ABC):
         """
         super().__init_subclass__(**kwargs)
         declared = cls.__dict__.get("CAPABILITIES")
-        if declared is None:
-            return
-        if isinstance(declared, str) or not all(isinstance(name, str) for name in declared):
-            raise TypeError(f"{cls.__name__}.CAPABILITIES must be a collection of str names, got {declared!r}")
-        cls.CAPABILITIES = declared = frozenset(declared)
-        if missing_core := set(_caps.KNOWN_CAPABILITIES[:4]) - declared:
-            raise TypeError(f"{cls.__name__}.CAPABILITIES lacks the core capabilities {sorted(missing_core)}")
-        for name in declared:
-            if name not in _caps.KNOWN_CAPABILITIES and not _VENDOR_CAPABILITY.fullmatch(name):
-                raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
+        if declared is not None:
+            if isinstance(declared, str) or not all(isinstance(name, str) for name in declared):
+                raise TypeError(f"{cls.__name__}.CAPABILITIES must be a collection of str names, got {declared!r}")
+            cls.CAPABILITIES = declared = frozenset(declared)
+            if missing_core := set(_caps.KNOWN_CAPABILITIES[:4]) - declared:
+                raise TypeError(f"{cls.__name__}.CAPABILITIES lacks the core capabilities {sorted(missing_core)}")
+            for name in declared:
+                if name not in _caps.KNOWN_CAPABILITIES and not _VENDOR_CAPABILITY.fullmatch(name):
+                    raise TypeError(f"{cls.__name__}.CAPABILITIES: unknown capability {name!r}, not 'vendor:name'")
+        # The member checks run against the effective (possibly inherited)
+        # declaration, so a subclass cannot revert a member its parent claims.
+        for name in getattr(cls, "CAPABILITIES", None) or ():
             method = _caps.OPTIONAL_CAPABILITY_METHODS.get(name)
             impl = getattr(cls, method, None) if method else None
             if method and (impl is getattr(SimEngine, method) or not callable(impl)):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but does not override {method}()")
             refusals = [vars(_caps.ManipulationOptional)[m] for m in _MIXIN_REFUSALS.get(name, ())]
-            if any(inspect.unwrap(getattr(cls, m.__name__)) is m for m in refusals):
+            if any(_underlying(inspect.getattr_static(cls, m.__name__, None)) is m for m in refusals):
                 raise TypeError(f"{cls.__name__}.CAPABILITIES claims {name!r} but keeps a ManipulationOptional refusal")
 
     def capabilities(self) -> frozenset[str]:
@@ -6701,6 +6728,35 @@ class SimEngine(ABC):
         except TypeError:
             return None
 
+    def _prune_absent_capability_methods(self, methods: dict[str, str]) -> dict[str, str]:
+        """Drop from a ``describe()`` methods map what an absent capability leaves unimplemented.
+
+        Backends call it last, after adding their own entries. An entry is dropped
+        only when its capability is absent AND the member is still the base
+        ``SimEngine`` implementation or the ``ManipulationOptional`` refusal: a
+        member the backend implements itself (a joint-less backend's
+        ``robot_action_keys``, say) is always advertised. When ``capabilities()``
+        cannot answer, ``methods`` is returned unchanged.
+
+        Args:
+            methods: The ``describe()["methods"]`` map; pruned in place.
+
+        Returns:
+            The same ``methods`` map.
+        """
+        present = self._described_capabilities()
+        if present is None:
+            return methods
+        refusals = vars(_caps.ManipulationOptional)
+        for capability, names in _DESCRIBE_GATES.items():
+            if capability in present:
+                continue
+            for name in names:
+                member = _underlying(inspect.getattr_static(type(self), name, None))
+                if member is None or member in (inspect.getattr_static(SimEngine, name, None), refusals.get(name)):
+                    methods.pop(name, None)
+        return methods
+
     def describe(self) -> dict[str, Any]:
         """Return a machine-readable summary of this engine's live contract.
 
@@ -6875,6 +6931,7 @@ class SimEngine(ABC):
         # than by a hand-kept list of which backend has what, so a backend that
         # gains one of these starts advertising it with no second edit, and a
         # fourth backend is held to the rule on arrival.
+        # Kept beside _prune_absent_capability_methods: it still applies when capabilities() cannot answer.
         for optional in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
             if getattr(type(self), optional, None) is getattr(SimEngine, optional):
                 methods.pop(optional, None)
@@ -6882,7 +6939,7 @@ class SimEngine(ABC):
             "robots": self.list_robots(),
             "capabilities": self._described_capabilities(),
             "cameras": [],  # backends override to list camera names
-            "methods": methods,
+            "methods": self._prune_absent_capability_methods(methods),
             "note": (
                 "robot_name defaults to the sole robot when only one exists "
                 "for get_observation, send_action, get_robot_state, run_policy, "
