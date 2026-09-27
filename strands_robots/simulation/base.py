@@ -72,6 +72,8 @@ from strands_robots.utils import (
 )
 
 _VENDOR_CAPABILITY = re.compile(r"[a-z][a-z0-9_]*:[a-z0-9_][a-z0-9_.-]*")
+#: What a policy rollout entry point needs; checked before a policy is built or the world steps.
+_ROLLOUT_CAPABILITIES = frozenset({_caps.JOINTS, _caps.POLICY_ROLLOUT})
 logger = logging.getLogger(__name__)
 
 
@@ -1106,6 +1108,9 @@ class SimEngine(ABC):
         bridge = getattr(self, "_ros_bridge", None)
         if bridge is None:
             return
+        # A backend without JOINTS has no joint_states to publish; skip them up
+        # front rather than catching its refusal on every robot every step.
+        has_joints = _caps.JOINTS in self.capabilities()
         for robot in self.list_robots():
             # Per-robot guard: a transient render/observation failure on one
             # robot (e.g. EGL/GL context loss, a camera that produced no frame)
@@ -1114,7 +1119,7 @@ class SimEngine(ABC):
             # the docstring promises on the hot ros2_bridge=True path.
             try:
                 obs = self.get_observation(robot, skip_images=skip_images)
-                names = self.robot_joint_names(robot)
+                names = self.robot_joint_names(robot) if has_joints else []
                 # Build the (name, position) pair together. A JointState's two
                 # arrays are one table read by index, so a joint the observation
                 # does not carry has to drop its NAME as well as its value:
@@ -1124,7 +1129,8 @@ class SimEngine(ABC):
                 # freejoint is joint 0 of robot_joint_names() and is not an
                 # observation key - which shifted the whole body by one.
                 reported = [(j, float(obs[j])) for j in names if j in obs and isinstance(obs[j], (int, float))]
-                bridge.publish_joint_states(robot, [j for j, _ in reported], [v for _, v in reported])
+                if has_joints:
+                    bridge.publish_joint_states(robot, [j for j, _ in reported], [v for _, v in reported])
                 if skip_images:
                     continue
                 for key, value in obs.items():
@@ -1569,6 +1575,36 @@ class SimEngine(ABC):
         if isinstance(outcome, str):
             return None, f"{surface}: {outcome}"
         return outcome, None
+
+    def _bind_state_keys(self, policy: Policy, robot_name: str) -> dict[str, Any] | None:
+        """Bind ``robot_name``'s action keys as ``policy``'s state keys, or refuse.
+
+        A ``NotImplementedError`` (``CapabilityNotSupported`` included) from
+        either member means this backend cannot name the robot's actions, so a
+        rollout would run blind. It becomes the ``unsupported_by_backend``
+        result, whose ``json.member`` names the member that raised.
+
+        Args:
+            policy: The policy about to be rolled out.
+            robot_name: The robot it drives.
+
+        Returns:
+            ``None`` once bound, otherwise the error result.
+
+        Raises:
+            Exception: Any other exception from ``robot_action_keys`` or
+                ``set_robot_state_keys``, unchanged, so each caller keeps its
+                own handling of it.
+        """
+        member = "robot_action_keys"
+        try:
+            keys = self.robot_action_keys(robot_name)
+            member = "set_robot_state_keys"
+            policy.set_robot_state_keys(keys)
+        except NotImplementedError as exc:
+            logger.debug("%s for %r is not implemented: %s", member, robot_name, exc)
+            return _caps.unsupported_result(_caps.JOINTS, member, type(self).__name__)
+        return None
 
     def _build_policy(
         self, entry: str, policy_provider: str, policy_config: dict[str, Any] | None
@@ -3547,6 +3583,8 @@ class SimEngine(ABC):
             robot's valid actuator names. A PARTIAL failure runs to completion,
             surfaced via ``partial_action_failure_rate``.
         """
+        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="run_policy"):
+            return refusal
         # Refuse a value outside the observer's domain before robot discovery,
         # policy construction, backend hook creation, clocks, or rollout work.
         if observer_error := optional_callable_error(observer, "observer", "run_policy"):
@@ -3696,9 +3734,11 @@ class SimEngine(ABC):
         # wrong-embodiment mismatch is surfaced far more actionably downstream
         # by PolicyRunner's fail-fast probe ("the robot has not moved"). This
         # matches the guarded binding in MujocoSimulation.run_policy's
-        # multi-robot path.
+        # multi-robot path. A NotImplementedError is the exception: it means the
+        # backend cannot name its actions at all, so the rollout would run blind.
         try:
-            policy.set_robot_state_keys(self.robot_action_keys(robot_name))
+            if refusal := self._bind_state_keys(policy, robot_name):
+                return refusal
             self.bind_policy_sim_context(policy, robot_name)
         except Exception as exc:  # noqa: BLE001 - non-fatal policy configuration
             logger.debug("policy binding for %r failed: %s", robot_name, exc)
@@ -3889,6 +3929,8 @@ class SimEngine(ABC):
             multi-robot rollout. Implementing backends return the standard
             status dict with per-robot step counts.
         """
+        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="run_multi_policy"):
+            return refusal
         return {
             "status": "error",
             "content": [
@@ -4821,6 +4863,8 @@ class SimEngine(ABC):
         ``policy_kwargs`` carries the per-call #300 goal payload through to
         ``policy.get_actions`` (see :meth:`run_policy`).
         """
+        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="start_policy"):
+            return refusal
         robot_name = self._resolve_single_robot(robot_name)
         return self.run_policy(
             robot_name,
@@ -5242,6 +5286,10 @@ class SimEngine(ABC):
         Override per backend for optimised replay (e.g. direct ctrl
         writes) only when measured necessary.
         """
+        # Replay drives recorded actions through robot_action_keys and a numeric
+        # send_action; it builds no policy, so it needs JOINTS alone.
+        if refusal := _caps.check_capabilities(self, {_caps.JOINTS}, caller="replay_episode"):
+            return refusal
 
         return PolicyRunner(self).replay(
             repo_id,
@@ -5496,6 +5544,8 @@ class SimEngine(ABC):
             ``rtc_avg_inference_ms`` and ``rtc_max_inference_ms`` are kept for
             one release with the same values.
         """
+        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="eval_policy"):
+            return refusal
         # Same posture-flag rule as run_policy, ahead of robot resolution: an
         # evaluation is the one place a misread here would be trusted as a
         # number, since a success rate carries no field saying which pipeline
@@ -5640,7 +5690,8 @@ class SimEngine(ABC):
             # set robot_state_keys; we set defensively so semantics match the
             # provider path.
             policy = policy_object
-        policy.set_robot_state_keys(self.robot_action_keys(resolved_robot))
+        if refusal := self._bind_state_keys(policy, resolved_robot):
+            return refusal
         self.bind_policy_sim_context(policy, resolved_robot)
         on_frame, recording_claim = self._evaluation_recording(resolved_robot, instruction, on_frame, "eval_policy")
 
@@ -5924,6 +5975,8 @@ class SimEngine(ABC):
             Only this route reports it: :meth:`eval_policy` takes a ``success_fn``
             and has no failure criterion to sample.
         """
+        if refusal := _caps.check_capabilities(self, _ROLLOUT_CAPABILITIES, caller="evaluate_benchmark"):
+            return refusal
         from strands_robots.simulation.benchmark import get_benchmark, spec_instruction
 
         # Same rule as eval_policy: an uncallable hook is refused before any
@@ -6067,7 +6120,8 @@ class SimEngine(ABC):
             # caller benchmark an already-loaded checkpoint (e.g. a multi-GB
             # VLA) without a create_policy round-trip / redundant reload.
             policy = policy_object
-        policy.set_robot_state_keys(self.robot_action_keys(resolved_robot))
+        if refusal := self._bind_state_keys(policy, resolved_robot):
+            return refusal
         self.bind_policy_sim_context(policy, resolved_robot)
         # Frames are labelled with the instruction the POLICY is conditioned on:
         # the caller's, else the benchmark's own (#187 - LIBERO and friends ship
