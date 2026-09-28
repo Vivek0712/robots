@@ -103,11 +103,11 @@ def test_any_engine_like_object_is_checked_and_a_clashing_name_does_not_break_de
 
 
 def test_unsupported_result_and_exception_carry_the_stable_code() -> None:
-    result = caps.unsupported_result(caps.OBJECTS, "add_object", "OrbitSim")
+    result = caps.unsupported_result(caps.OBJECTS, "add_object", "RemoteSim")
     assert_strands_tool_result(result)
     assert result["status"] == "error"
     expected = {"code": caps.UNSUPPORTED_BY_BACKEND, "capability": caps.OBJECTS}
-    assert tool_json(result) == {**expected, "member": "add_object", "backend": "OrbitSim"}
+    assert tool_json(result) == {**expected, "member": "add_object", "backend": "RemoteSim"}
     err = caps.CapabilityNotSupported(caps.JOINTS, "robot_joint_names")
     assert isinstance(err, NotImplementedError)
     assert (err.code, err.capability, err.member) == (caps.UNSUPPORTED_BY_BACKEND, caps.JOINTS, "robot_joint_names")
@@ -115,7 +115,7 @@ def test_unsupported_result_and_exception_carry_the_stable_code() -> None:
     assert (type(copy), copy.capability, copy.member, str(copy)) == (type(err), err.capability, err.member, str(err))
 
 
-class _Orbit(caps.ManipulationOptional, SimEngine):
+class _Remote(caps.ManipulationOptional, SimEngine):
     """The documented pattern, written statically so mypy checks it: the mixin supplies manipulation."""
 
     def create_world(self, *a: Any, **k: Any) -> dict[str, Any]:
@@ -149,20 +149,20 @@ class _Orbit(caps.ManipulationOptional, SimEngine):
         return {}
 
 
-@pytest.mark.parametrize("call", [lambda s: s.add_object("rock"), lambda s: s.remove_object("rock"), _Orbit.render])
+@pytest.mark.parametrize("call", [lambda s: s.add_object("rock"), lambda s: s.remove_object("rock"), _Remote.render])
 def test_mixin_refusals_are_error_results_with_stable_code(call: Any) -> None:
-    engine = _Orbit()
+    engine = _Remote()
     assert engine.capabilities() == _CORE
     result = call(engine)
     assert_strands_tool_result(result)
     assert result["status"] == "error"
     payload = tool_json(result)
-    assert (payload["code"], payload["backend"]) == (caps.UNSUPPORTED_BY_BACKEND, "_Orbit")
+    assert (payload["code"], payload["backend"]) == (caps.UNSUPPORTED_BY_BACKEND, "_Remote")
 
 
 def test_joint_names_without_joints_raises_rather_than_returning_empty() -> None:
     with pytest.raises(caps.CapabilityNotSupported) as info:
-        _Orbit().robot_joint_names("sat0")
+        _Remote().robot_joint_names("node0")
     assert (info.value.capability, info.value.member) == (caps.JOINTS, "robot_joint_names")
 
 
@@ -175,21 +175,21 @@ def test_mixin_keeps_shared_parameter_order(member: str) -> None:
 @pytest.mark.parametrize("claimed", [caps.OBJECTS, caps.RENDER, caps.JOINTS])
 def test_declared_capability_backed_by_refusal_is_a_type_error(claimed: str) -> None:
     with pytest.raises(TypeError, match=claimed):
-        type("X", (_Orbit,), {"CAPABILITIES": _CORE | {claimed}})
+        type("X", (_Remote,), {"CAPABILITIES": _CORE | {claimed}})
     wrapped = functools.wraps(caps.ManipulationOptional.render)(lambda self, *a, **k: {})
     with pytest.raises(TypeError, match="render"):
-        type("X", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": wrapped})
+        type("X", (_Remote,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": wrapped})
 
 
 def test_a_partial_or_an_inherited_claim_backed_by_refusal_is_a_type_error() -> None:
     partial = functools.partialmethod(caps.ManipulationOptional.render, "cam")
     with pytest.raises(TypeError, match="render"):
-        type("X", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": partial})
+        type("X", (_Remote,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": partial})
 
     def render(self: Any, camera_name: str = "default", width: int | None = None, height: int | None = None) -> Any:
         return {"status": "success", "content": [{"text": camera_name}]}
 
-    parent = type("Imager", (_Orbit,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": render})
+    parent = type("Imager", (_Remote,), {"CAPABILITIES": _CORE | {caps.RENDER}, "render": render})
     with pytest.raises(TypeError, match="render"):
         type("Reverted", (parent,), {"render": caps.ManipulationOptional.render})
 
@@ -199,7 +199,7 @@ def test_mixin_backend_that_overrides_render_may_declare_it() -> None:
         return {"status": "success", "content": [{"text": camera_name}]}
 
     declared = (caps.ManipulationOptional.CAPABILITIES or frozenset()) | {caps.RENDER}
-    engine = type("Imager", (_Orbit,), {"CAPABILITIES": declared, "render": render})()
+    engine = type("Imager", (_Remote,), {"CAPABILITIES": declared, "render": render})()
     assert engine.capabilities() == _CORE | {caps.RENDER}
     assert engine.render()["status"] == "success"
 
@@ -267,7 +267,7 @@ def test_a_narrowed_backend_hides_only_what_it_does_not_implement(backend: str) 
         assert hidden
 
 
-class _Advertising(_Orbit):
+class _Advertising(_Remote):
     """A joint-less backend that, like MuJoCo, adds its own entries to describe() and then prunes."""
 
     def describe(self) -> dict[str, Any]:
@@ -280,27 +280,27 @@ class _Advertising(_Orbit):
 def test_a_joint_less_backend_keeps_its_own_action_keys_and_drops_its_refusals() -> None:
     inherited = _Advertising().describe()["methods"]
     assert {"robot_action_keys", "robot_joint_names", "add_object", "render", "run_policy"}.isdisjoint(inherited)
-    burner = type("Burner", (_Advertising,), {"robot_action_keys": lambda self, robot_name: ["dv_mps", "burn_s"]})()
-    methods = burner.describe()["methods"]
+    mover = type("Mover", (_Advertising,), {"robot_action_keys": lambda self, robot_name: ["speed", "turn"]})()
+    methods = mover.describe()["methods"]
     assert "robot_action_keys" in methods and "send_action" in methods
     assert "robot_joint_names" not in methods
-    assert burner.robot_action_keys("sat") == ["dv_mps", "burn_s"]
+    assert mover.robot_action_keys("node") == ["speed", "turn"]
 
 
-class _Sat(_Orbit):
+class _Node(_Remote):
     """A core-only engine holding one robot, so a rollout gets past robot resolution."""
 
     def list_robots(self) -> list[str]:
-        return ["sat0"]
+        return ["node0"]
 
 
 _ROLLOUTS = {
-    "run_policy": lambda s: s.run_policy("sat0"),
-    "start_policy": lambda s: s.start_policy("sat0"),
-    "eval_policy": lambda s: s.eval_policy("sat0"),
-    "run_multi_policy": lambda s: s.run_multi_policy({"sat0": object()}),
-    "evaluate_benchmark": lambda s: s.evaluate_benchmark("any", "sat0"),
-    "replay_episode": lambda s: s.replay_episode("org/data", "sat0"),
+    "run_policy": lambda s: s.run_policy("node0"),
+    "start_policy": lambda s: s.start_policy("node0"),
+    "eval_policy": lambda s: s.eval_policy("node0"),
+    "run_multi_policy": lambda s: s.run_multi_policy({"node0": object()}),
+    "evaluate_benchmark": lambda s: s.evaluate_benchmark("any", "node0"),
+    "replay_episode": lambda s: s.replay_episode("org/data", "node0"),
 }
 
 
@@ -308,7 +308,7 @@ _ROLLOUTS = {
 def test_run_policy_on_backend_without_joints_refuses_before_any_step(caller: str, monkeypatch: Any) -> None:
     reached: list[str] = []
     monkeypatch.setattr("strands_robots.policies.create_policy", lambda *a, **k: reached.append("create_policy"))
-    engine = _Sat()
+    engine = _Node()
     monkeypatch.setattr(engine, "step", lambda *a, **k: reached.append("step"))
     result = _ROLLOUTS[caller](engine)
     assert_strands_tool_result(result)
@@ -322,10 +322,10 @@ def test_run_policy_on_backend_without_joints_refuses_before_any_step(caller: st
 
 def test_a_joint_less_backend_with_its_own_run_policy_can_start_a_policy() -> None:
     ran = {"status": "success", "content": [{"text": "ran"}]}
-    body = {"list_robots": lambda self: ["sat0"], "run_policy": lambda self, robot_name, **k: ran}
+    body = {"list_robots": lambda self: ["node0"], "run_policy": lambda self, robot_name, **k: ran}
     engine = _engine(CAPABILITIES=caps.DEFAULT_CAPABILITIES - {caps.JOINTS}, **body)()
-    assert engine.start_policy("sat0") is ran
-    for refused in (lambda e: e.eval_policy("sat0"), lambda e: e.replay_episode("org/data", "sat0")):
+    assert engine.start_policy("node0") is ran
+    for refused in (lambda e: e.eval_policy("node0"), lambda e: e.replay_episode("org/data", "node0")):
         assert tool_json(refused(engine))["missing"] == [caps.JOINTS]
 
 
@@ -425,17 +425,17 @@ def test_a_clashing_capabilities_member_falls_back_to_the_derived_set(clash: Any
 
 
 def test_stop_policy_destroy_reset_ignore_capabilities() -> None:
-    engine = _Sat()
+    engine = _Node()
     # destroy and reset are abstract, so this half pins only that no base wrapper gates them.
     assert (engine.destroy(), engine.reset()) == ({}, {})
-    result = engine.stop_policy("sat0")
+    result = engine.stop_policy("node0")
     assert_strands_tool_result(result)
     assert caps.UNSUPPORTED_BY_BACKEND not in repr(result)
 
 
 def test_ros_bridge_skips_joint_states_on_a_backend_without_joints(caplog: Any) -> None:
     published: list[str] = []
-    engine = _Sat()
+    engine = _Node()
     engine._ros_bridge = type("Bridge", (), {"publish_joint_states": lambda *a: published.append("joints")})()
     with caplog.at_level("WARNING"):
         engine._publish_ros_telemetry(skip_images=True)

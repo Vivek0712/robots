@@ -158,7 +158,7 @@ def _merge_user_robots(data: dict, overlay_source: bytes | None) -> dict:
     merged["robots"] = merged_robots
 
     # ``register_robot`` folds before it writes, but a hand-written overlay is
-    # read verbatim, and a key like ``sat-001`` then answers no query - not even
+    # read verbatim, and a key like ``rover-001`` then answers no query - not even
     # its own spelling, which is folded before it is looked up. The key is
     # refused here, where it is known to come from the overlay, rather than
     # folded: folding could collapse two keys (or an overlay key and a package

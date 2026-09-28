@@ -4,7 +4,7 @@ Every reader looks a robot up by :func:`~strands_robots.registry.loader.normaliz
 of the query - lowercase, trimmed, dashes as underscores. ``register_robot``
 folds the name before it writes, so its entries are always reachable. A
 ``user_robots.json`` written by hand (or by any tool other than
-``register_robot``) was merged verbatim, so a key like ``sat-001`` or ``My_Arm``
+``register_robot``) was merged verbatim, so a key like ``rover-001`` or ``My_Arm``
 loaded without complaint and then answered no query at all - not even the
 spelling it was declared in, because that query is folded before it reaches the
 registry.
@@ -44,7 +44,7 @@ def _entry(description: str = "hand-written") -> dict:
 
 @pytest.mark.parametrize(
     ("declared", "folded"),
-    [("sat-001", "sat_001"), ("My_Arm", "my_arm"), (" padded ", "padded")],
+    [("rover-001", "rover_001"), ("My_Arm", "my_arm"), (" padded ", "padded")],
     ids=["dashed", "mixed-case", "padded"],
 )
 def test_an_overlay_key_that_is_not_folded_is_refused_with_its_file_and_folded_spelling(
@@ -75,19 +75,19 @@ def test_an_overlay_key_that_folds_onto_a_shipped_robot_warns_that_renaming_repl
 
 def test_unregister_robot_removes_an_unfolded_key_by_its_raw_spelling(tmp_path: Path) -> None:
     """The recovery path: the refused key can be removed without hand-editing the file."""
-    overlay = _write_overlay(tmp_path, {"sat-001": _entry()})
+    overlay = _write_overlay(tmp_path, {"rover-001": _entry()})
 
-    assert unregister_robot("sat-001") is True
+    assert unregister_robot("rover-001") is True
 
-    assert "sat-001" not in json.loads(overlay.read_text())["robots"]
+    assert "rover-001" not in json.loads(overlay.read_text())["robots"]
     assert get_robot("so100") is not None
 
 
 def test_a_folded_overlay_key_still_loads_and_answers_every_spelling(tmp_path: Path) -> None:
     """Control: the refusal is about the key's spelling, not about hand-written overlays."""
-    _write_overlay(tmp_path, {"sat_001": _entry("folded")})
+    _write_overlay(tmp_path, {"rover_001": _entry("folded")})
 
-    for query in ("sat_001", "sat-001", "SAT-001"):
+    for query in ("rover_001", "rover-001", "ROVER-001"):
         entry = get_robot(query)
         assert entry is not None, f"{query!r} reached no robot"
         assert entry["description"] == "folded"
@@ -97,8 +97,8 @@ def test_register_robot_refuses_to_write_while_an_unfolded_key_is_present(tmp_pa
     """The write-time check mirrors the load: it does not persist into a registry that cannot load."""
     from strands_robots.registry.user_registry import register_robot
 
-    path = _write_overlay(tmp_path, {"sat-001": _entry()})
+    path = _write_overlay(tmp_path, {"rover-001": _entry()})
     before = path.read_text()
-    with pytest.raises(ValueError, match="rename it to 'sat_001'"):
-        register_robot("orbiter", hardware={"driver": "strands"}, overwrite=True)
+    with pytest.raises(ValueError, match="rename it to 'rover_001'"):
+        register_robot("drone", hardware={"driver": "strands"}, overwrite=True)
     assert path.read_text() == before
