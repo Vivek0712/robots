@@ -207,7 +207,7 @@ def register_robot(
         name: Canonical robot name (lowercase, underscores).
         model_xml: Path to MJCF/URDF model file, relative to ``asset_dir``.
             None (default) registers a robot with no simulation asset - a
-            spacecraft, a remote service robot - stored with no ``asset``
+            remote sensor node, a remote service robot - stored with no ``asset``
             block, like the package's hardware-only entries. Such a robot must
             declare *hardware* and is reachable in real mode only.
         description: Human-readable description.
@@ -265,7 +265,7 @@ def register_robot(
             joints=7,
             aliases=["myarm", "custom_arm"],
         )
-        register_robot("orbiter", category="aerial", hardware={"driver": "strands"})
+        register_robot("drone", category="aerial", hardware={"driver": "strands"})
     """
     if hardware is not None and not isinstance(hardware, dict):
         raise TypeError(f"hardware must be a dict, got {type(hardware).__name__}: {hardware!r}")
@@ -422,7 +422,7 @@ def unregister_robot(name: str) -> bool:
     only in the package registry, this is a no-op.
 
     A key spelled exactly as *name* is removed first, so a hand-written key the
-    loader refuses as not folded (``sat-001``) can be removed by the spelling
+    loader refuses as not folded (``rover-001``) can be removed by the spelling
     the refusal quotes. Otherwise *name* is folded and that key is removed. The
     overlay file is read directly, not through the merged registry, which fails
     to load while such a key is present.

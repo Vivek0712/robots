@@ -6,9 +6,9 @@ block, and it must declare `hardware` with a non-empty `lerobot_type` or
 `strands` driver still has to be registered with `register_native_driver`):
 
 ```python
-register_robot("orbiter", category="aerial", hardware={"driver": "strands"})
+register_robot("drone", category="aerial", hardware={"driver": "strands"})
 ```
 
 `scene_xml`, `asset_dir` and `robot_descriptions_module` only describe an asset
-and are refused without `model_xml`. `Robot("orbiter", mode="sim")` reports the
+and are refused without `model_xml`. `Robot("drone", mode="sim")` reports the
 robot as real-hardware only. Registration with `model_xml` is unchanged.
