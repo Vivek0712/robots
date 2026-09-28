@@ -23,6 +23,12 @@
       filters: ["!^_"]
       members_order: source
 
+## Capabilities
+
+::: strands_robots.simulation.capabilities
+    options:
+      heading_level: 3
+
 ## World model
 
 ::: strands_robots.simulation.models
