@@ -89,7 +89,9 @@ _HANDSHAKE = [
     {
         "service": "/ctrl_pkg/vehicle_state",
         "type": "deepracer_interfaces_pkg/srv/ActiveStateSrv",
-        "fields": {"state": 1},
+        # 0 = manual on the stock ctrl_pkg (1 = autonomous, 2 = calibration);
+        # only manual relays /manual_drive servo messages to the servo node.
+        "fields": {"state": 0},
     },
     {
         "service": "/ctrl_pkg/enable_state",
@@ -136,6 +138,16 @@ def test_from_deepracer_wiring_pinned() -> None:
     assert car.init_services == _HANDSHAKE
 
 
+def test_from_deepracer_handshake_selects_manual_mode() -> None:
+    # The stock ctrl_pkg relays /webserver_pkg/manual_drive to the servo node
+    # only while vehicle_state is 0 (manual). 1 selects the on-car autonomous
+    # inference loop, which drops manual servo messages; 2 is calibration.
+    # A car armed with 1 accepts the handshake and then silently never moves.
+    car = ack_mod.AckermannRosRobot.from_deepracer(node_name="dr")
+    vehicle_state = next(s for s in car.init_services if s["service"] == "/ctrl_pkg/vehicle_state")
+    assert vehicle_state["fields"] == {"state": 0}
+
+
 def test_from_deepracer_accepts_overrides() -> None:
     car = ack_mod.AckermannRosRobot.from_deepracer(node_name="dr", max_speed=0.8, scan_topic=None)
     assert car.max_speed == 0.8
@@ -153,7 +165,7 @@ def test_enable_calls_init_services_in_order(rec: Transport) -> None:
     assert [c["action"] for c in rec.calls] == ["service_call", "service_call"]
     assert rec.calls[0]["service"] == "/ctrl_pkg/vehicle_state"
     assert rec.calls[0]["type"] == "deepracer_interfaces_pkg/srv/ActiveStateSrv"
-    assert rec.calls[0]["fields"] == {"state": 1}
+    assert rec.calls[0]["fields"] == {"state": 0}
     assert rec.calls[1]["service"] == "/ctrl_pkg/enable_state"
     assert rec.calls[1]["fields"] == {"is_active": True}
 

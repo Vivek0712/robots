@@ -256,9 +256,12 @@ class AckermannRosRobot:
 
         Servo commands go to the webserver package's manual-drive topic, the
         RPLIDAR scan topic is preconfigured, and ``init_services`` carries the
-        two-step manual-mode handshake (``vehicle_state`` state=1, then
+        two-step manual-mode handshake (``vehicle_state`` state=0, then
         ``enable_state`` is_active=True) the car requires before it acts on
-        servo messages. Any keyword can be overridden for a modified car.
+        servo messages. The stock ``ctrl_pkg`` numbers its modes 0 = manual,
+        1 = autonomous, 2 = calibration, and only relays manual-drive servo
+        messages in mode 0; in mode 1 it runs the on-car inference loop and
+        drops them. Any keyword can be overridden for a modified car.
         """
         wiring: dict[str, Any] = {
             "servo_topic": "/webserver_pkg/manual_drive",
@@ -267,7 +270,7 @@ class AckermannRosRobot:
                 {
                     "service": "/ctrl_pkg/vehicle_state",
                     "type": "deepracer_interfaces_pkg/srv/ActiveStateSrv",
-                    "fields": {"state": 1},
+                    "fields": {"state": 0},
                 },
                 {
                     "service": "/ctrl_pkg/enable_state",
